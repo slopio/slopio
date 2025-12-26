@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, mem, rc::Rc, task::Waker};
+use std::{cell::UnsafeCell, rc::Rc, task::Waker};
 
 use slab::Slab;
 
@@ -12,14 +12,14 @@ pub struct IODriver {
 
 scoped_thread_local!(pub(crate) static IO_DRIVER: IODriver);
 
-struct OpCode;
+pub struct OpCode;
 
 impl IODriver {
     pub fn with<R>(&self, f: impl FnOnce() -> R) -> R {
         IO_DRIVER.set(self, f)
     }
 
-    pub fn poll(&self, id: usize, waker: &Waker) -> std::task::Poll<()> {
+    pub fn progress(&self, id: usize, waker: &Waker) -> std::task::Poll<()> {
         let slab = unsafe { &mut *self.slab.get() };
         let entry = slab.get_mut(id).unwrap();
         match entry {
@@ -36,12 +36,11 @@ impl IODriver {
 
     pub fn tick(&self) {
         let slab = unsafe { &mut *self.slab.get() };
-        for i in slab {}
+        for _ in slab {}
     }
 
-    pub fn submit_op(&self, op: OpCode) -> usize {
+    pub fn submit_op(&self, _op: OpCode) -> usize {
         let slab = unsafe { &mut *self.slab.get() };
-        //TODO turn insert op in submission queue.
         slab.insert(UringOperation::Init)
     }
 
@@ -68,6 +67,7 @@ impl UringOperation {
     }
 }
 
+#[allow(dead_code)]
 enum CompletionEnd {
     ToBeDeleted,
     Persistant,

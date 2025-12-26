@@ -5,11 +5,11 @@ use std::task::{Context, Waker};
 
 use crate::io_driver::IODriver;
 use crate::scoped_thread_local;
-use crate::task::Task;
+use crate::task::{Handle, TypeAgnosticTask, new_task};
 
 #[derive(Default)]
 pub struct RuntimeInner {
-    tasks: TaskList,
+    pub tasks: TaskList,
     io_driver: IODriver,
 }
 
@@ -22,7 +22,7 @@ impl RuntimeInner {
                 let mut pinned_f = pin!(f);
                 loop {
                     self.io_driver.tick();
-                    for item in self.tasks.drain() {
+                    while let Some(item) = self.tasks.pop() {
                         item.poll();
                     }
                     let pinned = pinned_f.as_mut();
@@ -38,30 +38,30 @@ impl RuntimeInner {
     }
 }
 
-pub fn spawn(f: impl Future) -> Join {
+pub fn spawn<F: Future>(f: F) -> Handle<F::Output> {
+    let (task, handle) = new_task(f);
     CURRENT.with(|ctx| {
-        ctx.push(Task {});
+        ctx.push(task);
     });
-    Join {}
+    handle
 }
-
-pub struct Join;
 
 scoped_thread_local!(pub(crate) static CURRENT: TaskList);
 
 #[derive(Default)]
 pub struct TaskList {
-    tasks: UnsafeCell<VecDeque<Task>>,
+    tasks: UnsafeCell<VecDeque<TypeAgnosticTask>>,
 }
 
 impl TaskList {
-    fn push(&self, task: Task) {
+    pub fn push(&self, task: TypeAgnosticTask) {
+        println!("pushing {task:?}");
         let tasks_list = unsafe { &mut *self.tasks.get() };
         tasks_list.push_back(task);
     }
 
-    fn drain(&self) -> std::collections::vec_deque::Drain<'_, Task> {
-        let tasks_list = unsafe { &mut *self.tasks.get() };
-        tasks_list.drain(..)
+    pub fn pop(&self) -> Option<TypeAgnosticTask> {
+        let task_list = unsafe { &mut *self.tasks.get() };
+        task_list.pop_front()
     }
 }

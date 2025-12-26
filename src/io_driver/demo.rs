@@ -1,4 +1,4 @@
-use crate::io_driver::{IO_DRIVER, UringOperation};
+use crate::io_driver::IO_DRIVER;
 
 pub struct Demo {}
 
@@ -13,7 +13,7 @@ impl Future for DemoFut {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        IO_DRIVER.with(|d| d.poll(self.id, cx.waker()))
+        IO_DRIVER.with(|d| d.progress(self.id, cx.waker()))
     }
 }
 

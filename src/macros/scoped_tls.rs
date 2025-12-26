@@ -63,20 +63,21 @@ impl<T> ScopedKey<T> {
         unsafe { f(&*(val as *const T)) }
     }
 
-    pub fn try_with<F, R>(&'static self, f: F) -> R
-    where
-        F: FnOnce(Option<&T>) -> R,
-    {
-        let val = self.inner.with(|c| c.get());
-        if val.is_null() {
-            f(None)
-        } else {
-            unsafe { f(Some(&*(val as *const T))) }
-        }
-    }
+    // #[allow(unused)]
+    // pub fn try_with<F, R>(&'static self, f: F) -> R
+    // where
+    //     F: FnOnce(Option<&T>) -> R,
+    // {
+    //     let val = self.inner.with(|c| c.get());
+    //     if val.is_null() {
+    //         f(None)
+    //     } else {
+    //         unsafe { f(Some(&*(val as *const T))) }
+    //     }
+    // }
 
-    #[inline]
-    pub fn is_set(&'static self) -> bool {
-        self.inner.with(|c| !c.get().is_null())
-    }
+    // #[inline]
+    // pub fn is_set(&'static self) -> bool {
+    //     self.inner.with(|c| !c.get().is_null())
+    // }
 }
