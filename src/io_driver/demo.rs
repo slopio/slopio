@@ -23,7 +23,7 @@ impl IntoFuture for Demo {
     type IntoFuture = DemoFut;
 
     fn into_future(self) -> Self::IntoFuture {
-        let id = IO_DRIVER.with(|d| d.submit_op(super::OpCode));
+        let id = IO_DRIVER.with(|d| d.submit_op(super::OpOp));
         Self::IntoFuture { id }
     }
 }

@@ -14,10 +14,10 @@ fn main() {
         });
         println!("owo");
         let x = r.await;
-        println!(">>> {}", x);
+        println!(">>> {x}");
 
         let demo = Demo {};
         let fut = demo.into_future();
-        let owo = fut.await;
+        let _ = fut.await;
     });
 }
