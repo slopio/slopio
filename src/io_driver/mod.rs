@@ -5,7 +5,7 @@ use slab::Slab;
 
 use crate::scoped_thread_local;
 pub mod demo;
-mod operations;
+pub mod operations;
 
 #[derive(Default)]
 pub struct IODriver {
