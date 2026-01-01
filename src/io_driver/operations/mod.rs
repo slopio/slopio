@@ -1,7 +1,4 @@
-use io_uring::squeue::Entry;
-
-pub trait Op {
-    fn into_entry(self) -> Entry;
+trait IoOP {
+    //registers the driver
+    fn register_to_driver(&self);
 }
-
-//opcode -> entry -> added_to_driver
