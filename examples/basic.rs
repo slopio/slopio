@@ -1,4 +1,4 @@
-use runtime::{io_driver::demo::Demo, runtime::spawn};
+use runtime::runtime::spawn;
 
 fn main() {
     let mut rt = runtime::runtime::RuntimeInner::default();
@@ -15,9 +15,5 @@ fn main() {
         println!("owo");
         let x = r.await;
         println!(">>> {x}");
-
-        let demo = Demo {};
-        let fut = demo.into_future();
-        let _ = fut.await;
     });
 }

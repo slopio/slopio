@@ -1,4 +1,11 @@
+use io_uring::squeue::Entry;
+
+pub mod open;
+
+pub(crate) type IoDriverToken = u64;
+
 trait IoOP {
-    //registers the driver
-    fn register_to_driver(&self);
+    fn register_to_driver(&mut self) -> IoDriverToken;
+
+    fn to_entry(&self) -> Entry;
 }

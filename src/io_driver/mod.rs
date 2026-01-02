@@ -1,16 +1,19 @@
 use std::{cell::UnsafeCell, rc::Rc, task::Waker};
 
-use io_uring::{IoUring, squeue::Entry};
+use io_uring::{
+    IoUring,
+    cqueue::Entry,
+    squeue::{self},
+};
 use slab::Slab;
 
-use crate::scoped_thread_local;
-pub mod demo;
+use crate::{io_driver::operations::IoDriverToken, scoped_thread_local};
 pub mod operations;
 
 #[derive(Default)]
 pub struct IODriver {
     slab: Rc<UnsafeCell<Slab<UringOperation>>>,
-    ring: Ring,
+    ring: UnsafeCell<Ring>,
 }
 
 impl Default for Ring {
@@ -23,21 +26,21 @@ impl Default for Ring {
 
 scoped_thread_local!(pub(crate) static IO_DRIVER: IODriver);
 
-pub struct OpOp;
-
 impl IODriver {
     pub fn with<R>(&self, f: impl FnOnce() -> R) -> R {
         IO_DRIVER.set(self, f)
     }
 
-    pub fn push_op(&mut self, entry: &mut Entry) {
+    pub fn push_op(&self, mut entry: squeue::Entry) -> IoDriverToken {
         let slab = unsafe { &mut *self.slab.get() };
-        let user_data = slab.insert(UringOperation::Init) as u64;
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        let user_data = slab.insert(UringOperation::Init) as IoDriverToken;
         entry.set_user_data(user_data);
-        self.ring.add(entry);
+        ring_inner.add(&entry);
+        user_data
     }
 
-    pub fn progress(&self, id: usize, waker: &Waker) -> std::task::Poll<()> {
+    pub fn poll_op(&self, id: usize, waker: &Waker) -> std::task::Poll<OpMetadata> {
         let slab = unsafe { &mut *self.slab.get() };
         let entry = slab.get_mut(id).unwrap();
         match entry {
@@ -47,36 +50,58 @@ impl IODriver {
             }
             UringOperation::Sent(waker) => {
                 waker.wake_by_ref();
-                std::task::Poll::Ready(())
+                std::task::Poll::Pending
             }
+            UringOperation::Ended(e) => std::task::Poll::Ready(*e),
         }
     }
 
-    pub fn tick(&self) {
-        let slab = unsafe { &mut *self.slab.get() };
-        for _ in slab {}
+    pub fn submit(&self) {
+        let ring = unsafe { &mut *self.ring.get() };
+        ring.inner.submit().unwrap();
     }
 
-    pub fn submit_op(&self, _op: OpOp) -> usize {
-        let slab = unsafe { &mut *self.slab.get() };
-        slab.insert(UringOperation::Init)
-    }
-
-    fn complete(&self, slab_index: usize) {
-        let slab = unsafe { &mut *self.slab.get() };
-        let entry = slab.get_mut(slab_index).unwrap();
-        match entry.completion() {
-            CompletionEnd::ToBeDeleted => {
-                slab.remove(slab_index);
-            }
-            CompletionEnd::Persistant => {}
+    pub fn process_completion_queue(&self) {
+        let ring = unsafe { &mut *self.ring.get() };
+        for c_event in ring.inner.completion() {
+            self.process_completion(c_event);
         }
+    }
+
+    fn process_completion(&self, entry: Entry) {
+        let slab = unsafe { &mut *self.slab.get() };
+        let slab_index = entry.user_data() as usize;
+        let slab_entry = slab.get_mut(slab_index).unwrap();
+        match slab_entry {
+            UringOperation::Init => unreachable!("submitted entry should't be in init"), //sure?
+            UringOperation::Sent(waker) => {
+                waker.wake_by_ref();
+            }
+            UringOperation::Ended(_) => {
+                unreachable!("should not be in ended state");
+            }
+        }
+        std::mem::swap(
+            slab_entry,
+            &mut UringOperation::Ended(OpMetadata {
+                result: entry.result(),
+                flags: entry.flags(),
+            }),
+        );
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpMetadata {
+    result: i32,
+    flags: u32,
+}
+
+#[derive(Debug)]
 enum UringOperation {
     Init,
     Sent(Waker),
+    Ended(OpMetadata),
 }
 
 impl UringOperation {
@@ -96,7 +121,7 @@ struct Ring {
 }
 
 impl Ring {
-    pub(crate) fn add(&mut self, entry: &Entry) {
+    pub(crate) fn add(&mut self, entry: &squeue::Entry) {
         unsafe {
             self.inner.submission().push(entry).unwrap();
         }

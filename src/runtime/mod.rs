@@ -21,7 +21,7 @@ impl RuntimeInner {
             CURRENT.set(&self.tasks, || {
                 let mut pinned_f = pin!(f);
                 loop {
-                    self.io_driver.tick();
+                    self.io_driver.process_completion_queue();
                     while let Some(item) = self.tasks.pop() {
                         item.poll();
                     }
@@ -32,6 +32,7 @@ impl RuntimeInner {
                         }
                         std::task::Poll::Pending => {}
                     }
+                    self.io_driver.submit()
                 }
             })
         })
@@ -55,7 +56,6 @@ pub struct TaskList {
 
 impl TaskList {
     pub fn push(&self, task: TypeAgnosticTask) {
-        println!("pushing {task:?}");
         let tasks_list = unsafe { &mut *self.tasks.get() };
         tasks_list.push_back(task);
     }
