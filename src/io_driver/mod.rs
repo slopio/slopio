@@ -40,7 +40,7 @@ impl IODriver {
         user_data
     }
 
-    pub fn poll_op(&self, id: usize, waker: &Waker) -> std::task::Poll<OpMetadata> {
+    fn poll_op(&self, id: usize, waker: &Waker) -> std::task::Poll<OpMetadata> {
         let slab = unsafe { &mut *self.slab.get() };
         let entry = slab.get_mut(id).unwrap();
         match entry {
@@ -56,12 +56,12 @@ impl IODriver {
         }
     }
 
-    pub fn submit(&self) {
+    pub(crate) fn submit(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         ring.inner.submit().unwrap();
     }
 
-    pub fn process_completion_queue(&self) {
+    pub(crate) fn process_completion_queue(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         for c_event in ring.inner.completion() {
             self.process_completion(c_event);

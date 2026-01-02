@@ -1,3 +1,4 @@
+use std::ffi::NulError;
 use std::future::Future;
 use std::os::fd::OwnedFd;
 use std::{ffi::CString, os::fd::FromRawFd};
@@ -16,8 +17,14 @@ pub struct OpenFile {
     id: Option<usize>,
 }
 
-pub async fn open_file(filename: &str, flags: i32, mode: u32) -> Result<OpenedFile, ()> {
-    let filename = CString::new(filename).map_err(|_| ())?;
+#[derive(Debug)]
+pub enum OpenFileError {
+    NameIssue(NulError),
+    Io(std::io::Error),
+}
+
+pub async fn open_file(filename: &str, flags: i32, mode: u32) -> Result<OpenedFile, OpenFileError> {
+    let filename = CString::new(filename).map_err(|e| OpenFileError::NameIssue(e))?;
     let mut s = OpenFile {
         filename,
         flags,
@@ -25,11 +32,12 @@ pub async fn open_file(filename: &str, flags: i32, mode: u32) -> Result<OpenedFi
         id: None,
     };
     s.register_to_driver();
-    let res = s.await.unwrap();
+    let res = s.await.map_err(|e| OpenFileError::Io(e))?;
     Ok(res)
 }
 
 ///this is the file handle, this file will be synchronously closed at drop.
+#[derive(Debug)]
 pub struct OpenedFile {
     fd: i32,
 }
