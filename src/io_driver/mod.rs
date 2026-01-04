@@ -7,7 +7,7 @@ use io_uring::{
 };
 use slab::Slab;
 
-use crate::{io_driver::operations::IoDriverToken, scoped_thread_local};
+use crate::{io_driver::operations::files::IoDriverToken, scoped_thread_local};
 pub mod operations;
 
 #[derive(Default)]

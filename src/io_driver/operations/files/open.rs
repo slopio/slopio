@@ -1,14 +1,12 @@
+use std::ffi::CString;
 use std::ffi::NulError;
 use std::future::Future;
-use std::os::fd::OwnedFd;
-use std::{ffi::CString, os::fd::FromRawFd};
 
 use io_uring::{opcode, squeue::Entry};
 
-use crate::io_driver::{
-    IO_DRIVER,
-    operations::{IoDriverToken, IoOP},
-};
+use crate::io_driver::IO_DRIVER;
+use crate::io_driver::operations::files::OpenedFile;
+use crate::io_driver::operations::files::{IoDriverToken, IoOP};
 
 pub struct OpenFile {
     filename: CString,
@@ -36,20 +34,6 @@ pub async fn open_file(filename: &str, flags: i32, mode: u32) -> Result<OpenedFi
     Ok(res)
 }
 
-///this is the file handle, this file will be synchronously closed at drop.
-#[derive(Debug)]
-pub struct OpenedFile {
-    fd: i32,
-}
-
-impl Drop for OpenedFile {
-    ///synchronous close, async close can lead to fd conflicts
-    fn drop(&mut self) {
-        let fd = unsafe { OwnedFd::from_raw_fd(self.fd) };
-        drop(fd);
-    }
-}
-
 impl Future for OpenFile {
     type Output = std::io::Result<OpenedFile>;
 
@@ -65,6 +49,14 @@ impl Future for OpenFile {
                 fd @ 0.. => Ok(OpenedFile { fd }),
                 err => Err(std::io::Error::from_raw_os_error(-err)),
             }),
+        }
+    }
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            todo!()
         }
     }
 }
