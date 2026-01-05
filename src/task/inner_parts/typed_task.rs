@@ -126,8 +126,8 @@ unsafe fn poll<F: Future>(ptr: NonNull<TypeInformation>) {
 }
 
 unsafe fn free<F: Future>(ptr: NonNull<TypeInformation>) {
-    let typed_task = TypedTask::<F>::from_raw(ptr);
-    typed_task.free();
+    // let typed_task = TypedTask::<F>::from_raw(ptr);
+    // typed_task.free();
 }
 
 unsafe fn get_output<F: Future>(ptr: NonNull<TypeInformation>, dest: *mut (), waker: &Waker) {

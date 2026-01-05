@@ -7,9 +7,10 @@ fn main() {
     rt.block_on(async {
         let ma = MultiAccept::new(8080).unwrap();
         let mut ma = std::pin::pin!(ma);
-        while let Some(_) = ma.next().await {
+        while let Some(c) = ma.next().await {
             let k = spawn(async move {
-                println!("hello");
+                println!("hello {c:?}");
+                loop {}
             });
         }
     });
