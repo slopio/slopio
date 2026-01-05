@@ -32,6 +32,9 @@ impl RuntimeInner {
                         }
                         std::task::Poll::Pending => {}
                     }
+                    if !self.tasks.empty() {
+                        continue;
+                    }
                     self.io_driver.submit()
                 }
             })
@@ -55,12 +58,17 @@ pub struct TaskList {
 }
 
 impl TaskList {
-    pub fn push(&self, task: TypeAgnosticTask) {
+    pub(crate) fn push(&self, task: TypeAgnosticTask) {
         let tasks_list = unsafe { &mut *self.tasks.get() };
         tasks_list.push_back(task);
     }
 
-    pub fn pop(&self) -> Option<TypeAgnosticTask> {
+    pub(crate) fn empty(&self) -> bool {
+        let tasks_list = unsafe { &*self.tasks.get() };
+        tasks_list.is_empty()
+    }
+
+    pub(crate) fn pop(&self) -> Option<TypeAgnosticTask> {
         let task_list = unsafe { &mut *self.tasks.get() };
         task_list.pop_front()
     }

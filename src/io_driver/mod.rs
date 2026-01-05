@@ -108,7 +108,6 @@ impl IODriver {
         let a = slab_multishot.get_mut(id).unwrap();
         let res = match a {
             MultiOpState::Init => {
-                println!("just init");
                 *a = MultiOpState::Sent {
                     waker: waker.clone(),
                     woken_up: false,
@@ -155,7 +154,16 @@ impl IODriver {
 
     pub(crate) fn submit(&self) {
         let ring = unsafe { &mut *self.ring.get() };
-        ring.inner.submit_and_wait(1).unwrap();
+        match ring.inner.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // EINTR is normal when a signal interrupts the syscall, just continue
+            }
+            Err(e) => {
+                // For other errors, panic
+                panic!("io_uring submit_and_wait failed: {:?}", e);
+            }
+        }
     }
 
     pub(crate) fn process_completion_queue(&self) {
@@ -191,9 +199,7 @@ impl IODriver {
         match multi {
             MultiOpState::Init => unimplemented!("init"),
             MultiOpState::Sent {
-                waker,
-                woken_up,
-                queue,
+                woken_up, queue, ..
             } => {
                 queue.push(MultishotCompletionEvent { fd: entry.result() });
                 if !*woken_up {
@@ -212,13 +218,10 @@ impl IODriver {
             OpState::Init => unreachable!("submitted entry should't be in init"),
             OpState::Sent(waker) => {
                 waker.wake_by_ref();
-                std::mem::swap(
-                    slab_entry,
-                    &mut OpState::Ended(OpMetadata {
-                        result: entry.result(),
-                        flags: entry.flags(),
-                    }),
-                );
+                *slab_entry = OpState::Ended(OpMetadata {
+                    result: entry.result(),
+                    flags: entry.flags(),
+                });
             }
             OpState::Ended(_) => {
                 unreachable!("polled ended op");
@@ -271,18 +274,6 @@ enum OpState {
     Ended(OpMetadata),
     CancellationAsked,
     CancellationOperation(usize),
-}
-
-impl OpState {
-    fn completion(&mut self) -> CompletionEnd {
-        CompletionEnd::ToBeDeleted
-    }
-}
-
-#[allow(dead_code)]
-enum CompletionEnd {
-    ToBeDeleted,
-    Persistant,
 }
 
 struct Ring {

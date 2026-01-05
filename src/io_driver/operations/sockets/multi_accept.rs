@@ -1,4 +1,5 @@
 use std::{
+    ffi::c_int,
     net::TcpListener,
     os::fd::IntoRawFd,
     pin::Pin,
@@ -23,9 +24,19 @@ pub struct Socket {
     fd: i32,
 }
 
-impl Into<Socket> for MultishotCompletionEvent {
-    fn into(self) -> Socket {
-        Socket { fd: self.fd }
+impl Drop for Socket {
+    fn drop(&mut self) {
+        unsafe {
+            let fd = self.fd as c_int;
+            println!("closing fd {fd}");
+            libc::close(fd);
+        }
+    }
+}
+
+impl From<MultishotCompletionEvent> for Socket {
+    fn from(value: MultishotCompletionEvent) -> Self {
+        Socket { fd: value.fd }
     }
 }
 
@@ -58,7 +69,6 @@ impl Stream for MultiAccept {
         if let Some(event) = self.sockets.pop() {
             return Poll::Ready(Some(event.into()));
         }
-
         match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.sockets)) {
             std::task::Poll::Pending => {
                 return std::task::Poll::Pending;
@@ -88,6 +98,10 @@ impl IoOP for MultiAccept {
     }
 
     fn free_driver(&mut self) {
-        todo!()
+        unsafe {
+            let fd = self.fd;
+            println!("closing fd {fd}");
+            libc::close(self.fd as c_int);
+        }
     }
 }

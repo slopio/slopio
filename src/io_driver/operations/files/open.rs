@@ -23,7 +23,7 @@ pub enum OpenFileError {
 }
 
 pub async fn open_file(filename: &str, flags: i32, mode: u32) -> Result<OpenedFile, OpenFileError> {
-    let filename = CString::new(filename).map_err(|e| OpenFileError::NameIssue(e))?;
+    let filename = CString::new(filename).map_err(OpenFileError::NameIssue)?;
     let mut s = OpenFile {
         filename,
         flags,
@@ -31,7 +31,7 @@ pub async fn open_file(filename: &str, flags: i32, mode: u32) -> Result<OpenedFi
         id: None,
     };
     s.register_to_driver();
-    let res = s.await.map_err(|e| OpenFileError::Io(e))?;
+    let res = s.await.map_err(OpenFileError::Io)?;
     Ok(res)
 }
 
