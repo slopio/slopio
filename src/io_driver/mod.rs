@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, rc::Rc, task::Waker};
+use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc, task::Waker};
 
 use io_uring::{
     IoUring,
@@ -104,6 +104,7 @@ impl IODriver {
         let mut index_to_remove = None;
         match slab_entry {
             OpState::Init => unreachable!("submitted entry should't be in init"),
+            OpState::Multi { waker, events } => todo!(),
             OpState::Sent(waker) => {
                 waker.wake_by_ref();
                 std::mem::swap(
@@ -156,9 +157,16 @@ pub(crate) struct OpMetadata {
 }
 
 #[derive(Debug)]
+struct Event {}
+
+#[derive(Debug)]
 enum OpState {
     Init,
     Sent(Waker),
+    Multi {
+        waker: Waker,
+        events: VecDeque<Event>,
+    },
     Ended(OpMetadata),
     CancellationAsked,
     CancellationOperation(usize),
