@@ -6,7 +6,7 @@ use std::{
 use io_uring::squeue::Entry;
 
 pub(crate) mod files;
-pub(crate) mod sockets;
+pub mod sockets;
 
 pub(crate) type IoDriverToken = u64;
 
@@ -17,13 +17,13 @@ trait IoOP: Drop {
 
     fn to_entry(&self) -> Entry;
 }
-trait Stream {
+pub trait Stream {
     type Item;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>)
     -> std::task::Poll<Option<Self::Item>>;
 }
 
-struct Next<'l, T: ?Sized>
+pub struct Next<'l, T: ?Sized>
 where
     T: Unpin,
 {
@@ -32,7 +32,7 @@ where
 
 impl<S: Stream + ?Sized> StreamExt for S {}
 
-trait StreamExt: Stream {
+pub trait StreamExt: Stream {
     fn next(&mut self) -> Next<'_, Self>
     where
         Self: Unpin,
