@@ -5,8 +5,9 @@ use std::future::Future;
 use io_uring::{opcode, squeue::Entry};
 
 use crate::io_driver::IO_DRIVER;
+use crate::io_driver::operations::IoDriverToken;
+use crate::io_driver::operations::IoOP;
 use crate::io_driver::operations::files::OpenedFile;
-use crate::io_driver::operations::files::{IoDriverToken, IoOP};
 
 pub struct OpenFile {
     filename: CString,
@@ -56,7 +57,7 @@ impl Future for OpenFile {
 impl Drop for OpenFile {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            todo!()
+            unimplemented!("free the thing")
         }
     }
 }
@@ -74,6 +75,10 @@ impl IoOP for OpenFile {
             .flags(self.flags)
             .mode(self.mode)
             .build()
+    }
+
+    fn free_driver(&mut self) {
+        todo!()
     }
 }
 

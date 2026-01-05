@@ -5,15 +5,15 @@ fn main() {
     rt.block_on(async {
         let r = spawn(async {
             let uwu = spawn(async {
-                println!("zuzu2");
+                println!("3");
             });
-            println!("pololo");
+            println!("2");
             uwu.await;
-            println!("pololo2");
-            3
+            println!("4");
+            5
         });
-        println!("owo");
+        println!("1");
         let x = r.await;
-        println!(">>> {x}");
+        println!("{x}");
     });
 }
