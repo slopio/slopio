@@ -3,9 +3,9 @@ use std::{
     task::{RawWaker, RawWakerVTable},
 };
 
-use crate::task::inner_parts::{TypeInformation, typed_task::TypedTask};
+use crate::task::inner_parts::{Metadata, typed_task::TypedTask};
 
-pub(super) fn raw_waker<T>(header: *const TypeInformation) -> RawWaker
+pub(super) fn raw_waker<T>(header: *const Metadata) -> RawWaker
 where
     T: Future,
 {
@@ -23,7 +23,7 @@ unsafe fn clone_waker<T>(ptr: *const ()) -> RawWaker
 where
     T: Future,
 {
-    let header = ptr as *const TypeInformation;
+    let header = ptr as *const Metadata;
     raw_waker::<T>(header)
 }
 
@@ -37,7 +37,7 @@ unsafe fn wake_by_val<T>(ptr: *const ())
 where
     T: Future,
 {
-    let ptr = unsafe { NonNull::new_unchecked(ptr as *mut TypeInformation) };
+    let ptr = unsafe { NonNull::new_unchecked(ptr as *mut Metadata) };
     let typed_task = TypedTask::<T>::from_raw(ptr);
     typed_task.wake_by_val()
 }
@@ -47,7 +47,7 @@ unsafe fn wake_by_ref<T>(ptr: *const ())
 where
     T: Future,
 {
-    let ptr = unsafe { NonNull::new_unchecked(ptr as *mut TypeInformation) };
+    let ptr = unsafe { NonNull::new_unchecked(ptr as *mut Metadata) };
     let typed_task = TypedTask::<T>::from_raw(ptr);
     typed_task.wake_by_ref();
 }

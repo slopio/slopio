@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     pin::{self},
     ptr::NonNull,
     task::{Context, Waker},
@@ -6,12 +7,12 @@ use std::{
 
 use crate::{
     runtime::CURRENT,
-    task::inner_parts::{Data, State, TypeInformation, type_agnostic_task::TypeAgnosticTask},
+    task::inner_parts::{Data, Metadata, State, type_agnostic_task::TypeAgnosticTask},
 };
 
 #[repr(C)]
 pub struct TypedTaskInner<F: Future> {
-    header: TypeInformation,
+    header: Metadata,
     data: Data<F>,
     waker: Tail,
 }
@@ -41,14 +42,9 @@ impl<F: Future> TypedTask<F> {
         inner.data.state.take()
     }
 
-    pub fn detach(mut self) {
-        println!("detach");
-        let inner = unsafe { self.inner.as_mut() };
-        inner.header.detached = true;
-    }
-
     pub fn poll(mut self) {
         let inner = unsafe { self.inner.as_mut() };
+        inner.header.counter.update(|c| c - 1);
         let state = &mut inner.data.state;
         match state {
             State::Running(future) => {
@@ -59,8 +55,10 @@ impl<F: Future> TypedTask<F> {
                 match pinned.poll(&mut ctx) {
                     std::task::Poll::Ready(r) => {
                         *state = State::Finished(r);
-                        if !inner.header.detached {
+                        if !inner.header.detached.get() {
                             inner.waker.waker.as_ref().unwrap().wake_by_ref();
+                        } else {
+                            self.free();
                         }
                     }
                     std::task::Poll::Pending => {}
@@ -86,24 +84,26 @@ impl<F: Future> TypedTask<F> {
     }
 
     pub fn free(self) {
+        println!("freed");
         drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
     }
 
     pub fn erase_type(&mut self) -> TypeAgnosticTask {
         TypeAgnosticTask::new(unsafe {
-            NonNull::new_unchecked(self.inner.as_ptr() as *mut _ as *mut TypeInformation)
+            NonNull::new_unchecked(self.inner.as_ptr() as *mut _ as *mut Metadata)
         })
     }
 
-    pub(crate) fn from_raw(raw: NonNull<TypeInformation>) -> Self {
+    pub(crate) fn from_raw(raw: NonNull<Metadata>) -> Self {
         Self { inner: raw.cast() }
     }
 
     pub fn new(future: F) -> Self {
         let ptr = Box::into_raw(Box::new(TypedTaskInner::<F> {
-            header: TypeInformation {
+            header: Metadata {
                 vtable: table::<F>(),
-                detached: false,
+                detached: Cell::new(false),
+                counter: Cell::new(1),
             },
             data: Data {
                 state: State::Running(future),
@@ -118,10 +118,9 @@ impl<F: Future> TypedTask<F> {
 
 #[derive(Debug)]
 pub struct Vtable {
-    pub poll: unsafe fn(NonNull<TypeInformation>),
-    pub free: unsafe fn(NonNull<TypeInformation>),
-    pub get_output: unsafe fn(NonNull<TypeInformation>, *mut (), &Waker),
-    pub detach: unsafe fn(NonNull<TypeInformation>),
+    pub poll: unsafe fn(NonNull<Metadata>),
+    pub free: unsafe fn(NonNull<Metadata>),
+    pub get_output: unsafe fn(NonNull<Metadata>, *mut (), &Waker),
 }
 
 fn table<F: Future>() -> &'static Vtable {
@@ -129,26 +128,20 @@ fn table<F: Future>() -> &'static Vtable {
         poll: poll::<F>,
         free: free::<F>,
         get_output: get_output::<F>,
-        detach: detach::<F>,
     }
 }
 
-unsafe fn poll<F: Future>(ptr: NonNull<TypeInformation>) {
+unsafe fn poll<F: Future>(ptr: NonNull<Metadata>) {
     let typed_task = TypedTask::<F>::from_raw(ptr);
     typed_task.poll();
 }
 
-unsafe fn detach<F: Future>(ptr: NonNull<TypeInformation>) {
-    let typed_task = TypedTask::<F>::from_raw(ptr);
-    typed_task.detach();
-}
-
-unsafe fn free<F: Future>(ptr: NonNull<TypeInformation>) {
+unsafe fn free<F: Future>(ptr: NonNull<Metadata>) {
     let typed_task = TypedTask::<F>::from_raw(ptr);
     typed_task.free();
 }
 
-unsafe fn get_output<F: Future>(ptr: NonNull<TypeInformation>, dest: *mut (), waker: &Waker) {
+unsafe fn get_output<F: Future>(ptr: NonNull<Metadata>, dest: *mut (), waker: &Waker) {
     let mut typed_task = TypedTask::<F>::from_raw(ptr);
     if let Some(result) = typed_task.take_output() {
         let p = dest as *mut std::task::Poll<F::Output>;

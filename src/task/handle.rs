@@ -20,6 +20,7 @@ impl<T> From<TypeAgnosticTask> for Handle<T> {
 
 impl<T> Drop for Handle<T> {
     fn drop(&mut self) {
+        println!("dropping handle");
         self.task.detach();
     }
 }

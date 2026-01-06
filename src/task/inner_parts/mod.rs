@@ -1,4 +1,4 @@
-use std::mem;
+use std::{cell::Cell, mem};
 
 use crate::task::{
     TypeAgnosticTask,
@@ -9,9 +9,10 @@ use crate::task::{
 pub(crate) mod type_agnostic_task;
 pub(crate) mod typed_task;
 
-pub struct TypeInformation {
-    detached: bool,
+pub struct Metadata {
+    detached: Cell<bool>,
     vtable: &'static Vtable,
+    counter: Cell<usize>,
 }
 
 enum State<T: Future> {
