@@ -30,6 +30,11 @@ impl TypeAgnosticTask {
         unsafe { (vtable.free)(self.ptr) }
     }
 
+    pub fn detach(self) {
+        let vtable = self.header().vtable;
+        unsafe { (vtable.detach)(self.ptr) }
+    }
+
     pub fn poll(self) {
         let vtable = self.header().vtable;
         unsafe { (vtable.poll)(self.ptr) }

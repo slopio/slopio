@@ -8,9 +8,8 @@ fn main() {
         let ma = MultiAccept::new(8080).unwrap();
         let mut ma = std::pin::pin!(ma);
         while let Some(c) = ma.next().await {
-            let k = spawn(async move {
+            spawn(async move {
                 println!("hello {c:?}");
-                loop {}
             });
         }
     });

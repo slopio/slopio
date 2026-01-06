@@ -7,7 +7,6 @@ pub struct Handle<T> {
     task: TypeAgnosticTask,
     _data: PhantomData<T>,
 }
-
 impl<T> Unpin for Handle<T> {}
 
 impl<T> From<TypeAgnosticTask> for Handle<T> {
@@ -21,7 +20,7 @@ impl<T> From<TypeAgnosticTask> for Handle<T> {
 
 impl<T> Drop for Handle<T> {
     fn drop(&mut self) {
-        self.task.free();
+        self.task.detach();
     }
 }
 

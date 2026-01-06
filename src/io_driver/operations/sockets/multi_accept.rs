@@ -10,28 +10,13 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER, MultishotCompletionEvent,
-    operations::{IoOP, Stream},
+    operations::{IoOP, Stream, sockets::Socket},
 };
 
 pub struct MultiAccept {
     id: Option<usize>,
     fd: i32,
     sockets: Vec<MultishotCompletionEvent>,
-}
-
-#[derive(Debug)]
-pub struct Socket {
-    fd: i32,
-}
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        unsafe {
-            let fd = self.fd as c_int;
-            println!("closing fd {fd}");
-            libc::close(fd);
-        }
-    }
 }
 
 impl From<MultishotCompletionEvent> for Socket {

@@ -10,6 +10,7 @@ pub(crate) mod type_agnostic_task;
 pub(crate) mod typed_task;
 
 pub struct TypeInformation {
+    detached: bool,
     vtable: &'static Vtable,
 }
 
