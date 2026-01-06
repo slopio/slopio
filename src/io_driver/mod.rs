@@ -39,9 +39,7 @@ impl MultiOpState {
         match self {
             MultiOpState::Init => {}
             MultiOpState::Sent {
-                waker,
-                woken_up,
-                queue,
+                waker, woken_up, ..
             } => {
                 waker.wake_by_ref();
                 *woken_up = true;

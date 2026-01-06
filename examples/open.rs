@@ -1,4 +1,4 @@
 fn main() {
     let mut rt = runtime::runtime::RuntimeInner::default();
-    let k = rt.block_on(async {});
+    let _ = rt.block_on(async { 3 });
 }
