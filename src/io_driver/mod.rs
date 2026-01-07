@@ -66,6 +66,7 @@ impl MultiOpState {
 impl Default for Ring {
     fn default() -> Self {
         Self {
+            //panicking is ok if we can't allocate at launch
             inner: IoUring::new(1024).unwrap(),
         }
     }
@@ -103,10 +104,10 @@ impl IODriver {
         v: &mut Vec<MultishotCompletionEvent>,
     ) -> std::task::Poll<()> {
         let slab_multishot = unsafe { &mut *self.multishot_slab.get() };
-        let a = slab_multishot.get_mut(id).unwrap();
-        let res = match a {
+        let entry = unsafe { slab_multishot.get_unchecked_mut(id) };
+        let res = match entry {
             MultiOpState::Init => {
-                *a = MultiOpState::Sent {
+                *entry = MultiOpState::Sent {
                     waker: waker.clone(),
                     woken_up: false,
                     queue: Vec::new(),
@@ -118,13 +119,13 @@ impl IODriver {
                 std::task::Poll::Ready(())
             }
         };
-        a.clean(waker.clone());
+        entry.clean(waker.clone());
         res
     }
 
     fn poll_op(&self, id: usize, waker: &Waker) -> std::task::Poll<OpMetadata> {
         let slab = unsafe { &mut *self.slab.get() };
-        let entry = slab.get_mut(id).unwrap();
+        let entry = unsafe { slab.get_unchecked_mut(id) };
         let mut id_to_delete = None;
         let res = match entry {
             OpState::Init => {
@@ -178,7 +179,7 @@ impl IODriver {
     pub fn cancel_op(&self, id: usize) {
         let ring_inner = unsafe { &mut *self.ring.get() };
         let slab = unsafe { &mut *self.slab.get() };
-        let op_to_cancel = slab.get_mut(id).unwrap();
+        let op_to_cancel = unsafe { slab.get_unchecked_mut(id) };
         if let OpState::Ended(_) = op_to_cancel {
             *op_to_cancel = OpState::CancellationAsked;
         } else {
@@ -193,7 +194,7 @@ impl IODriver {
     fn handle_completion_multishot(&self, entry: Entry) {
         let index = entry.user_data() & !MULTI_OP_FLAG;
         let slab_multi = unsafe { &mut *self.multishot_slab.get() };
-        let multi = slab_multi.get_mut(index as usize).unwrap();
+        let multi = unsafe { slab_multi.get_unchecked_mut(index as usize) };
         match multi {
             MultiOpState::Init => unimplemented!("init"),
             MultiOpState::Sent {
@@ -227,11 +228,10 @@ impl IODriver {
             OpState::CancellationAsked => {
                 match -entry.result() {
                     libc::ECANCELED => {
-                        println!("successful cancellation")
+                        //Ok
                     }
                     n if n <= 0 => {
                         //TODO solve buffer issues?
-                        println!("was not cancelled");
                     }
                     _ => unreachable!(),
                 };
@@ -241,7 +241,6 @@ impl IODriver {
                 0 => index_to_remove = Some(slab_index),
                 libc::ECANCELED => {
                     //todo warn
-                    println!("cancelled operations could not be found");
                     index_to_remove = Some(*cancelled_op_index);
                 }
                 libc::EALREADY => {

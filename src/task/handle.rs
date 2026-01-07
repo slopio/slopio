@@ -37,7 +37,10 @@ impl<T> Future for Handle<T> {
         let ptr = std::ptr::from_mut(&mut ret) as *mut ();
         self.task.unwrap().get_ouput(ptr, cx.waker());
         if ret.is_ready() {
-            self.task = None;
+            // Free the task when we take the output
+            if let Some(task) = self.task.take() {
+                task.free();
+            }
         }
         ret
     }

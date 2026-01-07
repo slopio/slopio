@@ -17,12 +17,6 @@ pub struct TypedTaskInner<F: Future> {
     waker: Tail,
 }
 
-impl<F: Future> Drop for TypedTaskInner<F> {
-    fn drop(&mut self) {
-        println!("XD")
-    }
-}
-
 pub struct Tail {
     waker: Option<Waker>,
 }
@@ -34,7 +28,6 @@ pub struct TypedTask<F: Future> {
 impl<F: Future> TypedTask<F> {
     pub fn register_waker(&mut self, waker: &Waker) {
         let inner = unsafe { self.inner.as_mut() };
-        println!("registering waker for {inner:p}");
         inner.waker.waker.replace(waker.clone());
     }
 
@@ -92,7 +85,6 @@ impl<F: Future> TypedTask<F> {
     }
 
     pub fn free(self) {
-        println!("freed");
         drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
     }
 
