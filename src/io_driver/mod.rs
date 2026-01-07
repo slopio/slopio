@@ -258,9 +258,11 @@ impl IODriver {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OpMetadata {
     result: i32,
+    #[allow(dead_code)]
     flags: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Event {}
 

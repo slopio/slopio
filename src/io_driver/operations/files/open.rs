@@ -9,7 +9,7 @@ use crate::io_driver::operations::IoDriverToken;
 use crate::io_driver::operations::IoOP;
 use crate::io_driver::operations::files::OpenedFile;
 
-pub struct OpenFile {
+struct OpenFile {
     filename: CString,
     flags: i32,
     mode: u32,
@@ -55,11 +55,7 @@ impl Future for OpenFile {
 }
 
 impl Drop for OpenFile {
-    fn drop(&mut self) {
-        if let Some(id) = self.id {
-            unimplemented!("free the thing")
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 impl IoOP for OpenFile {

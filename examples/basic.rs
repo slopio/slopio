@@ -1,7 +1,4 @@
-use runtime::runtime::spawn;
-
 fn main() {
     let mut rt = runtime::runtime::RuntimeInner::default();
-    rt.block_on(async {
-    });
+    rt.block_on(async {});
 }

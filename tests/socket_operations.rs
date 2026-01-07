@@ -72,8 +72,7 @@ fn test_socket_send_data() {
 
             if let Some(socket) = ma.next().await {
                 let data = b"Response from server";
-                let bytes_written = socket.send(data).await.unwrap();
-                bytes_written
+                socket.send(data).await.unwrap()
             } else {
                 0
             }
@@ -105,8 +104,7 @@ fn test_echo_server() {
                 let n_bytes = socket.recv(buffer.as_mut(), 128).await.unwrap();
 
                 // Echo back the data
-                let bytes_sent = socket.send(&buffer[..n_bytes]).await.unwrap();
-                bytes_sent
+                socket.send(&buffer[..n_bytes]).await.unwrap()
             } else {
                 0
             }

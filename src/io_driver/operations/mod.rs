@@ -5,11 +5,12 @@ use std::{
 
 use io_uring::squeue::Entry;
 
-pub(crate) mod files;
+pub mod files;
 pub mod sockets;
 
 pub(crate) type IoDriverToken = u64;
 
+#[allow(drop_bounds)]
 trait IoOP: Drop {
     fn register_to_driver(&mut self) -> IoDriverToken;
 

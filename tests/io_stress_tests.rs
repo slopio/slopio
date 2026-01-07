@@ -194,8 +194,7 @@ fn test_large_buffer_small_data() {
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 4096]);
-                let n = socket.recv(buffer.as_mut(), 4096).await.unwrap();
-                n
+                socket.recv(buffer.as_mut(), 4096).await.unwrap()
             } else {
                 0
             }
@@ -479,8 +478,7 @@ fn test_empty_send() {
 
             if let Some(socket) = ma.next().await {
                 // Send empty data
-                let n = socket.send(&[]).await.unwrap();
-                n
+                socket.send(&[]).await.unwrap()
             } else {
                 999
             }

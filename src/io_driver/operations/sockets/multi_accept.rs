@@ -84,7 +84,7 @@ impl IoOP for MultiAccept {
 
     fn free_driver(&mut self) {
         unsafe {
-            let fd = self.fd;
+            let _fd = self.fd;
             libc::close(self.fd as c_int);
         }
     }

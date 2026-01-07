@@ -51,8 +51,7 @@ fn test_async_computation() {
         let a = spawn(async { 5 });
         let b = spawn(async { 7 });
 
-        let sum = a.await + b.await;
-        sum
+        a.await + b.await
     });
     assert_eq!(result, 12);
 }
