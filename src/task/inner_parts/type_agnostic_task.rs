@@ -45,7 +45,9 @@ impl TypeAgnosticTask {
     }
 
     fn decrement_count(&self) {
-        self.header().counter.update(|c| c - 1);
+        self.header()
+            .counter
+            .update(|c| c.checked_sub(1).unwrap_or(0));
     }
 
     pub(crate) fn increment_count(&self) {

@@ -34,6 +34,7 @@ pub struct TypedTask<F: Future> {
 impl<F: Future> TypedTask<F> {
     pub fn register_waker(&mut self, waker: &Waker) {
         let inner = unsafe { self.inner.as_mut() };
+        println!("registering waker for {inner:p}");
         inner.waker.waker.replace(waker.clone());
     }
 
@@ -44,7 +45,8 @@ impl<F: Future> TypedTask<F> {
 
     pub fn poll(mut self) {
         let inner = unsafe { self.inner.as_mut() };
-        inner.header.counter.update(|c| c - 1);
+        println!("polling {inner:p}");
+        inner.header.counter.update(|c| c.saturating_sub(1));
         let state = &mut inner.data.state;
         match state {
             State::Running(future) => {
@@ -55,8 +57,11 @@ impl<F: Future> TypedTask<F> {
                 match pinned.poll(&mut ctx) {
                     std::task::Poll::Ready(r) => {
                         *state = State::Finished(r);
+                        let registered_waker = &inner.waker.waker;
                         if !inner.header.detached.get() {
-                            inner.waker.waker.as_ref().unwrap().wake_by_ref();
+                            if let Some(waker) = registered_waker {
+                                waker.wake_by_ref();
+                            }
                         } else {
                             self.free();
                         }
@@ -143,10 +148,9 @@ unsafe fn free<F: Future>(ptr: NonNull<Metadata>) {
 
 unsafe fn get_output<F: Future>(ptr: NonNull<Metadata>, dest: *mut (), waker: &Waker) {
     let mut typed_task = TypedTask::<F>::from_raw(ptr);
+    typed_task.register_waker(waker);
     if let Some(result) = typed_task.take_output() {
         let p = dest as *mut std::task::Poll<F::Output>;
         unsafe { *p = std::task::Poll::Ready(result) };
-    } else {
-        typed_task.register_waker(waker);
     }
 }
