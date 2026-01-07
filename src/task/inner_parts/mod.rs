@@ -10,9 +10,8 @@ pub(crate) mod type_agnostic_task;
 pub(crate) mod typed_task;
 
 pub struct Metadata {
-    detached: Cell<bool>,
+    detached_mode: Cell<bool>,
     vtable: &'static Vtable,
-    counter: Cell<usize>,
 }
 
 enum State<T: Future> {

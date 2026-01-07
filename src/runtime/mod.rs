@@ -59,7 +59,6 @@ pub struct TaskList {
 
 impl TaskList {
     pub(crate) fn push(&self, task: TypeAgnosticTask) {
-        task.increment_count();
         let tasks_list = unsafe { &mut *self.tasks.get() };
         tasks_list.push_back(task);
     }

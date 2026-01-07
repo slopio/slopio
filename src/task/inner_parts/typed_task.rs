@@ -43,10 +43,13 @@ impl<F: Future> TypedTask<F> {
         inner.data.state.take()
     }
 
+    pub fn detach(mut self) {
+        let inner = unsafe { self.inner.as_mut() };
+        inner.header.detached_mode.replace(true);
+    }
+
     pub fn poll(mut self) {
         let inner = unsafe { self.inner.as_mut() };
-        println!("polling {inner:p}");
-        inner.header.counter.update(|c| c.saturating_sub(1));
         let state = &mut inner.data.state;
         match state {
             State::Running(future) => {
@@ -58,7 +61,7 @@ impl<F: Future> TypedTask<F> {
                     std::task::Poll::Ready(r) => {
                         *state = State::Finished(r);
                         let registered_waker = &inner.waker.waker;
-                        if !inner.header.detached.get() {
+                        if !inner.header.detached_mode.get() {
                             if let Some(waker) = registered_waker {
                                 waker.wake_by_ref();
                             }
@@ -107,8 +110,7 @@ impl<F: Future> TypedTask<F> {
         let ptr = Box::into_raw(Box::new(TypedTaskInner::<F> {
             header: Metadata {
                 vtable: table::<F>(),
-                detached: Cell::new(false),
-                counter: Cell::new(1),
+                detached_mode: Cell::new(false),
             },
             data: Data {
                 state: State::Running(future),
@@ -126,6 +128,7 @@ pub struct Vtable {
     pub poll: unsafe fn(NonNull<Metadata>),
     pub free: unsafe fn(NonNull<Metadata>),
     pub get_output: unsafe fn(NonNull<Metadata>, *mut (), &Waker),
+    pub detach: unsafe fn(NonNull<Metadata>),
 }
 
 fn table<F: Future>() -> &'static Vtable {
@@ -133,12 +136,18 @@ fn table<F: Future>() -> &'static Vtable {
         poll: poll::<F>,
         free: free::<F>,
         get_output: get_output::<F>,
+        detach: detach::<F>,
     }
 }
 
 unsafe fn poll<F: Future>(ptr: NonNull<Metadata>) {
     let typed_task = TypedTask::<F>::from_raw(ptr);
     typed_task.poll();
+}
+
+unsafe fn detach<F: Future>(ptr: NonNull<Metadata>) {
+    let typed_task = TypedTask::<F>::from_raw(ptr);
+    typed_task.detach();
 }
 
 unsafe fn free<F: Future>(ptr: NonNull<Metadata>) {

@@ -31,31 +31,11 @@ impl TypeAgnosticTask {
     }
 
     pub fn detach(self) {
-        println!(">>{}", self.header().counter.get());
-        if self.header().counter.get() == 1 {
-            self.free();
-        } else {
-            self.decrement_count();
-            self.set_detached();
-        }
-    }
-
-    fn set_detached(&self) {
-        self.header().detached.replace(true);
-    }
-
-    fn decrement_count(&self) {
-        self.header()
-            .counter
-            .update(|c| c.checked_sub(1).unwrap_or(0));
-    }
-
-    pub(crate) fn increment_count(&self) {
-        self.header().counter.update(|c| c + 1);
+        let vtable = self.header().vtable;
+        unsafe { (vtable.detach)(self.ptr) }
     }
 
     pub fn poll(self) {
-        self.decrement_count();
         let vtable = self.header().vtable;
         unsafe { (vtable.poll)(self.ptr) }
     }
