@@ -48,6 +48,6 @@ where
     T: Future,
 {
     let ptr = unsafe { NonNull::new_unchecked(ptr as *mut Metadata) };
-    let typed_task = TypedTask::<T>::from_raw(ptr);
+    let mut typed_task = TypedTask::<T>::from_raw(ptr);
     typed_task.wake_by_ref();
 }

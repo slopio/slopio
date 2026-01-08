@@ -77,7 +77,7 @@ impl<F: Future> TypedTask<F> {
         });
     }
 
-    pub fn wake_by_ref(mut self) {
+    pub fn wake_by_ref(&self) {
         let erased = self.erase_type();
         CURRENT.with(|ctx| {
             ctx.push(erased);
@@ -88,7 +88,7 @@ impl<F: Future> TypedTask<F> {
         drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
     }
 
-    pub fn erase_type(&mut self) -> TypeAgnosticTask {
+    pub fn erase_type(&self) -> TypeAgnosticTask {
         TypeAgnosticTask::new(unsafe {
             NonNull::new_unchecked(self.inner.as_ptr() as *mut _ as *mut Metadata)
         })

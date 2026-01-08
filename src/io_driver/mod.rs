@@ -151,7 +151,25 @@ impl IODriver {
         res
     }
 
-    pub(crate) fn submit(&self) {
+    pub(crate) fn has_pending_submissions(&self) -> bool {
+        let ring = unsafe { &mut *self.ring.get() };
+        ring.inner.submission().len() > 0
+    }
+
+    pub(crate) fn submit_without_wait(&self) {
+        let ring = unsafe { &mut *self.ring.get() };
+        match ring.inner.submit() {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // EINTR is normal when a signal interrupts the syscall, just continue
+            }
+            Err(e) => {
+                panic!("io_uring submit failed: {:?}", e);
+            }
+        }
+    }
+
+    pub(crate) fn submit_and_wait(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         match ring.inner.submit_and_wait(1) {
             Ok(_) => {}
