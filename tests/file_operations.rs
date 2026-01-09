@@ -1,6 +1,6 @@
-use runtime::main_thread;
 use runtime::io_driver::operations::files::open::{flags, mode};
 use runtime::io_driver::operations::files::{AsyncFileRead, AsyncFileWrite, open_file};
+use runtime::main_thread;
 use std::fs;
 
 #[test]

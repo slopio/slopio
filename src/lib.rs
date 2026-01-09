@@ -1,3 +1,4 @@
+use core::panic;
 use std::thread::JoinHandle;
 
 use libc::cpu_set_t;
@@ -39,9 +40,22 @@ fn pin_core(core_id: usize) {
     }
 }
 
+fn get_numa_node_count() -> usize {
+    std::fs::read_dir("/sys/devices/system/node")
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(1)
+}
+
+fn numa_allocs(_core_id: usize) {
+    unimplemented!("no numa available atm");
+}
+
 fn spawn_worker_on<F: Future<Output = ()> + Send + 'static>(n: usize, f: F) -> JoinHandle<()> {
     std::thread::spawn(move || {
         pin_core(n);
+        // if get_numa_node_count() != 1 {
+        //     numa_allocs(n);
+        // }
         let rt = runtime::RuntimeInner::default();
         rt.block_on(f)
     })
