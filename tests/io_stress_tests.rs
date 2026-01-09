@@ -1,4 +1,4 @@
-use runtime::block_on;
+use runtime::main_thread;
 use runtime::io_driver::operations::StreamExt;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
 use runtime::io_driver::operations::sockets::{AsyncRead, AsyncWrite};
@@ -12,7 +12,7 @@ use std::time::Duration;
 #[test]
 fn test_rapid_connections() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9000).unwrap();
             let mut ma = std::pin::pin!(ma);
             let mut count = 0;
@@ -46,7 +46,7 @@ fn test_rapid_connections() {
 #[test]
 fn test_tiny_recv_chunks() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9001).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -82,7 +82,7 @@ fn test_tiny_recv_chunks() {
 #[test]
 fn test_tiny_send_chunks() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9002).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -130,7 +130,7 @@ fn test_tiny_send_chunks() {
 #[test]
 fn test_concurrent_connections() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9003).unwrap();
             let mut ma = std::pin::pin!(ma);
             let mut handlers = Vec::new();
@@ -188,7 +188,7 @@ fn test_concurrent_connections() {
 #[test]
 fn test_large_buffer_small_data() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9004).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -214,7 +214,7 @@ fn test_large_buffer_small_data() {
 #[test]
 fn test_multiple_cycles() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9005).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -257,7 +257,7 @@ fn test_multiple_cycles() {
 #[test]
 fn test_client_disconnect_during_recv() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9006).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -292,7 +292,7 @@ fn test_client_disconnect_during_recv() {
 #[test]
 fn test_nested_socket_spawns() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9007).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -330,7 +330,7 @@ fn test_nested_socket_spawns() {
 #[test]
 fn test_sequential_accept_handle() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9008).unwrap();
             let mut ma = std::pin::pin!(ma);
             let mut count = 0;
@@ -369,7 +369,7 @@ fn test_sequential_accept_handle() {
 #[test]
 fn test_interleaved_socket_operations() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9009).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -443,7 +443,7 @@ fn test_interleaved_socket_operations() {
 #[test]
 fn test_immediate_recv_after_accept() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9010).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -472,7 +472,7 @@ fn test_immediate_recv_after_accept() {
 #[test]
 fn test_empty_send() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9011).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -497,7 +497,7 @@ fn test_empty_send() {
 #[test]
 fn test_mixed_socket_handling() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(9012).unwrap();
             let mut ma = std::pin::pin!(ma);
             let results = Arc::new(Mutex::new(Vec::new()));

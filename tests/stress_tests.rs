@@ -1,11 +1,11 @@
-use runtime::block_on;
+use runtime::main_thread;
 use runtime::runtime::spawn;
 use std::sync::{Arc, Mutex};
 
 // Test spawning a massive number of tasks
 #[test]
 fn test_spawn_many_tasks() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let mut handles = Vec::new();
 
         // Spawn 1000 tasks
@@ -28,7 +28,7 @@ fn test_spawn_many_tasks() {
 // Test deeply nested spawns
 #[test]
 fn test_deeply_nested_spawns() {
-    let result = block_on(async {
+    let result = main_thread(async {
         // Create a chain of 100 nested spawns
         let mut task = spawn(async { 1 });
 
@@ -48,7 +48,7 @@ fn test_deeply_nested_spawns() {
 // Test spawning tasks from multiple spawned tasks (exponential growth)
 #[test]
 fn test_exponential_task_spawn() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let counter = Arc::new(Mutex::new(0));
 
         let handle = spawn_recursive(counter.clone(), 0, 6); // 2^6 = 64 tasks
@@ -84,7 +84,7 @@ async fn spawn_recursive(counter: Arc<Mutex<i32>>, depth: u32, max_depth: u32) {
 // Test immediately completing tasks
 #[test]
 fn test_immediate_completion() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let mut handles = Vec::new();
 
         for i in 0..100 {
@@ -109,7 +109,7 @@ fn test_immediate_completion() {
 // Test interleaved spawning and awaiting
 #[test]
 fn test_interleaved_spawn_await() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let mut sum = 0;
 
         for i in 0..50 {
@@ -129,7 +129,7 @@ fn test_interleaved_spawn_await() {
 // Test spawning tasks that share data through Arc<Mutex<>>
 #[test]
 fn test_shared_state_contention() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let shared = Arc::new(Mutex::new(0));
         let mut handles = Vec::new();
 
@@ -156,7 +156,7 @@ fn test_shared_state_contention() {
 // Test tasks that create more tasks while others are running
 #[test]
 fn test_dynamic_task_creation() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let counter = Arc::new(Mutex::new(0));
         let mut handles = Vec::new();
 
@@ -197,7 +197,7 @@ fn test_dynamic_task_creation() {
 // Test empty async blocks
 #[test]
 fn test_empty_tasks() {
-    block_on(async {
+    main_thread(async {
         let mut handles = Vec::new();
 
         for _ in 0..100 {
@@ -214,7 +214,7 @@ fn test_empty_tasks() {
 // Test tasks that return large values
 #[test]
 fn test_large_return_values() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let handle = spawn(async { vec![42u64; 1000] });
 
         handle.await
@@ -228,7 +228,7 @@ fn test_large_return_values() {
 // Test spawning tasks in a loop with dependencies
 #[test]
 fn test_sequential_dependencies() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let mut value = 0;
 
         for i in 0..50 {
@@ -246,7 +246,7 @@ fn test_sequential_dependencies() {
 // Test rapid spawn and drop without awaiting
 #[test]
 fn test_spawn_without_await() {
-    block_on(async {
+    main_thread(async {
         for _ in 0..100 {
             let _handle = spawn(async { 42 });
             // Don't await, just drop the handle
@@ -262,7 +262,7 @@ fn test_spawn_without_await() {
 #[test]
 fn test_multiple_block_on_calls() {
     for i in 0..10 {
-        let result = block_on(async move {
+        let result = main_thread(async move {
             let handle = spawn(async move { i * 10 });
             handle.await
         });
@@ -273,7 +273,7 @@ fn test_multiple_block_on_calls() {
 // Test nested block_on equivalent through multiple runtimes
 #[test]
 fn test_nested_runtime_simulation() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let outer_value = 10;
 
         let handle = spawn(async move {
@@ -292,7 +292,7 @@ fn test_nested_runtime_simulation() {
 #[test]
 #[should_panic]
 fn test_task_panic() {
-    block_on(async {
+    main_thread(async {
         let handle = spawn(async {
             panic!("Task intentionally panics");
         });
@@ -304,7 +304,7 @@ fn test_task_panic() {
 // Test zero-sized types
 #[test]
 fn test_zero_sized_returns() {
-    block_on(async {
+    main_thread(async {
         let mut handles = Vec::new();
 
         for _ in 0..100 {
@@ -321,7 +321,7 @@ fn test_zero_sized_returns() {
 // Test tasks with complex lifetime interactions
 #[test]
 fn test_complex_data_flow() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let data = vec![1, 2, 3, 4, 5];
         let sum = Arc::new(Mutex::new(0));
 
@@ -350,7 +350,7 @@ fn test_complex_data_flow() {
 // Test tasks creating circular-ish dependencies through shared state
 #[test]
 fn test_task_coordination() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let flags = Arc::new(Mutex::new(vec![false; 10]));
         let mut handles = Vec::new();
 
@@ -384,7 +384,7 @@ fn test_task_coordination() {
 // Test mixed async and sync operations
 #[test]
 fn test_mixed_operations() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let mut results = Vec::new();
 
         for i in 0..20 {

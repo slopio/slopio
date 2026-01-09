@@ -1,4 +1,4 @@
-use runtime::block_on;
+use runtime::main_thread;
 use runtime::io_driver::operations::files::open::{flags, mode};
 use runtime::io_driver::operations::files::{AsyncFileRead, AsyncFileWrite, open_file};
 use std::fs;
@@ -10,7 +10,7 @@ fn test_file_write_and_read() {
     // Clean up any existing file
     let _ = fs::remove_file(test_file);
 
-    block_on(async {
+    main_thread(async {
         // Write to file
         let file = open_file(
             test_file,
@@ -45,7 +45,7 @@ fn test_file_create_write() {
     let test_file = "/tmp/test_create.txt";
     let _ = fs::remove_file(test_file);
 
-    block_on(async {
+    main_thread(async {
         let file = open_file(test_file, flags::WRITE_ONLY | flags::CREATE, mode::RW_USER)
             .await
             .unwrap();
@@ -70,7 +70,7 @@ fn test_file_read_existing() {
     // Create file with std::fs
     fs::write(test_file, b"Existing content").unwrap();
 
-    block_on(async {
+    main_thread(async {
         let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
 
         let mut buffer = vec![0u8; 64];
@@ -89,7 +89,7 @@ fn test_file_append() {
     // Create initial file
     fs::write(test_file, b"First line\n").unwrap();
 
-    block_on(async {
+    main_thread(async {
         let file = open_file(test_file, flags::WRITE_ONLY | flags::APPEND, 0)
             .await
             .unwrap();
@@ -112,7 +112,7 @@ fn test_file_truncate() {
     // Create file with content
     fs::write(test_file, b"Old content that should be removed").unwrap();
 
-    block_on(async {
+    main_thread(async {
         let file = open_file(test_file, flags::WRITE_ONLY | flags::TRUNCATE, 0)
             .await
             .unwrap();
@@ -133,7 +133,7 @@ fn test_file_read_write() {
     let test_file = "/tmp/test_rw.txt";
     let _ = fs::remove_file(test_file);
 
-    block_on(async {
+    main_thread(async {
         // Open for reading and writing
         let file = open_file(test_file, flags::READ_WRITE | flags::CREATE, mode::DEFAULT)
             .await
@@ -163,7 +163,7 @@ fn test_file_multiple_writes() {
     let test_file = "/tmp/test_multi_write.txt";
     let _ = fs::remove_file(test_file);
 
-    block_on(async {
+    main_thread(async {
         let file = open_file(test_file, flags::WRITE_ONLY | flags::CREATE, mode::DEFAULT)
             .await
             .unwrap();
@@ -185,7 +185,7 @@ fn test_file_empty_write() {
     let test_file = "/tmp/test_empty.txt";
     let _ = fs::remove_file(test_file);
 
-    block_on(async {
+    main_thread(async {
         let file = open_file(test_file, flags::WRITE_ONLY | flags::CREATE, mode::DEFAULT)
             .await
             .unwrap();
@@ -205,7 +205,7 @@ fn test_file_large_write() {
     let test_file = "/tmp/test_large.txt";
     let _ = fs::remove_file(test_file);
 
-    block_on(async {
+    main_thread(async {
         let file = open_file(test_file, flags::WRITE_ONLY | flags::CREATE, mode::DEFAULT)
             .await
             .unwrap();
@@ -231,7 +231,7 @@ fn test_file_read_chunks() {
     // Create file with known content
     fs::write(test_file, b"0123456789ABCDEF").unwrap();
 
-    block_on(async {
+    main_thread(async {
         let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
 
         // Read in small chunks

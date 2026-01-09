@@ -1,12 +1,13 @@
 use std::{
     ffi::c_int,
-    net::TcpListener,
+    net::{Ipv4Addr, SocketAddr},
     os::fd::IntoRawFd,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use io_uring::{opcode, types::Fd};
+use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
     IO_DRIVER, MultishotCompletionEvent,
@@ -27,9 +28,14 @@ impl From<MultishotCompletionEvent> for Socket {
 
 impl MultiAccept {
     pub fn new(port: u16) -> std::io::Result<Self> {
-        let tcp_listener = TcpListener::bind(("0.0.0.0", port))?;
-        tcp_listener.set_nonblocking(true)?;
-        let fd = tcp_listener.into_raw_fd();
+        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+        let socket = S::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_port(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        let fd = socket.into_raw_fd();
+
         let mut multi_accept = Self {
             id: None,
             fd,

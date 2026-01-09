@@ -68,8 +68,10 @@ impl<'a> IoOP for RecvSocket<'a> {
     }
 
     fn to_entry(&self) -> Entry {
-        unimplemented!()
+        unimplemented!() //todo need a new trait for those with buffer
     }
 
-    fn free_driver(&mut self) {}
+    fn free_driver(&mut self) {
+        //no cleaning needed
+    }
 }

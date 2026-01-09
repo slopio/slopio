@@ -1,15 +1,15 @@
-use runtime::block_on;
+use runtime::main_thread;
 use runtime::runtime::spawn;
 
 #[test]
 fn test_block_on_simple() {
-    let result = block_on(async { 42 });
+    let result = main_thread(async { 42 });
     assert_eq!(result, 42);
 }
 
 #[test]
 fn test_spawn_single_task() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let handle = spawn(async { 100 });
         handle.await
     });
@@ -18,7 +18,7 @@ fn test_spawn_single_task() {
 
 #[test]
 fn test_spawn_multiple_tasks() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let h1 = spawn(async { 1 });
         let h2 = spawn(async { 2 });
         let h3 = spawn(async { 3 });
@@ -34,7 +34,7 @@ fn test_spawn_multiple_tasks() {
 
 #[test]
 fn test_nested_spawn() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let outer = spawn(async {
             let inner = spawn(async { 10 });
             let value = inner.await;
@@ -47,7 +47,7 @@ fn test_nested_spawn() {
 
 #[test]
 fn test_async_computation() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let a = spawn(async { 5 });
         let b = spawn(async { 7 });
 

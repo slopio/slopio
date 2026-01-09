@@ -40,7 +40,7 @@ impl<T: Future> State<T> {
 }
 
 pub fn new_task<F: Future>(f: F) -> (TypeAgnosticTask, Handle<F::Output>) {
-    let mut task = TypedTask::new(f);
+    let task = TypedTask::new(f);
     let erased_type_task = task.erase_type();
     let handle = Handle::from(erased_type_task);
     (erased_type_task, handle)

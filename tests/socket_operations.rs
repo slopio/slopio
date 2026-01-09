@@ -1,4 +1,4 @@
-use runtime::block_on;
+use runtime::main_thread;
 use runtime::io_driver::operations::StreamExt;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
 use runtime::io_driver::operations::sockets::{AsyncRead, AsyncWrite};
@@ -10,7 +10,7 @@ use std::time::Duration;
 #[test]
 fn test_multi_accept_single_connection() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(8081).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -36,7 +36,7 @@ fn test_multi_accept_single_connection() {
 #[test]
 fn test_socket_recv_data() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(8082).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -66,7 +66,7 @@ fn test_socket_recv_data() {
 #[test]
 fn test_socket_send_data() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(8083).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -95,7 +95,7 @@ fn test_socket_send_data() {
 #[test]
 fn test_echo_server() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(8084).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -129,7 +129,7 @@ fn test_echo_server() {
 #[test]
 fn test_multiple_recv_send() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(8085).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -186,7 +186,7 @@ fn test_multiple_recv_send() {
 #[test]
 fn test_spawned_socket_handler() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(8086).unwrap();
             let mut ma = std::pin::pin!(ma);
 
@@ -223,7 +223,7 @@ fn test_spawned_socket_handler() {
 #[test]
 fn test_zero_length_recv() {
     let handle = std::thread::spawn(|| {
-        block_on(async {
+        main_thread(async {
             let ma = MultiAccept::new(8087).unwrap();
             let mut ma = std::pin::pin!(ma);
 

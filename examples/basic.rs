@@ -1,4 +1,7 @@
+use runtime::thread_per_core;
+
 fn main() {
-    let mut rt = runtime::runtime::RuntimeInner::default();
-    rt.block_on(async {});
+    thread_per_core(|| async {
+        println!("XD");
+    });
 }

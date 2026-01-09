@@ -66,7 +66,6 @@ impl MultiOpState {
 impl Default for Ring {
     fn default() -> Self {
         Self {
-            //panicking is ok if we can't allocate at launch
             inner: IoUring::new(1024).unwrap(),
         }
     }
@@ -153,7 +152,7 @@ impl IODriver {
 
     pub(crate) fn has_pending_submissions(&self) -> bool {
         let ring = unsafe { &mut *self.ring.get() };
-        ring.inner.submission().len() > 0
+        !ring.inner.submission().is_empty()
     }
 
     pub(crate) fn submit_without_wait(&self) {

@@ -70,7 +70,7 @@ impl<F: Future> TypedTask<F> {
         }
     }
 
-    pub fn wake_by_val(mut self) {
+    pub fn wake_by_val(self) {
         let erased = self.erase_type();
         CURRENT.with(|ctx| {
             ctx.push(erased);

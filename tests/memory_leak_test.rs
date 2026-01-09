@@ -1,11 +1,11 @@
-use runtime::block_on;
+use runtime::main_thread;
 use runtime::runtime::spawn;
 use std::sync::{Arc, Mutex};
 
 // Heavy allocation test - spawn many tasks that allocate memory
 #[test]
 fn test_heavy_allocations() {
-    block_on(async {
+    main_thread(async {
         let mut handles = Vec::new();
 
         // Spawn 500 tasks that each allocate significant memory
@@ -34,7 +34,7 @@ fn test_heavy_allocations() {
 // Test with nested spawns and allocations
 #[test]
 fn test_nested_allocations() {
-    block_on(async {
+    main_thread(async {
         let outer_handles: Vec<_> = (0..50)
             .map(|i| {
                 spawn(async move {
@@ -69,7 +69,7 @@ fn test_nested_allocations() {
 // Test with shared allocations
 #[test]
 fn test_shared_allocations() {
-    block_on(async {
+    main_thread(async {
         let shared_data = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
 
@@ -95,7 +95,7 @@ fn test_shared_allocations() {
 // Test spawn without await (dropped handles)
 #[test]
 fn test_dropped_handles() {
-    block_on(async {
+    main_thread(async {
         // Spawn tasks but drop the handles
         for i in 0..200 {
             let _handle = spawn(async move {
@@ -116,7 +116,7 @@ fn test_dropped_handles() {
 #[test]
 fn test_allocation_cycles() {
     for _ in 0..10 {
-        block_on(async {
+        main_thread(async {
             let mut handles = Vec::new();
 
             for i in 0..100 {
@@ -139,7 +139,7 @@ fn test_allocation_cycles() {
 // Test large allocations
 #[test]
 fn test_large_allocations() {
-    block_on(async {
+    main_thread(async {
         let mut handles = Vec::new();
 
         for i in 0..50 {
@@ -160,7 +160,7 @@ fn test_large_allocations() {
 // Test mixed allocation patterns
 #[test]
 fn test_mixed_patterns() {
-    block_on(async {
+    main_thread(async {
         let counter = Arc::new(Mutex::new(0));
         let mut handles = Vec::new();
 
@@ -191,7 +191,7 @@ fn test_mixed_patterns() {
 // Test string allocations
 #[test]
 fn test_string_allocations() {
-    block_on(async {
+    main_thread(async {
         let mut handles = Vec::new();
 
         for i in 0..300 {

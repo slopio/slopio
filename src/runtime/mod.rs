@@ -14,7 +14,7 @@ pub struct RuntimeInner {
 }
 
 impl RuntimeInner {
-    pub fn block_on<F: Future>(&mut self, f: F) -> F::Output {
+    pub fn block_on<F: Future>(self, f: F) -> F::Output {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         self.io_driver.with(|| {

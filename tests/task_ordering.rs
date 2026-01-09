@@ -1,4 +1,4 @@
-use runtime::block_on;
+use runtime::main_thread;
 use runtime::runtime::spawn;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +7,7 @@ fn test_task_execution_order() {
     let execution_order = Arc::new(Mutex::new(Vec::new()));
     let order_clone = execution_order.clone();
 
-    block_on(async move {
+    main_thread(async move {
         order_clone.lock().unwrap().push(1);
 
         let handle = spawn(async {
@@ -25,7 +25,7 @@ fn test_task_execution_order() {
 
 #[test]
 fn test_multiple_nested_tasks() {
-    let result = block_on(async {
+    let result = main_thread(async {
         let t1 = spawn(async {
             let t2 = spawn(async {
                 let t3 = spawn(async { 1 });
@@ -40,7 +40,7 @@ fn test_multiple_nested_tasks() {
 
 #[test]
 fn test_parallel_task_results() {
-    let results = block_on(async {
+    let results = main_thread(async {
         let mut handles = Vec::new();
 
         for i in 0..5 {
