@@ -18,7 +18,6 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    // let cores_num = 2;
     let cores_num = std::thread::available_parallelism().unwrap().into();
     let handles = (0..cores_num)
         .map(|n| spawn_worker_on(n, f()))

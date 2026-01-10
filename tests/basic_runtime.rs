@@ -1,4 +1,5 @@
 use runtime::main_thread;
+use runtime::runtime::join::join;
 use runtime::runtime::spawn;
 
 #[test]
