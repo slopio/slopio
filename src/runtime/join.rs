@@ -86,7 +86,6 @@ where
 {
     type Output = (F1::Output, F2::Output);
 
-    #[allow(clippy::collapsible_if)] //checking bool first matters
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
         let mut this = self.project();
         let _ = this.f1.as_mut().poll(cx);
