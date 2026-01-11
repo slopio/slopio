@@ -1,4 +1,3 @@
-use libc::GENL_ADMIN_PERM;
 use runtime::{
     io_driver::operations::files::{
         AsyncFileWrite,

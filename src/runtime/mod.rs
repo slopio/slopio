@@ -36,13 +36,11 @@ impl RuntimeInner {
                         std::task::Poll::Pending => {}
                     }
                     if !self.tasks.is_empty() {
-                        // Il reste des tâches, mais soumettons les I/O en attente pour réduire la latence
                         if self.io_driver.has_pending_submissions() {
                             self.io_driver.submit_without_wait();
                         }
                         continue;
                     }
-                    // Plus de tâches, attendons des complétions I/O
                     self.io_driver.submit_and_wait()
                 }
             })

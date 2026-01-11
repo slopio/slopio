@@ -11,3 +11,11 @@ select :
 plein d'elements du slab ont le meme waker
 
 macros to generalize select/join for n Futures.
+
+handling signals
+
+
+mimaloc : 
+MIMALLOC_LARGE_OS_PAGES=1 \
+MIMALLOC_PAGE_RESET=0 \
+MIMALLOC_EAGER_COMMIT=1 \

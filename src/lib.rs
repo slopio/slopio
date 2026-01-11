@@ -3,10 +3,16 @@ use std::thread::JoinHandle;
 
 use libc::cpu_set_t;
 
+mod channels;
 pub mod io_driver;
 mod macros;
 pub mod runtime;
 mod task;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// That's it! No other configuration in Rust code
 
 pub fn main_thread<F: Future>(f: F) -> F::Output {
     let rt = runtime::RuntimeInner::default();
@@ -39,14 +45,18 @@ fn pin_core(core_id: usize) {
     }
 }
 
-fn get_numa_node_count() -> usize {
-    std::fs::read_dir("/sys/devices/system/node")
-        .map(|entries| entries.filter_map(|e| e.ok()).count())
-        .unwrap_or(1)
-}
+#[allow(unused)]
+mod numa {
+    fn get_numa_node_count() -> usize {
+        std::fs::read_dir("/sys/devices/system/node")
+            .map(|entries| entries.filter_map(|e| e.ok()).count())
+            .unwrap_or(1)
+    }
 
-fn numa_allocs(_core_id: usize) {
-    unimplemented!("no numa available atm");
+    #[allow(unused)]
+    fn numa_allocs(_core_id: usize) {
+        unimplemented!("no numa available atm");
+    }
 }
 
 fn spawn_worker_on<F: Future<Output = ()> + Send + 'static>(n: usize, f: F) -> JoinHandle<()> {

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 io-uring = "0.7.11"
 libc = "0.2.178"
+mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 pin-project = "1.1.10"
 slab = "0.4.11"
 socket2 = { version = "0.6.1", features = ["all"] }
