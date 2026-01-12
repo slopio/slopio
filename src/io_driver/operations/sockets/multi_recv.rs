@@ -1,4 +1,5 @@
 use io_uring::{opcode, types::Fd};
+use io_uring_buf_ring::BorrowedBuffer;
 use std::{
     ffi::c_int,
     pin::Pin,
@@ -18,26 +19,21 @@ pub struct MultiRecv {
 
 impl From<MultishotCompletionEvent> for Read {
     fn from(value: MultishotCompletionEvent) -> Self {
-        // Extract buffer ID from flags (upper 16 bits)
-        // IORING_CQE_F_BUFFER flag indicates buffer ID is present
         let buffer_id = (value.flags >> 16) as u16;
         let len = value.fd as usize; // For recv, result is bytes count
-
-        // Get the actual buffer slice from the driver
         let data = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len));
 
-        Read { buffer_id, data }
+        Read { inner: data }
     }
 }
 
 pub struct Read {
-    buffer_id: u16,
-    data: &'static [u8],
+    inner: BorrowedBuffer<'static, Vec<u8>>,
 }
 
-impl Drop for Read {
-    fn drop(&mut self) {
-        todo!() //give back the buffer to io_uring
+impl AsRef<[u8]> for Read {
+    fn as_ref(&self) -> &[u8] {
+        self.inner.as_ref()
     }
 }
 

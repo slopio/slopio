@@ -6,7 +6,7 @@ use io_uring::{
     opcode,
     squeue::{self},
 };
-use io_uring_buf_ring::IoUringBufRing;
+use io_uring_buf_ring::{BorrowedBuffer, IoUringBufRing};
 use slab::Slab;
 
 use crate::{io_driver::operations::IoDriverToken, scoped_thread_local};
@@ -67,18 +67,17 @@ impl MultiOpState {
 
 impl Default for Ring {
     fn default() -> Self {
+        let mut builder = IoUring::builder();
+        let ring = builder
+            .setup_coop_taskrun()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .build(4096)
+            .unwrap();
+        let buf_ring = IoUringBufRing::new_with_flags(&ring, 1024, 0, 1 << 14, 0).unwrap();
         Self {
-            inner: {
-                let mut builder = IoUring::builder();
-                let ring = builder
-                    .setup_coop_taskrun()
-                    .setup_single_issuer()
-                    .setup_defer_taskrun()
-                    .build(4096)
-                    .unwrap();
-                let buf_ring = IoUringBufRing::new_with_flags(&ring, 1024, 0, 1 << 14, 0).unwrap();
-                ring
-            },
+            buffer_ring: buf_ring,
+            inner: { ring },
         }
     }
 }
@@ -90,8 +89,11 @@ impl IODriver {
         IO_DRIVER.set(self, f)
     }
 
-    pub fn get_buffer(&self, id: u16, len: usize) -> &'static [u8] {
-        unimplemented!()
+    pub fn get_buffer(&self, id: u16, len: usize) -> BorrowedBuffer<'static, Vec<u8>> {
+        unsafe {
+            let ring_inner = &mut *self.ring.get();
+            std::mem::transmute(ring_inner.buffer_ring.get_buf(id, len).unwrap())
+        }
     }
 
     pub fn push_multishot_op(&self, mut entry: squeue::Entry) -> IoDriverToken {
@@ -313,6 +315,7 @@ enum OpState {
 
 struct Ring {
     inner: IoUring,
+    buffer_ring: IoUringBufRing<Vec<u8>>,
 }
 
 impl Ring {
