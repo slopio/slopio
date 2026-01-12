@@ -1,8 +1,7 @@
+use pin_project::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Context;
-
-use pin_project::pin_project;
 
 #[pin_project]
 pub struct JoinHandle<F1, F2>
@@ -49,14 +48,11 @@ impl<T: Future> Future for WrappedFut<T> {
         cx: &mut Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
-        match this {
-            WrappedFut::Future(f) => {
-                match unsafe { Pin::new_unchecked(f).poll(cx) } {
-                    std::task::Poll::Ready(result) => *this = WrappedFut::Result(result),
-                    std::task::Poll::Pending => {}
-                };
-            }
-            _ => {}
+        if let WrappedFut::Future(f) = this {
+            match unsafe { Pin::new_unchecked(f).poll(cx) } {
+                std::task::Poll::Ready(result) => *this = WrappedFut::Result(result),
+                std::task::Poll::Pending => {}
+            };
         };
         std::task::Poll::Ready(())
     }

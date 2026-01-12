@@ -1,5 +1,6 @@
 use libc::c_int;
 pub mod multi_accept;
+pub mod multi_recv;
 pub mod recv;
 pub mod write;
 

@@ -6,6 +6,7 @@ use io_uring::{
     opcode,
     squeue::{self},
 };
+use io_uring_buf_ring::IoUringBufRing;
 use slab::Slab;
 
 use crate::{io_driver::operations::IoDriverToken, scoped_thread_local};
@@ -23,6 +24,7 @@ pub struct IODriver {
 #[derive(Clone, Copy)]
 struct MultishotCompletionEvent {
     pub fd: i32,
+    pub flags: u32,
 }
 
 enum MultiOpState {
@@ -66,7 +68,17 @@ impl MultiOpState {
 impl Default for Ring {
     fn default() -> Self {
         Self {
-            inner: IoUring::new(1024).unwrap(),
+            inner: {
+                let mut builder = IoUring::builder();
+                let ring = builder
+                    .setup_coop_taskrun()
+                    .setup_single_issuer()
+                    .setup_defer_taskrun()
+                    .build(4096)
+                    .unwrap();
+                let buf_ring = IoUringBufRing::new_with_flags(&ring, 1024, 0, 1 << 14, 0).unwrap();
+                ring
+            },
         }
     }
 }
@@ -76,6 +88,10 @@ scoped_thread_local!(pub(crate) static IO_DRIVER: IODriver);
 impl IODriver {
     pub fn with<R>(&self, f: impl FnOnce() -> R) -> R {
         IO_DRIVER.set(self, f)
+    }
+
+    pub fn get_buffer(&self, id: u16, len: usize) -> &'static [u8] {
+        unimplemented!()
     }
 
     pub fn push_multishot_op(&self, mut entry: squeue::Entry) -> IoDriverToken {
@@ -217,7 +233,10 @@ impl IODriver {
             MultiOpState::Sent {
                 woken_up, queue, ..
             } => {
-                queue.push(MultishotCompletionEvent { fd: entry.result() });
+                queue.push(MultishotCompletionEvent {
+                    fd: entry.result(),
+                    flags: entry.flags(),
+                });
                 if !*woken_up {
                     multi.wake();
                 }
