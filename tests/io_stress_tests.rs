@@ -13,8 +13,7 @@ use std::time::Duration;
 fn test_rapid_connections() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9000).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9000).unwrap();
             let mut count = 0;
 
             // Accept 50 connections
@@ -47,8 +46,7 @@ fn test_rapid_connections() {
 fn test_tiny_recv_chunks() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9001).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9001).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let mut total_received = Vec::new();
@@ -83,8 +81,7 @@ fn test_tiny_recv_chunks() {
 fn test_tiny_send_chunks() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9002).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9002).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let data = b"ABCDEFGHIJ";
@@ -131,8 +128,7 @@ fn test_tiny_send_chunks() {
 fn test_concurrent_connections() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9003).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9003).unwrap();
             let mut handlers = Vec::new();
 
             // Accept 10 connections and spawn a handler for each
@@ -189,8 +185,7 @@ fn test_concurrent_connections() {
 fn test_large_buffer_small_data() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9004).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9004).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 4096]);
@@ -215,8 +210,7 @@ fn test_large_buffer_small_data() {
 fn test_multiple_cycles() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9005).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9005).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let mut total = 0;
@@ -258,8 +252,7 @@ fn test_multiple_cycles() {
 fn test_client_disconnect_during_recv() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9006).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9006).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 64]);
@@ -293,8 +286,7 @@ fn test_client_disconnect_during_recv() {
 fn test_nested_socket_spawns() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9007).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9007).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let outer_task = spawn(async move {
@@ -331,8 +323,7 @@ fn test_nested_socket_spawns() {
 fn test_sequential_accept_handle() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9008).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9008).unwrap();
             let mut count = 0;
 
             for _ in 0..20 {
@@ -370,8 +361,7 @@ fn test_sequential_accept_handle() {
 fn test_interleaved_socket_operations() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9009).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9009).unwrap();
 
             // Accept 3 sockets and spawn handlers for each
             let mut handlers = Vec::new();
@@ -444,8 +434,7 @@ fn test_interleaved_socket_operations() {
 fn test_immediate_recv_after_accept() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9010).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9010).unwrap();
 
             if let Some(socket) = ma.next().await {
                 // Immediately try to recv - client may have already sent data
@@ -473,8 +462,7 @@ fn test_immediate_recv_after_accept() {
 fn test_empty_send() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9011).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9011).unwrap();
 
             if let Some(socket) = ma.next().await {
                 // Send empty data
@@ -498,8 +486,7 @@ fn test_empty_send() {
 fn test_mixed_socket_handling() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(9012).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(9012).unwrap();
             let results = Arc::new(Mutex::new(Vec::new()));
 
             // First socket - handle directly

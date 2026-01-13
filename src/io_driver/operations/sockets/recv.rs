@@ -13,7 +13,7 @@ use crate::io_driver::{
     operations::{IoDriverToken, IoOP},
 };
 
-use super::Socket;
+use super::SocketWrapper;
 
 pub struct RecvSocket<'a> {
     fd: i32,
@@ -21,7 +21,7 @@ pub struct RecvSocket<'a> {
     _data: PhantomData<&'a ()>,
 }
 
-impl AsyncRead for Socket {
+impl AsyncRead for SocketWrapper {
     type Reader<'a> = RecvSocket<'a>;
 
     fn recv<'a>(&self, buffer: &'a mut [u8], len: u32) -> Self::Reader<'a> {
@@ -71,7 +71,7 @@ impl<'a> IoOP for RecvSocket<'a> {
         unimplemented!() //todo need a new trait for those with buffer
     }
 
-    fn free_driver(&mut self) {
+    fn driver_cleanup(&mut self) {
         //no cleaning needed
     }
 }

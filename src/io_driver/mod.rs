@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, rc::Rc, task::Waker};
+use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc, task::Waker};
 
 use io_uring::{
     IoUring,
@@ -21,9 +21,9 @@ pub struct IODriver {
     multishot_slab: Rc<UnsafeCell<Slab<MultiOpState>>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct MultishotCompletionEvent {
-    pub fd: i32,
+    pub result: i32,
     pub flags: u32,
 }
 
@@ -118,7 +118,7 @@ impl IODriver {
         &self,
         id: usize,
         waker: &Waker,
-        v: &mut Vec<MultishotCompletionEvent>,
+        v: &mut VecDeque<MultishotCompletionEvent>,
     ) -> std::task::Poll<()> {
         let slab_multishot = unsafe { &mut *self.multishot_slab.get() };
         let entry = unsafe { slab_multishot.get_unchecked_mut(id) };
@@ -236,7 +236,7 @@ impl IODriver {
                 woken_up, queue, ..
             } => {
                 queue.push(MultishotCompletionEvent {
-                    fd: entry.result(),
+                    result: entry.result(),
                     flags: entry.flags(),
                 });
                 if !*woken_up {

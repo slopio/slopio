@@ -1,29 +1,49 @@
-use io_uring::{opcode, types::Fd};
+use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 use io_uring_buf_ring::BorrowedBuffer;
 use std::{
-    ffi::c_int,
+    collections::VecDeque,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use crate::io_driver::{
     IO_DRIVER, MultishotCompletionEvent,
-    operations::{IoOP, Stream},
+    operations::{
+        IoOP, Stream,
+        sockets::{MultiAsyncRead, SocketWrapper},
+    },
 };
 
 pub struct MultiRecv {
     id: Option<usize>,
     fd: i32,
-    reads: Vec<MultishotCompletionEvent>,
+    reads: VecDeque<MultishotCompletionEvent>,
 }
 
-impl From<MultishotCompletionEvent> for Read {
-    fn from(value: MultishotCompletionEvent) -> Self {
-        let buffer_id = (value.flags >> 16) as u16;
-        let len = value.fd as usize; // For recv, result is bytes count
-        let data = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len));
+pub enum CompletionError {
+    Eof,
+}
 
-        Read { inner: data }
+impl CompletionError {
+    fn from_code(code: i32) -> Self {
+        match code {
+            0 => Self::Eof,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl TryFrom<MultishotCompletionEvent> for Read {
+    type Error = CompletionError;
+
+    fn try_from(event: MultishotCompletionEvent) -> Result<Self, Self::Error> {
+        if event.result <= 0 {
+            return Err(CompletionError::from_code(event.result));
+        }
+        let len = event.result;
+        let buffer_id = buffer_select(event.flags).unwrap();
+        let data = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len as usize));
+        Ok(Read { inner: data })
     }
 }
 
@@ -38,42 +58,46 @@ impl AsRef<[u8]> for Read {
 }
 
 impl MultiRecv {
-    pub fn new(fd: i32) -> std::io::Result<Self> {
+    pub fn new(fd: i32) -> Self {
         let mut multi_recv = Self {
             id: None,
             fd,
-            reads: Vec::new(),
+            reads: Default::default(),
         };
         multi_recv.register_to_driver();
-        Ok(multi_recv)
+        multi_recv
     }
 }
 
 impl Drop for MultiRecv {
     fn drop(&mut self) {
-        self.free_driver();
+        self.driver_cleanup();
     }
 }
+
+impl Unpin for MultiRecv {}
+
 impl Stream for MultiRecv {
     type Item = Read;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let waker = cx.waker();
-        let id = self.id.unwrap();
-        if let Some(event) = self.reads.pop() {
-            return Poll::Ready(Some(event.into()));
+        if let Some(completion_event) = self.reads.pop_front() {
+            return Poll::Ready(completion_event.try_into().ok());
         }
-        match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads)) {
-            std::task::Poll::Pending => {
-                return std::task::Poll::Pending;
-            }
-            std::task::Poll::Ready(_) => {}
+
+        let (waker, id) = (cx.waker(), self.id.unwrap());
+        if IO_DRIVER
+            .with(|d| d.poll_op_multishot(id, waker, &mut self.reads))
+            .is_pending()
+        {
+            return std::task::Poll::Pending;
         }
-        if let Some(event) = self.reads.pop() {
-            Poll::Ready(Some(event.into()))
-        } else {
-            Poll::Pending
+
+        if let Some(completion_event) = self.reads.pop_front() {
+            println!("processing {:?}", completion_event);
+            return Poll::Ready(completion_event.try_into().ok());
         }
+        Poll::Pending
     }
 }
 
@@ -86,12 +110,16 @@ impl IoOP for MultiRecv {
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMulti::new(Fd(self.fd), 2).build()
+        opcode::RecvMulti::new(Fd(self.fd), 0).build()
     }
 
-    fn free_driver(&mut self) {
-        unsafe {
-            libc::close(self.fd as c_int);
-        }
+    fn driver_cleanup(&mut self) {}
+}
+
+impl MultiAsyncRead for SocketWrapper {
+    type MultiRecv = MultiRecv;
+
+    fn multi_recv(&self) -> Self::MultiRecv {
+        MultiRecv::new(self.fd)
     }
 }

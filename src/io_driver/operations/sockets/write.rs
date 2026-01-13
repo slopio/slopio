@@ -4,10 +4,10 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::sockets::{AsyncWrite, Socket},
+    operations::sockets::{AsyncWrite, SocketWrapper},
 };
 
-impl AsyncWrite for Socket {
+impl AsyncWrite for SocketWrapper {
     type Writer<'a> = WriteSocket<'a>;
 
     fn send<'a>(&self, data: &'a [u8]) -> Self::Writer<'a> {

@@ -73,7 +73,7 @@ impl IoOP for OpenFile {
             .build()
     }
 
-    fn free_driver(&mut self) {
+    fn driver_cleanup(&mut self) {
         unimplemented!()
     }
 }

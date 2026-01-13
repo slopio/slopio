@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ffi::c_int,
     net::{Ipv4Addr, SocketAddr},
     os::fd::IntoRawFd,
@@ -11,18 +12,18 @@ use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
     IO_DRIVER, MultishotCompletionEvent,
-    operations::{IoOP, Stream, sockets::Socket},
+    operations::{IoOP, Stream, sockets::SocketWrapper},
 };
 
 pub struct MultiAccept {
     id: Option<usize>,
     fd: i32,
-    sockets: Vec<MultishotCompletionEvent>,
+    sockets: VecDeque<MultishotCompletionEvent>,
 }
 
-impl From<MultishotCompletionEvent> for Socket {
+impl From<MultishotCompletionEvent> for SocketWrapper {
     fn from(value: MultishotCompletionEvent) -> Self {
-        Socket { fd: value.fd }
+        SocketWrapper { fd: value.result }
     }
 }
 
@@ -39,7 +40,7 @@ impl MultiAccept {
         let mut multi_accept = Self {
             id: None,
             fd,
-            sockets: Vec::new(),
+            sockets: Default::default(),
         };
         multi_accept.register_to_driver();
         Ok(multi_accept)
@@ -48,25 +49,28 @@ impl MultiAccept {
 
 impl Drop for MultiAccept {
     fn drop(&mut self) {
-        self.free_driver();
+        self.driver_cleanup();
     }
 }
+
+impl Unpin for MultiAccept {}
+
 impl Stream for MultiAccept {
-    type Item = Socket; // ou Result<TcpStream, Error>
+    type Item = SocketWrapper; // ou Result<TcpStream, Error>
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let waker = cx.waker();
         let id = self.id.unwrap();
-        if let Some(event) = self.sockets.pop() {
+        if let Some(event) = self.sockets.pop_front() {
             return Poll::Ready(Some(event.into()));
         }
-        match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.sockets)) {
-            std::task::Poll::Pending => {
-                return std::task::Poll::Pending;
-            }
-            std::task::Poll::Ready(_) => {}
+        if IO_DRIVER
+            .with(|d| d.poll_op_multishot(id, waker, &mut self.sockets))
+            .is_pending()
+        {
+            return std::task::Poll::Pending;
         }
-        if let Some(fd) = self.sockets.pop() {
+        if let Some(fd) = self.sockets.pop_front() {
             Poll::Ready(Some(fd.into()))
         } else {
             Poll::Pending
@@ -88,7 +92,7 @@ impl IoOP for MultiAccept {
             .build()
     }
 
-    fn free_driver(&mut self) {
+    fn driver_cleanup(&mut self) {
         unsafe {
             libc::close(self.fd as c_int);
         }

@@ -11,8 +11,7 @@ use std::time::Duration;
 fn test_multi_accept_single_connection() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(8081).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(8081).unwrap();
 
             if let Some(_socket) = ma.next().await {
                 // Successfully accepted a connection
@@ -37,8 +36,7 @@ fn test_multi_accept_single_connection() {
 fn test_socket_recv_data() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(8082).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(8082).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 128]);
@@ -67,8 +65,7 @@ fn test_socket_recv_data() {
 fn test_socket_send_data() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(8083).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(8083).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let data = b"Response from server";
@@ -96,8 +93,7 @@ fn test_socket_send_data() {
 fn test_echo_server() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(8084).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(8084).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 128]);
@@ -130,8 +126,7 @@ fn test_echo_server() {
 fn test_multiple_recv_send() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(8085).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(8085).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let mut total_bytes = 0;
@@ -187,8 +182,7 @@ fn test_multiple_recv_send() {
 fn test_spawned_socket_handler() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(8086).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(8086).unwrap();
 
             if let Some(socket) = ma.next().await {
                 // Spawn a task to handle the socket
@@ -224,8 +218,7 @@ fn test_spawned_socket_handler() {
 fn test_zero_length_recv() {
     let handle = std::thread::spawn(|| {
         main_thread(async {
-            let ma = MultiAccept::new(8087).unwrap();
-            let mut ma = std::pin::pin!(ma);
+            let mut ma = MultiAccept::new(8087).unwrap();
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 64]);
