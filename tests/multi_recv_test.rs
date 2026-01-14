@@ -22,7 +22,6 @@ fn test_stream_stops_on_close() {
                 while let Some(_data) = multi_recv.next().await {
                     recv_count += 1;
                 }
-                // Le stream doit s'arrêter (retourner None) quand le client ferme
                 return Some(recv_count);
             }
             None
@@ -31,12 +30,10 @@ fn test_stream_stops_on_close() {
 
     sleep(Duration::from_millis(100));
 
-    // Se connecter et fermer immédiatement sans envoyer de données
     let client = TcpStream::connect("localhost:9091").unwrap();
-    drop(client); // Fermeture immédiate
+    drop(client);
 
     let recv_count = reading_thread.join().unwrap().unwrap();
-    // On doit avoir reçu 0 événements (juste EOF)
     assert_eq!(recv_count, 0, "Stream should receive no data, only EOF");
 }
 
@@ -51,7 +48,6 @@ fn test_stream_stops_on_abrupt_close_rst() {
                 while let Some(_data) = multi_recv.next().await {
                     recv_count += 1;
                 }
-                // Le stream doit s'arrêter même avec un RST
                 return Some(recv_count);
             }
             None
@@ -60,14 +56,12 @@ fn test_stream_stops_on_abrupt_close_rst() {
 
     sleep(Duration::from_millis(100));
 
-    // Se connecter et fermer brutalement avec TCP RST
     let client = TcpStream::connect("localhost:9092").unwrap();
 
-    // Configurer SO_LINGER avec timeout 0 pour forcer un RST
     unsafe {
         let linger = libc::linger {
-            l_onoff: 1,  // Activer SO_LINGER
-            l_linger: 0, // Timeout à 0 = RST immédiat
+            l_onoff: 1,
+            l_linger: 0,
         };
         libc::setsockopt(
             client.as_raw_fd(),
@@ -77,10 +71,9 @@ fn test_stream_stops_on_abrupt_close_rst() {
             std::mem::size_of::<libc::linger>() as u32,
         );
     }
-    drop(client); // Envoie un RST au lieu de FIN
+    drop(client);
 
     let recv_count = reading_thread.join().unwrap().unwrap();
-    // On doit avoir reçu 0 événements (le stream doit se terminer)
     assert_eq!(recv_count, 0, "Stream should stop on RST");
 }
 
@@ -95,7 +88,6 @@ fn test_stream_stops_on_process_kill() {
                 while let Some(_data) = multi_recv.next().await {
                     recv_count += 1;
                 }
-                // Le stream doit s'arrêter même si le processus client est tué
                 return Some(recv_count);
             }
             None
@@ -104,18 +96,16 @@ fn test_stream_stops_on_process_kill() {
 
     sleep(Duration::from_millis(100));
 
-    // Spawner un processus qui se connecte puis le tuer brutalement
     let mut child = Command::new("bash")
         .args(&["-c", "exec 3<>/dev/tcp/localhost/9093; sleep 10"])
         .spawn()
         .unwrap();
 
     sleep(Duration::from_millis(200));
-    child.kill().unwrap(); // Tue le processus → connexion brutalement fermée
+    child.kill().unwrap();
     child.wait().unwrap();
 
     let recv_count = reading_thread.join().unwrap().unwrap();
-    // On doit avoir reçu 0 événements (le stream doit se terminer)
     assert_eq!(
         recv_count, 0,
         "Stream should stop when client process is killed"
@@ -126,7 +116,6 @@ fn test_stream_stops_on_process_kill() {
 fn byte_per_byte() {
     let reading_thread = std::thread::spawn(|| {
         main_thread(async {
-            println!("go");
             let mut multiaccept = MultiAccept::new(9090).unwrap();
             if let Some(socket) = multiaccept.next().await {
                 let mut s = String::new();
