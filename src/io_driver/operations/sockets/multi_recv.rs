@@ -22,13 +22,18 @@ pub struct MultiRecv {
 
 pub enum CompletionError {
     Eof,
+    ConnectionReset,
+    BrokenPipe,
+    Other(i32),
 }
 
 impl CompletionError {
     fn from_code(code: i32) -> Self {
         match code {
             0 => Self::Eof,
-            _ => unimplemented!(),
+            -104 => Self::ConnectionReset, // ECONNRESET
+            -32 => Self::BrokenPipe,       // EPIPE
+            _ => Self::Other(code),
         }
     }
 }
@@ -94,7 +99,6 @@ impl Stream for MultiRecv {
         }
 
         if let Some(completion_event) = self.reads.pop_front() {
-            println!("processing {:?}", completion_event);
             return Poll::Ready(completion_event.try_into().ok());
         }
         Poll::Pending

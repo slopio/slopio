@@ -132,6 +132,7 @@ impl IODriver {
                 std::task::Poll::Pending
             }
             MultiOpState::Sent { queue, .. } => {
+                println!("taking elements");
                 v.extend(queue.iter().cloned());
                 std::task::Poll::Ready(())
             }

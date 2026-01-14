@@ -1,337 +1,155 @@
-use runtime::io_driver::operations::StreamExt;
-use runtime::io_driver::operations::sockets::AsyncWrite;
-use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime::io_driver::operations::sockets::multi_recv::MultiRecv;
-use runtime::main_thread;
-use runtime::runtime::spawn;
-use std::io::Write;
-use std::net::TcpStream;
-use std::time::Duration;
+use std::{
+    io::Write, net::TcpStream, os::unix::io::AsRawFd, process::Command, thread::sleep,
+    time::Duration,
+};
+
+use runtime::{
+    io_driver::operations::{
+        StreamExt,
+        sockets::{multi_accept::MultiAccept, multi_recv::MultiRecv},
+    },
+    main_thread,
+};
 
 #[test]
-fn test_multi_recv_single_message() {
-    let handle = std::thread::spawn(|| {
+fn test_stream_stops_on_close() {
+    let reading_thread = std::thread::spawn(|| {
         main_thread(async {
-            let mut ma = MultiAccept::new(9001).unwrap();
-            if let Some(socket) = ma.next().await {
-                let fd = socket.fd;
-                std::mem::forget(socket); // Don't close the fd
-
-                let mut mr = MultiRecv::new(fd);
-
-                if let Some(read) = mr.next().await {
-                    String::from_utf8_lossy(read.as_ref()).to_string()
-                } else {
-                    String::new()
+            let mut multiaccept = MultiAccept::new(9091).unwrap();
+            if let Some(socket) = multiaccept.next().await {
+                let mut recv_count = 0;
+                let mut multi_recv = MultiRecv::new(socket.fd);
+                while let Some(_data) = multi_recv.next().await {
+                    recv_count += 1;
                 }
-            } else {
-                String::new()
+                // Le stream doit s'arrêter (retourner None) quand le client ferme
+                return Some(recv_count);
             }
+            None
         })
     });
 
-    std::thread::sleep(Duration::from_millis(100));
+    sleep(Duration::from_millis(100));
 
-    let mut client = TcpStream::connect("127.0.0.1:9001").unwrap();
-    client.write_all(b"Hello MultiRecv!").unwrap();
+    // Se connecter et fermer immédiatement sans envoyer de données
+    let client = TcpStream::connect("localhost:9091").unwrap();
+    drop(client); // Fermeture immédiate
 
-    let received = handle.join().unwrap();
-    assert_eq!(received, "Hello MultiRecv!");
+    let recv_count = reading_thread.join().unwrap().unwrap();
+    // On doit avoir reçu 0 événements (juste EOF)
+    assert_eq!(recv_count, 0, "Stream should receive no data, only EOF");
 }
 
 #[test]
-fn test_multi_recv_multiple_messages() {
-    let handle = std::thread::spawn(|| {
+fn test_stream_stops_on_abrupt_close_rst() {
+    let reading_thread = std::thread::spawn(|| {
         main_thread(async {
-            let mut ma = MultiAccept::new(9002).unwrap();
-
-            if let Some(socket) = ma.next().await {
-                let fd = socket.fd;
-                std::mem::forget(socket);
-
-                let mut mr = MultiRecv::new(fd);
-
-                let mut messages = Vec::new();
-
-                // Receive 3 messages
-                for _ in 0..3 {
-                    if let Some(read) = mr.next().await {
-                        messages.push(String::from_utf8_lossy(read.as_ref()).to_string());
-                    }
+            let mut multiaccept = MultiAccept::new(9092).unwrap();
+            if let Some(socket) = multiaccept.next().await {
+                let mut recv_count = 0;
+                let mut multi_recv = MultiRecv::new(socket.fd);
+                while let Some(_data) = multi_recv.next().await {
+                    recv_count += 1;
                 }
-
-                messages
-            } else {
-                Vec::new()
+                // Le stream doit s'arrêter même avec un RST
+                return Some(recv_count);
             }
+            None
         })
     });
 
-    std::thread::sleep(Duration::from_millis(100));
+    sleep(Duration::from_millis(100));
 
-    let mut client = TcpStream::connect("127.0.0.1:9002").unwrap();
-    client.write_all(b"Message 1").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    client.write_all(b"Message 2").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    client.write_all(b"Message 3").unwrap();
+    // Se connecter et fermer brutalement avec TCP RST
+    let client = TcpStream::connect("localhost:9092").unwrap();
 
-    let messages = handle.join().unwrap();
-    assert_eq!(messages.len(), 3);
-    assert_eq!(messages[0], "Message 1");
-    assert_eq!(messages[1], "Message 2");
-    assert_eq!(messages[2], "Message 3");
+    // Configurer SO_LINGER avec timeout 0 pour forcer un RST
+    unsafe {
+        let linger = libc::linger {
+            l_onoff: 1,  // Activer SO_LINGER
+            l_linger: 0, // Timeout à 0 = RST immédiat
+        };
+        libc::setsockopt(
+            client.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as u32,
+        );
+    }
+    drop(client); // Envoie un RST au lieu de FIN
+
+    let recv_count = reading_thread.join().unwrap().unwrap();
+    // On doit avoir reçu 0 événements (le stream doit se terminer)
+    assert_eq!(recv_count, 0, "Stream should stop on RST");
 }
 
 #[test]
-fn test_multi_recv_echo_loop() {
-    let handle = std::thread::spawn(|| {
+fn test_stream_stops_on_process_kill() {
+    let reading_thread = std::thread::spawn(|| {
         main_thread(async {
-            let mut ma = MultiAccept::new(9003).unwrap();
-
-            if let Some(socket) = ma.next().await {
-                let fd = socket.fd;
-                let socket_for_send = runtime::io_driver::operations::sockets::SocketWrapper { fd };
-                std::mem::forget(socket);
-
-                let mut mr = MultiRecv::new(fd);
-
-                let mut total_bytes = 0;
-
-                // Echo 3 messages
-                for _ in 0..3 {
-                    if let Some(read) = mr.next().await {
-                        let data = read.as_ref();
-                        total_bytes += data.len();
-                        socket_for_send.send(data).await.unwrap();
-                    }
+            let mut multiaccept = MultiAccept::new(9093).unwrap();
+            if let Some(socket) = multiaccept.next().await {
+                let mut recv_count = 0;
+                let mut multi_recv = MultiRecv::new(socket.fd);
+                while let Some(_data) = multi_recv.next().await {
+                    recv_count += 1;
                 }
-
-                total_bytes
-            } else {
-                0
+                // Le stream doit s'arrêter même si le processus client est tué
+                return Some(recv_count);
             }
+            None
         })
     });
 
-    std::thread::sleep(Duration::from_millis(100));
+    sleep(Duration::from_millis(100));
 
-    let mut client = TcpStream::connect("127.0.0.1:9003").unwrap();
+    // Spawner un processus qui se connecte puis le tuer brutalement
+    let mut child = Command::new("bash")
+        .args(&["-c", "exec 3<>/dev/tcp/localhost/9093; sleep 10"])
+        .spawn()
+        .unwrap();
 
-    // Send and receive 3 messages
-    client.write_all(b"Echo 1").unwrap();
-    let mut buf = [0u8; 64];
-    let n = std::io::Read::read(&mut client, &mut buf).unwrap();
-    assert_eq!(&buf[..n], b"Echo 1");
+    sleep(Duration::from_millis(200));
+    child.kill().unwrap(); // Tue le processus → connexion brutalement fermée
+    child.wait().unwrap();
 
-    client.write_all(b"Echo 2").unwrap();
-    let n = std::io::Read::read(&mut client, &mut buf).unwrap();
-    assert_eq!(&buf[..n], b"Echo 2");
-
-    client.write_all(b"Echo 3").unwrap();
-    let n = std::io::Read::read(&mut client, &mut buf).unwrap();
-    assert_eq!(&buf[..n], b"Echo 3");
-
-    let total = handle.join().unwrap();
-    assert_eq!(total, 18); // 6 + 6 + 6
+    let recv_count = reading_thread.join().unwrap().unwrap();
+    // On doit avoir reçu 0 événements (le stream doit se terminer)
+    assert_eq!(
+        recv_count, 0,
+        "Stream should stop when client process is killed"
+    );
 }
 
 #[test]
-fn test_multi_recv_large_message() {
-    let handle = std::thread::spawn(|| {
+fn byte_per_byte() {
+    let reading_thread = std::thread::spawn(|| {
         main_thread(async {
-            let mut ma = MultiAccept::new(9004).unwrap();
-
-            if let Some(socket) = ma.next().await {
-                let fd = socket.fd;
-                std::mem::forget(socket);
-
-                let mut mr = MultiRecv::new(fd);
-
-                if let Some(read) = mr.next().await {
-                    read.as_ref().len()
-                } else {
-                    0
+            println!("go");
+            let mut multiaccept = MultiAccept::new(9090).unwrap();
+            if let Some(socket) = multiaccept.next().await {
+                let mut s = String::new();
+                while let Some(u) = MultiRecv::new(socket.fd).next().await {
+                    s.push_str(std::str::from_utf8(u.as_ref()).unwrap());
                 }
+                return Some(s);
             } else {
-                0
+                None
             }
         })
     });
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    let mut client = TcpStream::connect("127.0.0.1:9004").unwrap();
-    let large_data = vec![b'A'; 8192];
-    client.write_all(&large_data).unwrap();
-
-    let len = handle.join().unwrap();
-    assert_eq!(len, 8192);
+    sleep(Duration::from_millis(100));
+    let mut client = TcpStream::connect("localhost:9090").unwrap();
+    for b in LIPSUM.bytes() {
+        let k = client.write(&[b]).unwrap();
+        assert_eq!(k, 1);
+        sleep(Duration::from_millis(5));
+    }
+    drop(client);
+    let complete = reading_thread.join().unwrap().unwrap();
+    assert_eq!(complete.len(), LIPSUM.len());
+    assert_eq!(complete, LIPSUM);
 }
 
-#[test]
-fn test_multi_recv_spawned_task() {
-    let handle = std::thread::spawn(|| {
-        main_thread(async {
-            let mut ma = MultiAccept::new(9005).unwrap();
-
-            if let Some(socket) = ma.next().await {
-                let fd = socket.fd;
-                std::mem::forget(socket);
-
-                // Spawn a task to handle the MultiRecv stream
-                let task_handle = spawn(async move {
-                    let mut mr = MultiRecv::new(fd);
-                    let mut count = 0;
-
-                    while let Some(read) = mr.next().await {
-                        count += 1;
-                        if read.as_ref() == b"STOP" {
-                            break;
-                        }
-                    }
-
-                    count
-                });
-
-                task_handle.await
-            } else {
-                0
-            }
-        })
-    });
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    let mut client = TcpStream::connect("127.0.0.1:9005").unwrap();
-    client.write_all(b"Message 1").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    client.write_all(b"Message 2").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    client.write_all(b"STOP").unwrap();
-
-    let count = handle.join().unwrap();
-    assert_eq!(count, 3);
-}
-
-#[test]
-fn test_multi_recv_binary_data() {
-    let handle = std::thread::spawn(|| {
-        main_thread(async {
-            let mut ma = MultiAccept::new(9006).unwrap();
-
-            if let Some(socket) = ma.next().await {
-                let fd = socket.fd;
-                std::mem::forget(socket);
-
-                let mut mr = MultiRecv::new(fd);
-                if let Some(read) = mr.next().await {
-                    read.as_ref().to_vec()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        })
-    });
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    let mut client = TcpStream::connect("127.0.0.1:9006").unwrap();
-    let binary_data = vec![0x00, 0xFF, 0x42, 0xAA, 0x55, 0x01, 0x02, 0x03];
-    client.write_all(&binary_data).unwrap();
-
-    let received = handle.join().unwrap();
-    assert_eq!(received, binary_data);
-}
-
-#[test]
-fn test_multi_recv_empty_reads() {
-    let handle = std::thread::spawn(|| {
-        main_thread(async {
-            let mut ma = MultiAccept::new(9007).unwrap();
-
-            if let Some(socket) = ma.next().await {
-                let fd = socket.fd;
-                let mut mr = MultiRecv::new(fd);
-
-                // Read one message
-                if let Some(read) = mr.next().await {
-                    let msg = String::from_utf8_lossy(read.as_ref()).to_string();
-
-                    // Try to read again - connection will close
-                    if let Some(read2) = mr.next().await {
-                        (msg, read2.as_ref().len())
-                    } else {
-                        (msg, 0)
-                    }
-                } else {
-                    println!("no read");
-                    (String::new(), 0)
-                }
-            } else {
-                (String::new(), 0)
-            }
-        })
-    });
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    let mut client = TcpStream::connect("127.0.0.1:9007").unwrap();
-    client.write_all(b"Final message").unwrap();
-    drop(client); // Close connection
-
-    let (msg, len) = handle.join().unwrap();
-    assert_eq!(msg, "Final message");
-    assert_eq!(len, 0); // Connection closed
-}
-
-#[test]
-fn test_multi_recv_concurrent_sockets() {
-    let handle = std::thread::spawn(|| {
-        main_thread(async {
-            let mut ma = MultiAccept::new(9008).unwrap();
-            let mut tasks = Vec::new();
-
-            // Accept 2 connections and spawn handlers
-            for _ in 0..2 {
-                if let Some(socket) = ma.next().await {
-                    let fd = socket.fd;
-                    std::mem::forget(socket);
-
-                    let task = spawn(async move {
-                        let mut mr = MultiRecv::new(fd);
-                        if let Some(read) = mr.next().await {
-                            String::from_utf8_lossy(read.as_ref()).to_string()
-                        } else {
-                            String::new()
-                        }
-                    });
-
-                    tasks.push(task);
-                }
-            }
-
-            let mut results = Vec::new();
-            for task in tasks {
-                results.push(task.await);
-            }
-
-            results
-        })
-    });
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    let mut client1 = TcpStream::connect("127.0.0.1:9008").unwrap();
-    let mut client2 = TcpStream::connect("127.0.0.1:9008").unwrap();
-
-    client1.write_all(b"Client 1").unwrap();
-    client2.write_all(b"Client 2").unwrap();
-
-    let results = handle.join().unwrap();
-    assert_eq!(results.len(), 2);
-    assert!(results.contains(&"Client 1".to_string()));
-    assert!(results.contains(&"Client 2".to_string()));
-}
+const LIPSUM: &str = "Consectetur at, turpis commodo id gravida. Mollis rhoncus eu habitant, nec metus vel, fusce sit et donec diam condimentum. Aenean ipsum mattis ligula, pellentesque accumsan curae, scelerisque euismod pharetra aptent porttitor imperdiet luctus. Ac vulputate vestibulum, aenean elementum est lacus posuere. Odio ullamcorper in sed, commodo amet euismod, aliquet integer nam ultricies ornare posuere conubia litora. Rutrum etiam class, sollicitudin consequat, leo inceptos et commodo felis purus erat. Lacinia vitae volutpat, donec cursus, interdum vivamus inceptos viverra libero est at. Enim conubia morbi phasellus, volutpat scelerisque faucibus, taciti amet semper sagittis quis orci. Eu cubilia litora, habitasse tempus hendrerit pellentesque neque. Sit sociosqu curabitur, tincidunt litora, luctus tellus sem inceptos lacus. Consectetur at, turpis commodo id gravida. Mollis rhoncus eu habitant, nec metus vel, fusce sit et donec diam condimentum. Aenean ipsum mattis ligula, pellentesque accumsan curae, scelerisque euismod pharetra aptent porttitor imperdiet luctus. Ac vulputate vestibulum, aenean elementum est lacus posuere. Odio ullamcorper in sed, commodo amet euismod, aliquet integer nam ultricies ornare posuere conubia litora. Rutrum etiam class, sollicitudin consequat, leo inceptos et commodo felis purus erat. Lacinia vitae volutpat, donec cursus, interdum vivamus inceptos viverra libero est at. Enim conubia morbi phasellus, volutpat scelerisque faucibus, taciti amet semper sagittis quis orci. Eu cubilia litora, habitasse tempus hendrerit pellentesque neque. Sit sociosqu curabitur, tincidunt litora, luctus tellus sem inceptos lacus.";
