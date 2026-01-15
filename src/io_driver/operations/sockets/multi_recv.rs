@@ -20,6 +20,7 @@ pub struct MultiRecv {
     reads: VecDeque<MultishotCompletionEvent>,
 }
 
+#[derive(Debug)]
 pub enum CompletionError {
     Eof,
     ConnectionReset,
@@ -27,12 +28,22 @@ pub enum CompletionError {
     Other(i32),
 }
 
+#[allow(unreachable_patterns)]
 impl CompletionError {
+    pub fn can_continue(&self) -> bool {
+        match self {
+            Self::Eof => false,
+            Self::ConnectionReset => false,
+            Self::BrokenPipe => false,
+            Self::Other(code) => matches!(-code, libc::EINTR | libc::EAGAIN | libc::EWOULDBLOCK),
+        }
+    }
+
     fn from_code(code: i32) -> Self {
         match code {
             0 => Self::Eof,
-            -104 => Self::ConnectionReset, // ECONNRESET
-            -32 => Self::BrokenPipe,       // EPIPE
+            -104 => Self::ConnectionReset,
+            -32 => Self::BrokenPipe,
             _ => Self::Other(code),
         }
     }
@@ -86,10 +97,13 @@ impl Stream for MultiRecv {
     type Item = Read;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(completion_event) = self.reads.pop_front() {
-            return Poll::Ready(completion_event.try_into().ok());
+        while let Some(completion_event) = self.reads.pop_front() {
+            match completion_event.try_into() {
+                Ok(r) => return Poll::Ready(Some(r)),
+                Err(e) if e.can_continue() => {}
+                _ => return Poll::Ready(None),
+            };
         }
-
         let (waker, id) = (cx.waker(), self.id.unwrap());
         if IO_DRIVER
             .with(|d| d.poll_op_multishot(id, waker, &mut self.reads))
@@ -97,9 +111,12 @@ impl Stream for MultiRecv {
         {
             return std::task::Poll::Pending;
         }
-
-        if let Some(completion_event) = self.reads.pop_front() {
-            return Poll::Ready(completion_event.try_into().ok());
+        while let Some(completion_event) = self.reads.pop_front() {
+            match completion_event.try_into() {
+                Ok(r) => return Poll::Ready(Some(r)),
+                Err(e) if e.can_continue() => {}
+                _ => return Poll::Ready(None),
+            };
         }
         Poll::Pending
     }

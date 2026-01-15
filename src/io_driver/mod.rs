@@ -40,7 +40,12 @@ enum MultiOpState {
     Sent {
         waker: Waker,
         woken_up: bool,
-        queue: Vec<MultishotCompletionEvent>,
+        queue: VecDeque<MultishotCompletionEvent>,
+    },
+    Paused {
+        waker: Waker,
+        fd: i32,
+        queue: VecDeque<MultishotCompletionEvent>,
     },
 }
 
@@ -53,6 +58,9 @@ impl MultiOpState {
             } => {
                 waker.wake_by_ref();
                 *woken_up = true;
+            }
+            MultiOpState::Paused { waker, .. } => {
+                waker.wake_by_ref();
             }
         }
     }
@@ -69,6 +77,7 @@ impl MultiOpState {
                 *waker = w;
                 *woken_up = false;
             }
+            MultiOpState::Paused { .. } => {}
         }
     }
 }
@@ -151,14 +160,15 @@ impl IODriver {
                 *entry = MultiOpState::Sent {
                     waker: waker.clone(),
                     woken_up: false,
-                    queue: Vec::new(),
+                    queue: VecDeque::new(),
                 };
                 std::task::Poll::Pending
             }
             MultiOpState::Sent { queue, .. } => {
-                v.extend(queue.iter().cloned());
+                std::mem::swap(v, queue);
                 std::task::Poll::Ready(())
             }
+            MultiOpState::Paused { waker, fd, queue } => todo!(), //TODO RESTART
         };
         entry.clean(waker.clone());
         res
@@ -259,7 +269,7 @@ impl IODriver {
             MultiOpState::Sent {
                 woken_up, queue, ..
             } => {
-                queue.push(MultishotCompletionEvent {
+                queue.push_back(MultishotCompletionEvent {
                     result: entry.result(),
                     flags: entry.flags(),
                 });
@@ -267,6 +277,7 @@ impl IODriver {
                     multi.wake();
                 }
             }
+            MultiOpState::Paused { waker, fd, queue } => todo!(),
         }
     }
 

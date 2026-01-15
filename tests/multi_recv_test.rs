@@ -114,31 +114,47 @@ fn test_stream_stops_on_process_kill() {
 
 #[test]
 fn byte_per_byte() {
-    let reading_thread = std::thread::spawn(|| {
+    use rand::RngCore;
+    let mut rng = rand::thread_rng();
+    let mut random_bytes = vec![0u8; 5_000_000];
+    rng.fill_bytes(&mut random_bytes);
+
+    let random_bytes_clone = random_bytes.clone();
+
+    let reading_thread = std::thread::spawn(move || {
         main_thread(async {
             let mut multiaccept = MultiAccept::new(9090).unwrap();
             if let Some(socket) = multiaccept.next().await {
-                let mut s = String::new();
-                while let Some(u) = MultiRecv::new(socket.fd).next().await {
-                    s.push_str(std::str::from_utf8(u.as_ref()).unwrap());
+                let mut received = Vec::new();
+                let mut multirecv = MultiRecv::new(socket.fd);
+                while let Some(data) = multirecv.next().await {
+                    received.extend_from_slice(data.as_ref());
                 }
-                Some(s)
+                Some(received)
             } else {
                 None
             }
         })
     });
+
     sleep(Duration::from_millis(100));
     let mut client = TcpStream::connect("localhost:9090").unwrap();
-    for b in LIPSUM.bytes() {
-        let k = client.write(&[b]).unwrap();
+    for b in random_bytes_clone.iter() {
+        let k = client.write(&[*b]).unwrap();
         assert_eq!(k, 1);
-        sleep(Duration::from_millis(5));
     }
     drop(client);
-    let complete = reading_thread.join().unwrap().unwrap();
-    assert_eq!(complete.len(), LIPSUM.len());
-    assert_eq!(complete, LIPSUM);
-}
 
-const LIPSUM: &str = "Consectetur at, turpis commodo id gravida. Mollis rhoncus eu habitant, nec metus vel, fusce sit et donec diam condimentum. Aenean ipsum mattis ligula, pellentesque accumsan curae, scelerisque euismod pharetra aptent porttitor imperdiet luctus. Ac vulputate vestibulum, aenean elementum est lacus posuere. Odio ullamcorper in sed, commodo amet euismod, aliquet integer nam ultricies ornare posuere conubia litora. Rutrum etiam class, sollicitudin consequat, leo inceptos et commodo felis purus erat. Lacinia vitae volutpat, donec cursus, interdum vivamus inceptos viverra libero est at. Enim conubia morbi phasellus, volutpat scelerisque faucibus, taciti amet semper sagittis quis orci. Eu cubilia litora, habitasse tempus hendrerit pellentesque neque. Sit sociosqu curabitur, tincidunt litora, luctus tellus sem inceptos lacus. Consectetur at, turpis commodo id gravida. Mollis rhoncus eu habitant, nec metus vel, fusce sit et donec diam condimentum. Aenean ipsum mattis ligula, pellentesque accumsan curae, scelerisque euismod pharetra aptent porttitor imperdiet luctus. Ac vulputate vestibulum, aenean elementum est lacus posuere. Odio ullamcorper in sed, commodo amet euismod, aliquet integer nam ultricies ornare posuere conubia litora. Rutrum etiam class, sollicitudin consequat, leo inceptos et commodo felis purus erat. Lacinia vitae volutpat, donec cursus, interdum vivamus inceptos viverra libero est at. Enim conubia morbi phasellus, volutpat scelerisque faucibus, taciti amet semper sagittis quis orci. Eu cubilia litora, habitasse tempus hendrerit pellentesque neque. Sit sociosqu curabitur, tincidunt litora, luctus tellus sem inceptos lacus.";
+    let received = reading_thread.join().unwrap().unwrap();
+    assert_eq!(
+        received.len(),
+        random_bytes.len(),
+        "Received {} bytes but expected {}",
+        received.len(),
+        random_bytes.len()
+    );
+    assert_eq!(
+        received, random_bytes,
+        "Received data doesn't match sent data"
+    );
+}

@@ -11,3 +11,6 @@ mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 pin-project = "1.1.10"
 slab = "0.4.11"
 socket2 = { version = "0.6.1", features = ["all"] }
+
+[dev-dependencies]
+rand = "0.8"
