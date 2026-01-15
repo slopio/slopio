@@ -18,6 +18,7 @@ pub struct MultiRecv {
     id: Option<usize>,
     fd: i32,
     reads: VecDeque<MultishotCompletionEvent>,
+    reads_this_batch: usize,
 }
 
 #[derive(Debug)]
@@ -79,6 +80,7 @@ impl MultiRecv {
             id: None,
             fd,
             reads: Default::default(),
+            reads_this_batch: 0,
         };
         multi_recv.register_to_driver();
         multi_recv
@@ -93,32 +95,46 @@ impl Drop for MultiRecv {
 
 impl Unpin for MultiRecv {}
 
+impl MultiRecv {
+    fn try_drain_one(&mut self, cx: &mut Context<'_>) -> Poll<Option<Read>> {
+        const MAX_READS_PER_POLL: usize = 32;
+
+        while let Some(completion_event) = self.reads.pop_front() {
+            match completion_event.try_into() {
+                Ok(r) => {
+                    self.reads_this_batch += 1;
+                    // If we've hit the batch limit and there's more to read, yield
+                    if self.reads_this_batch >= MAX_READS_PER_POLL && !self.reads.is_empty() {
+                        self.reads_this_batch = 0;
+                        cx.waker().wake_by_ref();
+                    }
+                    return Poll::Ready(Some(r));
+                }
+                Err(e) if e.can_continue() => continue,
+                _ => return Poll::Ready(None),
+            }
+        }
+        Poll::Pending
+    }
+}
+
 impl Stream for MultiRecv {
     type Item = Read;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        while let Some(completion_event) = self.reads.pop_front() {
-            match completion_event.try_into() {
-                Ok(r) => return Poll::Ready(Some(r)),
-                Err(e) if e.can_continue() => {}
-                _ => return Poll::Ready(None),
-            };
+        if let Poll::Ready(result) = self.try_drain_one(cx) {
+            return Poll::Ready(result);
         }
+
         let (waker, id) = (cx.waker(), self.id.unwrap());
         if IO_DRIVER
             .with(|d| d.poll_op_multishot(id, waker, &mut self.reads))
             .is_pending()
         {
-            return std::task::Poll::Pending;
+            return Poll::Pending;
         }
-        while let Some(completion_event) = self.reads.pop_front() {
-            match completion_event.try_into() {
-                Ok(r) => return Poll::Ready(Some(r)),
-                Err(e) if e.can_continue() => {}
-                _ => return Poll::Ready(None),
-            };
-        }
-        Poll::Pending
+        self.reads_this_batch = 0;
+        self.try_drain_one(cx)
     }
 }
 
