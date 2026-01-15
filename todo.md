@@ -7,7 +7,7 @@
 - (???) thread communication (64 align)
 
 - macros to generalize select/join for n Futures.
-- handling signals
+- better shutdown (how can it be graceful ?)
 
 
 

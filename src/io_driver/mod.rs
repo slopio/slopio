@@ -1,10 +1,17 @@
-use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc, task::Waker};
+use std::{
+    cell::{Cell, UnsafeCell},
+    collections::VecDeque,
+    os::fd::RawFd,
+    rc::Rc,
+    task::Waker,
+};
 
 use io_uring::{
     IoUring,
     cqueue::Entry,
     opcode,
     squeue::{self},
+    types::Fd,
 };
 use io_uring_buf_ring::{BorrowedBuffer, IoUringBufRing};
 use slab::Slab;
@@ -19,6 +26,7 @@ pub struct IODriver {
     ring: UnsafeCell<Ring>,
     slab: Rc<UnsafeCell<Slab<OpState>>>,
     multishot_slab: Rc<UnsafeCell<Slab<MultiOpState>>>,
+    shutting_down: Cell<bool>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +93,10 @@ impl Default for Ring {
 scoped_thread_local!(pub(crate) static IO_DRIVER: IODriver);
 
 impl IODriver {
+    pub fn shutdown(&self) -> bool {
+        self.shutting_down.get()
+    }
+
     pub fn with<R>(&self, f: impl FnOnce() -> R) -> R {
         IO_DRIVER.set(self, f)
     }
@@ -109,6 +121,18 @@ impl IODriver {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
         let user_data = slab.insert(OpState::Init) as IoDriverToken;
+        entry.set_user_data(user_data);
+        ring_inner.add(&entry);
+        user_data
+    }
+
+    pub fn push_signal_op(&self, fd: RawFd) -> IoDriverToken {
+        let slab = unsafe { &mut *self.slab.get() };
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        let mut sig_data = Box::new([0u8; 8]);
+        let ptr = sig_data.as_mut_ptr();
+        let user_data = slab.insert(OpState::Signal(sig_data)) as IoDriverToken;
+        let mut entry = opcode::Read::new(Fd(fd), ptr, 8).build();
         entry.set_user_data(user_data);
         ring_inner.add(&entry);
         user_data
@@ -264,13 +288,10 @@ impl IODriver {
                 unreachable!("polled ended op");
             }
             OpState::CancellationAsked => {
+                //todo
                 match -entry.result() {
-                    libc::ECANCELED => {
-                        //Ok
-                    }
-                    n if n <= 0 => {
-                        //TODO solve buffer issues?
-                    }
+                    libc::ECANCELED => {}
+                    n if n <= 0 => {}
                     _ => unreachable!(),
                 };
                 index_to_remove = Some(slab_index);
@@ -286,6 +307,10 @@ impl IODriver {
                 }
                 _ => {}
             },
+            OpState::Signal(_arr) => {
+                // let value = u64::from_ne_bytes(**arr);
+                self.shutting_down.replace(true);
+            }
         }
         if let Some(index) = index_to_remove {
             slab.remove(index);
@@ -311,6 +336,7 @@ enum OpState {
     Ended(OpMetadata),
     CancellationAsked,
     CancellationOperation(usize),
+    Signal(Box<[u8; 8]>),
 }
 
 struct Ring {

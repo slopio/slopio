@@ -1,12 +1,14 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::os::fd::RawFd;
 use std::pin::pin;
 use std::task::{Context, Waker};
 
 use crate::io_driver::IODriver;
-use crate::scoped_thread_local;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
+use crate::{runtime, scoped_thread_local};
 
+pub mod eventfd;
 pub mod join;
 pub mod select;
 
@@ -17,17 +19,25 @@ pub struct RuntimeInner {
 }
 
 impl RuntimeInner {
-    pub fn block_on<F: Future>(self, f: F) -> F::Output {
+    pub fn block_on<F: Future>(self, f: F, event_fd: Option<RawFd>) -> F::Output {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         self.io_driver.with(|| {
             CURRENT.set(&self.tasks, || {
+                if let Some(fd) = event_fd {
+                    runtime::eventfd::register_eventfd_read(fd);
+                }
                 let mut pinned_f = pin!(f);
                 loop {
                     self.io_driver.process_completion_queue();
+                    if self.io_driver.shutdown() {
+                        //TODO graceful
+                        panic!("shutdown");
+                    }
                     while let Some(item) = self.tasks.pop() {
                         item.poll();
                     }
+
                     let pinned = pinned_f.as_mut();
                     match pinned.poll(&mut context) {
                         std::task::Poll::Ready(output) => {

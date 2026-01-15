@@ -3,6 +3,8 @@ use std::thread::JoinHandle;
 
 use libc::cpu_set_t;
 
+use crate::runtime::eventfd;
+
 mod channels;
 pub mod io_driver;
 mod macros;
@@ -12,11 +14,38 @@ mod task;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-// That's it! No other configuration in Rust code
-
 pub fn main_thread<F: Future>(f: F) -> F::Output {
     let rt = runtime::RuntimeInner::default();
-    rt.block_on(f)
+    rt.block_on(f, None)
+}
+
+fn block_signals_for_thread() {
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+
+        let result = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+        if result != 0 {
+            panic!("pthread_sigmask failed with error {result}");
+        }
+    }
+}
+
+fn setup_sig_handling(fds: Vec<i32>) {
+    std::thread::spawn(move || unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+
+        let mut sig: libc::c_int = 0;
+        libc::sigwait(&mask, &mut sig);
+        for fd in fds {
+            eventfd::signal_eventfd(fd, sig as u64);
+        }
+    });
 }
 
 pub fn thread_per_core<F, Fut>(f: F)
@@ -24,9 +53,18 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    block_signals_for_thread();
     let cores_num = std::thread::available_parallelism().unwrap().into();
-    let handles = (0..cores_num)
-        .map(|n| spawn_worker_on(n, f()))
+    let fds = (0..cores_num)
+        .map(|_| eventfd::create_eventfd())
+        .collect::<Vec<_>>();
+
+    setup_sig_handling(fds.clone());
+
+    let handles = fds
+        .iter()
+        .zip(0..cores_num)
+        .map(|(sig_handler_fd, n)| spawn_worker_on(n, f(), *sig_handler_fd))
         .collect::<Vec<_>>();
 
     for handle in handles {
@@ -59,13 +97,17 @@ mod numa {
     }
 }
 
-fn spawn_worker_on<F: Future<Output = ()> + Send + 'static>(n: usize, f: F) -> JoinHandle<()> {
+fn spawn_worker_on<F: Future<Output = ()> + Send + 'static>(
+    n: usize,
+    f: F,
+    event_fd: i32,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         pin_core(n);
         // if get_numa_node_count() != 1 {
         //     numa_allocs(n);
         // }
         let rt = runtime::RuntimeInner::default();
-        rt.block_on(f)
+        rt.block_on(f, Some(event_fd))
     })
 }

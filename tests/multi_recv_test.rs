@@ -97,7 +97,7 @@ fn test_stream_stops_on_process_kill() {
     sleep(Duration::from_millis(100));
 
     let mut child = Command::new("bash")
-        .args(&["-c", "exec 3<>/dev/tcp/localhost/9093; sleep 10"])
+        .args(["-c", "exec 3<>/dev/tcp/localhost/9093; sleep 10"])
         .spawn()
         .unwrap();
 
@@ -122,7 +122,7 @@ fn byte_per_byte() {
                 while let Some(u) = MultiRecv::new(socket.fd).next().await {
                     s.push_str(std::str::from_utf8(u.as_ref()).unwrap());
                 }
-                return Some(s);
+                Some(s)
             } else {
                 None
             }
