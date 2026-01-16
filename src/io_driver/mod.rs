@@ -21,6 +21,8 @@ pub mod operations;
 
 const MULTI_OP_FLAG: u64 = 1u64 << 63;
 
+const QUEUE_PAUSE_THRESHOLD: usize = 64;
+
 #[derive(Default)]
 pub struct IODriver {
     ring: UnsafeCell<Ring>,
@@ -36,10 +38,13 @@ struct MultishotCompletionEvent {
 }
 
 enum MultiOpState {
-    Init,
+    Init {
+        fd: i32,
+    },
     Sent {
         waker: Waker,
         woken_up: bool,
+        fd: i32,
         queue: VecDeque<MultishotCompletionEvent>,
     },
     Paused {
@@ -52,7 +57,7 @@ enum MultiOpState {
 impl MultiOpState {
     fn wake(&mut self) {
         match self {
-            MultiOpState::Init => {}
+            MultiOpState::Init { .. } => {}
             MultiOpState::Sent {
                 waker, woken_up, ..
             } => {
@@ -65,21 +70,22 @@ impl MultiOpState {
         }
     }
 
-    fn clean(&mut self, w: Waker) {
-        match self {
-            MultiOpState::Init => {}
-            MultiOpState::Sent {
-                waker,
-                woken_up,
-                queue,
-            } => {
-                queue.clear();
-                *waker = w;
-                *woken_up = false;
-            }
-            MultiOpState::Paused { .. } => {}
-        }
-    }
+    // fn clean(&mut self, w: Waker) {
+    //     match self {
+    //         MultiOpState::Init { .. } => {}
+    //         MultiOpState::Sent {
+    //             waker,
+    //             woken_up,
+    //             queue,
+    //             ..
+    //         } => {
+    //             queue.clear();
+    //             *waker = w;
+    //             *woken_up = false;
+    //         }
+    //         MultiOpState::Paused { .. } => {}
+    //     }
+    // }
 }
 
 impl Default for Ring {
@@ -117,10 +123,10 @@ impl IODriver {
         }
     }
 
-    pub fn push_multishot_op(&self, mut entry: squeue::Entry) -> IoDriverToken {
+    pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> IoDriverToken {
         let slab_multishot = unsafe { &mut *self.multishot_slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let user_data = slab_multishot.insert(MultiOpState::Init) as IoDriverToken;
+        let user_data = slab_multishot.insert(MultiOpState::Init { fd }) as IoDriverToken;
         entry.set_user_data(user_data | MULTI_OP_FLAG);
         ring_inner.add(&entry);
         user_data
@@ -151,27 +157,50 @@ impl IODriver {
         &self,
         id: usize,
         waker: &Waker,
-        v: &mut VecDeque<MultishotCompletionEvent>,
+        poller_queue: &mut VecDeque<MultishotCompletionEvent>,
     ) -> std::task::Poll<()> {
+        //if you care about the order of received data, call only if poller_queue is empty
         let slab_multishot = unsafe { &mut *self.multishot_slab.get() };
         let entry = unsafe { slab_multishot.get_unchecked_mut(id) };
-        let res = match entry {
-            MultiOpState::Init => {
+        match entry {
+            MultiOpState::Init { fd } => {
+                let fd_copy = *fd;
                 *entry = MultiOpState::Sent {
                     waker: waker.clone(),
                     woken_up: false,
+                    fd: fd_copy,
                     queue: VecDeque::new(),
                 };
                 std::task::Poll::Pending
             }
-            MultiOpState::Sent { queue, .. } => {
-                std::mem::swap(v, queue);
-                std::task::Poll::Ready(())
+            MultiOpState::Sent {
+                queue: provision,
+                waker: existant_waker,
+                ..
+            } => {
+                if !provision.is_empty() {
+                    std::mem::swap(poller_queue, provision);
+                    std::task::Poll::Ready(())
+                } else {
+                    *existant_waker = waker.clone();
+                    std::task::Poll::Pending
+                }
             }
-            MultiOpState::Paused { waker, fd, queue } => todo!(), //TODO RESTART
-        };
-        entry.clean(waker.clone());
-        res
+            MultiOpState::Paused {
+                waker, queue, fd, ..
+            } => {
+                println!("resuming");
+                self.resume_multirecv(id, *fd);
+                std::mem::swap(poller_queue, queue);
+                *entry = MultiOpState::Sent {
+                    waker: waker.clone(),
+                    woken_up: false,
+                    fd: *fd,
+                    queue: std::mem::take(queue),
+                };
+                std::task::Poll::Pending
+            }
+        }
     }
 
     fn poll_op(&self, id: usize, waker: &Waker) -> std::task::Poll<OpMetadata> {
@@ -260,12 +289,31 @@ impl IODriver {
         }
     }
 
+    pub fn cancel_multishot_op(&self, id: usize) {
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        let slab = unsafe { &mut *self.slab.get() };
+        let cancel_id = slab.insert(OpState::Init);
+        let user_data_to_cancel = (id as u64) | MULTI_OP_FLAG;
+        let cancel_op = opcode::AsyncCancel::new(user_data_to_cancel)
+            .build()
+            .user_data(cancel_id as u64);
+        ring_inner.add(&cancel_op);
+    }
+
+    pub fn resume_multirecv(&self, id: usize, fd: i32) {
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        let entry = opcode::RecvMulti::new(Fd(fd), 0)
+            .build()
+            .user_data((id as u64) | MULTI_OP_FLAG);
+        ring_inner.add(&entry);
+    }
+
     fn handle_completion_multishot(&self, entry: Entry) {
         let index = entry.user_data() & !MULTI_OP_FLAG;
         let slab_multi = unsafe { &mut *self.multishot_slab.get() };
         let multi = unsafe { slab_multi.get_unchecked_mut(index as usize) };
         match multi {
-            MultiOpState::Init => unimplemented!("init"),
+            MultiOpState::Init { .. } => unimplemented!("init"),
             MultiOpState::Sent {
                 woken_up, queue, ..
             } => {
@@ -273,11 +321,40 @@ impl IODriver {
                     result: entry.result(),
                     flags: entry.flags(),
                 });
-                if !*woken_up {
+                let should_wake = !*woken_up;
+                let should_pause = queue.len() >= QUEUE_PAUSE_THRESHOLD;
+
+                if should_wake {
                     multi.wake();
                 }
+
+                // Check if we need to pause due to queue overflow
+                if should_pause {
+                    // Transition to Paused state
+                    if let MultiOpState::Sent {
+                        waker, fd, queue, ..
+                    } = multi
+                    {
+                        let paused_state = MultiOpState::Paused {
+                            waker: waker.clone(),
+                            fd: *fd,
+                            queue: std::mem::take(queue),
+                        };
+                        *multi = paused_state;
+
+                        // Cancel the multishot operation
+                        self.cancel_multishot_op(index as usize);
+                    }
+                }
             }
-            MultiOpState::Paused { waker, fd, queue } => todo!(),
+            MultiOpState::Paused { queue, .. } => {
+                // Still receiving events while paused (race condition)
+                // Just queue them
+                queue.push_back(MultishotCompletionEvent {
+                    result: entry.result(),
+                    flags: entry.flags(),
+                });
+            }
         }
     }
 

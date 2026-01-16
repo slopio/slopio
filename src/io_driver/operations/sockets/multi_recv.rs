@@ -141,7 +141,7 @@ impl Stream for MultiRecv {
 impl IoOP for MultiRecv {
     fn register_to_driver(&mut self) -> crate::io_driver::operations::IoDriverToken {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry));
+        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd));
         self.id = Some(token as usize);
         token
     }
