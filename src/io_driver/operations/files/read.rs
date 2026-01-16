@@ -49,7 +49,5 @@ impl<'a> Future for ReadFile<'a> {
 }
 
 impl<'a> Drop for ReadFile<'a> {
-    fn drop(&mut self) {
-        //nothing to clean
-    }
+    fn drop(&mut self) {}
 }

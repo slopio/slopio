@@ -76,7 +76,6 @@ mod tests {
             select(fut1, fut2).await
         });
 
-        // Either could complete first in this case
         match result {
             SelectResult::First(val) => assert_eq!(val, 10),
             SelectResult::Second(val) => assert_eq!(val, "hello"),

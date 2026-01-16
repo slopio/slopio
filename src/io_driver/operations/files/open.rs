@@ -78,7 +78,6 @@ impl IoOP for OpenFile {
     }
 }
 
-// File open flags
 pub mod flags {
     #![allow(unused)]
     pub const READ_ONLY: i32 = libc::O_RDONLY;
@@ -93,7 +92,6 @@ pub mod flags {
     pub const NONBLOCK: i32 = libc::O_NONBLOCK;
 }
 
-// File mode constants
 pub mod mode {
     #![allow(unused)]
     pub const OWNER_READ: u32 = 0o400;

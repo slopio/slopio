@@ -29,6 +29,7 @@ impl<T> Drop for Handle<T> {
 impl<T> Future for Handle<T> {
     type Output = T;
 
+    #[allow(clippy::collapsible_if)]
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -37,7 +38,6 @@ impl<T> Future for Handle<T> {
         let ptr = std::ptr::from_mut(&mut ret) as *mut ();
         self.task.unwrap().get_ouput(ptr, cx.waker());
         if ret.is_ready() {
-            // Free the task when we take the output
             if let Some(task) = self.task.take() {
                 task.free();
             }

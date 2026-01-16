@@ -7,7 +7,6 @@ use std::fs;
 fn test_file_write_and_read() {
     let test_file = "/tmp/test_write_read.txt";
 
-    // Clean up any existing file
     let _ = fs::remove_file(test_file);
 
     main_thread(async {

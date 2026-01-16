@@ -56,7 +56,7 @@ impl Drop for MultiAccept {
 impl Unpin for MultiAccept {}
 
 impl Stream for MultiAccept {
-    type Item = SocketWrapper; // ou Result<TcpStream, Error>
+    type Item = SocketWrapper;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let waker = cx.waker();

@@ -42,7 +42,6 @@ where
     typed_task.wake_by_val()
 }
 
-// Wake without consuming the waker
 unsafe fn wake_by_ref<T>(ptr: *const ())
 where
     T: Future,

@@ -103,7 +103,6 @@ impl MultiRecv {
             match completion_event.try_into() {
                 Ok(r) => {
                     self.reads_this_batch += 1;
-                    // If we've hit the batch limit and there's more to read, yield
                     if self.reads_this_batch >= MAX_READS_PER_POLL && !self.reads.is_empty() {
                         self.reads_this_batch = 0;
                         cx.waker().wake_by_ref();
