@@ -1,5 +1,7 @@
+use core::slice;
 use std::{
     cell::{Cell, UnsafeCell},
+    cmp::min,
     collections::VecDeque,
     os::fd::RawFd,
     rc::Rc,
@@ -13,7 +15,7 @@ use io_uring::{
     squeue::{self},
     types::Fd,
 };
-use io_uring_buf_ring::{BorrowedBuffer, IoUringBufRing};
+use io_uring_buf_ring::IoUringBufRing;
 use libc::ECANCELED;
 use slab::Slab;
 
@@ -22,7 +24,7 @@ pub mod operations;
 
 const MULTI_OP_FLAG: u64 = 1u64 << 63;
 const CANCEL_OP_FLAG: u64 = 1u64 << 62;
-pub const RING_BUFFER_SIZE: usize = 10 << 12;
+pub const RING_BUFFER_SIZE: usize = 1;
 
 const QUEUE_PAUSE_THRESHOLD: usize = 54;
 
@@ -49,6 +51,7 @@ impl From<Entry> for MultishotCompletionEvent {
     }
 }
 
+#[derive(Debug)]
 struct MultiOpQueue {
     inner: VecDeque<MultishotCompletionEvent>,
 }
@@ -66,7 +69,6 @@ impl MultiOpQueue {
 
     fn push(&mut self, element: MultishotCompletionEvent) -> QueueInsertEvent {
         self.inner.push_back(element);
-        println!("len: {} {}", self.inner.len(), element.result);
         match self.inner.len() {
             1 => QueueInsertEvent::WasEmpty,
             k if k > QUEUE_PAUSE_THRESHOLD => QueueInsertEvent::TooFull,
@@ -158,7 +160,6 @@ impl MultiOpState {
             MultiOpState::Init { .. } => {}
             MultiOpState::Sent { waker, .. } => {
                 waker.wake_by_ref();
-                // *woken_up = true;
             }
             MultiOpState::Paused { waker, .. } => {
                 waker.wake_by_ref();
@@ -196,7 +197,7 @@ impl Default for Ring {
             .setup_defer_taskrun()
             .build(4096)
             .unwrap();
-        let buf_ring = IoUringBufRing::new_with_flags(&ring, 1024, 0, RING_BUFFER_SIZE, 0).unwrap();
+        let buf_ring = IoUringBufRing::new_with_flags(&ring, 50, 0, RING_BUFFER_SIZE, 0).unwrap();
         Self {
             buffer_ring: buf_ring,
             inner: { ring },
@@ -205,6 +206,24 @@ impl Default for Ring {
 }
 
 scoped_thread_local!(pub(crate) static IO_DRIVER: IODriver);
+
+struct GluedBuffers {
+    first_id: u16,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl AsRef<[u8]> for GluedBuffers {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for GluedBuffers {
+    fn drop(&mut self) {
+        IO_DRIVER.with(|d| d.give_buffers_back(self))
+    }
+}
 
 impl IODriver {
     pub fn shutdown(&self) -> bool {
@@ -215,11 +234,40 @@ impl IODriver {
         IO_DRIVER.set(self, f)
     }
 
-    pub fn get_buffer(&self, id: u16, len: usize) -> BorrowedBuffer<'static, Vec<u8>> {
-        unsafe {
-            let ring_inner = &mut *self.ring.get();
-            std::mem::transmute(ring_inner.buffer_ring.get_buf(id, len).unwrap())
+    fn get_buffer(&self, id: u16, len: usize) -> GluedBuffers {
+        println!("get buffer for {len}bytes");
+        //multirecv BUNDLE
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        let buffer = unsafe {
+            ring_inner
+                .buffer_ring
+                .get_buf(id, min(RING_BUFFER_SIZE, len))
         }
+        .unwrap();
+        let ptr = buffer.as_ref().as_ptr();
+
+        core::mem::forget(buffer);
+        GluedBuffers {
+            first_id: id,
+            ptr,
+            len,
+        }
+    }
+
+    fn give_buffers_back(&self, buffer: &GluedBuffers) {
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        let num_buffers = buffer.len.div_ceil(RING_BUFFER_SIZE);
+        println!("len: {} first:{}", buffer.len, buffer.first_id);
+        (0..num_buffers)
+            .map(|i| buffer.first_id + i as u16)
+            .map(|id| unsafe {
+                println!("freeing {id}");
+                ring_inner
+                    .buffer_ring
+                    .get_buf(id, RING_BUFFER_SIZE)
+                    .unwrap()
+            })
+            .for_each(drop);
     }
 
     pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> IoDriverToken {
@@ -281,7 +329,7 @@ impl IODriver {
             }
             MultiOpState::TringToPause {
                 waker, fd, queue, ..
-            } => std::task::Poll::Pending,
+            } => todo!(),
             MultiOpState::Paused {
                 waker, queue, fd, ..
             } => todo!(),
@@ -359,7 +407,6 @@ impl IODriver {
                 self.handle_completion(c_event)
             }
         }
-        println!("WOW");
     }
 
     pub fn send_multiop_cancel_event(&self, id: usize) {
@@ -368,14 +415,6 @@ impl IODriver {
             .build()
             .user_data(id as u64 | MULTI_OP_FLAG | CANCEL_OP_FLAG);
         ring_inner.add(&cancel_op);
-    }
-
-    pub fn resume_multirecv(&self, id: usize, fd: i32) {
-        let ring_inner = unsafe { &mut *self.ring.get() };
-        let entry = opcode::RecvMulti::new(Fd(fd), 0)
-            .build()
-            .user_data((id as u64) | MULTI_OP_FLAG);
-        ring_inner.add(&entry);
     }
 
     fn handle_completion_multishot(&self, entry: Entry) {

@@ -1,4 +1,3 @@
-use core::slice;
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 use std::{
     pin::Pin,
@@ -6,7 +5,7 @@ use std::{
 };
 
 use crate::io_driver::{
-    IO_DRIVER, MultiOpQueue, MultishotCompletionEvent, RING_BUFFER_SIZE,
+    GluedBuffers, IO_DRIVER, MultiOpQueue, MultishotCompletionEvent,
     operations::{
         IoOP, Stream,
         sockets::{MultiAsyncRead, SocketWrapper},
@@ -22,7 +21,7 @@ pub struct MultiRecv {
 
 #[derive(Debug)]
 pub enum CompletionError {
-    Eof,
+    Eof { flags: u32 },
     ConnectionReset,
     BrokenPipe,
     Other(i32),
@@ -31,20 +30,21 @@ pub enum CompletionError {
 #[allow(unreachable_patterns)]
 impl CompletionError {
     pub fn can_continue(&self) -> bool {
+        println!("got an error");
         match self {
-            Self::Eof => false,
+            Self::Eof { .. } => false,
             Self::ConnectionReset => false,
             Self::BrokenPipe => false,
             Self::Other(code) => matches!(-code, libc::EINTR | libc::EAGAIN | libc::EWOULDBLOCK),
         }
     }
 
-    fn from_code(code: i32) -> Self {
-        match code {
-            0 => Self::Eof,
+    fn from_code(MultishotCompletionEvent { result, flags }: MultishotCompletionEvent) -> Self {
+        match result {
+            0 => Self::Eof { flags },
             -104 => Self::ConnectionReset,
             -32 => Self::BrokenPipe,
-            _ => Self::Other(code),
+            _ => Self::Other(result),
         }
     }
 }
@@ -54,44 +54,17 @@ impl TryFrom<MultishotCompletionEvent> for Read {
 
     fn try_from(event: MultishotCompletionEvent) -> Result<Self, Self::Error> {
         if event.result <= 0 {
-            return Err(CompletionError::from_code(event.result));
+            return Err(CompletionError::from_code(event));
         }
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
-        let data =
-            IO_DRIVER.with(|d| d.get_buffer(buffer_id, std::cmp::min(len, RING_BUFFER_SIZE)));
-        let ptr = data.as_ptr();
-        std::mem::forget(data);
-        Ok(Read {
-            inner: ReadInner {
-                buffer_id,
-                ptr,
-                len,
-            },
-        })
-    }
-}
-
-struct ReadInner {
-    buffer_id: u16,
-    ptr: *const u8,
-    len: usize,
-}
-
-impl Drop for ReadInner {
-    fn drop(&mut self) {
-        todo!()
-    }
-}
-
-impl AsRef<[u8]> for ReadInner {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+        let inner = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len));
+        Ok(Read { inner })
     }
 }
 
 pub struct Read {
-    inner: ReadInner,
+    inner: GluedBuffers,
 }
 
 impl AsRef<[u8]> for Read {
@@ -158,6 +131,7 @@ impl Stream for MultiRecv {
         {
             return Poll::Pending;
         }
+        println!("{:?}", self.reads);
         self.reads_this_batch = 0;
         self.try_drain_one(cx)
     }

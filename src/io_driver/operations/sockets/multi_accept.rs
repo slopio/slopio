@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     ffi::c_int,
     net::{Ipv4Addr, SocketAddr},
     os::fd::IntoRawFd,
@@ -64,7 +63,6 @@ impl Stream for MultiAccept {
         if let Some(event) = self.sockets.pop() {
             return Poll::Ready(Some(event.into()));
         }
-        println!("rien");
         if IO_DRIVER
             .with(|d| d.poll_op_multishot(id, waker, &mut self.sockets))
             .is_pending()

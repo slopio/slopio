@@ -4,7 +4,7 @@ use std::{
     os::unix::io::AsRawFd,
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::sleep,
@@ -169,9 +169,10 @@ fn byte_per_byte() {
 }
 
 #[test]
-fn test_queue_pause_resume() {
+fn pause() {
     let mut rng = thread_rng();
-    let mut random_bytes = vec![0u8; 5_000_000];
+    let recv_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut random_bytes = vec![0u8; 10_000_000];
     rng.fill_bytes(&mut random_bytes);
     let reading_thread = std::thread::spawn(move || {
         main_thread(async move {
@@ -179,25 +180,22 @@ fn test_queue_pause_resume() {
             if let Some(socket) = multiaccept.next().await {
                 let mut multirecv = MultiRecv::new(socket.fd);
                 sleep(Duration::from_secs(1));
-                while let Some(data) = multirecv.next().await {}
+                while let Some(r) = multirecv.next().await {
+                    recv_data.lock().unwrap().extend(r.as_ref());
+                }
                 println!("END");
             }
         })
     });
     sleep(Duration::from_millis(100));
 
-    let mut it = random_bytes.chunks(1024);
-    let it1 = it.by_ref().take(200);
+    let it = random_bytes.chunks(1024);
     let mut client = TcpStream::connect("localhost:9094").unwrap();
-    for chunk in it1 {
-        let n = client.write(chunk).unwrap();
-        println!("{}", n);
-    }
-    sleep(Duration::from_millis(50));
     for chunk in it {
-        let _ = client.write(chunk).unwrap();
+        let n = client.write(chunk).unwrap();
+        assert!(n > 1);
     }
-
+    drop(client);
     reading_thread.join().unwrap();
 }
 
