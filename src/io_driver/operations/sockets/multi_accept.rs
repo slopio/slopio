@@ -11,14 +11,14 @@ use io_uring::{opcode, types::Fd};
 use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
-    IO_DRIVER, MultishotCompletionEvent,
+    IO_DRIVER, MultiOpQueue, MultishotCompletionEvent,
     operations::{IoOP, Stream, sockets::SocketWrapper},
 };
 
 pub struct MultiAccept {
     id: Option<usize>,
     fd: i32,
-    sockets: VecDeque<MultishotCompletionEvent>,
+    sockets: MultiOpQueue,
 }
 
 impl From<MultishotCompletionEvent> for SocketWrapper {
@@ -61,16 +61,17 @@ impl Stream for MultiAccept {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let waker = cx.waker();
         let id = self.id.unwrap();
-        if let Some(event) = self.sockets.pop_front() {
+        if let Some(event) = self.sockets.pop() {
             return Poll::Ready(Some(event.into()));
         }
+        println!("rien");
         if IO_DRIVER
             .with(|d| d.poll_op_multishot(id, waker, &mut self.sockets))
             .is_pending()
         {
             return std::task::Poll::Pending;
         }
-        if let Some(fd) = self.sockets.pop_front() {
+        if let Some(fd) = self.sockets.pop() {
             Poll::Ready(Some(fd.into()))
         } else {
             Poll::Pending

@@ -14,14 +14,17 @@ use io_uring::{
     types::Fd,
 };
 use io_uring_buf_ring::{BorrowedBuffer, IoUringBufRing};
+use libc::ECANCELED;
 use slab::Slab;
 
 use crate::{io_driver::operations::IoDriverToken, scoped_thread_local};
 pub mod operations;
 
 const MULTI_OP_FLAG: u64 = 1u64 << 63;
+const CANCEL_OP_FLAG: u64 = 1u64 << 62;
+pub const RING_BUFFER_SIZE: usize = 10 << 12;
 
-const QUEUE_PAUSE_THRESHOLD: usize = 64;
+const QUEUE_PAUSE_THRESHOLD: usize = 54;
 
 #[derive(Default)]
 pub struct IODriver {
@@ -37,34 +40,130 @@ struct MultishotCompletionEvent {
     pub flags: u32,
 }
 
+impl From<Entry> for MultishotCompletionEvent {
+    fn from(value: Entry) -> Self {
+        Self {
+            result: value.result(),
+            flags: value.flags(),
+        }
+    }
+}
+
+struct MultiOpQueue {
+    inner: VecDeque<MultishotCompletionEvent>,
+}
+
+enum QueueInsertEvent {
+    Ok,
+    TooFull,
+    WasEmpty,
+}
+
+impl MultiOpQueue {
+    fn has_content(&self) -> bool {
+        !self.inner.is_empty()
+    }
+
+    fn push(&mut self, element: MultishotCompletionEvent) -> QueueInsertEvent {
+        self.inner.push_back(element);
+        println!("len: {} {}", self.inner.len(), element.result);
+        match self.inner.len() {
+            1 => QueueInsertEvent::WasEmpty,
+            k if k > QUEUE_PAUSE_THRESHOLD => QueueInsertEvent::TooFull,
+            _ => QueueInsertEvent::Ok,
+        }
+    }
+
+    fn pop(&mut self) -> Option<MultishotCompletionEvent> {
+        self.inner.pop_front()
+    }
+}
+
+impl Default for MultiOpQueue {
+    fn default() -> Self {
+        Self {
+            inner: VecDeque::with_capacity(QUEUE_PAUSE_THRESHOLD + 10),
+        }
+    }
+}
+
+impl MultiOpQueue {}
+
 enum MultiOpState {
     Init {
         fd: i32,
     },
     Sent {
         waker: Waker,
-        woken_up: bool,
+        // woken_up: bool,
         fd: i32,
-        queue: VecDeque<MultishotCompletionEvent>,
+        queue: MultiOpQueue,
+    },
+    TringToPause {
+        waker: Waker,
+        fd: i32,
+        queue: MultiOpQueue,
+        last_cqe: bool,
+        ecancelled: bool,
     },
     Paused {
         waker: Waker,
         fd: i32,
-        queue: VecDeque<MultishotCompletionEvent>,
+        queue: MultiOpQueue,
     },
 }
 
 impl MultiOpState {
-    fn wake(&mut self) {
+    fn transition_init_to_sent(&mut self, waker: &Waker) {
+        println!("init to send");
+        if let MultiOpState::Init { fd } = self {
+            *self = MultiOpState::Sent {
+                waker: waker.clone(),
+                fd: *fd,
+                queue: Default::default(),
+            };
+        }
+    }
+    fn transition_to_paused(&mut self) {
+        println!("to paused");
+        if let MultiOpState::TringToPause {
+            waker, fd, queue, ..
+        } = self
+        {
+            *self = MultiOpState::Paused {
+                waker: waker.clone(),
+                fd: *fd,
+                queue: std::mem::take(queue),
+            }
+        }
+    }
+
+    fn transition_to_trying_to_pause(&mut self) {
+        println!("trying to pause");
+        if let MultiOpState::Sent { waker, fd, queue } = self {
+            *self = Self::TringToPause {
+                waker: waker.clone(),
+                fd: *fd,
+                queue: std::mem::take(queue),
+                last_cqe: false,
+                ecancelled: false,
+            };
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn wake(&self) {
         match self {
             MultiOpState::Init { .. } => {}
-            MultiOpState::Sent {
-                waker, woken_up, ..
-            } => {
+            MultiOpState::Sent { waker, .. } => {
                 waker.wake_by_ref();
-                *woken_up = true;
+                // *woken_up = true;
             }
             MultiOpState::Paused { waker, .. } => {
+                waker.wake_by_ref();
+            }
+            MultiOpState::TringToPause { waker, .. } => {
                 waker.wake_by_ref();
             }
         }
@@ -97,7 +196,7 @@ impl Default for Ring {
             .setup_defer_taskrun()
             .build(4096)
             .unwrap();
-        let buf_ring = IoUringBufRing::new_with_flags(&ring, 1024, 0, 1 << 14, 0).unwrap();
+        let buf_ring = IoUringBufRing::new_with_flags(&ring, 1024, 0, RING_BUFFER_SIZE, 0).unwrap();
         Self {
             buffer_ring: buf_ring,
             inner: { ring },
@@ -157,20 +256,14 @@ impl IODriver {
         &self,
         id: usize,
         waker: &Waker,
-        poller_queue: &mut VecDeque<MultishotCompletionEvent>,
+        poller_queue: &mut MultiOpQueue,
     ) -> std::task::Poll<()> {
         //if you care about the order of received data, call only if poller_queue is empty
         let slab_multishot = unsafe { &mut *self.multishot_slab.get() };
-        let entry = unsafe { slab_multishot.get_unchecked_mut(id) };
-        match entry {
-            MultiOpState::Init { fd } => {
-                let fd_copy = *fd;
-                *entry = MultiOpState::Sent {
-                    waker: waker.clone(),
-                    woken_up: false,
-                    fd: fd_copy,
-                    queue: VecDeque::new(),
-                };
+        let multishot_op = unsafe { slab_multishot.get_unchecked_mut(id) };
+        match multishot_op {
+            MultiOpState::Init { .. } => {
+                multishot_op.transition_init_to_sent(waker);
                 std::task::Poll::Pending
             }
             MultiOpState::Sent {
@@ -178,7 +271,7 @@ impl IODriver {
                 waker: existant_waker,
                 ..
             } => {
-                if !provision.is_empty() {
+                if provision.has_content() {
                     std::mem::swap(poller_queue, provision);
                     std::task::Poll::Ready(())
                 } else {
@@ -186,20 +279,12 @@ impl IODriver {
                     std::task::Poll::Pending
                 }
             }
+            MultiOpState::TringToPause {
+                waker, fd, queue, ..
+            } => std::task::Poll::Pending,
             MultiOpState::Paused {
                 waker, queue, fd, ..
-            } => {
-                println!("resuming");
-                self.resume_multirecv(id, *fd);
-                std::mem::swap(poller_queue, queue);
-                *entry = MultiOpState::Sent {
-                    waker: waker.clone(),
-                    woken_up: false,
-                    fd: *fd,
-                    queue: std::mem::take(queue),
-                };
-                std::task::Poll::Pending
-            }
+            } => todo!(),
         }
     }
 
@@ -220,7 +305,6 @@ impl IODriver {
                 id_to_delete = Some(id);
                 std::task::Poll::Ready(*e)
             }
-            OpState::CancellationAsked => unimplemented!("should not poll this"),
             _ => {
                 unreachable!("this should never get polled")
             }
@@ -266,37 +350,23 @@ impl IODriver {
     pub(crate) fn process_completion_queue(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         for c_event in ring.inner.completion() {
+            if c_event.user_data() & CANCEL_OP_FLAG != 0 {
+                continue; //we don't treat cancel completion events
+            }
             if c_event.user_data() & MULTI_OP_FLAG != 0 {
                 self.handle_completion_multishot(c_event);
             } else {
                 self.handle_completion(c_event)
             }
         }
+        println!("WOW");
     }
 
-    pub fn cancel_op(&self, id: usize) {
+    pub fn send_multiop_cancel_event(&self, id: usize) {
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let slab = unsafe { &mut *self.slab.get() };
-        let op_to_cancel = unsafe { slab.get_unchecked_mut(id) };
-        if let OpState::Ended(_) = op_to_cancel {
-            *op_to_cancel = OpState::CancellationAsked;
-        } else {
-            let cancel_id = slab.insert(OpState::CancellationOperation(id));
-            let cancel_op = opcode::AsyncCancel::new(cancel_id as u64)
-                .build()
-                .user_data(cancel_id as u64);
-            ring_inner.add(&cancel_op);
-        }
-    }
-
-    pub fn cancel_multishot_op(&self, id: usize) {
-        let ring_inner = unsafe { &mut *self.ring.get() };
-        let slab = unsafe { &mut *self.slab.get() };
-        let cancel_id = slab.insert(OpState::Init);
-        let user_data_to_cancel = (id as u64) | MULTI_OP_FLAG;
-        let cancel_op = opcode::AsyncCancel::new(user_data_to_cancel)
+        let cancel_op = opcode::AsyncCancel::new(id as u64)
             .build()
-            .user_data(cancel_id as u64);
+            .user_data(id as u64 | MULTI_OP_FLAG | CANCEL_OP_FLAG);
         ring_inner.add(&cancel_op);
     }
 
@@ -309,51 +379,41 @@ impl IODriver {
     }
 
     fn handle_completion_multishot(&self, entry: Entry) {
-        let index = entry.user_data() & !MULTI_OP_FLAG;
+        let slab_index = (entry.user_data() & !MULTI_OP_FLAG) as usize;
         let slab_multi = unsafe { &mut *self.multishot_slab.get() };
-        let multi = unsafe { slab_multi.get_unchecked_mut(index as usize) };
-        match multi {
-            MultiOpState::Init { .. } => unimplemented!("init"),
-            MultiOpState::Sent {
-                woken_up, queue, ..
-            } => {
-                queue.push_back(MultishotCompletionEvent {
-                    result: entry.result(),
-                    flags: entry.flags(),
-                });
-                let should_wake = !*woken_up;
-                let should_pause = queue.len() >= QUEUE_PAUSE_THRESHOLD;
-
-                if should_wake {
-                    multi.wake();
+        let multi_op = unsafe { slab_multi.get_unchecked_mut(slab_index) };
+        match multi_op {
+            MultiOpState::Init { .. } => unimplemented!("should not be in init state now."),
+            MultiOpState::Sent { queue, .. } => match queue.push(entry.into()) {
+                QueueInsertEvent::Ok => {}
+                QueueInsertEvent::TooFull => {
+                    self.send_multiop_cancel_event(slab_index);
+                    multi_op.transition_to_trying_to_pause();
                 }
-
-                // Check if we need to pause due to queue overflow
-                if should_pause {
-                    // Transition to Paused state
-                    if let MultiOpState::Sent {
-                        waker, fd, queue, ..
-                    } = multi
-                    {
-                        let paused_state = MultiOpState::Paused {
-                            waker: waker.clone(),
-                            fd: *fd,
-                            queue: std::mem::take(queue),
-                        };
-                        *multi = paused_state;
-
-                        // Cancel the multishot operation
-                        self.cancel_multishot_op(index as usize);
-                    }
+                QueueInsertEvent::WasEmpty => {
+                    multi_op.wake();
+                }
+            },
+            MultiOpState::TringToPause {
+                queue,
+                ecancelled,
+                last_cqe,
+                ..
+            } => {
+                if io_uring::cqueue::more(entry.flags()) {
+                    *last_cqe = true;
+                }
+                if entry.result() == -ECANCELED {
+                    *ecancelled = true;
+                }
+                queue.push(entry.into());
+                if *ecancelled && *last_cqe {
+                    multi_op.transition_to_paused();
                 }
             }
             MultiOpState::Paused { queue, .. } => {
-                // Still receiving events while paused (race condition)
-                // Just queue them
-                queue.push_back(MultishotCompletionEvent {
-                    result: entry.result(),
-                    flags: entry.flags(),
-                });
+                queue.push(entry.into());
+                eprintln!("receiving while paused?");
             }
         }
     }
@@ -362,7 +422,7 @@ impl IODriver {
         let slab = unsafe { &mut *self.slab.get() };
         let slab_index = entry.user_data() as usize;
         let slab_entry = slab.get_mut(slab_index).unwrap();
-        let mut index_to_remove = None;
+        let index_to_remove = None;
         match slab_entry {
             OpState::Init => unreachable!("submitted entry should't be in init"),
             OpState::Sent(waker) => {
@@ -375,26 +435,6 @@ impl IODriver {
             OpState::Ended(_) => {
                 unreachable!("polled ended op");
             }
-            OpState::CancellationAsked => {
-                //todo
-                match -entry.result() {
-                    libc::ECANCELED => {}
-                    n if n <= 0 => {}
-                    _ => unreachable!(),
-                };
-                index_to_remove = Some(slab_index);
-            }
-            OpState::CancellationOperation(cancelled_op_index) => match -entry.result() {
-                0 => index_to_remove = Some(slab_index),
-                libc::ECANCELED => {
-                    //todo warn
-                    index_to_remove = Some(*cancelled_op_index);
-                }
-                libc::EALREADY => {
-                    unreachable!("operation was already cancelled");
-                }
-                _ => {}
-            },
             OpState::Signal(_arr) => {
                 // let value = u64::from_ne_bytes(**arr);
                 self.shutting_down.replace(true);
@@ -422,8 +462,6 @@ enum OpState {
     Init,
     Sent(Waker),
     Ended(OpMetadata),
-    CancellationAsked,
-    CancellationOperation(usize),
     Signal(Box<[u8; 8]>),
 }
 

@@ -1,6 +1,5 @@
-use std::{future::Future, marker::PhantomData};
-
 use io_uring::{opcode, types::Fd};
+use std::{future::Future, marker::PhantomData};
 
 use crate::io_driver::{
     IO_DRIVER,

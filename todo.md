@@ -10,6 +10,8 @@
 - better shutdown (how can it be graceful ?)
 
 
+BUFFERMORE
+
 
 mimaloc : 
 MIMALLOC_LARGE_OS_PAGES=1 \

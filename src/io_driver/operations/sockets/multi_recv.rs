@@ -1,13 +1,12 @@
+use core::slice;
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
-use io_uring_buf_ring::BorrowedBuffer;
 use std::{
-    collections::VecDeque,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use crate::io_driver::{
-    IO_DRIVER, MultishotCompletionEvent,
+    IO_DRIVER, MultiOpQueue, MultishotCompletionEvent, RING_BUFFER_SIZE,
     operations::{
         IoOP, Stream,
         sockets::{MultiAsyncRead, SocketWrapper},
@@ -17,7 +16,7 @@ use crate::io_driver::{
 pub struct MultiRecv {
     id: Option<usize>,
     fd: i32,
-    reads: VecDeque<MultishotCompletionEvent>,
+    reads: MultiOpQueue,
     reads_this_batch: usize,
 }
 
@@ -57,15 +56,42 @@ impl TryFrom<MultishotCompletionEvent> for Read {
         if event.result <= 0 {
             return Err(CompletionError::from_code(event.result));
         }
-        let len = event.result;
+        let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
-        let data = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len as usize));
-        Ok(Read { inner: data })
+        let data =
+            IO_DRIVER.with(|d| d.get_buffer(buffer_id, std::cmp::min(len, RING_BUFFER_SIZE)));
+        let ptr = data.as_ptr();
+        std::mem::forget(data);
+        Ok(Read {
+            inner: ReadInner {
+                buffer_id,
+                ptr,
+                len,
+            },
+        })
+    }
+}
+
+struct ReadInner {
+    buffer_id: u16,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl Drop for ReadInner {
+    fn drop(&mut self) {
+        todo!()
+    }
+}
+
+impl AsRef<[u8]> for ReadInner {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
 pub struct Read {
-    inner: BorrowedBuffer<'static, Vec<u8>>,
+    inner: ReadInner,
 }
 
 impl AsRef<[u8]> for Read {
@@ -99,11 +125,11 @@ impl MultiRecv {
     fn try_drain_one(&mut self, cx: &mut Context<'_>) -> Poll<Option<Read>> {
         const MAX_READS_PER_POLL: usize = 32;
 
-        while let Some(completion_event) = self.reads.pop_front() {
+        while let Some(completion_event) = self.reads.pop() {
             match completion_event.try_into() {
                 Ok(r) => {
                     self.reads_this_batch += 1;
-                    if self.reads_this_batch >= MAX_READS_PER_POLL && !self.reads.is_empty() {
+                    if self.reads_this_batch >= MAX_READS_PER_POLL && self.reads.has_content() {
                         self.reads_this_batch = 0;
                         cx.waker().wake_by_ref();
                     }
@@ -146,7 +172,7 @@ impl IoOP for MultiRecv {
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMulti::new(Fd(self.fd), 0).build()
+        opcode::RecvMultiBundle::new(Fd(self.fd), 0).build()
     }
 
     fn driver_cleanup(&mut self) {}

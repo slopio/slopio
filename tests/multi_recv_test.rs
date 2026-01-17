@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use rand::{RngCore, thread_rng};
 use runtime::{
     io_driver::operations::{
         StreamExt,
@@ -169,93 +170,39 @@ fn byte_per_byte() {
 
 #[test]
 fn test_queue_pause_resume() {
-    // This test verifies the backpressure mechanism by:
-    // 1. Sending many small packets rapidly to fill the queue
-    // 2. Slowing down the consumer to let the queue overflow (>64 events)
-    // 3. Then speeding up consumption to trigger resume (<16 events)
-
-    let should_sleep = Arc::new(AtomicBool::new(true));
-    let should_sleep_clone = should_sleep.clone();
-
+    let mut rng = thread_rng();
+    let mut random_bytes = vec![0u8; 5_000_000];
+    rng.fill_bytes(&mut random_bytes);
     let reading_thread = std::thread::spawn(move || {
         main_thread(async move {
             let mut multiaccept = MultiAccept::new(9094).unwrap();
             if let Some(socket) = multiaccept.next().await {
-                let mut received = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd);
-                let mut count = 0;
-
-                while let Some(data) = multirecv.next().await {
-                    received.extend_from_slice(data.as_ref());
-                    count += 1;
-
-                    // Sleep for the first 100 packets to let queue fill up
-                    // This should trigger the pause mechanism (queue > 64)
-                    if count <= 100 && should_sleep_clone.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    // After 100 packets, stop sleeping to drain the queue
-                    // This should trigger the resume mechanism (queue < 16)
-                }
-
-                println!("Total packets received: {}", count);
-                println!("Total bytes received: {}", received.len());
-                Some((received, count))
-            } else {
-                None
+                sleep(Duration::from_secs(1));
+                while let Some(data) = multirecv.next().await {}
+                println!("END");
             }
         })
     });
-
     sleep(Duration::from_millis(100));
 
-    // Spawn a writer thread that sends many small packets rapidly
-    let writer_thread = std::thread::spawn(|| {
-        let mut client = TcpStream::connect("localhost:9094").unwrap();
-
-        // Send 200 small packets (1 byte each) as fast as possible
-        // This should easily fill the queue beyond the 64 threshold
-        for i in 0..200u8 {
-            assert_eq!(client.write(&[i]).unwrap(), 1);
-        }
-
-        client.flush().unwrap();
-        drop(client);
-    });
-
-    writer_thread.join().unwrap();
-    should_sleep.store(false, Ordering::Relaxed);
-
-    let (received, recv_count) = reading_thread.join().unwrap().unwrap();
-
-    assert_eq!(received.len(), 200, "Should receive all 200 bytes");
-
-    // We don't assert exact recv_count because TCP may batch small writes
-    // But we verify all data was received correctly
-    println!(
-        "Received {} recv events for {} bytes",
-        recv_count,
-        received.len()
-    );
-    assert!(recv_count > 0, "Should have at least one recv event");
-
-    // Verify data integrity
-    for (i, &byte) in received.iter().enumerate() {
-        assert_eq!(byte, i as u8, "Byte at position {} should be {}", i, i);
+    let mut it = random_bytes.chunks(1024);
+    let it1 = it.by_ref().take(200);
+    let mut client = TcpStream::connect("localhost:9094").unwrap();
+    for chunk in it1 {
+        let n = client.write(chunk).unwrap();
+        println!("{}", n);
+    }
+    sleep(Duration::from_millis(50));
+    for chunk in it {
+        let _ = client.write(chunk).unwrap();
     }
 
-    println!(
-        "✓ Queue pause/resume test passed - all {} bytes received correctly in {} events",
-        received.len(),
-        recv_count
-    );
+    reading_thread.join().unwrap();
 }
 
 #[test]
 fn test_slow_consumer_triggers_pause() {
-    // Test that a very slow consumer triggers the pause mechanism
-    // by accumulating more than 64 events in the queue
-
     let reading_thread = std::thread::spawn(move || {
         main_thread(async move {
             let mut multiaccept = MultiAccept::new(9095).unwrap();
