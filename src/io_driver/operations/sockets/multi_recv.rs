@@ -1,11 +1,12 @@
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
+use io_uring_rb::{buffer::Buffer, buffers_range::BufferRange};
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
 
 use crate::io_driver::{
-    GluedBuffers, IO_DRIVER, MultiOpQueue, MultishotCompletionEvent,
+    IO_DRIVER, MultiOpQueue, MultishotCompletionEvent,
     operations::{
         IoOP, Stream,
         sockets::{MultiAsyncRead, SocketWrapper},
@@ -30,7 +31,6 @@ pub enum CompletionError {
 #[allow(unreachable_patterns)]
 impl CompletionError {
     pub fn can_continue(&self) -> bool {
-        println!("got an error");
         match self {
             Self::Eof { .. } => false,
             Self::ConnectionReset => false,
@@ -58,18 +58,25 @@ impl TryFrom<MultishotCompletionEvent> for Read {
         }
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
-        let inner = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len));
+        let inner = IO_DRIVER.with(|d| d.get_buffer_range(buffer_id, len));
         Ok(Read { inner })
     }
 }
 
 pub struct Read {
-    inner: GluedBuffers,
+    inner: BufferRange,
 }
 
-impl AsRef<[u8]> for Read {
-    fn as_ref(&self) -> &[u8] {
-        self.inner.as_ref()
+impl Drop for Read {
+    fn drop(&mut self) {
+        let inner = &mut self.inner;
+        IO_DRIVER.with(|d| d.return_buffer_range(inner));
+    }
+}
+
+impl Read {
+    pub fn as_parts(&self) -> (&[u8], Option<&[u8]>) {
+        self.inner.as_parts()
     }
 }
 

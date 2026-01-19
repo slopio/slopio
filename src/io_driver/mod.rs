@@ -1,7 +1,5 @@
-use core::slice;
 use std::{
     cell::{Cell, UnsafeCell},
-    cmp::min,
     collections::VecDeque,
     os::fd::RawFd,
     rc::Rc,
@@ -15,7 +13,7 @@ use io_uring::{
     squeue::{self},
     types::Fd,
 };
-use io_uring_buf_ring::IoUringBufRing;
+use io_uring_rb::{RingBuffer, buffers_range::BufferRange};
 use libc::ECANCELED;
 use slab::Slab;
 
@@ -24,7 +22,8 @@ pub mod operations;
 
 const MULTI_OP_FLAG: u64 = 1u64 << 63;
 const CANCEL_OP_FLAG: u64 = 1u64 << 62;
-pub const RING_BUFFER_SIZE: usize = 1;
+pub const RING_SIZE: u16 = 1024;
+pub const BUFFER_SIZE: u32 = 4096;
 
 const QUEUE_PAUSE_THRESHOLD: usize = 54;
 
@@ -197,7 +196,9 @@ impl Default for Ring {
             .setup_defer_taskrun()
             .build(4096)
             .unwrap();
-        let buf_ring = IoUringBufRing::new_with_flags(&ring, 50, 0, RING_BUFFER_SIZE, 0).unwrap();
+        // let buf_ring = IoUringBufRing::new_with_flags(&ring, 50, 0, RING_BUFFER_SIZE, 0).unwrap();
+        let buf_ring = io_uring_rb::RingBuffer::new(&ring, 0, 0).unwrap();
+
         Self {
             buffer_ring: buf_ring,
             inner: { ring },
@@ -206,24 +207,6 @@ impl Default for Ring {
 }
 
 scoped_thread_local!(pub(crate) static IO_DRIVER: IODriver);
-
-struct GluedBuffers {
-    first_id: u16,
-    ptr: *const u8,
-    len: usize,
-}
-
-impl AsRef<[u8]> for GluedBuffers {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
-
-impl Drop for GluedBuffers {
-    fn drop(&mut self) {
-        IO_DRIVER.with(|d| d.give_buffers_back(self))
-    }
-}
 
 impl IODriver {
     pub fn shutdown(&self) -> bool {
@@ -234,40 +217,14 @@ impl IODriver {
         IO_DRIVER.set(self, f)
     }
 
-    fn get_buffer(&self, id: u16, len: usize) -> GluedBuffers {
-        println!("get buffer for {len}bytes");
-        //multirecv BUNDLE
-        let ring_inner = unsafe { &mut *self.ring.get() };
-        let buffer = unsafe {
-            ring_inner
-                .buffer_ring
-                .get_buf(id, min(RING_BUFFER_SIZE, len))
-        }
-        .unwrap();
-        let ptr = buffer.as_ref().as_ptr();
-
-        core::mem::forget(buffer);
-        GluedBuffers {
-            first_id: id,
-            ptr,
-            len,
-        }
+    fn get_buffer_range(&self, id: u16, len: usize) -> BufferRange {
+        let ring_inner = unsafe { &*self.ring.get() };
+        ring_inner.buffer_ring.get_buffers_range(id, len).unwrap()
     }
 
-    fn give_buffers_back(&self, buffer: &GluedBuffers) {
-        let ring_inner = unsafe { &mut *self.ring.get() };
-        let num_buffers = buffer.len.div_ceil(RING_BUFFER_SIZE);
-        println!("len: {} first:{}", buffer.len, buffer.first_id);
-        (0..num_buffers)
-            .map(|i| buffer.first_id + i as u16)
-            .map(|id| unsafe {
-                println!("freeing {id}");
-                ring_inner
-                    .buffer_ring
-                    .get_buf(id, RING_BUFFER_SIZE)
-                    .unwrap()
-            })
-            .for_each(drop);
+    fn return_buffer_range(&self, buffer_range: &mut BufferRange) {
+        let ring_inner = unsafe { &*self.ring.get() };
+        ring_inner.buffer_ring.recycle_inner_range(buffer_range);
     }
 
     pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> IoDriverToken {
@@ -506,7 +463,7 @@ enum OpState {
 
 struct Ring {
     inner: IoUring,
-    buffer_ring: IoUringBufRing<Vec<u8>>,
+    buffer_ring: RingBuffer<BUFFER_SIZE, RING_SIZE>,
 }
 
 impl Ring {

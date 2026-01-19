@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 io-uring = "0.7.11"
-io_uring_buf_ring = "0.2.3"
 libc = "0.2.178"
+io_uring_rb = { git = "https://github.com/saucisoupe/io_uring_rb" }
 mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 pin-project = "1.1.10"
 slab = "0.4.11"

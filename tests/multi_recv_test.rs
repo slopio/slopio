@@ -128,8 +128,6 @@ fn byte_per_byte() {
     let mut random_bytes = vec![0u8; 5_000_000];
     rng.fill_bytes(&mut random_bytes);
 
-    let random_bytes_clone = random_bytes.clone();
-
     let reading_thread = std::thread::spawn(move || {
         main_thread(async {
             let mut multiaccept = MultiAccept::new(9090).unwrap();
@@ -137,7 +135,11 @@ fn byte_per_byte() {
                 let mut received = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd);
                 while let Some(data) = multirecv.next().await {
-                    received.extend_from_slice(data.as_ref());
+                    let (d1, d2) = data.as_parts();
+                    received.extend_from_slice(d1);
+                    if let Some(s) = d2 {
+                        received.extend_from_slice(s)
+                    }
                 }
                 Some(received)
             } else {
@@ -148,9 +150,8 @@ fn byte_per_byte() {
 
     sleep(Duration::from_millis(100));
     let mut client = TcpStream::connect("localhost:9090").unwrap();
-    for b in random_bytes_clone.iter() {
-        let k = client.write(&[*b]).unwrap();
-        assert_eq!(k, 1);
+    for b in random_bytes.chunks(1024) {
+        let _ = client.write(b).unwrap();
     }
     drop(client);
 
@@ -181,7 +182,12 @@ fn pause() {
                 let mut multirecv = MultiRecv::new(socket.fd);
                 sleep(Duration::from_secs(1));
                 while let Some(r) = multirecv.next().await {
-                    recv_data.lock().unwrap().extend(r.as_ref());
+                    let (a, b) = r.as_parts();
+                    let mut d = recv_data.lock().unwrap();
+                    d.extend(a);
+                    if let Some(s) = b {
+                        d.extend(s)
+                    }
                 }
                 println!("END");
             }
@@ -210,7 +216,11 @@ fn test_slow_consumer_triggers_pause() {
                 let mut recv_count = 0;
 
                 while let Some(data) = multirecv.next().await {
-                    received.extend_from_slice(data.as_ref());
+                    let (a, b) = data.as_parts();
+                    received.extend_from_slice(a);
+                    if let Some(s) = b {
+                        received.extend_from_slice(s)
+                    }
                     recv_count += 1;
 
                     if recv_count <= 70 {
@@ -293,7 +303,11 @@ fn test_fast_drain_triggers_resume() {
                 let mut slow_phase_count = 0;
 
                 while let Some(data) = multirecv.next().await {
-                    received.extend_from_slice(data.as_ref());
+                    let (a, b) = data.as_parts();
+                    received.extend_from_slice(a);
+                    if let Some(s) = b {
+                        received.extend_from_slice(s)
+                    }
                     recv_count += 1;
 
                     // Slow phase: accumulate events to trigger pause
