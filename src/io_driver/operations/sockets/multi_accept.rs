@@ -10,7 +10,7 @@ use io_uring::{opcode, types::Fd};
 use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
-    IO_DRIVER, MultiOpQueue, MultishotCompletionEvent,
+    IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     operations::{IoOP, Stream, sockets::SocketWrapper},
 };
 
@@ -20,9 +20,39 @@ pub struct MultiAccept {
     sockets: MultiOpQueue,
 }
 
-impl From<MultishotCompletionEvent> for SocketWrapper {
-    fn from(value: MultishotCompletionEvent) -> Self {
-        SocketWrapper { fd: value.result }
+/// Error from accepting a connection.
+#[derive(Debug)]
+pub enum AcceptError {
+    /// The operation was cancelled (e.g., during pause).
+    Cancelled,
+    /// Other error with errno.
+    Other(i32),
+}
+
+impl AcceptError {
+    fn from_result(result: i32) -> Self {
+        if result == -libc::ECANCELED {
+            AcceptError::Cancelled
+        } else {
+            AcceptError::Other(-result)
+        }
+    }
+
+    /// Returns true if this error is recoverable and we should continue accepting.
+    pub fn can_continue(&self) -> bool {
+        matches!(self, AcceptError::Cancelled)
+    }
+}
+
+impl TryFrom<MultishotCompletionEvent> for SocketWrapper {
+    type Error = AcceptError;
+
+    fn try_from(value: MultishotCompletionEvent) -> Result<Self, Self::Error> {
+        if value.result < 0 {
+            Err(AcceptError::from_result(value.result))
+        } else {
+            Ok(SocketWrapper { fd: value.result })
+        }
     }
 }
 
@@ -54,25 +84,41 @@ impl Drop for MultiAccept {
 
 impl Unpin for MultiAccept {}
 
+impl MultiAccept {
+    /// Try to drain one valid socket from the queue, skipping errors.
+    fn try_drain_one(&mut self) -> Poll<Option<SocketWrapper>> {
+        while let Some(event) = self.sockets.pop() {
+            match event.try_into() {
+                Ok(socket) => return Poll::Ready(Some(socket)),
+                Err(e) if e.can_continue() => continue,
+                Err(_) => return Poll::Ready(None),
+            }
+        }
+        Poll::Pending
+    }
+}
+
 impl Stream for MultiAccept {
     type Item = SocketWrapper;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // First try to drain from local queue
+        if let Poll::Ready(result) = self.try_drain_one() {
+            return Poll::Ready(result);
+        }
+
         let waker = cx.waker();
         let id = self.id.unwrap();
-        if let Some(event) = self.sockets.pop() {
-            return Poll::Ready(Some(event.into()));
-        }
-        if IO_DRIVER
-            .with(|d| d.poll_op_multishot(id, waker, &mut self.sockets))
-            .is_pending()
-        {
-            return std::task::Poll::Pending;
-        }
-        if let Some(fd) = self.sockets.pop() {
-            Poll::Ready(Some(fd.into()))
-        } else {
-            Poll::Pending
+
+        match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.sockets)) {
+            MultiPollResult::Pending => Poll::Pending,
+            MultiPollResult::Ready => self.try_drain_one(),
+            MultiPollResult::NeedsResubmit => {
+                // Resubmit the multishot operation
+                let entry = self.to_entry();
+                IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
+                Poll::Pending
+            }
         }
     }
 }

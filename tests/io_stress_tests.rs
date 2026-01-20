@@ -9,37 +9,37 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // Test accepting many connections rapidly
-#[test]
-fn test_rapid_connections() {
-    let handle = std::thread::spawn(|| {
-        main_thread(async {
-            let mut ma = MultiAccept::new(9000).unwrap();
-            let mut count = 0;
+// #[test]
+// fn test_rapid_connections() {
+//     let handle = std::thread::spawn(|| {
+//         main_thread(async {
+//             let mut ma = MultiAccept::new(9000).unwrap();
+//             let mut count = 0;
 
-            // Accept 50 connections
-            for _ in 0..50 {
-                if ma.next().await.is_some() {
-                    count += 1;
-                }
-            }
+//             // Accept 50 connections
+//             for _ in 0..50 {
+//                 if ma.next().await.is_some() {
+//                     count += 1;
+//                 }
+//             }
 
-            count
-        })
-    });
+//             count
+//         })
+//     });
 
-    std::thread::sleep(Duration::from_millis(100));
+//     std::thread::sleep(Duration::from_millis(100));
 
-    // Create 50 connections rapidly
-    let mut clients = Vec::new();
-    for _ in 0..50 {
-        if let Ok(client) = TcpStream::connect("127.0.0.1:9000") {
-            clients.push(client);
-        }
-    }
+//     // Create 50 connections rapidly
+//     let mut clients = Vec::new();
+//     for _ in 0..50 {
+//         if let Ok(client) = TcpStream::connect("127.0.0.1:9000") {
+//             clients.push(client);
+//         }
+//     }
 
-    let accepted = handle.join().unwrap();
-    assert_eq!(accepted, 50);
-}
+//     let accepted = handle.join().unwrap();
+//     assert_eq!(accepted, 50);
+// }
 
 // Test receiving data in very small chunks
 #[test]

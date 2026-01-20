@@ -1,12 +1,12 @@
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
-use io_uring_rb::{buffer::Buffer, buffers_range::BufferRange};
+use io_uring_rb::buffers_range::BufferRange;
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
 
 use crate::io_driver::{
-    IO_DRIVER, MultiOpQueue, MultishotCompletionEvent,
+    IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     operations::{
         IoOP, Stream,
         sockets::{MultiAsyncRead, SocketWrapper},
@@ -22,9 +22,13 @@ pub struct MultiRecv {
 
 #[derive(Debug)]
 pub enum CompletionError {
-    Eof { flags: u32 },
+    Eof {
+        flags: u32,
+    },
     ConnectionReset,
     BrokenPipe,
+    /// The operation was cancelled (e.g., during pause for backpressure).
+    Cancelled,
     Other(i32),
 }
 
@@ -35,6 +39,7 @@ impl CompletionError {
             Self::Eof { .. } => false,
             Self::ConnectionReset => false,
             Self::BrokenPipe => false,
+            Self::Cancelled => true, // Cancellation is recoverable - we'll resubmit
             Self::Other(code) => matches!(-code, libc::EINTR | libc::EAGAIN | libc::EWOULDBLOCK),
         }
     }
@@ -42,14 +47,15 @@ impl CompletionError {
     fn from_code(MultishotCompletionEvent { result, flags }: MultishotCompletionEvent) -> Self {
         match result {
             0 => Self::Eof { flags },
-            -104 => Self::ConnectionReset,
-            -32 => Self::BrokenPipe,
+            r if r == -libc::ECONNRESET => Self::ConnectionReset,
+            r if r == -libc::EPIPE => Self::BrokenPipe,
+            r if r == -libc::ECANCELED => Self::Cancelled,
             _ => Self::Other(result),
         }
     }
 }
 
-impl TryFrom<MultishotCompletionEvent> for Read {
+impl TryFrom<MultishotCompletionEvent> for ReadRange {
     type Error = CompletionError;
 
     fn try_from(event: MultishotCompletionEvent) -> Result<Self, Self::Error> {
@@ -59,24 +65,25 @@ impl TryFrom<MultishotCompletionEvent> for Read {
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
         let inner = IO_DRIVER.with(|d| d.get_buffer_range(buffer_id, len));
-        Ok(Read { inner })
+        Ok(ReadRange { inner })
     }
 }
 
-pub struct Read {
+pub struct ReadRange {
     inner: BufferRange,
 }
 
-impl Drop for Read {
+impl Drop for ReadRange {
     fn drop(&mut self) {
         let inner = &mut self.inner;
         IO_DRIVER.with(|d| d.return_buffer_range(inner));
     }
 }
 
-impl Read {
-    pub fn as_parts(&self) -> (&[u8], Option<&[u8]>) {
-        self.inner.as_parts()
+impl ReadRange {
+    pub fn as_parts(&self) -> [Option<&[u8]>; 2] {
+        let parts = self.inner.as_parts();
+        [Some(parts.0), parts.1]
     }
 }
 
@@ -102,7 +109,7 @@ impl Drop for MultiRecv {
 impl Unpin for MultiRecv {}
 
 impl MultiRecv {
-    fn try_drain_one(&mut self, cx: &mut Context<'_>) -> Poll<Option<Read>> {
+    fn try_drain_one(&mut self, cx: &mut Context<'_>) -> Poll<Option<ReadRange>> {
         const MAX_READS_PER_POLL: usize = 32;
 
         while let Some(completion_event) = self.reads.pop() {
@@ -116,7 +123,7 @@ impl MultiRecv {
                     return Poll::Ready(Some(r));
                 }
                 Err(e) if e.can_continue() => continue,
-                _ => return Poll::Ready(None),
+                Err(_) => return Poll::Ready(None),
             }
         }
         Poll::Pending
@@ -124,22 +131,36 @@ impl MultiRecv {
 }
 
 impl Stream for MultiRecv {
-    type Item = Read;
+    type Item = ReadRange;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // First try to drain from local queue
         if let Poll::Ready(result) = self.try_drain_one(cx) {
             return Poll::Ready(result);
         }
 
-        let (waker, id) = (cx.waker(), self.id.unwrap());
-        if IO_DRIVER
-            .with(|d| d.poll_op_multishot(id, waker, &mut self.reads))
-            .is_pending()
-        {
-            return Poll::Pending;
+        let waker = cx.waker();
+        let id = self.id.unwrap();
+
+        loop {
+            match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads)) {
+                MultiPollResult::Pending => return Poll::Pending,
+                MultiPollResult::Ready => {
+                    self.reads_this_batch = 0;
+                    if let Poll::Ready(result) = self.try_drain_one(cx) {
+                        return Poll::Ready(result);
+                    }
+                    // Queue was drained but only had skippable errors,
+                    // loop to check if we need to resubmit
+                }
+                MultiPollResult::NeedsResubmit => {
+                    // Resubmit the multishot operation
+                    let entry = self.to_entry();
+                    IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
+                    return Poll::Pending;
+                }
+            }
         }
-        self.reads_this_batch = 0;
-        self.try_drain_one(cx)
     }
 }
 

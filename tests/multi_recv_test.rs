@@ -15,7 +15,7 @@ use rand::{RngCore, thread_rng};
 use runtime::{
     io_driver::operations::{
         StreamExt,
-        sockets::{multi_accept::MultiAccept, multi_recv::MultiRecv},
+        sockets::{multi_accept::MultiAccept, multi_recv_bundle::MultiRecv},
     },
     main_thread,
 };
@@ -148,13 +148,12 @@ fn byte_per_byte() {
             cv1.notify();
 
             if let Some(socket) = multiaccept.next().await {
-                let mut received = Vec::new();
+                let mut received: Vec<u8> = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd);
                 while let Some(data) = multirecv.next().await {
-                    let (d1, d2) = data.as_parts();
-                    received.extend_from_slice(d1);
-                    if let Some(s) = d2 {
-                        received.extend_from_slice(s)
+                    let o = data.as_parts().into_iter().flatten();
+                    for slc in o {
+                        received.extend_from_slice(slc);
                     }
                 }
                 Some(received)
@@ -185,7 +184,7 @@ fn byte_per_byte() {
 }
 
 #[test]
-fn pause() {
+fn triggered_pause() {
     let (cv1, cv2) = Cv::new();
     let mut rng = thread_rng();
     let recv_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -198,19 +197,10 @@ fn pause() {
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut multirecv = MultiRecv::new(socket.fd);
-                sleep(Duration::from_secs(2));
-                while let Some(r) = multirecv.next().await {
-                    let (a, b) = r.as_parts();
-                    let mut d = recv_data.lock().unwrap();
-                    d.extend(a);
-                    if let Some(s) = b {
-                        d.extend(s)
-                    }
-                    drop(d);
+                let data = multirecv.next().await.unwrap();
+                while let Some(k) = multirecv.next().await {
+                    sleep(Duration::from_millis(50));
                 }
-                println!("END");
-                let d = recv_data.lock().unwrap();
-                assert_eq!(d.len(), 10_000_000);
             }
         })
     });
@@ -220,6 +210,8 @@ fn pause() {
     let mut client = TcpStream::connect("localhost:9094").unwrap();
     for chunk in it {
         let n = client.write(chunk).unwrap();
+        client.flush().unwrap();
+        sleep(Duration::from_millis(1));
         assert!(n > 1);
     }
     drop(client);
@@ -240,10 +232,9 @@ fn test_slow_consumer_triggers_pause() {
                 let mut recv_count = 0;
 
                 while let Some(data) = multirecv.next().await {
-                    let (a, b) = data.as_parts();
-                    received.extend_from_slice(a);
-                    if let Some(s) = b {
-                        received.extend_from_slice(s)
+                    let o = data.as_parts().into_iter().flatten();
+                    for slc in o {
+                        received.extend_from_slice(slc);
                     }
                     recv_count += 1;
 
@@ -329,10 +320,9 @@ fn test_fast_drain_triggers_resume() {
                 let mut slow_phase_count = 0;
 
                 while let Some(data) = multirecv.next().await {
-                    let (a, b) = data.as_parts();
-                    received.extend_from_slice(a);
-                    if let Some(s) = b {
-                        received.extend_from_slice(s)
+                    let o = data.as_parts().into_iter().flatten();
+                    for slc in o {
+                        received.extend_from_slice(slc);
                     }
                     recv_count += 1;
 

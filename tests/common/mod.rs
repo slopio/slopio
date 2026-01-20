@@ -1,9 +1,5 @@
 use std::sync::{Arc, Condvar, Mutex};
 
-pub fn condvar() -> Arc<(Mutex<bool>, Condvar)> {
-    Arc::new((Mutex::new(false), Condvar::new()))
-}
-
 pub struct Cv {
     inner: Arc<(Mutex<bool>, Condvar)>,
 }
