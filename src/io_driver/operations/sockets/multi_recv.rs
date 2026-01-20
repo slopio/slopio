@@ -138,7 +138,6 @@ impl Stream for MultiRecv {
         {
             return Poll::Pending;
         }
-        println!("{:?}", self.reads);
         self.reads_this_batch = 0;
         self.try_drain_one(cx)
     }

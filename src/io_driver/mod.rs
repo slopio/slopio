@@ -116,7 +116,6 @@ enum MultiOpState {
 
 impl MultiOpState {
     fn transition_init_to_sent(&mut self, waker: &Waker) {
-        println!("init to send");
         if let MultiOpState::Init { fd } = self {
             *self = MultiOpState::Sent {
                 waker: waker.clone(),
@@ -126,7 +125,6 @@ impl MultiOpState {
         }
     }
     fn transition_to_paused(&mut self) {
-        println!("to paused");
         if let MultiOpState::TringToPause {
             waker, fd, queue, ..
         } = self
@@ -140,7 +138,6 @@ impl MultiOpState {
     }
 
     fn transition_to_trying_to_pause(&mut self) {
-        println!("trying to pause");
         if let MultiOpState::Sent { waker, fd, queue } = self {
             *self = Self::TringToPause {
                 waker: waker.clone(),
@@ -377,7 +374,6 @@ impl IODriver {
     }
 
     fn handle_completion_multishot(&self, entry: Entry) {
-        println!("{entry:?}");
         let slab_index = (entry.user_data() & !MULTI_OP_FLAG) as usize;
         let slab_multi = unsafe { &mut *self.multishot_slab.get() };
         let multi_op = unsafe { slab_multi.get_unchecked_mut(slab_index) };
@@ -400,11 +396,9 @@ impl IODriver {
                 ..
             } => {
                 if !io_uring::cqueue::more(entry.flags()) {
-                    println!("owo");
                     *last_cqe = true;
                 }
                 if entry.result() == -ECANCELED {
-                    println!("uwu");
                     *ecancelled = true;
                 }
                 queue.push(entry.into());
