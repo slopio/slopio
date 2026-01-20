@@ -20,11 +20,18 @@ use runtime::{
     main_thread,
 };
 
+use crate::common::Cv;
+
+mod common;
+
 #[test]
 fn test_stream_stops_on_close() {
-    let reading_thread = std::thread::spawn(|| {
+    let (cv1, cv2) = Cv::new();
+
+    let reading_thread = std::thread::spawn(move || {
         main_thread(async {
             let mut multiaccept = MultiAccept::new(9091).unwrap();
+            cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::new(socket.fd);
@@ -37,7 +44,7 @@ fn test_stream_stops_on_close() {
         })
     });
 
-    sleep(Duration::from_millis(100));
+    cv2.wait();
 
     let client = TcpStream::connect("localhost:9091").unwrap();
     drop(client);
@@ -48,9 +55,12 @@ fn test_stream_stops_on_close() {
 
 #[test]
 fn test_stream_stops_on_abrupt_close_rst() {
-    let reading_thread = std::thread::spawn(|| {
+    let (cv1, cv2) = Cv::new();
+
+    let reading_thread = std::thread::spawn(move || {
         main_thread(async {
             let mut multiaccept = MultiAccept::new(9092).unwrap();
+            cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::new(socket.fd);
@@ -63,7 +73,7 @@ fn test_stream_stops_on_abrupt_close_rst() {
         })
     });
 
-    sleep(Duration::from_millis(100));
+    cv2.wait();
 
     let client = TcpStream::connect("localhost:9092").unwrap();
 
@@ -88,9 +98,12 @@ fn test_stream_stops_on_abrupt_close_rst() {
 
 #[test]
 fn test_stream_stops_on_process_kill() {
-    let reading_thread = std::thread::spawn(|| {
+    let (cv1, cv2) = Cv::new();
+
+    let reading_thread = std::thread::spawn(move || {
         main_thread(async {
             let mut multiaccept = MultiAccept::new(9093).unwrap();
+            cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::new(socket.fd);
@@ -103,7 +116,7 @@ fn test_stream_stops_on_process_kill() {
         })
     });
 
-    sleep(Duration::from_millis(100));
+    cv2.wait();
 
     let mut child = Command::new("bash")
         .args(["-c", "exec 3<>/dev/tcp/localhost/9093; sleep 10"])
@@ -127,10 +140,13 @@ fn byte_per_byte() {
     let mut rng = rand::thread_rng();
     let mut random_bytes = vec![0u8; 5_000_000];
     rng.fill_bytes(&mut random_bytes);
+    let (cv1, cv2) = Cv::new();
 
     let reading_thread = std::thread::spawn(move || {
         main_thread(async {
             let mut multiaccept = MultiAccept::new(9090).unwrap();
+            cv1.notify();
+
             if let Some(socket) = multiaccept.next().await {
                 let mut received = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd);
@@ -147,8 +163,7 @@ fn byte_per_byte() {
             }
         })
     });
-
-    sleep(Duration::from_millis(100));
+    cv2.wait();
     let mut client = TcpStream::connect("localhost:9090").unwrap();
     for b in random_bytes.chunks(1024) {
         let _ = client.write(b).unwrap();
@@ -171,16 +186,19 @@ fn byte_per_byte() {
 
 #[test]
 fn pause() {
+    let (cv1, cv2) = Cv::new();
     let mut rng = thread_rng();
     let recv_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let mut random_bytes = vec![0u8; 10_000_000];
+
     rng.fill_bytes(&mut random_bytes);
     let reading_thread = std::thread::spawn(move || {
         main_thread(async move {
             let mut multiaccept = MultiAccept::new(9094).unwrap();
+            cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut multirecv = MultiRecv::new(socket.fd);
-                sleep(Duration::from_secs(1));
+                sleep(Duration::from_secs(2));
                 while let Some(r) = multirecv.next().await {
                     let (a, b) = r.as_parts();
                     let mut d = recv_data.lock().unwrap();
@@ -188,12 +206,15 @@ fn pause() {
                     if let Some(s) = b {
                         d.extend(s)
                     }
+                    drop(d);
                 }
                 println!("END");
+                let d = recv_data.lock().unwrap();
+                assert_eq!(d.len(), 10_000_000);
             }
         })
     });
-    sleep(Duration::from_millis(100));
+    cv2.wait();
 
     let it = random_bytes.chunks(1024);
     let mut client = TcpStream::connect("localhost:9094").unwrap();
@@ -207,9 +228,12 @@ fn pause() {
 
 #[test]
 fn test_slow_consumer_triggers_pause() {
+    let (cv1, cv2) = Cv::new();
+
     let reading_thread = std::thread::spawn(move || {
         main_thread(async move {
             let mut multiaccept = MultiAccept::new(9095).unwrap();
+            cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut received = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd);
@@ -235,7 +259,7 @@ fn test_slow_consumer_triggers_pause() {
         })
     });
 
-    sleep(Duration::from_millis(100));
+    cv2.wait();
 
     // Fast writer - send many small writes rapidly
     let writer_thread = std::thread::spawn(|| {
@@ -290,12 +314,14 @@ fn test_fast_drain_triggers_resume() {
     // Test that draining the queue triggers resume
     // Start slow, let queue fill, then drain fast
 
+    let (cv1, cv2) = Cv::new();
     let switch_to_fast = Arc::new(AtomicBool::new(false));
     let switch_clone = switch_to_fast.clone();
 
     let reading_thread = std::thread::spawn(move || {
         main_thread(async move {
             let mut multiaccept = MultiAccept::new(9096).unwrap();
+            cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut received = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd);
@@ -327,7 +353,7 @@ fn test_fast_drain_triggers_resume() {
         })
     });
 
-    sleep(Duration::from_millis(100));
+    cv2.wait();
 
     // Writer sends data continuously
     let writer_thread = std::thread::spawn(|| {

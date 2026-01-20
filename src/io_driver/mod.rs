@@ -25,7 +25,7 @@ const CANCEL_OP_FLAG: u64 = 1u64 << 62;
 pub const RING_SIZE: u16 = 1024;
 pub const BUFFER_SIZE: u32 = 4096;
 
-const QUEUE_PAUSE_THRESHOLD: usize = 54;
+const QUEUE_PAUSE_THRESHOLD: usize = 2;
 
 #[derive(Default)]
 pub struct IODriver {
@@ -275,6 +275,11 @@ impl IODriver {
                 queue: provision,
                 waker: existant_waker,
                 ..
+            }
+            | MultiOpState::TringToPause {
+                waker: existant_waker,
+                queue: provision,
+                ..
             } => {
                 if provision.has_content() {
                     std::mem::swap(poller_queue, provision);
@@ -284,9 +289,6 @@ impl IODriver {
                     std::task::Poll::Pending
                 }
             }
-            MultiOpState::TringToPause {
-                waker, fd, queue, ..
-            } => todo!(),
             MultiOpState::Paused {
                 waker, queue, fd, ..
             } => todo!(),
@@ -375,6 +377,7 @@ impl IODriver {
     }
 
     fn handle_completion_multishot(&self, entry: Entry) {
+        println!("{entry:?}");
         let slab_index = (entry.user_data() & !MULTI_OP_FLAG) as usize;
         let slab_multi = unsafe { &mut *self.multishot_slab.get() };
         let multi_op = unsafe { slab_multi.get_unchecked_mut(slab_index) };
@@ -396,10 +399,12 @@ impl IODriver {
                 last_cqe,
                 ..
             } => {
-                if io_uring::cqueue::more(entry.flags()) {
+                if !io_uring::cqueue::more(entry.flags()) {
+                    println!("owo");
                     *last_cqe = true;
                 }
                 if entry.result() == -ECANCELED {
+                    println!("uwu");
                     *ecancelled = true;
                 }
                 queue.push(entry.into());
