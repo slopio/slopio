@@ -161,7 +161,7 @@ impl MultiOpState {
 
     fn transition_to_trying_to_pause(&mut self) {
         match self {
-            MultiOpState::Init { fd } => unreachable!("pause a non init ?"),
+            MultiOpState::Init { .. } => unreachable!("pause a non init ?"),
             MultiOpState::Sent { waker, fd, queue } => {
                 *self = Self::TringToPause {
                     waker: waker.clone(),
@@ -171,14 +171,8 @@ impl MultiOpState {
                     ecancelled: false,
                 };
             }
-            MultiOpState::TringToPause {
-                waker,
-                fd,
-                queue,
-                last_cqe,
-                ecancelled,
-            } => unreachable!("already"),
-            MultiOpState::Paused { waker, fd, queue } => todo!(),
+            MultiOpState::TringToPause { .. } => unreachable!("already"),
+            MultiOpState::Paused { .. } => todo!(),
         }
     }
 

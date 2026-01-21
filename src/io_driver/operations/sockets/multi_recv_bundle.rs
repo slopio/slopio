@@ -142,23 +142,28 @@ impl Stream for MultiRecv {
         let waker = cx.waker();
         let id = self.id.unwrap();
 
-        loop {
-            match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads)) {
-                MultiPollResult::Pending => return Poll::Pending,
-                MultiPollResult::Ready => {
-                    self.reads_this_batch = 0;
-                    if let Poll::Ready(result) = self.try_drain_one(cx) {
-                        return Poll::Ready(result);
+        match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads)) {
+            MultiPollResult::Pending => Poll::Pending,
+            MultiPollResult::Ready => {
+                self.reads_this_batch = 0;
+                match self.try_drain_one(cx) {
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => {
+                        // Queue had only skippable errors, check if we need resubmit
+                        if let MultiPollResult::NeedsResubmit =
+                            IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads))
+                        {
+                            let entry = self.to_entry();
+                            IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
+                        }
+                        Poll::Pending
                     }
-                    // Queue was drained but only had skippable errors,
-                    // loop to check if we need to resubmit
                 }
-                MultiPollResult::NeedsResubmit => {
-                    // Resubmit the multishot operation
-                    let entry = self.to_entry();
-                    IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
-                    return Poll::Pending;
-                }
+            }
+            MultiPollResult::NeedsResubmit => {
+                let entry = self.to_entry();
+                IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
+                Poll::Pending
             }
         }
     }
