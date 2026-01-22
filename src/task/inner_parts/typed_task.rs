@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    runtime::CURRENT,
+    runtime::TASK_LIST,
     task::inner_parts::{Data, Metadata, State, type_agnostic_task::TypeAgnosticTask},
 };
 
@@ -72,14 +72,14 @@ impl<F: Future> TypedTask<F> {
 
     pub fn wake_by_val(self) {
         let erased = self.erase_type();
-        CURRENT.with(|ctx| {
+        TASK_LIST.with(|ctx| {
             ctx.push(erased);
         });
     }
 
     pub fn wake_by_ref(&self) {
         let erased = self.erase_type();
-        CURRENT.with(|ctx| {
+        TASK_LIST.with(|ctx| {
             ctx.push(erased);
         });
     }

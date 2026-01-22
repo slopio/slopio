@@ -4,9 +4,15 @@ use std::{
     os::fd::RawFd,
     rc::Rc,
     task::Waker,
+    time::Duration,
 };
 
-use io_uring::{IoUring, cqueue::Entry, opcode, squeue, types::Fd};
+use io_uring::{
+    IoUring,
+    cqueue::Entry,
+    opcode, squeue,
+    types::{Fd, Timespec},
+};
 use io_uring_rb::{RingBuffer, buffers_range::BufferRange};
 use slab::Slab;
 
@@ -292,6 +298,17 @@ impl IODriver {
         entry.set_user_data(user_data);
         ring_inner.add(&entry);
         user_data
+    }
+
+    pub fn push_wakeup_timeout(&self, duration: Duration) {
+        let ms = duration.as_millis();
+        let time = Timespec::new().nsec((ms * 1_000_000) as u32);
+        let entry = io_uring::opcode::Timeout::new(&time)
+            .count(1)
+            .build()
+            .user_data(CANCEL_OP_FLAG);
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        ring_inner.add(&entry);
     }
 
     pub fn push_signal_op(&self, fd: RawFd) -> IoDriverToken {

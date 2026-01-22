@@ -4,18 +4,26 @@ use std::os::fd::RawFd;
 use std::pin::pin;
 use std::task::{Context, Waker};
 
+use io_uring::types::Timespec;
+
 use crate::io_driver::IODriver;
+use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
 use crate::{runtime, scoped_thread_local};
 
 pub mod eventfd;
 pub mod join;
 pub mod select;
+mod time;
+
+scoped_thread_local!(pub(crate) static TASK_LIST: TaskList);
+scoped_thread_local!(pub(crate) static TIME_DRIVER: TimeDriver);
 
 #[derive(Default)]
 pub struct RuntimeInner {
     pub tasks: TaskList,
     io_driver: IODriver,
+    time_driver: TimeDriver,
 }
 
 impl RuntimeInner {
@@ -23,36 +31,42 @@ impl RuntimeInner {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         self.io_driver.with(|| {
-            CURRENT.set(&self.tasks, || {
-                if let Some(fd) = event_fd {
-                    runtime::eventfd::register_eventfd_read(fd);
-                }
-                let mut pinned_f = pin!(f);
-                loop {
-                    self.io_driver.process_completion_queue();
-                    if self.io_driver.shutdown() {
-                        //TODO graceful
-                        panic!("shutdown");
+            TASK_LIST.set(&self.tasks, || {
+                TIME_DRIVER.set(&self.time_driver, || {
+                    if let Some(fd) = event_fd {
+                        runtime::eventfd::register_eventfd_read(fd);
                     }
-                    while let Some(item) = self.tasks.pop() {
-                        item.poll();
-                    }
+                    let mut pinned_f = pin!(f);
+                    loop {
+                        self.io_driver.process_completion_queue();
+                        if self.io_driver.shutdown() {
+                            //TODO graceful
+                            panic!("shutdown");
+                        }
+                        while let Some(item) = self.tasks.pop() {
+                            item.poll();
+                        }
 
-                    let pinned = pinned_f.as_mut();
-                    match pinned.poll(&mut context) {
-                        std::task::Poll::Ready(output) => {
-                            return output;
+                        let pinned = pinned_f.as_mut();
+                        match pinned.poll(&mut context) {
+                            std::task::Poll::Ready(output) => {
+                                return output;
+                            }
+                            std::task::Poll::Pending => {}
                         }
-                        std::task::Poll::Pending => {}
-                    }
-                    if !self.tasks.is_empty() {
-                        if self.io_driver.has_pending_submissions() {
-                            self.io_driver.submit_without_wait();
+                        if !self.tasks.is_empty() {
+                            if self.io_driver.has_pending_submissions() {
+                                self.io_driver.submit_without_wait();
+                            }
+                            continue;
                         }
-                        continue;
+                        self.time_driver.tick();
+                        if let Some(duration) = self.time_driver.next_deadline() {
+                            self.io_driver.push_wakeup_timeout(duration);
+                        }
+                        self.io_driver.submit_and_wait()
                     }
-                    self.io_driver.submit_and_wait()
-                }
+                })
             })
         })
     }
@@ -60,13 +74,11 @@ impl RuntimeInner {
 
 pub fn spawn<F: Future>(f: F) -> Handle<F::Output> {
     let (task, handle) = new_task(f);
-    CURRENT.with(|ctx| {
+    TASK_LIST.with(|ctx| {
         ctx.push(task);
     });
     handle
 }
-
-scoped_thread_local!(pub(crate) static CURRENT: TaskList);
 
 #[derive(Default)]
 pub struct TaskList {
