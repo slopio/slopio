@@ -13,7 +13,7 @@ pub struct Sleep {
 }
 
 impl Sleep {
-    fn during(duration: Duration) -> Self {
+    pub fn during(duration: Duration) -> Self {
         Self { duration, id: None }
     }
 }
@@ -44,6 +44,7 @@ impl Drop for Sleep {
 
 impl TimeDriver {
     pub fn tick(&self) {
+        eprintln!("[DEBUG] TimeDriver::tick() called");
         let this = unsafe { &mut *self.inner.get() };
         this.tick();
     }

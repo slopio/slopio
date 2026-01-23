@@ -4,8 +4,6 @@ use std::os::fd::RawFd;
 use std::pin::pin;
 use std::task::{Context, Waker};
 
-use io_uring::types::Timespec;
-
 use crate::io_driver::IODriver;
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
@@ -14,7 +12,7 @@ use crate::{runtime, scoped_thread_local};
 pub mod eventfd;
 pub mod join;
 pub mod select;
-mod time;
+pub mod time;
 
 scoped_thread_local!(pub(crate) static TASK_LIST: TaskList);
 scoped_thread_local!(pub(crate) static TIME_DRIVER: TimeDriver);
