@@ -36,33 +36,29 @@ impl RuntimeInner {
                     }
                     let mut pinned_f = pin!(f);
                     loop {
-                        self.io_driver.process_completion_queue();
                         if self.io_driver.shutdown() {
                             //TODO graceful
                             panic!("shutdown");
                         }
-                        while let Some(item) = self.tasks.pop() {
-                            item.poll();
-                        }
+                        loop {
+                            //TODO limit activity
+                            while let Some(item) = self.tasks.pop() {
+                                item.poll();
+                            }
 
-                        let pinned = pinned_f.as_mut();
-                        match pinned.poll(&mut context) {
-                            std::task::Poll::Ready(output) => {
-                                return output;
+                            let pinned = pinned_f.as_mut();
+                            match pinned.poll(&mut context) {
+                                std::task::Poll::Ready(output) => {
+                                    return output;
+                                }
+                                std::task::Poll::Pending => {}
                             }
-                            std::task::Poll::Pending => {}
-                        }
-                        if !self.tasks.is_empty() {
-                            if self.io_driver.has_pending_submissions() {
-                                self.io_driver.submit_without_wait();
+                            if self.tasks.is_empty() {
+                                break;
                             }
-                            continue;
                         }
-                        self.time_driver.tick();
-                        if let Some(duration) = self.time_driver.next_deadline() {
-                            self.io_driver.push_wakeup_timeout(duration);
-                        }
-                        self.io_driver.submit_and_wait()
+                        self.io_driver.submit_and_wait();
+                        self.io_driver.process_completion_queue();
                     }
                 })
             })
