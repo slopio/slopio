@@ -68,14 +68,10 @@ enum QueueInsertEvent {
     WasEmpty,
 }
 
-/// Result of polling a multishot operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MultiPollResult {
-    /// Operation is pending, no data available yet.
     Pending,
-    /// Data is ready in the queue.
     Ready,
-    /// Operation is paused and queue is drained. Consumer should resubmit.
     NeedsResubmit,
 }
 
@@ -207,7 +203,6 @@ impl Default for Ring {
             .setup_defer_taskrun()
             .build(4096)
             .unwrap();
-        // let buf_ring = IoUringBufRing::new_with_flags(&ring, 50, 0, RING_BUFFER_SIZE, 0).unwrap();
         let buf_ring = io_uring_rb::RingBuffer::new(&ring, 0, 0).unwrap();
 
         Self {
@@ -302,8 +297,8 @@ impl IODriver {
 
     pub fn push_wakeup_timeout(&self, duration: Duration) {
         let ms = duration.as_millis();
-        let time = Timespec::new().nsec((ms * 1_000_000) as u32);
-        let entry = io_uring::opcode::Timeout::new(&time)
+        let time = Box::leak(Box::new(Timespec::new().nsec((ms * 1_500_000) as u32)));
+        let entry = io_uring::opcode::Timeout::new(time)
             .count(1)
             .build()
             .user_data(CANCEL_OP_FLAG);
@@ -329,7 +324,6 @@ impl IODriver {
         waker: &Waker,
         poller_queue: &mut MultiOpQueue,
     ) -> MultiPollResult {
-        //if you care about the order of received data, call only if poller_queue is empty
         let slab_multishot = unsafe { &mut *self.multishot_slab.get() };
         let multishot_op = unsafe { slab_multishot.get_unchecked_mut(id) };
         match multishot_op {
@@ -356,12 +350,10 @@ impl IODriver {
                 }
             }
             MultiOpState::Paused { queue, .. } => {
-                // If there's still data in the queue, drain it first
                 if queue.has_content() {
                     std::mem::swap(poller_queue, queue);
                     MultiPollResult::Ready
                 } else {
-                    // Queue is empty, consumer should resubmit
                     MultiPollResult::NeedsResubmit
                 }
             }
@@ -400,28 +392,12 @@ impl IODriver {
         !ring.inner.submission().is_empty()
     }
 
-    pub(crate) fn submit_without_wait(&self) {
-        let ring = unsafe { &mut *self.ring.get() };
-        match ring.inner.submit() {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                // EINTR is normal when a signal interrupts the syscall, just continue
-            }
-            Err(e) => {
-                panic!("io_uring submit failed: {:?}", e);
-            }
-        }
-    }
-
     pub(crate) fn submit_and_wait(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         match ring.inner.submit_and_wait(1) {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                // EINTR is normal when a signal interrupts the syscall, just continue
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
-                // For other errors, panic
                 panic!("io_uring submit_and_wait failed: {:?}", e);
             }
         }
@@ -430,10 +406,10 @@ impl IODriver {
     pub(crate) fn process_completion_queue(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         for c_event in ring.inner.completion() {
+            println!("{c_event:?}");
             if let Some(completion_event) = CompletionEvent::from_entry(c_event) {
                 self.process_cqe(completion_event);
             }
-            // None means it was a cancellation CQE, which we ignore
         }
     }
 
@@ -445,12 +421,6 @@ impl IODriver {
         ring_inner.add(&cancel_op);
     }
 
-    /// Resubmit a paused multishot operation.
-    ///
-    /// The consumer provides the entry (since only it knows how to construct it).
-    /// The driver keeps the same slab slot and sets the user_data appropriately.
-    ///
-    /// Returns true if resubmission was successful, false if the op wasn't in Paused state.
     pub fn resubmit_multishot(&self, id: usize, mut entry: squeue::Entry, waker: &Waker) -> bool {
         let slab = unsafe { &mut *self.multishot_slab.get() };
         let op = match slab.get_mut(id) {
@@ -462,13 +432,10 @@ impl IODriver {
             return false;
         }
 
-        // Transition back to Sent state
         op.transition_paused_to_sent(waker);
 
-        // Set user_data with the slab ID and multishot flag
         entry = entry.user_data((id as u64) | MULTI_OP_FLAG);
 
-        // Submit to the ring
         let ring = unsafe { &mut *self.ring.get() };
         ring.add(&entry);
 

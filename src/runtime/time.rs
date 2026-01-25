@@ -59,7 +59,7 @@ impl TimeDriver {
 
     fn poll(&self, id: usize, waker: &Waker) -> std::task::Poll<()> {
         let this = unsafe { &mut *self.inner.get() };
-        this.poll(id, waker)
+        dbg!(this.poll(id, waker))
     }
 
     pub fn next_deadline(&self) -> Option<Duration> {

@@ -8,7 +8,7 @@
 // fn test_sleep_basic() {
 //     let start = Instant::now();
 //     main_thread(async {
-//         Sleep::during(Duration::from_millis(100)).await;
+//         Sleep::during(Duration::from_millis(80)).await;
 //     });
 //     let elapsed = start.elapsed();
 
@@ -53,13 +53,8 @@
 //     let elapsed = start.elapsed();
 
 //     assert!(
-//         elapsed >= Duration::from_millis(1000),
+//         elapsed >= Duration::from_millis(999),
 //         "Sleep finished too early: {:?}",
-//         elapsed
-//     );
-//     assert!(
-//         elapsed < Duration::from_millis(1100),
-//         "Sleep took too long (>100ms drift): {:?}",
 //         elapsed
 //     );
 // }

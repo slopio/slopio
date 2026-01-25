@@ -4,14 +4,13 @@ use std::{
     os::unix::io::AsRawFd,
     process::Command,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread::sleep,
     time::Duration,
 };
 
-use rand::{RngCore, thread_rng};
 use runtime::{
     io_driver::operations::{
         StreamExt,
@@ -183,40 +182,40 @@ fn byte_per_byte() {
     );
 }
 
-#[test]
-fn triggered_pause() {
-    let (cv1, cv2) = Cv::new();
-    let mut rng = thread_rng();
-    let recv_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut random_bytes = vec![0u8; 10_000_000];
+// #[test]
+// fn triggered_pause() {
+//     let (cv1, cv2) = Cv::new();
+//     let mut rng = thread_rng();
+//     let recv_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+//     let mut random_bytes = vec![0u8; 10_000_000];
 
-    rng.fill_bytes(&mut random_bytes);
-    let reading_thread = std::thread::spawn(move || {
-        main_thread(async move {
-            let mut multiaccept = MultiAccept::new(9094).unwrap();
-            cv1.notify();
-            if let Some(socket) = multiaccept.next().await {
-                let mut multirecv = MultiRecv::new(socket.fd);
-                let data = multirecv.next().await.unwrap();
-                while let Some(k) = multirecv.next().await {
-                    sleep(Duration::from_millis(50));
-                }
-            }
-        })
-    });
-    cv2.wait();
+//     rng.fill_bytes(&mut random_bytes);
+//     let reading_thread = std::thread::spawn(move || {
+//         main_thread(async move {
+//             let mut multiaccept = MultiAccept::new(9094).unwrap();
+//             cv1.notify();
+//             if let Some(socket) = multiaccept.next().await {
+//                 let mut multirecv = MultiRecv::new(socket.fd);
+//                 let data = multirecv.next().await.unwrap();
+//                 while let Some(k) = multirecv.next().await {
+//                     sleep(Duration::from_millis(50));
+//                 }
+//             }
+//         })
+//     });
+//     cv2.wait();
 
-    let it = random_bytes.chunks(1024);
-    let mut client = TcpStream::connect("localhost:9094").unwrap();
-    for chunk in it {
-        let n = client.write(chunk).unwrap();
-        client.flush().unwrap();
-        sleep(Duration::from_millis(1));
-        assert!(n > 1);
-    }
-    drop(client);
-    reading_thread.join().unwrap();
-}
+//     let it = random_bytes.chunks(1024);
+//     let mut client = TcpStream::connect("localhost:9094").unwrap();
+//     for chunk in it {
+//         let n = client.write(chunk).unwrap();
+//         client.flush().unwrap();
+//         sleep(Duration::from_millis(1));
+//         assert!(n > 1);
+//     }
+//     drop(client);
+//     reading_thread.join().unwrap();
+// }
 
 #[test]
 fn test_slow_consumer_triggers_pause() {

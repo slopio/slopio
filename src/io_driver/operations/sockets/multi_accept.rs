@@ -20,12 +20,9 @@ pub struct MultiAccept {
     sockets: MultiOpQueue,
 }
 
-/// Error from accepting a connection.
 #[derive(Debug)]
 pub enum AcceptError {
-    /// The operation was cancelled (e.g., during pause).
     Cancelled,
-    /// Other error with errno.
     Other(i32),
 }
 
@@ -102,7 +99,6 @@ impl Stream for MultiAccept {
     type Item = SocketWrapper;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // First try to drain from local queue
         if let Poll::Ready(result) = self.try_drain_one() {
             return Poll::Ready(result);
         }
@@ -114,7 +110,6 @@ impl Stream for MultiAccept {
             MultiPollResult::Pending => Poll::Pending,
             MultiPollResult::Ready => self.try_drain_one(),
             MultiPollResult::NeedsResubmit => {
-                // Resubmit the multishot operation
                 let entry = self.to_entry();
                 IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
                 Poll::Pending
