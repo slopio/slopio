@@ -1,0 +1,3 @@
+- io operations are hold by a SLAB, when no task has the id pointing to the op, it should be freed.
+- same for time operations
+- io_uring always replies to demands.
