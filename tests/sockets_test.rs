@@ -1,8 +1,8 @@
-use runtime::io_driver::operations::StreamExt;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
 use runtime::io_driver::operations::sockets::{AsyncRead, AsyncWrite};
 use runtime::main_thread;
 use runtime::runtime::spawn;
+use runtime_streams::StreamExt;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;

@@ -10,6 +10,7 @@ pub mod io_driver;
 mod macros;
 pub mod runtime;
 mod task;
+mod tls;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

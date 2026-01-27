@@ -7,11 +7,12 @@ use std::{
 };
 
 use io_uring::{opcode, types::Fd};
+use runtime_streams::Stream;
 use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
     IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
-    operations::{IoOP, Stream, sockets::SocketWrapper},
+    operations::{IoOP, sockets::SocketWrapper},
 };
 
 pub struct MultiAccept {

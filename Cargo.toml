@@ -8,6 +8,9 @@ io-uring = "0.7.11"
 libc = "0.2.178"
 io_uring_rb = { git = "https://github.com/saucisoupe/io_uring_rb" }
 async_timers =  { git = "https://github.com/saucisoupe/async_timers" }
+runtime-streams =  { git = "https://github.com/saucisoupe/runtime-streams" }
+rustls = "0.23.36"
+rustls-pemfile = "2"
 
 mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 pin-project = "1.1.10"

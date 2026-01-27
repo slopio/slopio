@@ -12,12 +12,10 @@ use std::{
 };
 
 use runtime::{
-    io_driver::operations::{
-        StreamExt,
-        sockets::{multi_accept::MultiAccept, multi_recv_bundle::MultiRecv},
-    },
+    io_driver::operations::sockets::{multi_accept::MultiAccept, multi_recv_bundle::MultiRecv},
     main_thread,
 };
+use runtime_streams::StreamExt;
 
 use crate::common::Cv;
 

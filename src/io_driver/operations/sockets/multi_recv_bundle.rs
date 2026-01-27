@@ -1,5 +1,6 @@
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 use io_uring_rb::buffers_range::BufferRange;
+use runtime_streams::Stream;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -8,7 +9,7 @@ use std::{
 use crate::io_driver::{
     IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     operations::{
-        IoOP, Stream,
+        IoOP,
         sockets::{MultiAsyncRead, SocketWrapper},
     },
 };
