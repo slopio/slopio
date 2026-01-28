@@ -1,6 +1,7 @@
 use io_uring::squeue::Entry;
 
 pub mod files;
+pub mod io_traits;
 pub mod sockets;
 
 pub(crate) type IoDriverToken = u64;

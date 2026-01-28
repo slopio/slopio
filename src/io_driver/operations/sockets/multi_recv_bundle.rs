@@ -18,17 +18,13 @@ pub struct MultiRecv {
     id: Option<usize>,
     fd: i32,
     reads: MultiOpQueue,
-    reads_this_batch: usize,
 }
 
 #[derive(Debug)]
 pub enum CompletionError {
-    Eof {
-        flags: u32,
-    },
+    Eof { flags: u32 },
     ConnectionReset,
     BrokenPipe,
-    /// The operation was cancelled (e.g., during pause for backpressure).
     Cancelled,
     Other(i32),
 }
@@ -94,7 +90,6 @@ impl MultiRecv {
             id: None,
             fd,
             reads: Default::default(),
-            reads_this_batch: 0,
         };
         multi_recv.register_to_driver();
         multi_recv
@@ -110,19 +105,10 @@ impl Drop for MultiRecv {
 impl Unpin for MultiRecv {}
 
 impl MultiRecv {
-    fn try_drain_one(&mut self, cx: &mut Context<'_>) -> Poll<Option<ReadRange>> {
-        const MAX_READS_PER_POLL: usize = 32;
-
+    fn try_drain_one(&mut self) -> Poll<Option<ReadRange>> {
         while let Some(completion_event) = self.reads.pop() {
             match completion_event.try_into() {
-                Ok(r) => {
-                    self.reads_this_batch += 1;
-                    if self.reads_this_batch >= MAX_READS_PER_POLL && self.reads.has_content() {
-                        self.reads_this_batch = 0;
-                        cx.waker().wake_by_ref();
-                    }
-                    return Poll::Ready(Some(r));
-                }
+                Ok(r) => return Poll::Ready(Some(r)),
                 Err(e) if e.can_continue() => continue,
                 Err(_) => return Poll::Ready(None),
             }
@@ -136,7 +122,7 @@ impl Stream for MultiRecv {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // First try to drain from local queue
-        if let Poll::Ready(result) = self.try_drain_one(cx) {
+        if let Poll::Ready(result) = self.try_drain_one() {
             return Poll::Ready(result);
         }
 
@@ -146,8 +132,7 @@ impl Stream for MultiRecv {
         match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads)) {
             MultiPollResult::Pending => Poll::Pending,
             MultiPollResult::Ready => {
-                self.reads_this_batch = 0;
-                match self.try_drain_one(cx) {
+                match self.try_drain_one() {
                     Poll::Ready(result) => Poll::Ready(result),
                     Poll::Pending => {
                         // Queue had only skippable errors, check if we need resubmit
