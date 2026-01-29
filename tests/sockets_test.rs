@@ -1,5 +1,6 @@
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime::io_driver::operations::sockets::{AsyncRead, AsyncWrite};
+use runtime::io_driver::operations::sockets::recv::socket_recv;
+use runtime::io_driver::operations::sockets::send::socket_send;
 use runtime::main_thread;
 use runtime::runtime::spawn;
 use runtime_streams::StreamExt;
@@ -40,7 +41,7 @@ fn test_socket_recv_data() {
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 128]);
-                let n_bytes = socket.recv(buffer.as_mut(), 128).await.unwrap();
+                let n_bytes = socket_recv(&socket, buffer.as_mut(), 128).await.unwrap();
 
                 // Return the received data
                 String::from_utf8_lossy(&buffer[..n_bytes]).to_string()
@@ -69,7 +70,7 @@ fn test_socket_send_data() {
 
             if let Some(socket) = ma.next().await {
                 let data = b"Response from server";
-                socket.send(data).await.unwrap()
+                socket_send(&socket, data).await.unwrap()
             } else {
                 0
             }
@@ -97,10 +98,10 @@ fn test_echo_server() {
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 128]);
-                let n_bytes = socket.recv(buffer.as_mut(), 128).await.unwrap();
+                let n_bytes = socket_recv(&socket, buffer.as_mut(), 128).await.unwrap();
 
                 // Echo back the data
-                socket.send(&buffer[..n_bytes]).await.unwrap()
+                socket_send(&socket, &buffer[..n_bytes]).await.unwrap()
             } else {
                 0
             }
@@ -133,19 +134,19 @@ fn test_multiple_recv_send() {
 
                 // Receive first message
                 let mut buffer1 = Box::new([0u8; 64]);
-                let n1 = socket.recv(buffer1.as_mut(), 64).await.unwrap();
+                let n1 = socket_recv(&socket, buffer1.as_mut(), 64).await.unwrap();
                 total_bytes += n1;
 
                 // Send response
-                socket.send(b"ACK1").await.unwrap();
+                socket_send(&socket, b"ACK1").await.unwrap();
 
                 // Receive second message
                 let mut buffer2 = Box::new([0u8; 64]);
-                let n2 = socket.recv(buffer2.as_mut(), 64).await.unwrap();
+                let n2 = socket_recv(&socket, buffer2.as_mut(), 64).await.unwrap();
                 total_bytes += n2;
 
                 // Send final response
-                socket.send(b"ACK2").await.unwrap();
+                socket_send(&socket, b"ACK2").await.unwrap();
 
                 total_bytes
             } else {
@@ -188,8 +189,8 @@ fn test_spawned_socket_handler() {
                 // Spawn a task to handle the socket
                 let task_handle = spawn(async move {
                     let mut buffer = Box::new([0u8; 128]);
-                    let n_bytes = socket.recv(buffer.as_mut(), 128).await.unwrap();
-                    socket.send(&buffer[..n_bytes]).await.unwrap();
+                    let n_bytes = socket_recv(&socket, buffer.as_mut(), 128).await.unwrap();
+                    socket_send(&socket, &buffer[..n_bytes]).await.unwrap();
                     n_bytes
                 });
 
@@ -224,10 +225,10 @@ fn test_zero_length_recv() {
                 let mut buffer = Box::new([0u8; 64]);
 
                 // Receive some data first
-                let n = socket.recv(buffer.as_mut(), 64).await.unwrap();
+                let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
 
                 // Client closes connection, should get 0 bytes
-                let n_zero = socket.recv(buffer.as_mut(), 64).await.unwrap();
+                let n_zero = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
 
                 (n, n_zero)
             } else {

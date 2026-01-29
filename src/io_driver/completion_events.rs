@@ -1,7 +1,7 @@
-use io_uring::cqueue::{self, Entry};
+use io_uring::cqueue::{self, Entry, buffer_select};
 use libc::ECANCELED;
 
-use super::{MultiOpState, MultishotCompletionEvent, OpMetadata, OpState};
+use super::{MultiOpState, MultishotCompletionEvent, OpMetadata, SingleOpState};
 
 pub(crate) const MULTI_OP_FLAG: u64 = 1u64 << 63;
 pub(crate) const CANCEL_OP_FLAG: u64 = 1u64 << 62;
@@ -65,6 +65,7 @@ impl CompletionEvent {
 pub(crate) enum SingleProcessResult {
     Completed,
     Shutdown,
+    CancelledRecycling { id: u16, len: i32 },
     InvalidState(&'static str),
 }
 
@@ -77,19 +78,38 @@ pub(crate) enum MultiProcessResult {
     InvalidState(&'static str),
 }
 
-pub(crate) fn process_single(op_state: &mut OpState, data: Data) -> SingleProcessResult {
+pub(crate) fn process_single(op_state: &mut SingleOpState, data: Data) -> SingleProcessResult {
     match op_state {
-        OpState::Init => SingleProcessResult::InvalidState("submitted entry shouldn't be in init"),
-        OpState::Sent(waker) => {
+        SingleOpState::Init => {
+            SingleProcessResult::InvalidState("submitted entry shouldn't be in init")
+        }
+        SingleOpState::Sent(waker) => {
             waker.wake_by_ref();
-            *op_state = OpState::Ended(OpMetadata {
+            *op_state = SingleOpState::Ended(OpMetadata {
                 result: data.result,
                 flags: data.flags,
             });
             SingleProcessResult::Completed
         }
-        OpState::Ended(_) => SingleProcessResult::InvalidState("received CQE for ended op"),
-        OpState::Signal(_) => SingleProcessResult::Shutdown,
+        SingleOpState::Ended(_) => SingleProcessResult::InvalidState("received CQE for ended op"),
+        SingleOpState::Signal(_) => SingleProcessResult::Shutdown,
+        SingleOpState::Cancelled => {
+            if data.result == -ECANCELED {
+                SingleProcessResult::Completed
+            } else {
+                if let Some(id) = buffer_select(data.flags)
+                    && data.result > 0
+                {
+                    SingleProcessResult::CancelledRecycling {
+                        id,
+                        len: data.result,
+                    }
+                } else {
+                    //no buffers were taken from the ring or there was an error
+                    SingleProcessResult::Completed
+                }
+            }
+        }
     }
 }
 

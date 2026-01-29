@@ -13,7 +13,7 @@ use io_uring::{
     opcode, squeue,
     types::{Fd, Timespec},
 };
-use io_uring_rb::{RingBuffer, buffers_range::BufferRange};
+use io_uring_rb::{RingBuffer, buffer::Buffer, buffers_range::BufferRange};
 use slab::Slab;
 
 use crate::{
@@ -37,7 +37,7 @@ const QUEUE_PAUSE_THRESHOLD: usize = 2;
 #[derive(Default)]
 pub struct IODriver {
     ring: UnsafeCell<Ring>,
-    slab: Rc<UnsafeCell<Slab<OpState>>>,
+    slab: Rc<UnsafeCell<Slab<SingleOpState>>>,
     multishot_slab: Rc<UnsafeCell<Slab<MultiOpState>>>,
     shutting_down: Cell<bool>,
 }
@@ -258,6 +258,11 @@ impl IODriver {
                     SingleProcessResult::InvalidState(msg) => {
                         eprintln!("singleshot CQE invalid state: {}", msg);
                     }
+                    SingleProcessResult::CancelledRecycling { id, len } => {
+                        let mut b = self.get_buffer_range(id, len as usize);
+                        self.return_buffer_range(&mut b);
+                        slab.remove(completion_event.slab_index); //will never be polled
+                    }
                 }
             }
         }
@@ -270,6 +275,11 @@ impl IODriver {
     fn get_buffer_range(&self, id: u16, len: usize) -> BufferRange {
         let ring_inner = unsafe { &*self.ring.get() };
         ring_inner.buffer_ring.get_buffers_range(id, len).unwrap()
+    }
+
+    fn get_buffer(&self, id: u16, len: usize) -> Buffer {
+        let ring_inner = unsafe { &*self.ring.get() };
+        ring_inner.buffer_ring.get_buffer(id, len).unwrap()
     }
 
     fn return_buffer_range(&self, buffer_range: &mut BufferRange) {
@@ -289,7 +299,7 @@ impl IODriver {
     pub fn push_op(&self, mut entry: squeue::Entry) -> IoDriverToken {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let user_data = slab.insert(OpState::Init) as IoDriverToken;
+        let user_data = slab.insert(SingleOpState::Init) as IoDriverToken;
         entry.set_user_data(user_data);
         ring_inner.add(&entry);
         user_data
@@ -311,7 +321,7 @@ impl IODriver {
         let ring_inner = unsafe { &mut *self.ring.get() };
         let mut sig_data = Box::new([0u8; 8]);
         let ptr = sig_data.as_mut_ptr();
-        let user_data = slab.insert(OpState::Signal(sig_data)) as IoDriverToken;
+        let user_data = slab.insert(SingleOpState::Signal(sig_data)) as IoDriverToken;
         let mut entry = opcode::Read::new(Fd(fd), ptr, 8).build();
         entry.set_user_data(user_data);
         ring_inner.add(&entry);
@@ -350,12 +360,8 @@ impl IODriver {
                 }
             }
             MultiOpState::Paused { queue, .. } => {
-                if queue.has_content() {
-                    std::mem::swap(poller_queue, queue);
-                    MultiPollResult::Ready
-                } else {
-                    MultiPollResult::NeedsResubmit
-                }
+                std::mem::swap(poller_queue, queue);
+                MultiPollResult::NeedsResubmit
             }
         }
     }
@@ -365,15 +371,15 @@ impl IODriver {
         let entry = unsafe { slab.get_unchecked_mut(id) };
         let mut id_to_delete = None;
         let res = match entry {
-            OpState::Init => {
-                *entry = OpState::Sent(waker.clone());
+            SingleOpState::Init => {
+                *entry = SingleOpState::Sent(waker.clone());
                 std::task::Poll::Pending
             }
-            OpState::Sent(waker) => {
+            SingleOpState::Sent(waker) => {
                 waker.wake_by_ref();
                 std::task::Poll::Pending
             }
-            OpState::Ended(e) => {
+            SingleOpState::Ended(e) => {
                 id_to_delete = Some(id);
                 std::task::Poll::Ready(*e)
             }
@@ -385,11 +391,6 @@ impl IODriver {
             slab.remove(id);
         }
         res
-    }
-
-    pub(crate) fn has_pending_submissions(&self) -> bool {
-        let ring = unsafe { &mut *self.ring.get() };
-        !ring.inner.submission().is_empty()
     }
 
     pub(crate) fn submit_and_wait(&self) {
@@ -406,11 +407,24 @@ impl IODriver {
     pub(crate) fn process_completion_queue(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         for c_event in ring.inner.completion() {
-            println!("{c_event:?}");
             if let Some(completion_event) = CompletionEvent::from_entry(c_event) {
                 self.process_cqe(completion_event);
             }
         }
+    }
+
+    pub fn cancel_single_op(&self, id: usize) {
+        let slab = unsafe { &mut *self.slab.get() };
+        *slab.get_mut(id).unwrap() = SingleOpState::Cancelled;
+        self.send_singleop_cancel_event(id as u64);
+    }
+
+    fn send_singleop_cancel_event(&self, id: u64) {
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        let cancel_op = opcode::AsyncCancel::new(id)
+            .build()
+            .user_data(id | CANCEL_OP_FLAG);
+        ring_inner.add(&cancel_op);
     }
 
     pub fn send_multiop_cancel_event(&self, id: u64) {
@@ -451,11 +465,12 @@ pub(crate) struct OpMetadata {
 }
 
 #[derive(Debug)]
-enum OpState {
+enum SingleOpState {
     Init,
     Sent(Waker),
     Ended(OpMetadata),
     Signal(Box<[u8; 8]>),
+    Cancelled,
 }
 
 struct Ring {

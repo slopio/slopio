@@ -6,7 +6,6 @@ fn unbounding() {
         let (send, recv) = unbounded_channel::<usize>();
         let k = spawn(async move {
             send.send(3);
-            println!("sent");
         });
         let k2 = spawn(async move {
             let v = recv.recv().await;
@@ -346,9 +345,7 @@ fn recv_before_send() {
     main_thread(async {
         let (send, recv) = unbounded_channel::<i32>();
 
-        let h = spawn(async move {
-            recv.recv().await
-        });
+        let h = spawn(async move { recv.recv().await });
 
         // Yield to let receiver start waiting
         spawn(async {}).await;

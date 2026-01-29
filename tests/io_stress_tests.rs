@@ -1,5 +1,6 @@
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime::io_driver::operations::sockets::{AsyncRead, AsyncWrite};
+use runtime::io_driver::operations::sockets::recv::socket_recv;
+use runtime::io_driver::operations::sockets::send::socket_send;
 use runtime::main_thread;
 use runtime::runtime::spawn;
 use runtime_streams::StreamExt;
@@ -8,38 +9,39 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-// Test accepting many connections rapidly
-// #[test]
-// fn test_rapid_connections() {
-//     let handle = std::thread::spawn(|| {
-//         main_thread(async {
-//             let mut ma = MultiAccept::new(9000).unwrap();
-//             let mut count = 0;
+#[test]
+fn test_rapid_connections() {
+    let handle = std::thread::spawn(|| {
+        main_thread(async {
+            let mut ma = MultiAccept::new(9000).unwrap();
+            let mut count = 0;
 
-//             // Accept 50 connections
-//             for _ in 0..50 {
-//                 if ma.next().await.is_some() {
-//                     count += 1;
-//                 }
-//             }
+            // Accept 50 connections
+            for _ in 0..50 {
+                if ma.next().await.is_some() {
+                    println!("xd");
+                    count += 1;
+                }
+            }
+            println!("FINI");
+            count
+        })
+    });
 
-//             count
-//         })
-//     });
+    std::thread::sleep(Duration::from_millis(100));
 
-//     std::thread::sleep(Duration::from_millis(100));
+    // Create 50 connections rapidly
+    let mut clients = Vec::new();
+    for _ in 0..50 {
+        if let Ok(client) = TcpStream::connect("127.0.0.1:9000") {
+            println!("client");
+            clients.push(client);
+        }
+    }
 
-//     // Create 50 connections rapidly
-//     let mut clients = Vec::new();
-//     for _ in 0..50 {
-//         if let Ok(client) = TcpStream::connect("127.0.0.1:9000") {
-//             clients.push(client);
-//         }
-//     }
-
-//     let accepted = handle.join().unwrap();
-//     assert_eq!(accepted, 50);
-// }
+    let accepted = handle.join().unwrap();
+    assert_eq!(accepted, 50);
+}
 
 // Test receiving data in very small chunks
 #[test]
@@ -54,7 +56,7 @@ fn test_tiny_recv_chunks() {
                 // Read 1 byte at a time, 20 times
                 for _ in 0..20 {
                     let mut buffer = Box::new([0u8; 1]);
-                    let n = socket.recv(buffer.as_mut(), 1).await.unwrap();
+                    let n = socket_recv(&socket, buffer.as_mut(), 1).await.unwrap();
                     if n > 0 {
                         total_received.push(buffer[0]);
                     }
@@ -89,7 +91,7 @@ fn test_tiny_send_chunks() {
 
                 // Send 1 byte at a time
                 for &byte in data.iter() {
-                    let n = socket.send(&[byte]).await.unwrap();
+                    let n = socket_send(&socket, &[byte]).await.unwrap();
                     total_sent += n;
                 }
 
@@ -136,8 +138,8 @@ fn test_concurrent_connections() {
                 if let Some(socket) = ma.next().await {
                     let handler = spawn(async move {
                         let mut buffer = Box::new([0u8; 64]);
-                        let n = socket.recv(buffer.as_mut(), 64).await.unwrap();
-                        socket.send(&buffer[..n]).await.unwrap();
+                        let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                        socket_send(&socket, &buffer[..n]).await.unwrap();
                         n
                     });
                     handlers.push(handler);
@@ -189,7 +191,7 @@ fn test_large_buffer_small_data() {
 
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 4096]);
-                socket.recv(buffer.as_mut(), 4096).await.unwrap()
+                socket_recv(&socket, buffer.as_mut(), 4096).await.unwrap()
             } else {
                 0
             }
@@ -217,8 +219,8 @@ fn test_multiple_cycles() {
 
                 for _ in 0..10 {
                     let mut buffer = Box::new([0u8; 64]);
-                    let n = socket.recv(buffer.as_mut(), 64).await.unwrap();
-                    socket.send(&buffer[..n]).await.unwrap();
+                    let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                    socket_send(&socket, &buffer[..n]).await.unwrap();
                     total += n;
                 }
 
@@ -258,10 +260,10 @@ fn test_client_disconnect_during_recv() {
                 let mut buffer = Box::new([0u8; 64]);
 
                 // First recv should succeed
-                let n1 = socket.recv(buffer.as_mut(), 64).await.unwrap();
+                let n1 = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
 
                 // Second recv should get 0 (connection closed)
-                let n2 = socket.recv(buffer.as_mut(), 64).await.unwrap();
+                let n2 = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
 
                 (n1, n2)
             } else {
@@ -292,8 +294,8 @@ fn test_nested_socket_spawns() {
                 let outer_task = spawn(async move {
                     let inner_task = spawn(async move {
                         let mut buffer = Box::new([0u8; 64]);
-                        let n = socket.recv(buffer.as_mut(), 64).await.unwrap();
-                        socket.send(b"PONG").await.unwrap();
+                        let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                        socket_send(&socket, b"PONG").await.unwrap();
                         n
                     });
                     inner_task.await
@@ -329,8 +331,8 @@ fn test_sequential_accept_handle() {
             for _ in 0..20 {
                 if let Some(socket) = ma.next().await {
                     let mut buffer = Box::new([0u8; 32]);
-                    socket.recv(buffer.as_mut(), 32).await.unwrap();
-                    socket.send(b"OK").await.unwrap();
+                    socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
+                    socket_send(&socket, b"OK").await.unwrap();
                     count += 1;
                 }
             }
@@ -371,10 +373,10 @@ fn test_interleaved_socket_operations() {
                     let handler = spawn(async move {
                         // Receive data
                         let mut buffer = Box::new([0u8; 32]);
-                        let n = socket.recv(buffer.as_mut(), 32).await.unwrap();
+                        let n = socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
 
                         // Echo it back
-                        socket.send(&buffer[..n]).await.unwrap();
+                        socket_send(&socket, &buffer[..n]).await.unwrap();
                         (i, n)
                     });
                     handlers.push(handler);
@@ -439,7 +441,7 @@ fn test_immediate_recv_after_accept() {
             if let Some(socket) = ma.next().await {
                 // Immediately try to recv - client may have already sent data
                 let mut buffer = Box::new([0u8; 64]);
-                let n = socket.recv(buffer.as_mut(), 64).await.unwrap();
+                let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
                 String::from_utf8_lossy(&buffer[..n]).to_string()
             } else {
                 String::new()
@@ -465,8 +467,7 @@ fn test_empty_send() {
             let mut ma = MultiAccept::new(9011).unwrap();
 
             if let Some(socket) = ma.next().await {
-                // Send empty data
-                socket.send(&[]).await.unwrap()
+                socket_send(&socket, &[]).await.unwrap()
             } else {
                 999
             }
@@ -492,7 +493,7 @@ fn test_mixed_socket_handling() {
             // First socket - handle directly
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 32]);
-                socket.recv(buffer.as_mut(), 32).await.unwrap();
+                socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
                 results.lock().unwrap().push(1);
             }
 
@@ -501,7 +502,7 @@ fn test_mixed_socket_handling() {
                 let r = results.clone();
                 let task = spawn(async move {
                     let mut buffer = Box::new([0u8; 32]);
-                    socket.recv(buffer.as_mut(), 32).await.unwrap();
+                    socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
                     r.lock().unwrap().push(2);
                 });
                 task.await;
@@ -510,7 +511,7 @@ fn test_mixed_socket_handling() {
             // Third socket - handle directly again
             if let Some(socket) = ma.next().await {
                 let mut buffer = Box::new([0u8; 32]);
-                socket.recv(buffer.as_mut(), 32).await.unwrap();
+                socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
                 results.lock().unwrap().push(3);
             }
 

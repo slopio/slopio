@@ -1,43 +1,47 @@
+use io_uring::opcode::{self};
+use io_uring::types::Fd;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use io_uring::opcode;
-use io_uring::squeue::Entry;
-use io_uring::types::Fd;
-
-use crate::io_driver::operations::sockets::AsyncRead;
-use crate::io_driver::{
-    IO_DRIVER,
-    operations::{IoDriverToken, IoOP},
-};
+use crate::io_driver::IO_DRIVER;
 
 use super::SocketWrapper;
 
-pub struct RecvSocket<'a> {
+pub struct ClassicRecv<'a> {
     fd: i32,
     id: Option<usize>,
-    _data: PhantomData<&'a ()>,
+    buffer: &'a mut [u8],
+    len: usize,
 }
 
-impl AsyncRead for SocketWrapper {
-    type Reader<'a> = RecvSocket<'a>;
-
-    fn recv<'a>(&self, buffer: &'a mut [u8], len: u32) -> Self::Reader<'a> {
-        let mut rs = RecvSocket {
-            fd: self.fd,
+impl<'a> ClassicRecv<'a> {
+    fn from_socket(socket: &SocketWrapper, buffer: &'a mut [u8], len: usize) -> Self {
+        Self {
+            fd: socket.fd(),
             id: None,
-            _data: PhantomData,
-        };
-        let entry = opcode::Recv::new(Fd(rs.fd), buffer.as_mut_ptr(), len).build();
+            len,
+            buffer,
+        }
+    }
+
+    fn register_to_driver(&mut self) {
+        let entry =
+            opcode::Recv::new(Fd(self.fd), self.buffer.as_mut_ptr(), self.len as u32).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        rs.id = Some(token as usize);
-        rs
+        self.id = Some(token as usize);
     }
 }
 
-impl<'a> Future for RecvSocket<'a> {
+pub fn socket_recv<'a>(
+    socket: &SocketWrapper,
+    buffer: &'a mut [u8],
+    len: usize,
+) -> ClassicRecv<'a> {
+    ClassicRecv::<'a>::from_socket(socket, buffer, len)
+}
+
+impl<'a> Future for ClassicRecv<'a> {
     type Output = std::io::Result<usize>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -50,28 +54,21 @@ impl<'a> Future for RecvSocket<'a> {
 
         match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(io_result) => Poll::Ready(match io_result.result {
-                bytes_read @ 0.. => Ok(bytes_read as usize),
-                err => Err(std::io::Error::from_raw_os_error(-err)),
-            }),
+            Poll::Ready(io_result) => {
+                self.id = None;
+                Poll::Ready(match io_result.result {
+                    bytes_read @ 0.. => Ok(bytes_read as usize),
+                    err => Err(std::io::Error::from_raw_os_error(-err)),
+                })
+            }
         }
     }
 }
 
-impl<'a> Drop for RecvSocket<'a> {
-    fn drop(&mut self) {}
-}
-
-impl<'a> IoOP for RecvSocket<'a> {
-    fn register_to_driver(&mut self) -> IoDriverToken {
-        unimplemented!()
-    }
-
-    fn to_entry(&self) -> Entry {
-        unimplemented!() //todo need a new trait for those with buffer
-    }
-
-    fn driver_cleanup(&mut self) {
-        //no cleaning needed
+impl Drop for ClassicRecv<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(id))
+        }
     }
 }
