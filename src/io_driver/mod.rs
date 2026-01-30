@@ -263,7 +263,7 @@ impl IODriver {
                     }
                     SingleProcessResult::CancelledRecycling { id, len } => {
                         let b = self.get_buffer(id, len as usize);
-                        self.return_buffer(b);
+                        self.recycle_buffer(&b);
                         slab.remove(completion_event.slab_index); //will never be polled
                     }
                 }
@@ -280,7 +280,8 @@ impl IODriver {
         ring_inner.buffer_ring.get_buffer(id, len).unwrap()
     }
 
-    fn return_buffer(&self, buffer: Buffer) {
+    fn recycle_buffer(&self, buffer: &Buffer) {
+        println!("recyling");
         let ring_inner = unsafe { &*self.ring.get() };
         ring_inner.buffer_ring.recycle_buffer(&buffer);
     }

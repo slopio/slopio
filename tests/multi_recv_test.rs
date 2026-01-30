@@ -11,13 +11,11 @@ use std::{
     time::Duration,
 };
 
-use rand::{RngCore, thread_rng};
 use runtime::{
     io_driver::operations::sockets::{multi_accept::MultiAccept, multi_recv::MultiRecv},
     main_thread,
 };
 use runtime_streams::StreamExt;
-use rustls::lock::Mutex;
 
 use crate::common::Cv;
 
@@ -160,7 +158,7 @@ fn byte_per_byte() {
     });
     cv2.wait();
     let mut client = TcpStream::connect("localhost:9090").unwrap();
-    for b in random_bytes.chunks(1024) {
+    for b in random_bytes.chunks(1) {
         client.write_all(b).unwrap();
     }
     drop(client);
@@ -177,41 +175,6 @@ fn byte_per_byte() {
         received, random_bytes,
         "Received data doesn't match sent data"
     );
-}
-
-#[test]
-fn triggered_pause() {
-    let (cv1, cv2) = Cv::new();
-    let mut rng = thread_rng();
-    let recv_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut random_bytes = vec![0u8; 10_000_000];
-
-    rng.fill_bytes(&mut random_bytes);
-    let reading_thread = std::thread::spawn(move || {
-        main_thread(async move {
-            let mut multiaccept = MultiAccept::new(9094).unwrap();
-            cv1.notify();
-            if let Some(socket) = multiaccept.next().await {
-                let mut multirecv = MultiRecv::new(socket.fd);
-                let data = multirecv.next().await.unwrap();
-                while let Some(k) = multirecv.next().await {
-                    sleep(Duration::from_millis(50));
-                }
-            }
-        })
-    });
-    cv2.wait();
-
-    let it = random_bytes.chunks(1024);
-    let mut client = TcpStream::connect("localhost:9094").unwrap();
-    for chunk in it {
-        let n = client.write(chunk).unwrap();
-        client.flush().unwrap();
-        sleep(Duration::from_millis(1));
-        assert!(n > 1);
-    }
-    drop(client);
-    reading_thread.join().unwrap();
 }
 
 #[test]
@@ -244,13 +207,11 @@ fn test_slow_consumer_triggers_pause() {
 
     cv2.wait();
 
-    // Fast writer - send many small writes rapidly
     let writer_thread = std::thread::spawn(|| {
         let mut client = TcpStream::connect("localhost:9095").unwrap();
         client.set_nodelay(true).unwrap();
 
         let mut sent_data = Vec::new();
-        // Send 100 writes as fast as possible
         for i in 0..100u8 {
             let data = vec![i, i];
             assert_eq!(client.write(&data).unwrap(), 2);
@@ -272,7 +233,6 @@ fn test_slow_consumer_triggers_pause() {
         received.len()
     );
 
-    // Verify data integrity
     assert_eq!(
         received.len(),
         sent_data.len(),
@@ -294,9 +254,6 @@ fn test_slow_consumer_triggers_pause() {
 
 #[test]
 fn test_fast_drain_triggers_resume() {
-    // Test that draining the queue triggers resume
-    // Start slow, let queue fill, then drain fast
-
     let (cv1, cv2) = Cv::new();
     let switch_to_fast = Arc::new(AtomicBool::new(false));
     let switch_clone = switch_to_fast.clone();

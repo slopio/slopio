@@ -53,6 +53,7 @@ impl TryFrom<MultishotCompletionEvent> for BorrowedBuffer {
 
     fn try_from(event: MultishotCompletionEvent) -> Result<Self, Self::Error> {
         if event.result <= 0 {
+            println!("{}", event.result);
             return Err(CompletionError::from_code(event.result, event.flags));
         }
         let len = event.result as usize;
@@ -162,4 +163,10 @@ impl IoOP for MultiRecv {
     }
 
     fn driver_cleanup(&mut self) {}
+}
+
+impl Drop for BorrowedBuffer {
+    fn drop(&mut self) {
+        IO_DRIVER.with(|d| d.recycle_buffer(&self.inner))
+    }
 }
