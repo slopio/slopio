@@ -11,11 +11,13 @@ use std::{
     time::Duration,
 };
 
+use rand::{RngCore, thread_rng};
 use runtime::{
-    io_driver::operations::sockets::{multi_accept::MultiAccept, multi_recv_bundle::MultiRecv},
+    io_driver::operations::sockets::{multi_accept::MultiAccept, multi_recv::MultiRecv},
     main_thread,
 };
 use runtime_streams::StreamExt;
+use rustls::lock::Mutex;
 
 use crate::common::Cv;
 
@@ -148,10 +150,7 @@ fn byte_per_byte() {
                 let mut received: Vec<u8> = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd);
                 while let Some(data) = multirecv.next().await {
-                    let o = data.as_parts().into_iter().flatten();
-                    for slc in o {
-                        received.extend_from_slice(slc);
-                    }
+                    received.extend_from_slice(data.as_ref());
                 }
                 Some(received)
             } else {
@@ -162,7 +161,7 @@ fn byte_per_byte() {
     cv2.wait();
     let mut client = TcpStream::connect("localhost:9090").unwrap();
     for b in random_bytes.chunks(1024) {
-        let _ = client.write(b).unwrap();
+        client.write_all(b).unwrap();
     }
     drop(client);
 
@@ -180,40 +179,40 @@ fn byte_per_byte() {
     );
 }
 
-// #[test]
-// fn triggered_pause() {
-//     let (cv1, cv2) = Cv::new();
-//     let mut rng = thread_rng();
-//     let recv_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-//     let mut random_bytes = vec![0u8; 10_000_000];
+#[test]
+fn triggered_pause() {
+    let (cv1, cv2) = Cv::new();
+    let mut rng = thread_rng();
+    let recv_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut random_bytes = vec![0u8; 10_000_000];
 
-//     rng.fill_bytes(&mut random_bytes);
-//     let reading_thread = std::thread::spawn(move || {
-//         main_thread(async move {
-//             let mut multiaccept = MultiAccept::new(9094).unwrap();
-//             cv1.notify();
-//             if let Some(socket) = multiaccept.next().await {
-//                 let mut multirecv = MultiRecv::new(socket.fd);
-//                 let data = multirecv.next().await.unwrap();
-//                 while let Some(k) = multirecv.next().await {
-//                     sleep(Duration::from_millis(50));
-//                 }
-//             }
-//         })
-//     });
-//     cv2.wait();
+    rng.fill_bytes(&mut random_bytes);
+    let reading_thread = std::thread::spawn(move || {
+        main_thread(async move {
+            let mut multiaccept = MultiAccept::new(9094).unwrap();
+            cv1.notify();
+            if let Some(socket) = multiaccept.next().await {
+                let mut multirecv = MultiRecv::new(socket.fd);
+                let data = multirecv.next().await.unwrap();
+                while let Some(k) = multirecv.next().await {
+                    sleep(Duration::from_millis(50));
+                }
+            }
+        })
+    });
+    cv2.wait();
 
-//     let it = random_bytes.chunks(1024);
-//     let mut client = TcpStream::connect("localhost:9094").unwrap();
-//     for chunk in it {
-//         let n = client.write(chunk).unwrap();
-//         client.flush().unwrap();
-//         sleep(Duration::from_millis(1));
-//         assert!(n > 1);
-//     }
-//     drop(client);
-//     reading_thread.join().unwrap();
-// }
+    let it = random_bytes.chunks(1024);
+    let mut client = TcpStream::connect("localhost:9094").unwrap();
+    for chunk in it {
+        let n = client.write(chunk).unwrap();
+        client.flush().unwrap();
+        sleep(Duration::from_millis(1));
+        assert!(n > 1);
+    }
+    drop(client);
+    reading_thread.join().unwrap();
+}
 
 #[test]
 fn test_slow_consumer_triggers_pause() {
@@ -224,17 +223,13 @@ fn test_slow_consumer_triggers_pause() {
             let mut multiaccept = MultiAccept::new(9095).unwrap();
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
-                let mut received = Vec::new();
+                let mut received: Vec<u8> = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd);
                 let mut recv_count = 0;
 
                 while let Some(data) = multirecv.next().await {
-                    let o = data.as_parts().into_iter().flatten();
-                    for slc in o {
-                        received.extend_from_slice(slc);
-                    }
                     recv_count += 1;
-
+                    received.extend_from_slice(data.as_ref());
                     if recv_count <= 70 {
                         std::thread::sleep(Duration::from_millis(50));
                     }
@@ -317,10 +312,7 @@ fn test_fast_drain_triggers_resume() {
                 let mut slow_phase_count = 0;
 
                 while let Some(data) = multirecv.next().await {
-                    let o = data.as_parts().into_iter().flatten();
-                    for slc in o {
-                        received.extend_from_slice(slc);
-                    }
+                    received.extend_from_slice(data.as_ref());
                     recv_count += 1;
 
                     // Slow phase: accumulate events to trigger pause

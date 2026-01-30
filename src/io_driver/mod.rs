@@ -13,7 +13,7 @@ use io_uring::{
     opcode, squeue,
     types::{Fd, Timespec},
 };
-use io_uring_rb::{RingBuffer, buffer::Buffer, buffers_range::BufferRange};
+use io_uring_rb::{RingBuffer, buffer::Buffer};
 use slab::Slab;
 
 use crate::{
@@ -139,6 +139,7 @@ impl MultiOpState {
         }
     }
     fn transition_to_paused(&mut self) {
+        println!("paused");
         if let MultiOpState::TringToPause {
             waker, fd, queue, ..
         } = self
@@ -152,6 +153,7 @@ impl MultiOpState {
     }
 
     fn transition_paused_to_sent(&mut self, new_waker: &Waker) {
+        println!("restarted");
         if let MultiOpState::Paused { fd, queue, .. } = self {
             *self = MultiOpState::Sent {
                 waker: new_waker.clone(),
@@ -162,6 +164,7 @@ impl MultiOpState {
     }
 
     fn transition_to_trying_to_pause(&mut self) {
+        println!("try pausing");
         match self {
             MultiOpState::Init { .. } => unreachable!("pause a non init ?"),
             MultiOpState::Sent { waker, fd, queue } => {
@@ -259,8 +262,8 @@ impl IODriver {
                         eprintln!("singleshot CQE invalid state: {}", msg);
                     }
                     SingleProcessResult::CancelledRecycling { id, len } => {
-                        let mut b = self.get_buffer_range(id, len as usize);
-                        self.return_buffer_range(&mut b);
+                        let b = self.get_buffer(id, len as usize);
+                        self.return_buffer(b);
                         slab.remove(completion_event.slab_index); //will never be polled
                     }
                 }
@@ -272,19 +275,14 @@ impl IODriver {
         IO_DRIVER.set(self, f)
     }
 
-    fn get_buffer_range(&self, id: u16, len: usize) -> BufferRange {
-        let ring_inner = unsafe { &*self.ring.get() };
-        ring_inner.buffer_ring.get_buffers_range(id, len).unwrap()
-    }
-
     fn get_buffer(&self, id: u16, len: usize) -> Buffer {
         let ring_inner = unsafe { &*self.ring.get() };
         ring_inner.buffer_ring.get_buffer(id, len).unwrap()
     }
 
-    fn return_buffer_range(&self, buffer_range: &mut BufferRange) {
+    fn return_buffer(&self, buffer: Buffer) {
         let ring_inner = unsafe { &*self.ring.get() };
-        ring_inner.buffer_ring.recycle_inner_range(buffer_range);
+        ring_inner.buffer_ring.recycle_buffer(&buffer);
     }
 
     pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> IoDriverToken {

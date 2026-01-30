@@ -1,5 +1,5 @@
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
-use io_uring_rb::{buffer::Buffer, buffers_range::BufferRange};
+use io_uring_rb::buffer::Buffer;
 use runtime_streams::Stream;
 use std::{
     pin::Pin,
@@ -48,7 +48,7 @@ impl CompletionError {
     }
 }
 
-impl TryFrom<MultishotCompletionEvent> for ReadRange {
+impl TryFrom<MultishotCompletionEvent> for BorrowedBuffer {
     type Error = CompletionError;
 
     fn try_from(event: MultishotCompletionEvent) -> Result<Self, Self::Error> {
@@ -57,48 +57,24 @@ impl TryFrom<MultishotCompletionEvent> for ReadRange {
         }
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
-        let inner = IO_DRIVER.with(|d| d.get_buffer_range(buffer_id, len));
-        Ok(ReadRange { inner })
+        let inner = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len));
+        Ok(BorrowedBuffer { inner })
     }
 }
 
-impl From<BufferRange> for ReadRange {
-    fn from(inner: BufferRange) -> Self {
-        Self { inner }
-    }
-}
-
-pub struct Read {
+pub struct BorrowedBuffer {
     inner: Buffer,
 }
 
-impl Read {
+impl BorrowedBuffer {
     pub fn from_buffer(inner: Buffer) -> Self {
         Self { inner }
     }
 }
 
-impl AsRef<[u8]> for Read {
+impl AsRef<[u8]> for BorrowedBuffer {
     fn as_ref(&self) -> &[u8] {
         self.inner.as_ref()
-    }
-}
-
-pub struct ReadRange {
-    inner: BufferRange,
-}
-
-impl Drop for ReadRange {
-    fn drop(&mut self) {
-        let inner = &mut self.inner;
-        IO_DRIVER.with(|d| d.return_buffer_range(inner));
-    }
-}
-
-impl ReadRange {
-    pub fn as_parts(&self) -> [Option<&[u8]>; 2] {
-        let parts = self.inner.as_parts();
-        [Some(parts.0), parts.1]
     }
 }
 
@@ -123,7 +99,7 @@ impl Drop for MultiRecv {
 impl Unpin for MultiRecv {}
 
 impl MultiRecv {
-    fn try_drain_one(&mut self) -> Poll<Option<ReadRange>> {
+    fn try_drain_one(&mut self) -> Poll<Option<BorrowedBuffer>> {
         while let Some(completion_event) = self.reads.pop() {
             match completion_event.try_into() {
                 Ok(r) => return Poll::Ready(Some(r)),
@@ -136,7 +112,7 @@ impl MultiRecv {
 }
 
 impl Stream for MultiRecv {
-    type Item = ReadRange;
+    type Item = BorrowedBuffer;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // First try to drain from local queue
@@ -182,16 +158,8 @@ impl IoOP for MultiRecv {
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMultiBundle::new(Fd(self.fd), 0).build()
+        opcode::RecvMulti::new(Fd(self.fd), 0).build()
     }
 
     fn driver_cleanup(&mut self) {}
 }
-
-// impl MultiAsyncRead for SocketWrapper {
-//     type MultiRecv = MultiRecv;
-
-//     fn multi_recv(&self) -> Self::MultiRecv {
-//         MultiRecv::new(self.fd)
-//     }
-// }

@@ -3,7 +3,7 @@ use libc::c_int;
 pub mod managed_recv;
 pub mod managed_recv_bundle;
 pub mod multi_accept;
-pub mod multi_recv_bundle;
+pub mod multi_recv;
 pub mod recv;
 pub mod send;
 

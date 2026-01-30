@@ -1,12 +1,26 @@
-use std::{fs::File, io::BufReader};
+use std::{fs::File, io::BufReader, sync::Arc};
 
 use rustls::{
     ClientConfig, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 
-pub static mut TLS_SERV_CONFIG: *const ServerConfig = std::ptr::null();
-pub static mut TLS_CLIENT_CONFIG: *const ClientConfig = std::ptr::null();
+static TLS_SERV_CONFIG: std::sync::OnceLock<Arc<ServerConfig>> = std::sync::OnceLock::new();
+static TLS_CLIENT_CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
+
+pub fn tls_serv_config() -> Arc<ServerConfig> {
+    TLS_SERV_CONFIG
+        .get()
+        .expect("TLS_SERV_CONFIG not initialized")
+        .clone()
+}
+
+pub fn tls_client_config() -> Arc<ClientConfig> {
+    TLS_CLIENT_CONFIG
+        .get()
+        .expect("TLS_CLIENT_CONFIG not initialized")
+        .clone()
+}
 
 fn load_ca(path: &str) -> Vec<CertificateDer<'static>> {
     let file = File::open(path).expect("cannot open CA file");
@@ -39,11 +53,7 @@ pub fn serv_static_init() {
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .expect("bad cert/key");
-    let config = Box::leak(Box::new(config));
-    unsafe {
-        TLS_SERV_CONFIG = config;
-        assert!(!TLS_SERV_CONFIG.is_null());
-    }
+    let _ = TLS_SERV_CONFIG.set(Arc::new(config));
 }
 
 pub fn client_static_init() {
@@ -57,9 +67,5 @@ pub fn client_static_init() {
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    let config = Box::leak(Box::new(config));
-    unsafe {
-        TLS_CLIENT_CONFIG = config;
-        assert!(!TLS_CLIENT_CONFIG.is_null());
-    }
+    let _ = TLS_CLIENT_CONFIG.set(Arc::new(config));
 }

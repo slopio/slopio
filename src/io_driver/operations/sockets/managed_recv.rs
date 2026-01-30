@@ -8,7 +8,7 @@ use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER, OpMetadata,
-    operations::sockets::{SocketWrapper, multi_recv_bundle::Read},
+    operations::sockets::{SocketWrapper, multi_recv::BorrowedBuffer},
 };
 
 pub struct ManagedRecv {
@@ -37,7 +37,7 @@ impl ManagedRecv {
     }
 }
 
-impl TryFrom<OpMetadata> for Read {
+impl TryFrom<OpMetadata> for BorrowedBuffer {
     type Error = std::io::Error;
 
     fn try_from(event: OpMetadata) -> Result<Self, Self::Error> {
@@ -47,12 +47,12 @@ impl TryFrom<OpMetadata> for Read {
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
         let inner = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len));
-        Ok(Read::from_buffer(inner))
+        Ok(BorrowedBuffer::from_buffer(inner))
     }
 }
 
 impl Future for ManagedRecv {
-    type Output = std::io::Result<Read>;
+    type Output = std::io::Result<BorrowedBuffer>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.id.is_none() {
@@ -66,7 +66,7 @@ impl Future for ManagedRecv {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
-                Poll::Ready(Read::try_from(io_result))
+                Poll::Ready(BorrowedBuffer::try_from(io_result))
             }
         }
     }
