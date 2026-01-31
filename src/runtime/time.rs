@@ -44,7 +44,6 @@ impl Drop for Sleep {
 
 impl TimeDriver {
     pub fn tick(&self) {
-        eprintln!("[DEBUG] TimeDriver::tick() called");
         let this = unsafe { &mut *self.inner.get() };
         this.tick();
     }

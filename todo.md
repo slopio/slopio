@@ -10,6 +10,8 @@
 - better shutdown (how can it be graceful ?)
 
 
+align io buffers 64 for vectorization
+
 BUFFERMORE
 
 

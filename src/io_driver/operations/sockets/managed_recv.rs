@@ -31,7 +31,8 @@ impl ManagedRecv {
     fn register_to_driver(&mut self) {
         let entry = opcode::Recv::new(Fd(self.fd), null::<u8>() as _, 0)
             .buf_group(0)
-            .build();
+            .build()
+            .flags(io_uring::squeue::Flags::BUFFER_SELECT);
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token as usize);
     }

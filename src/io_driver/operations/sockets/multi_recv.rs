@@ -79,6 +79,12 @@ impl AsRef<[u8]> for BorrowedBuffer {
     }
 }
 
+impl AsMut<[u8]> for BorrowedBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.inner.as_mut()
+    }
+}
+
 impl MultiRecv {
     pub fn new(fd: i32) -> Self {
         let mut multi_recv = Self {

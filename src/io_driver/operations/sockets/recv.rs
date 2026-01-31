@@ -1,6 +1,7 @@
 use io_uring::opcode::{self};
 use io_uring::types::Fd;
 use std::future::Future;
+use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -11,12 +12,12 @@ use super::SocketWrapper;
 pub struct ClassicRecv<'a> {
     fd: i32,
     id: Option<usize>,
-    buffer: &'a mut [u8],
+    buffer: &'a mut [MaybeUninit<u8>],
     len: usize,
 }
 
 impl<'a> ClassicRecv<'a> {
-    fn from_socket(socket: &SocketWrapper, buffer: &'a mut [u8], len: usize) -> Self {
+    fn from_socket(socket: &SocketWrapper, buffer: &'a mut [MaybeUninit<u8>], len: usize) -> Self {
         Self {
             fd: socket.fd(),
             id: None,
@@ -26,8 +27,12 @@ impl<'a> ClassicRecv<'a> {
     }
 
     fn register_to_driver(&mut self) {
-        let entry =
-            opcode::Recv::new(Fd(self.fd), self.buffer.as_mut_ptr(), self.len as u32).build();
+        let entry = opcode::Recv::new(
+            Fd(self.fd),
+            self.buffer.as_mut_ptr().cast::<u8>(),
+            self.len as u32,
+        )
+        .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token as usize);
     }
@@ -35,10 +40,23 @@ impl<'a> ClassicRecv<'a> {
 
 pub fn socket_recv<'a>(
     socket: &SocketWrapper,
-    buffer: &'a mut [u8],
+    buffer: &'a mut [MaybeUninit<u8>],
     len: usize,
 ) -> ClassicRecv<'a> {
     ClassicRecv::<'a>::from_socket(socket, buffer, len)
+}
+
+/// Convenience wrapper that accepts an initialized `[u8]` slice.
+/// Use `socket_recv` with `MaybeUninit` for zero-cost uninitialized buffers.
+pub fn socket_recv_init<'a>(
+    socket: &SocketWrapper,
+    buffer: &'a mut [u8],
+    len: usize,
+) -> ClassicRecv<'a> {
+    // SAFETY: MaybeUninit<u8> has the same layout as u8, and the buffer is already initialized
+    let uninit_buffer: &'a mut [MaybeUninit<u8>] =
+        unsafe { &mut *(buffer as *mut [u8] as *mut [MaybeUninit<u8>]) };
+    ClassicRecv::<'a>::from_socket(socket, uninit_buffer, len)
 }
 
 impl<'a> Future for ClassicRecv<'a> {

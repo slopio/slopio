@@ -1,5 +1,5 @@
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime::io_driver::operations::sockets::recv::socket_recv;
+use runtime::io_driver::operations::sockets::recv::socket_recv_init as socket_recv;
 use runtime::io_driver::operations::sockets::send::socket_send;
 use runtime::main_thread;
 use runtime::runtime::spawn;
