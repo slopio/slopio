@@ -15,6 +15,11 @@ align io buffers 64 for vectorization
 BUFFERMORE
 
 
+test http3 with : 
+/snap/bin/curl --http3 -k https://localhost:4433/{1,2,3} --parallel
+
+
+
 mimaloc : 
 MIMALLOC_LARGE_OS_PAGES=1 \
 MIMALLOC_PAGE_RESET=0 \
