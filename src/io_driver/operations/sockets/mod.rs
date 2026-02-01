@@ -6,6 +6,7 @@ pub mod multi_accept;
 pub mod multi_recv;
 pub mod recv;
 pub mod send;
+pub mod udp;
 
 #[derive(Debug)]
 pub struct SocketWrapper {

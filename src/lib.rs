@@ -10,7 +10,8 @@ pub mod io_driver;
 mod macros;
 pub mod runtime;
 mod task;
-// pub mod tls;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
