@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::io_driver::{
-    IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent, operations::IoOP,
+    BUFFER_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
+    operations::IoOP,
 };
 
 pub struct MultiRecv {
@@ -64,11 +65,11 @@ impl TryFrom<MultishotCompletionEvent> for BorrowedBuffer {
 }
 
 pub struct BorrowedBuffer {
-    inner: Buffer,
+    inner: Buffer<BUFFER_SIZE>,
 }
 
 impl BorrowedBuffer {
-    pub fn from_buffer(inner: Buffer) -> Self {
+    pub fn from_buffer(inner: Buffer<BUFFER_SIZE>) -> Self {
         Self { inner }
     }
 }
@@ -122,7 +123,6 @@ impl Stream for MultiRecv {
     type Item = BorrowedBuffer;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // First try to drain from local queue
         if let Poll::Ready(result) = self.try_drain_one() {
             return Poll::Ready(result);
         }

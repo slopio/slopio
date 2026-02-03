@@ -275,12 +275,12 @@ impl IODriver {
         IO_DRIVER.set(self, f)
     }
 
-    fn get_buffer(&self, id: u16, len: usize) -> Buffer {
+    fn get_buffer(&self, id: u16, len: usize) -> Buffer<BUFFER_SIZE> {
         let ring_inner = unsafe { &*self.ring.get() };
         ring_inner.buffer_ring.get_buffer(id, len).unwrap()
     }
 
-    fn recycle_buffer(&self, buffer: &Buffer) {
+    fn recycle_buffer(&self, buffer: &Buffer<BUFFER_SIZE>) {
         println!("recyling");
         let ring_inner = unsafe { &*self.ring.get() };
         ring_inner.buffer_ring.recycle_buffer(&buffer);

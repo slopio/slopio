@@ -63,6 +63,16 @@ pub struct UdpPacket {
     pub addr: SocketAddr,
 }
 
+impl UdpPacket {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
 impl<'a> Future for UdpRecvFrom<'a> {
     type Output = std::io::Result<UdpPacket>;
 
