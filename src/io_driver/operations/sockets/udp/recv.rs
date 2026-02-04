@@ -59,16 +59,20 @@ impl<'a> UdpRecvFrom<'a> {
 }
 
 pub struct UdpPacket {
-    pub len: usize,
-    pub addr: SocketAddr,
+    len: usize,
+    addr: SocketAddr,
 }
 
 impl UdpPacket {
-    fn len(&self) -> usize {
-        self.len()
+    pub fn len(&self) -> usize {
+        self.len
     }
 
-    fn addr(&self) -> SocketAddr {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 }

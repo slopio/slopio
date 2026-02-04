@@ -9,8 +9,8 @@ fn main() {
         loop {
             let packet = udp.recv_from(&mut buffer).await.unwrap();
             let data =
-                unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), packet.len) };
-            udp.send_to(data, packet.addr).await.unwrap();
+                unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), packet.len()) };
+            udp.send_to(data, packet.addr()).await.unwrap();
         }
     });
 }
