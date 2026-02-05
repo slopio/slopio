@@ -19,7 +19,7 @@ use slab::Slab;
 use crate::{
     io_driver::{
         completion_events::{
-            CANCEL_OP_FLAG, CompletionEvent, Event, MULTI_OP_FLAG, MultiProcessResult,
+            CompletionEvent, Event, IGNORED_FLAG, MULTI_OP_FLAG, MultiProcessResult,
             SingleProcessResult, process_multi, process_single,
         },
         operations::IoDriverToken,
@@ -28,6 +28,9 @@ use crate::{
 };
 mod completion_events;
 pub mod operations;
+mod sending_buffers;
+
+pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
 pub const RING_SIZE: u16 = 1024;
 pub const BUFFER_SIZE: u32 = 4096;
@@ -39,6 +42,7 @@ pub struct IODriver {
     ring: UnsafeCell<Ring>,
     slab: Rc<UnsafeCell<Slab<SingleOpState>>>,
     multishot_slab: Rc<UnsafeCell<Slab<MultiOpState>>>,
+    sending_buffers: SendingBufferPool,
     shutting_down: Cell<bool>,
 }
 
@@ -268,6 +272,15 @@ impl IODriver {
                     }
                 }
             }
+            Event::SendBuffer(result) => {
+                if result < 0 {
+                    eprintln!(
+                        "sendmsg failed: {}",
+                        std::io::Error::from_raw_os_error(-result)
+                    );
+                }
+                self.sending_buffers.release(completion_event.slab_index);
+            }
         }
     }
 
@@ -295,6 +308,11 @@ impl IODriver {
         user_data
     }
 
+    pub fn push_anon_op(&self, entry: squeue::Entry) {
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        ring_inner.add(&entry)
+    }
+
     pub fn push_op(&self, mut entry: squeue::Entry) -> IoDriverToken {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
@@ -310,7 +328,7 @@ impl IODriver {
         let entry = io_uring::opcode::Timeout::new(time)
             .count(1)
             .build()
-            .user_data(CANCEL_OP_FLAG);
+            .user_data(IGNORED_FLAG);
         let ring_inner = unsafe { &mut *self.ring.get() };
         ring_inner.add(&entry);
     }
@@ -422,7 +440,7 @@ impl IODriver {
         let ring_inner = unsafe { &mut *self.ring.get() };
         let cancel_op = opcode::AsyncCancel::new(id)
             .build()
-            .user_data(id | CANCEL_OP_FLAG);
+            .user_data(id | IGNORED_FLAG);
         ring_inner.add(&cancel_op);
     }
 
@@ -430,7 +448,7 @@ impl IODriver {
         let ring_inner = unsafe { &mut *self.ring.get() };
         let cancel_op = opcode::AsyncCancel::new(id)
             .build()
-            .user_data(id | MULTI_OP_FLAG | CANCEL_OP_FLAG);
+            .user_data(id | MULTI_OP_FLAG | IGNORED_FLAG);
         ring_inner.add(&cancel_op);
     }
 
@@ -453,6 +471,11 @@ impl IODriver {
         ring.add(&entry);
 
         true
+    }
+
+    /// Returns a reference to the sending buffer pool.
+    pub fn sending_buffers(&self) -> &SendingBufferPool {
+        &self.sending_buffers
     }
 }
 

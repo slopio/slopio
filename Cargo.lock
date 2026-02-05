@@ -626,6 +626,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "async_timers",
+ "bytes",
  "io-uring",
  "io_uring_rb",
  "libc",

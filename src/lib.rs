@@ -9,6 +9,7 @@ mod buffers;
 pub mod channels;
 pub mod io_driver;
 mod macros;
+pub mod quic;
 pub mod runtime;
 mod task;
 #[cfg(feature = "tls")]

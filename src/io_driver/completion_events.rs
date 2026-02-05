@@ -4,7 +4,8 @@ use libc::ECANCELED;
 use super::{MultiOpState, MultishotCompletionEvent, OpMetadata, SingleOpState};
 
 pub(crate) const MULTI_OP_FLAG: u64 = 1u64 << 63;
-pub(crate) const CANCEL_OP_FLAG: u64 = 1u64 << 62;
+pub(crate) const IGNORED_FLAG: u64 = 1u64 << 62;
+pub(crate) const SEND_BUFFER_FLAG: u64 = 1u64 << 61;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Data {
@@ -25,6 +26,7 @@ impl From<Entry> for Data {
 pub(crate) enum Event {
     SingleShot(Data),
     MultiShot(Data),
+    SendBuffer(i32),
 }
 
 #[derive(Debug)]
@@ -37,13 +39,18 @@ impl CompletionEvent {
     pub fn from_entry(entry: Entry) -> Option<Self> {
         let user_data = entry.user_data();
 
-        if user_data & CANCEL_OP_FLAG != 0 {
+        if user_data & IGNORED_FLAG != 0 {
             return None;
         }
 
         let data = Data::from(entry);
 
-        if user_data & MULTI_OP_FLAG != 0 {
+        if user_data & SEND_BUFFER_FLAG != 0 {
+            Some(CompletionEvent {
+                slab_index: (user_data & !(SEND_BUFFER_FLAG)) as usize,
+                event: Event::SendBuffer(data.result),
+            })
+        } else if user_data & MULTI_OP_FLAG != 0 {
             Some(CompletionEvent {
                 slab_index: user_data as usize,
                 event: Event::MultiShot(data),
@@ -174,11 +181,11 @@ mod tests {
 
     #[test]
     fn test_flag_constants() {
-        assert_eq!(MULTI_OP_FLAG & CANCEL_OP_FLAG, 0);
+        assert_eq!(MULTI_OP_FLAG & IGNORED_FLAG, 0);
 
-        let combined = MULTI_OP_FLAG | CANCEL_OP_FLAG;
+        let combined = MULTI_OP_FLAG | IGNORED_FLAG;
         assert!(combined & MULTI_OP_FLAG != 0);
-        assert!(combined & CANCEL_OP_FLAG != 0);
+        assert!(combined & IGNORED_FLAG != 0);
 
         let slab_index: u64 = 42;
         let user_data = slab_index | MULTI_OP_FLAG;
