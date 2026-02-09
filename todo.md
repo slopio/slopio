@@ -9,6 +9,7 @@
 - macros to generalize select/join for n Futures.
 - better shutdown (how can it be graceful ?)
 
+constant time in the event loop -> needs to improve the time driver.
 
 align io buffers 64 for vectorization
 

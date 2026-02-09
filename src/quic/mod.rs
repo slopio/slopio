@@ -5,14 +5,16 @@ use std::{
 
 use bytes::Bytes;
 
-use io_uring::opcode;
 use tquic::{
     Config, Connection, Endpoint, PacketInfo, PacketSendHandler, TlsConfig, TlsConfigSelector,
     TransportHandler,
-    h3::{Header, Http3Config, Http3Error, Http3Event, NameValue, connection::Http3Connection},
+    h3::{Header, Http3Config, Http3Error, Http3Event, connection::Http3Connection},
 };
 
 use crate::io_driver::{IO_DRIVER, operations::sockets::udp::UdpSocket};
+use crate::runtime::spawn;
+mod process_request;
+use process_request::Http3Request;
 
 pub struct Http3Server {
     endpoint: Endpoint,
@@ -21,7 +23,7 @@ pub struct Http3Server {
 }
 
 impl Http3Server {
-    pub async fn recv(&mut self) {
+    async fn recv(&mut self) {
         let mut buffer = [MaybeUninit::uninit(); 1500];
         let datagram = self.socket.recv_from(&mut buffer).await.unwrap();
         let data = unsafe {
@@ -36,8 +38,13 @@ impl Http3Server {
         self.endpoint.recv(data, &info).unwrap();
         self.endpoint.process_connections().unwrap();
 
-        // Process HTTP/3 events for all connections
         self.handler.borrow_mut().process_http3();
+    }
+
+    pub async fn run(mut self) {
+        loop {
+            self.recv().await;
+        }
     }
 
     pub fn build() -> Self {
@@ -98,14 +105,49 @@ impl Response {
 }
 
 /// Per-connection state holding the Http3Connection
-struct ConnectionState {
+pub(super) struct ConnectionState {
     h3_conn: Http3Connection,
     conn_ptr: *mut Connection,
 }
 
+impl ConnectionState {
+    pub fn send_response(&mut self, stream_id: u64, response: Response) {
+        let conn = unsafe { &mut *self.conn_ptr };
+
+        let mut headers = vec![Header::new(
+            b":status",
+            response.status.to_string().as_bytes(),
+        )];
+
+        for (name, value) in &response.headers {
+            headers.push(Header::new(name.as_bytes(), value.as_bytes()));
+        }
+
+        let has_body = !response.body.is_empty();
+
+        if let Err(e) = self
+            .h3_conn
+            .send_headers(conn, stream_id, &headers, !has_body)
+        {
+            println!("Failed to send headers: {:?}", e);
+            return;
+        }
+
+        if has_body
+            && let Err(e) =
+                self.h3_conn
+                    .send_body(conn, stream_id, Bytes::from(response.body), true)
+        {
+            println!("Failed to send body: {:?}", e);
+        }
+    }
+}
+
 struct Handler {
     h3_config: Http3Config,
-    connections: HashMap<u64, ConnectionState>,
+    connections: HashMap<u64, Rc<RefCell<ConnectionState>>>,
+    /// Maps stream_id to slab index in STREAM_SLAB
+    streams: HashMap<u64, usize>,
 }
 
 impl Handler {
@@ -113,37 +155,51 @@ impl Handler {
         Self {
             h3_config: Http3Config::new().unwrap(),
             connections: HashMap::new(),
+            streams: HashMap::new(),
         }
     }
 
     fn process_http3(&mut self) {
-        for (_, state) in self.connections.iter_mut() {
+        for (_, conn_state) in self.connections.iter() {
+            let mut state = conn_state.borrow_mut();
             let conn = unsafe { &mut *state.conn_ptr };
 
             loop {
                 match state.h3_conn.poll(conn) {
                     Ok((stream_id, Http3Event::Headers { headers, fin })) => {
-                        let request = Self::parse_request(&headers);
-                        println!("HTTP/3 request: {} {}", request.method, request.path);
+                        let slab_id = process_request::insert(&headers, fin);
+                        self.streams.insert(stream_id, slab_id);
 
-                        // Send response
-                        let response = Self::handle_request(&request);
-                        Self::send_response(&mut state.h3_conn, conn, stream_id, response);
+                        let conn_state = conn_state.clone();
+                        spawn(async move {
+                            let request = Http3Request::new(slab_id).await;
+                            process_request::remove(slab_id);
+                            println!("HTTP/3 request: {} {}", request.method, request.path);
+                            let response = Self::handle_request(&request);
+                            conn_state.borrow_mut().send_response(stream_id, response);
+                        });
                     }
                     Ok((stream_id, Http3Event::Data)) => {
-                        let mut buf = [0u8; 4096];
-                        while let Ok(len) = state.h3_conn.recv_body(conn, stream_id, &mut buf) {
-                            if len == 0 {
-                                break;
+                        if let Some(&slab_id) = self.streams.get(&stream_id) {
+                            let mut buf = [0u8; 4096];
+                            while let Ok(len) = state.h3_conn.recv_body(conn, stream_id, &mut buf) {
+                                if len == 0 {
+                                    break;
+                                }
+                                process_request::on_data(slab_id, &buf[..len]);
                             }
-                            // Process body data here if needed
                         }
                     }
                     Ok((stream_id, Http3Event::Finished)) => {
-                        println!("Stream {} finished", stream_id);
+                        if let Some(slab_id) = self.streams.remove(&stream_id) {
+                            process_request::on_finished(slab_id);
+                        }
                     }
-                    Ok((_, Http3Event::Reset(err))) => {
-                        println!("Stream reset: {}", err);
+                    Ok((stream_id, Http3Event::Reset(err))) => {
+                        println!("Stream {} reset: {}", stream_id, err);
+                        if let Some(slab_id) = self.streams.remove(&stream_id) {
+                            process_request::remove(slab_id);
+                        }
                     }
                     Ok((_, Http3Event::GoAway)) => {
                         println!("GoAway received");
@@ -159,35 +215,7 @@ impl Handler {
         }
     }
 
-    fn parse_request(headers: &[Header]) -> Request {
-        let mut method = String::new();
-        let mut path = String::new();
-        let mut req_headers = Vec::new();
-
-        for h in headers {
-            let name = String::from_utf8_lossy(h.name()).to_string();
-            let value = String::from_utf8_lossy(h.value()).to_string();
-
-            match name.as_str() {
-                ":method" => method = value,
-                ":path" => path = value,
-                _ if !name.starts_with(':') => {
-                    req_headers.push((name, value));
-                }
-                _ => {}
-            }
-        }
-
-        Request {
-            method,
-            path,
-            headers: req_headers,
-            body: Vec::new(),
-        }
-    }
-
     fn handle_request(request: &Request) -> Response {
-        // Simple router - customize as needed
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/") => Response::new(200)
                 .header("content-type", "text/plain")
@@ -197,38 +225,8 @@ impl Handler {
                 .body("Not Found"),
         }
     }
-
-    fn send_response(
-        h3_conn: &mut Http3Connection,
-        conn: &mut Connection,
-        stream_id: u64,
-        response: Response,
-    ) {
-        let mut headers = vec![Header::new(
-            b":status",
-            response.status.to_string().as_bytes(),
-        )];
-
-        for (name, value) in &response.headers {
-            headers.push(Header::new(name.as_bytes(), value.as_bytes()));
-        }
-
-        let has_body = !response.body.is_empty();
-
-        if let Err(e) = h3_conn.send_headers(conn, stream_id, &headers, !has_body) {
-            println!("Failed to send headers: {:?}", e);
-            return;
-        }
-
-        if has_body {
-            if let Err(e) = h3_conn.send_body(conn, stream_id, Bytes::from(response.body), true) {
-                println!("Failed to send body: {:?}", e);
-            }
-        }
-    }
 }
 
-/// Bridge to forward TransportHandler events to our Handler
 struct HandlerBridge(Rc<RefCell<Handler>>);
 
 impl TransportHandler for HandlerBridge {
@@ -239,16 +237,15 @@ impl TransportHandler for HandlerBridge {
 
         let mut handler = self.0.borrow_mut();
 
-        // Create HTTP/3 connection wrapping the QUIC connection
         match Http3Connection::new_with_quic_conn(conn, &handler.h3_config) {
             Ok(h3_conn) => {
                 let key = conn as *mut Connection as u64;
                 handler.connections.insert(
                     key,
-                    ConnectionState {
+                    Rc::new(RefCell::new(ConnectionState {
                         h3_conn,
                         conn_ptr: conn as *mut Connection,
-                    },
+                    })),
                 );
             }
             Err(e) => {
