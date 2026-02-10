@@ -1,6 +1,13 @@
 use std::{
-    cell::RefCell, collections::HashMap, mem::MaybeUninit, net::SocketAddr, os::fd::RawFd, rc::Rc,
-    str::FromStr, sync::Arc, time::Instant,
+    cell::{RefCell, UnsafeCell},
+    collections::{HashMap, VecDeque},
+    mem::MaybeUninit,
+    net::SocketAddr,
+    os::fd::RawFd,
+    rc::Rc,
+    str::FromStr,
+    sync::Arc,
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -107,6 +114,7 @@ impl Response {
 /// Per-connection state holding the Http3Connection
 pub(super) struct ConnectionState {
     h3_conn: Http3Connection,
+    streams: HashMap<u64, usize>,
     conn_ptr: *mut Connection,
 }
 
@@ -145,9 +153,8 @@ impl ConnectionState {
 
 struct Handler {
     h3_config: Http3Config,
-    connections: HashMap<u64, Rc<RefCell<ConnectionState>>>,
-    /// Maps stream_id to slab index in STREAM_SLAB
-    streams: HashMap<u64, usize>,
+    connections: HashMap<u64, Rc<UnsafeCell<ConnectionState>>>,
+    connections_to_check: VecDeque<u64>,
 }
 
 impl Handler {
@@ -155,20 +162,22 @@ impl Handler {
         Self {
             h3_config: Http3Config::new().unwrap(),
             connections: HashMap::new(),
-            streams: HashMap::new(),
+            connections_to_check: VecDeque::new(),
         }
     }
 
     fn process_http3(&mut self) {
-        for (_, conn_state) in self.connections.iter() {
-            let mut state = conn_state.borrow_mut();
+        while let Some(key) = self.connections_to_check.pop_front() {
+            let Some(conn_state) = self.connections.get(&key) else {
+                continue;
+            };
+            let state = unsafe { &mut *conn_state.get() };
             let conn = unsafe { &mut *state.conn_ptr };
-
             loop {
                 match state.h3_conn.poll(conn) {
                     Ok((stream_id, Http3Event::Headers { headers, fin })) => {
                         let slab_id = process_request::insert(&headers, fin);
-                        self.streams.insert(stream_id, slab_id);
+                        state.streams.insert(stream_id, slab_id);
 
                         let conn_state = conn_state.clone();
                         spawn(async move {
@@ -176,11 +185,12 @@ impl Handler {
                             process_request::remove(slab_id);
                             println!("HTTP/3 request: {} {}", request.method, request.path);
                             let response = Self::handle_request(&request);
-                            conn_state.borrow_mut().send_response(stream_id, response);
+                            let state = unsafe { &mut *conn_state.get() };
+                            state.send_response(stream_id, response);
                         });
                     }
                     Ok((stream_id, Http3Event::Data)) => {
-                        if let Some(&slab_id) = self.streams.get(&stream_id) {
+                        if let Some(&slab_id) = state.streams.get(&stream_id) {
                             let mut buf = [0u8; 4096];
                             while let Ok(len) = state.h3_conn.recv_body(conn, stream_id, &mut buf) {
                                 if len == 0 {
@@ -191,13 +201,13 @@ impl Handler {
                         }
                     }
                     Ok((stream_id, Http3Event::Finished)) => {
-                        if let Some(slab_id) = self.streams.remove(&stream_id) {
+                        if let Some(slab_id) = state.streams.remove(&stream_id) {
                             process_request::on_finished(slab_id);
                         }
                     }
                     Ok((stream_id, Http3Event::Reset(err))) => {
                         println!("Stream {} reset: {}", stream_id, err);
-                        if let Some(slab_id) = self.streams.remove(&stream_id) {
+                        if let Some(slab_id) = state.streams.remove(&stream_id) {
                             process_request::remove(slab_id);
                         }
                     }
@@ -242,9 +252,10 @@ impl TransportHandler for HandlerBridge {
                 let key = conn as *mut Connection as u64;
                 handler.connections.insert(
                     key,
-                    Rc::new(RefCell::new(ConnectionState {
+                    Rc::new(UnsafeCell::new(ConnectionState {
                         h3_conn,
                         conn_ptr: conn as *mut Connection,
+                        streams: HashMap::new(),
                     })),
                 );
             }
@@ -261,9 +272,24 @@ impl TransportHandler for HandlerBridge {
     }
 
     fn on_stream_created(&mut self, _conn: &mut Connection, _stream_id: u64) {}
-    fn on_stream_readable(&mut self, _conn: &mut Connection, _stream_id: u64) {}
+    fn on_stream_readable(&mut self, conn: &mut Connection, _stream_id: u64) {
+        let key = conn as *mut Connection as u64;
+        let mut handler = self.0.borrow_mut();
+        if !handler.connections_to_check.contains(&key) {
+            handler.connections_to_check.push_back(key);
+        }
+    }
     fn on_stream_writable(&mut self, _conn: &mut Connection, _stream_id: u64) {}
-    fn on_stream_closed(&mut self, _conn: &mut Connection, _stream_id: u64) {}
+    fn on_stream_closed(&mut self, conn: &mut Connection, stream_id: u64) {
+        let key = conn as *mut Connection as u64;
+        let handler = self.0.borrow();
+        if let Some(conn_state) = handler.connections.get(&key) {
+            let state = unsafe { &mut *conn_state.get() };
+            if let Some(slab_id) = state.streams.remove(&stream_id) {
+                process_request::remove(slab_id);
+            }
+        }
+    }
     fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}
 }
 
