@@ -1,6 +1,8 @@
+mod multi_recv;
 mod recv;
 mod send;
 
+pub use multi_recv::{UdpDatagram, UdpMultiRecv};
 pub use recv::{UdpPacket, UdpRecvFrom};
 pub use send::UdpSendTo;
 

@@ -5,7 +5,6 @@ use libc::cpu_set_t;
 
 use crate::runtime::eventfd;
 
-mod buffers;
 pub mod channels;
 pub mod io_driver;
 mod macros;

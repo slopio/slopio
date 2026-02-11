@@ -1,9 +1,9 @@
 use std::{
     cell::{RefCell, UnsafeCell},
     collections::{HashMap, VecDeque},
-    mem::MaybeUninit,
     net::SocketAddr,
     os::fd::RawFd,
+    ptr::NonNull,
     rc::Rc,
     str::FromStr,
     sync::Arc,
@@ -18,47 +18,46 @@ use tquic::{
     h3::{Header, Http3Config, Http3Error, Http3Event, connection::Http3Connection},
 };
 
-use crate::io_driver::{IO_DRIVER, operations::sockets::udp::UdpSocket};
+use runtime_streams::StreamExt;
+
+use crate::io_driver::{
+    IO_DRIVER,
+    operations::sockets::udp::{UdpMultiRecv, UdpSocket},
+};
 use crate::runtime::spawn;
 mod process_request;
 use process_request::Http3Request;
 
 pub struct Http3Server {
     endpoint: Endpoint,
-    socket: Rc<UdpSocket>,
+    socket: UdpSocket,
     handler: Rc<RefCell<Handler>>,
 }
 
 impl Http3Server {
-    async fn recv(&mut self) {
-        let mut buffer = [MaybeUninit::uninit(); 1500];
-        let datagram = self.socket.recv_from(&mut buffer).await.unwrap();
-        let data = unsafe {
-            std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), datagram.len())
-        };
-        let info = PacketInfo {
-            src: datagram.addr(),
-            time: Instant::now(),
-            dst: SocketAddr::from_str("0.0.0.0:4433").unwrap(),
-        };
-
-        self.endpoint.recv(data, &info).unwrap();
-        self.endpoint.process_connections().unwrap();
-
-        self.handler.borrow_mut().process_http3();
-    }
-
     pub async fn run(mut self) {
-        loop {
-            self.recv().await;
+        let mut recv = UdpMultiRecv::new(self.socket.fd());
+        while let Some(datagram) = recv.next().await {
+            let info = PacketInfo {
+                src: datagram.addr(),
+                time: Instant::now(),
+                dst: SocketAddr::from_str("0.0.0.0:4433").unwrap(),
+            };
+            self.endpoint
+                .recv(&mut datagram.payload().to_vec(), &info)
+                .unwrap();
+            self.endpoint.process_connections().unwrap();
+
+            self.handler.borrow_mut().process_http3();
         }
     }
 
     pub fn build() -> Self {
-        let udp = Rc::new(UdpSocket::bind(4433).unwrap());
+        let udp = UdpSocket::bind(4433).unwrap();
         let mut config = Box::new(Config::new().unwrap());
+        let tls = Tls::new();
 
-        config.set_tls_config_selector(Arc::new(Tls {}));
+        config.set_tls_config_selector(Arc::new(tls));
         let handler = Rc::new(RefCell::new(Handler::new()));
         let sender = Rc::new(Sender { fd: udp.fd() });
         let endpoint = Endpoint::new(
@@ -77,7 +76,7 @@ impl Http3Server {
 }
 
 /// HTTP/3 request representation
-pub struct Request {
+pub struct HttpRequest {
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
@@ -85,13 +84,13 @@ pub struct Request {
 }
 
 /// HTTP/3 response builder
-pub struct Response {
+pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
-impl Response {
+impl HttpResponse {
     pub fn new(status: u16) -> Self {
         Self {
             status,
@@ -114,13 +113,16 @@ impl Response {
 /// Per-connection state holding the Http3Connection
 pub(super) struct ConnectionState {
     h3_conn: Http3Connection,
-    streams: HashMap<u64, usize>,
-    conn_ptr: *mut Connection,
+    pub streams: HashMap<u64, usize>,
+    conn_ptr: Option<NonNull<Connection>>,
 }
 
 impl ConnectionState {
-    pub fn send_response(&mut self, stream_id: u64, response: Response) {
-        let conn = unsafe { &mut *self.conn_ptr };
+    pub fn send_response(&mut self, stream_id: u64, response: HttpResponse) {
+        let Some(mut conn_ptr) = self.conn_ptr else {
+            return;
+        };
+        let conn = unsafe { conn_ptr.as_mut() };
 
         let mut headers = vec![Header::new(
             b":status",
@@ -172,7 +174,10 @@ impl Handler {
                 continue;
             };
             let state = unsafe { &mut *conn_state.get() };
-            let conn = unsafe { &mut *state.conn_ptr };
+            let Some(mut conn_ptr) = state.conn_ptr else {
+                continue;
+            };
+            let conn = unsafe { conn_ptr.as_mut() };
             loop {
                 match state.h3_conn.poll(conn) {
                     Ok((stream_id, Http3Event::Headers { headers, fin })) => {
@@ -181,7 +186,10 @@ impl Handler {
 
                         let conn_state = conn_state.clone();
                         spawn(async move {
-                            let request = Http3Request::new(slab_id).await;
+                            let Some(request) = Http3Request::new(slab_id).await else {
+                                process_request::remove(slab_id);
+                                return;
+                            };
                             process_request::remove(slab_id);
                             println!("HTTP/3 request: {} {}", request.method, request.path);
                             let response = Self::handle_request(&request);
@@ -208,7 +216,7 @@ impl Handler {
                     Ok((stream_id, Http3Event::Reset(err))) => {
                         println!("Stream {} reset: {}", stream_id, err);
                         if let Some(slab_id) = state.streams.remove(&stream_id) {
-                            process_request::remove(slab_id);
+                            process_request::on_connection_lost(slab_id);
                         }
                     }
                     Ok((_, Http3Event::GoAway)) => {
@@ -225,12 +233,12 @@ impl Handler {
         }
     }
 
-    fn handle_request(request: &Request) -> Response {
+    fn handle_request(request: &HttpRequest) -> HttpResponse {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/") => Response::new(200)
+            ("GET", "/") => HttpResponse::new(200)
                 .header("content-type", "text/plain")
                 .body("Hello from HTTP/3!"),
-            _ => Response::new(404)
+            _ => HttpResponse::new(404)
                 .header("content-type", "text/plain")
                 .body("Not Found"),
         }
@@ -254,7 +262,7 @@ impl TransportHandler for HandlerBridge {
                     key,
                     Rc::new(UnsafeCell::new(ConnectionState {
                         h3_conn,
-                        conn_ptr: conn as *mut Connection,
+                        conn_ptr: Some(NonNull::from(conn)),
                         streams: HashMap::new(),
                     })),
                 );
@@ -268,10 +276,18 @@ impl TransportHandler for HandlerBridge {
     fn on_conn_closed(&mut self, conn: &mut Connection) {
         println!("Connection closed");
         let key = conn as *mut Connection as u64;
-        self.0.borrow_mut().connections.remove(&key);
+        let mut handler = self.0.borrow_mut();
+        if let Some(conn_state) = handler.connections.remove(&key) {
+            let state = unsafe { &mut *conn_state.get() };
+            state.conn_ptr = None;
+            for (_, slab_id) in state.streams.drain() {
+                process_request::on_connection_lost(slab_id);
+            }
+        }
     }
 
     fn on_stream_created(&mut self, _conn: &mut Connection, _stream_id: u64) {}
+
     fn on_stream_readable(&mut self, conn: &mut Connection, _stream_id: u64) {
         let key = conn as *mut Connection as u64;
         let mut handler = self.0.borrow_mut();
@@ -286,7 +302,7 @@ impl TransportHandler for HandlerBridge {
         if let Some(conn_state) = handler.connections.get(&key) {
             let state = unsafe { &mut *conn_state.get() };
             if let Some(slab_id) = state.streams.remove(&stream_id) {
-                process_request::remove(slab_id);
+                process_request::on_connection_lost(slab_id);
             }
         }
     }
@@ -297,17 +313,27 @@ struct Sender {
     fd: RawFd,
 }
 
-struct Tls {}
+struct Tls {
+    config: Arc<TlsConfig>,
+}
 
-impl TlsConfigSelector for Tls {
-    fn get_default(&self) -> Option<Arc<TlsConfig>> {
+impl Tls {
+    fn new() -> Self {
         let mut tls_config = TlsConfig::new().unwrap();
         tls_config.set_certificate_file("certs/cert.pem").unwrap();
         tls_config.set_private_key_file("certs/key.pem").unwrap();
         tls_config
             .set_application_protos(vec![b"h3".to_vec()])
             .unwrap();
-        Some(Arc::new(tls_config))
+        Self {
+            config: Arc::new(tls_config),
+        }
+    }
+}
+
+impl TlsConfigSelector for Tls {
+    fn get_default(&self) -> Option<Arc<TlsConfig>> {
+        Some(self.config.clone())
     }
 
     fn select(&self, _server_name: &str) -> Option<Arc<TlsConfig>> {

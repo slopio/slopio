@@ -143,7 +143,6 @@ impl MultiOpState {
         }
     }
     fn transition_to_paused(&mut self) {
-        println!("paused");
         if let MultiOpState::TringToPause {
             waker, fd, queue, ..
         } = self
@@ -157,7 +156,6 @@ impl MultiOpState {
     }
 
     fn transition_paused_to_sent(&mut self, new_waker: &Waker) {
-        println!("restarted");
         if let MultiOpState::Paused { fd, queue, .. } = self {
             *self = MultiOpState::Sent {
                 waker: new_waker.clone(),
@@ -168,7 +166,6 @@ impl MultiOpState {
     }
 
     fn transition_to_trying_to_pause(&mut self) {
-        println!("try pausing");
         match self {
             MultiOpState::Init { .. } => unreachable!("pause a non init ?"),
             MultiOpState::Sent { waker, fd, queue } => {
@@ -294,7 +291,6 @@ impl IODriver {
     }
 
     fn recycle_buffer(&self, buffer: &Buffer<BUFFER_SIZE>) {
-        println!("recyling");
         let ring_inner = unsafe { &*self.ring.get() };
         ring_inner.buffer_ring.recycle_buffer(&buffer);
     }

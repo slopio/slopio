@@ -8,13 +8,13 @@ use std::{
 use slab::Slab;
 use tquic::h3::{Header, NameValue};
 
-use super::Request;
+use super::HttpRequest;
 
 thread_local! {
-    static STREAM_SLAB: UnsafeCell<Slab<StreamState>> = UnsafeCell::new(Slab::new());
+    static STREAM_SLAB: UnsafeCell<Slab<StreamState>> = const { UnsafeCell::new(Slab::new()) };
 }
 
-fn with_slab<F, R>(f: F) -> R
+fn stream_slab<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Slab<StreamState>) -> R,
 {
@@ -27,7 +27,11 @@ pub(super) fn insert(headers: &[Header], fin: bool) -> usize {
         path: String::new(),
         headers: Vec::new(),
         body: Vec::new(),
-        complete: fin,
+        status: if fin {
+            StreamStatus::Complete
+        } else {
+            StreamStatus::Waiting
+        },
         waker: None,
     };
 
@@ -44,19 +48,29 @@ pub(super) fn insert(headers: &[Header], fin: bool) -> usize {
         }
     }
 
-    with_slab(|slab| slab.insert(state))
+    stream_slab(|slab| slab.insert(state))
 }
 
 pub(super) fn on_data(id: usize, chunk: &[u8]) {
-    with_slab(|slab| {
+    stream_slab(|slab| {
         slab[id].body.extend_from_slice(chunk);
     });
 }
 
 pub(super) fn on_finished(id: usize) {
-    with_slab(|slab| {
+    stream_slab(|slab| {
         let state = &mut slab[id];
-        state.complete = true;
+        state.status = StreamStatus::Complete;
+        if let Some(w) = state.waker.take() {
+            w.wake();
+        }
+    });
+}
+
+pub(super) fn on_connection_lost(id: usize) {
+    stream_slab(|slab| {
+        let state = &mut slab[id];
+        state.status = StreamStatus::ConnectionLost;
         if let Some(w) = state.waker.take() {
             w.wake();
         }
@@ -64,9 +78,16 @@ pub(super) fn on_finished(id: usize) {
 }
 
 pub(super) fn remove(id: usize) {
-    with_slab(|slab| {
+    stream_slab(|slab| {
         slab.remove(id);
     });
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamStatus {
+    Waiting,
+    Complete,
+    ConnectionLost,
 }
 
 struct StreamState {
@@ -74,7 +95,7 @@ struct StreamState {
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    complete: bool,
+    status: StreamStatus,
     waker: Option<Waker>,
 }
 
@@ -89,21 +110,23 @@ impl Http3Request {
 }
 
 impl Future for Http3Request {
-    type Output = Request;
+    type Output = Option<HttpRequest>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        with_slab(|slab| {
+        stream_slab(|slab| {
             let state = &mut slab[self.id];
-            if state.complete {
-                Poll::Ready(Request {
+            match state.status {
+                StreamStatus::Complete => Poll::Ready(Some(HttpRequest {
                     method: std::mem::take(&mut state.method),
                     path: std::mem::take(&mut state.path),
                     headers: std::mem::take(&mut state.headers),
                     body: std::mem::take(&mut state.body),
-                })
-            } else {
-                state.waker = Some(cx.waker().clone());
-                Poll::Pending
+                })),
+                StreamStatus::ConnectionLost => Poll::Ready(None),
+                StreamStatus::Waiting => {
+                    state.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
             }
         })
     }
