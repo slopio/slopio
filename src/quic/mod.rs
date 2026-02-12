@@ -1,13 +1,14 @@
 use std::{
     cell::{RefCell, UnsafeCell},
     collections::{HashMap, VecDeque},
+    fmt, io,
     net::SocketAddr,
     os::fd::RawFd,
+    path::{Path, PathBuf},
     ptr::NonNull,
     rc::Rc,
-    str::FromStr,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -20,17 +21,81 @@ use tquic::{
 
 use runtime_streams::StreamExt;
 
-use crate::io_driver::{
-    IO_DRIVER,
-    operations::sockets::udp::{UdpMultiRecv, UdpSocket},
-};
 use crate::runtime::spawn;
+use crate::{
+    io_driver::{
+        IO_DRIVER,
+        operations::sockets::udp::{UdpMultiRecv, UdpSocket},
+    },
+    quic::handler::handle_request,
+};
+mod handler;
 mod process_request;
 use process_request::Http3Request;
+
+#[derive(Debug)]
+pub enum Http3ServerError {
+    Io(io::Error),
+    Quic(tquic::Error),
+    Http3(Http3Error),
+    Tls(String),
+}
+
+impl fmt::Display for Http3ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::Quic(e) => write!(f, "QUIC error: {e}"),
+            Self::Http3(e) => write!(f, "HTTP/3 error: {e}"),
+            Self::Tls(e) => write!(f, "TLS error: {e}"),
+        }
+    }
+}
+
+impl From<io::Error> for Http3ServerError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<tquic::Error> for Http3ServerError {
+    fn from(e: tquic::Error) -> Self {
+        Self::Quic(e)
+    }
+}
+
+impl From<Http3Error> for Http3ServerError {
+    fn from(e: Http3Error) -> Self {
+        Self::Http3(e)
+    }
+}
+
+pub struct Http3ServerConfig {
+    pub bind_addr: SocketAddr,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub idle_timeout: Duration,
+    pub max_concurrent_streams: u64,
+    pub max_body_size: usize,
+}
+
+impl Default for Http3ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 4433)),
+            cert_path: PathBuf::from("certs/cert.pem"),
+            key_path: PathBuf::from("certs/key.pem"),
+            idle_timeout: Duration::from_secs(30),
+            max_concurrent_streams: 100,
+            max_body_size: 8 * 1024 * 1024, // 8 MiB
+        }
+    }
+}
 
 pub struct Http3Server {
     endpoint: Endpoint,
     socket: UdpSocket,
+    config: Rc<Http3ServerConfig>,
     handler: Rc<RefCell<Handler>>,
 }
 
@@ -41,24 +106,31 @@ impl Http3Server {
             let info = PacketInfo {
                 src: datagram.addr(),
                 time: Instant::now(),
-                dst: SocketAddr::from_str("0.0.0.0:4433").unwrap(),
+                dst: self.config.bind_addr,
             };
-            self.endpoint
-                .recv(&mut datagram.payload().to_vec(), &info)
-                .unwrap();
-            self.endpoint.process_connections().unwrap();
+            if let Err(e) = self.endpoint.recv(&mut datagram.payload().to_vec(), &info) {
+                eprintln!("QUIC recv error: {e}");
+                continue;
+            }
+            if let Err(e) = self.endpoint.process_connections() {
+                eprintln!("QUIC process_connections error: {e}");
+            }
 
             self.handler.borrow_mut().process_http3();
         }
     }
 
-    pub fn build() -> Self {
-        let udp = UdpSocket::bind(4433).unwrap();
-        let mut config = Box::new(Config::new().unwrap());
-        let tls = Tls::new();
+    pub fn build(server_config: Http3ServerConfig) -> Result<Self, Http3ServerError> {
+        let udp = UdpSocket::bind(server_config.bind_addr.port())?;
+        let mut config = Box::new(Config::new()?);
+        let tls = Tls::new(&server_config.cert_path, &server_config.key_path)?;
 
+        config.set_max_idle_timeout(server_config.idle_timeout.as_millis() as u64);
+        config.set_initial_max_streams_bidi(server_config.max_concurrent_streams);
         config.set_tls_config_selector(Arc::new(tls));
-        let handler = Rc::new(RefCell::new(Handler::new()));
+
+        let server_config = Rc::new(server_config);
+        let handler = Rc::new(RefCell::new(Handler::new(server_config.clone())?));
         let sender = Rc::new(Sender { fd: udp.fd() });
         let endpoint = Endpoint::new(
             config,
@@ -67,11 +139,12 @@ impl Http3Server {
             sender,
         );
 
-        Self {
+        Ok(Self {
             endpoint,
             socket: udp,
+            config: server_config,
             handler,
-        }
+        })
     }
 }
 
@@ -113,7 +186,7 @@ impl HttpResponse {
 /// Per-connection state holding the Http3Connection
 pub(super) struct ConnectionState {
     h3_conn: Http3Connection,
-    pub streams: HashMap<u64, usize>,
+    pub connection_streams: HashMap<u64, usize>,
     conn_ptr: Option<NonNull<Connection>>,
 }
 
@@ -139,7 +212,7 @@ impl ConnectionState {
             .h3_conn
             .send_headers(conn, stream_id, &headers, !has_body)
         {
-            println!("Failed to send headers: {:?}", e);
+            eprintln!("Failed to send headers: {e}");
             return;
         }
 
@@ -148,7 +221,7 @@ impl ConnectionState {
                 self.h3_conn
                     .send_body(conn, stream_id, Bytes::from(response.body), true)
         {
-            println!("Failed to send body: {:?}", e);
+            eprintln!("Failed to send body: {e}");
         }
     }
 }
@@ -157,15 +230,17 @@ struct Handler {
     h3_config: Http3Config,
     connections: HashMap<u64, Rc<UnsafeCell<ConnectionState>>>,
     connections_to_check: VecDeque<u64>,
+    config: Rc<Http3ServerConfig>,
 }
 
 impl Handler {
-    fn new() -> Self {
-        Self {
-            h3_config: Http3Config::new().unwrap(),
+    fn new(config: Rc<Http3ServerConfig>) -> Result<Self, Http3ServerError> {
+        Ok(Self {
+            h3_config: Http3Config::new()?,
             connections: HashMap::new(),
             connections_to_check: VecDeque::new(),
-        }
+            config,
+        })
     }
 
     fn process_http3(&mut self) {
@@ -173,74 +248,65 @@ impl Handler {
             let Some(conn_state) = self.connections.get(&key) else {
                 continue;
             };
-            let state = unsafe { &mut *conn_state.get() };
-            let Some(mut conn_ptr) = state.conn_ptr else {
-                continue;
-            };
-            let conn = unsafe { conn_ptr.as_mut() };
             loop {
+                let state = unsafe { &mut *conn_state.get() };
+                let Some(mut conn_ptr) = state.conn_ptr else {
+                    break;
+                };
+                let conn = unsafe { conn_ptr.as_mut() };
                 match state.h3_conn.poll(conn) {
                     Ok((stream_id, Http3Event::Headers { headers, fin })) => {
                         let slab_id = process_request::insert(&headers, fin);
-                        state.streams.insert(stream_id, slab_id);
+                        state.connection_streams.insert(stream_id, slab_id);
+                        drop(state);
 
                         let conn_state = conn_state.clone();
-                        spawn(async move {
-                            let Some(request) = Http3Request::new(slab_id).await else {
-                                process_request::remove(slab_id);
-                                return;
-                            };
-                            process_request::remove(slab_id);
-                            println!("HTTP/3 request: {} {}", request.method, request.path);
-                            let response = Self::handle_request(&request);
-                            let state = unsafe { &mut *conn_state.get() };
-                            state.send_response(stream_id, response);
-                        });
+                        spawn(handle_request(slab_id, stream_id, conn_state));
                     }
                     Ok((stream_id, Http3Event::Data)) => {
-                        if let Some(&slab_id) = state.streams.get(&stream_id) {
+                        if let Some(&slab_id) = state.connection_streams.get(&stream_id) {
                             let mut buf = [0u8; 4096];
                             while let Ok(len) = state.h3_conn.recv_body(conn, stream_id, &mut buf) {
                                 if len == 0 {
                                     break;
                                 }
-                                process_request::on_data(slab_id, &buf[..len]);
+                                if !process_request::on_data(
+                                    slab_id,
+                                    &buf[..len],
+                                    self.config.max_body_size,
+                                ) {
+                                    eprintln!(
+                                        "Stream {stream_id}: body exceeds max size, rejecting"
+                                    );
+                                    state.connection_streams.remove(&stream_id);
+                                    process_request::on_connection_lost(slab_id);
+                                    break;
+                                }
                             }
                         }
                     }
                     Ok((stream_id, Http3Event::Finished)) => {
-                        if let Some(slab_id) = state.streams.remove(&stream_id) {
+                        if let Some(slab_id) = state.connection_streams.remove(&stream_id) {
                             process_request::on_finished(slab_id);
                         }
                     }
                     Ok((stream_id, Http3Event::Reset(err))) => {
-                        println!("Stream {} reset: {}", stream_id, err);
-                        if let Some(slab_id) = state.streams.remove(&stream_id) {
+                        eprintln!("Stream {stream_id} reset: {err}");
+                        if let Some(slab_id) = state.connection_streams.remove(&stream_id) {
                             process_request::on_connection_lost(slab_id);
                         }
                     }
                     Ok((_, Http3Event::GoAway)) => {
-                        println!("GoAway received");
+                        eprintln!("GoAway received");
                     }
                     Ok((_, Http3Event::PriorityUpdate)) => {}
                     Err(Http3Error::Done) => break,
                     Err(e) => {
-                        println!("HTTP/3 error: {:?}", e);
+                        eprintln!("HTTP/3 poll error: {e}");
                         break;
                     }
                 }
             }
-        }
-    }
-
-    fn handle_request(request: &HttpRequest) -> HttpResponse {
-        match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/") => HttpResponse::new(200)
-                .header("content-type", "text/plain")
-                .body("Hello from HTTP/3!"),
-            _ => HttpResponse::new(404)
-                .header("content-type", "text/plain")
-                .body("Not Found"),
         }
     }
 }
@@ -251,8 +317,6 @@ impl TransportHandler for HandlerBridge {
     fn on_conn_created(&mut self, _conn: &mut Connection) {}
 
     fn on_conn_established(&mut self, conn: &mut Connection) {
-        println!("Connection established: {:?}", conn.dcid());
-
         let mut handler = self.0.borrow_mut();
 
         match Http3Connection::new_with_quic_conn(conn, &handler.h3_config) {
@@ -263,24 +327,23 @@ impl TransportHandler for HandlerBridge {
                     Rc::new(UnsafeCell::new(ConnectionState {
                         h3_conn,
                         conn_ptr: Some(NonNull::from(conn)),
-                        streams: HashMap::new(),
+                        connection_streams: HashMap::new(),
                     })),
                 );
             }
             Err(e) => {
-                println!("Failed to create HTTP/3 connection: {:?}", e);
+                eprintln!("Failed to create HTTP/3 connection: {e}");
             }
         }
     }
 
     fn on_conn_closed(&mut self, conn: &mut Connection) {
-        println!("Connection closed");
         let key = conn as *mut Connection as u64;
         let mut handler = self.0.borrow_mut();
         if let Some(conn_state) = handler.connections.remove(&key) {
             let state = unsafe { &mut *conn_state.get() };
             state.conn_ptr = None;
-            for (_, slab_id) in state.streams.drain() {
+            for (_, slab_id) in state.connection_streams.drain() {
                 process_request::on_connection_lost(slab_id);
             }
         }
@@ -301,9 +364,7 @@ impl TransportHandler for HandlerBridge {
         let handler = self.0.borrow();
         if let Some(conn_state) = handler.connections.get(&key) {
             let state = unsafe { &mut *conn_state.get() };
-            if let Some(slab_id) = state.streams.remove(&stream_id) {
-                process_request::on_connection_lost(slab_id);
-            }
+            state.connection_streams.remove(&stream_id);
         }
     }
     fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}
@@ -318,16 +379,21 @@ struct Tls {
 }
 
 impl Tls {
-    fn new() -> Self {
-        let mut tls_config = TlsConfig::new().unwrap();
-        tls_config.set_certificate_file("certs/cert.pem").unwrap();
-        tls_config.set_private_key_file("certs/key.pem").unwrap();
+    fn new(cert_path: &Path, key_path: &Path) -> Result<Self, Http3ServerError> {
+        let mut tls_config = TlsConfig::new()
+            .map_err(|e| Http3ServerError::Tls(format!("failed to create TLS config: {e}")))?;
+        tls_config
+            .set_certificate_file(cert_path.to_str().unwrap_or(""))
+            .map_err(|e| Http3ServerError::Tls(format!("failed to load certificate: {e}")))?;
+        tls_config
+            .set_private_key_file(key_path.to_str().unwrap_or(""))
+            .map_err(|e| Http3ServerError::Tls(format!("failed to load private key: {e}")))?;
         tls_config
             .set_application_protos(vec![b"h3".to_vec()])
-            .unwrap();
-        Self {
+            .map_err(|e| Http3ServerError::Tls(format!("failed to set ALPN: {e}")))?;
+        Ok(Self {
             config: Arc::new(tls_config),
-        }
+        })
     }
 }
 
@@ -351,12 +417,6 @@ impl PacketSendHandler for Sender {
             let pool = driver.sending_buffers();
 
             for (data, info) in pkts {
-                println!(
-                    "Sending {} bytes to {} (dst={})",
-                    data.len(),
-                    info.src,
-                    info.dst
-                );
                 let entry = pool.add(self.fd, data, info.dst);
                 driver.push_anon_op(entry);
             }

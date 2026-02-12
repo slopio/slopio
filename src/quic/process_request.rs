@@ -51,10 +51,16 @@ pub(super) fn insert(headers: &[Header], fin: bool) -> usize {
     stream_slab(|slab| slab.insert(state))
 }
 
-pub(super) fn on_data(id: usize, chunk: &[u8]) {
+/// Returns false if the body would exceed max_size after appending.
+pub(super) fn on_data(id: usize, chunk: &[u8], max_size: usize) -> bool {
     stream_slab(|slab| {
-        slab[id].body.extend_from_slice(chunk);
-    });
+        let state = &mut slab[id];
+        if state.body.len() + chunk.len() > max_size {
+            return false;
+        }
+        state.body.extend_from_slice(chunk);
+        true
+    })
 }
 
 pub(super) fn on_finished(id: usize) {
