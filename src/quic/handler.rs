@@ -1,11 +1,11 @@
-use std::{cell::UnsafeCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use crate::quic::{ConnectionState, Http3Request, HttpRequest, HttpResponse, process_request};
 
 pub async fn handle_request(
     slab_id: usize,
     stream_id: u64,
-    conn_state: Rc<UnsafeCell<ConnectionState>>,
+    conn_state: Rc<RefCell<ConnectionState>>,
 ) {
     let Some(request) = Http3Request::new(slab_id).await else {
         process_request::remove(slab_id);
@@ -13,8 +13,7 @@ pub async fn handle_request(
     };
     process_request::remove(slab_id);
     let response = route(&request).await;
-    let state = unsafe { &mut *conn_state.get() };
-    state.send_response(stream_id, response);
+    conn_state.borrow_mut().send_response(stream_id, response);
 }
 
 async fn route(request: &HttpRequest) -> HttpResponse {

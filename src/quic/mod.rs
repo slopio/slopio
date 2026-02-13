@@ -1,5 +1,5 @@
 use std::{
-    cell::{RefCell, UnsafeCell},
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     fmt, io,
     net::SocketAddr,
@@ -228,7 +228,7 @@ impl ConnectionState {
 
 struct Handler {
     h3_config: Http3Config,
-    connections: HashMap<u64, Rc<UnsafeCell<ConnectionState>>>,
+    connections: HashMap<u64, Rc<RefCell<ConnectionState>>>,
     connections_to_check: VecDeque<u64>,
     config: Rc<Http3ServerConfig>,
 }
@@ -249,7 +249,7 @@ impl Handler {
                 continue;
             };
             loop {
-                let state = unsafe { &mut *conn_state.get() };
+                let mut state = conn_state.borrow_mut();
                 let Some(mut conn_ptr) = state.conn_ptr else {
                     break;
                 };
@@ -258,7 +258,6 @@ impl Handler {
                     Ok((stream_id, Http3Event::Headers { headers, fin })) => {
                         let slab_id = process_request::insert(&headers, fin);
                         state.connection_streams.insert(stream_id, slab_id);
-                        drop(state);
 
                         let conn_state = conn_state.clone();
                         spawn(handle_request(slab_id, stream_id, conn_state));
@@ -324,7 +323,7 @@ impl TransportHandler for HandlerBridge {
                 let key = conn as *mut Connection as u64;
                 handler.connections.insert(
                     key,
-                    Rc::new(UnsafeCell::new(ConnectionState {
+                    Rc::new(RefCell::new(ConnectionState {
                         h3_conn,
                         conn_ptr: Some(NonNull::from(conn)),
                         connection_streams: HashMap::new(),
@@ -341,7 +340,7 @@ impl TransportHandler for HandlerBridge {
         let key = conn as *mut Connection as u64;
         let mut handler = self.0.borrow_mut();
         if let Some(conn_state) = handler.connections.remove(&key) {
-            let state = unsafe { &mut *conn_state.get() };
+            let mut state = conn_state.borrow_mut();
             state.conn_ptr = None;
             for (_, slab_id) in state.connection_streams.drain() {
                 process_request::on_connection_lost(slab_id);
@@ -363,8 +362,10 @@ impl TransportHandler for HandlerBridge {
         let key = conn as *mut Connection as u64;
         let handler = self.0.borrow();
         if let Some(conn_state) = handler.connections.get(&key) {
-            let state = unsafe { &mut *conn_state.get() };
-            state.connection_streams.remove(&stream_id);
+            conn_state
+                .borrow_mut()
+                .connection_streams
+                .remove(&stream_id);
         }
     }
     fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}

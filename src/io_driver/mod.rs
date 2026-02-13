@@ -292,7 +292,7 @@ impl IODriver {
 
     fn recycle_buffer(&self, buffer: &Buffer<BUFFER_SIZE>) {
         let ring_inner = unsafe { &*self.ring.get() };
-        ring_inner.buffer_ring.recycle_buffer(&buffer);
+        ring_inner.buffer_ring.recycle_buffer(buffer);
     }
 
     pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> IoDriverToken {
