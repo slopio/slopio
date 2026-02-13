@@ -7,7 +7,6 @@ use runtime::quic::monitor;
 use runtime::quic::{H3Server, Http3ServerConfig};
 use std::net::SocketAddr;
 use std::process::Command;
-use std::time::Duration;
 
 fn curl_http3(port: u16, path: &str) -> (u16, String) {
     let url = format!("https://localhost:{port}{path}");
