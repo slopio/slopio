@@ -78,6 +78,27 @@ pub fn spawn<F: Future>(f: F) -> Handle<F::Output> {
     handle
 }
 
+/// Yields execution so other spawned tasks can run.
+/// Returns `Pending` once, then `Ready` on the next poll.
+pub async fn yield_now() {
+    struct YieldNow(bool);
+
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<()> {
+            if self.0 {
+                std::task::Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    YieldNow(false).await;
+}
+
 #[derive(Default)]
 pub struct TaskList {
     tasks: UnsafeCell<VecDeque<TypeAgnosticTask>>,
