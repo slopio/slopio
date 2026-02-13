@@ -114,38 +114,10 @@ impl H3Server {
         use tquic::PacketInfo;
 
         use crate::io_driver::operations::sockets::udp::UdpMultiRecv;
-        use crate::runtime::select::{SelectResult, select};
-        use crate::runtime::time::Sleep;
 
         let mut recv = UdpMultiRecv::new(self.socket.fd());
         loop {
-            // Get the endpoint's next timeout deadline.
-            let timeout = with_state(|state| state.endpoint.as_ref().and_then(|ep| ep.timeout()));
-
-            let datagram = match timeout {
-                Some(duration) => {
-                    match select(recv.next(), Sleep::during(duration)).await {
-                        SelectResult::First(dg) => dg,
-                        SelectResult::Second(()) => {
-                            // Timer fired — process timeouts.
-                            with_state(|state| {
-                                let Some(endpoint) = &mut state.endpoint else {
-                                    return;
-                                };
-                                endpoint.on_timeout(Instant::now());
-                                if let Err(e) = endpoint.process_connections() {
-                                    eprintln!("QUIC process_connections error: {e}");
-                                }
-                                state.handler.process_http3(endpoint);
-                            });
-                            continue;
-                        }
-                    }
-                }
-                None => recv.next().await,
-            };
-
-            let Some(datagram) = datagram else {
+            let Some(datagram) = recv.next().await else {
                 break;
             };
 

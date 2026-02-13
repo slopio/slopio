@@ -320,7 +320,7 @@ impl IODriver {
 
     pub fn push_wakeup_timeout(&self, duration: Duration) {
         let ms = duration.as_millis();
-        let time = Box::leak(Box::new(Timespec::new().nsec((ms * 1_500_000) as u32)));
+        let time = Box::leak(Box::new(Timespec::new().nsec((ms * 1_000_000) as u32)));
         let entry = io_uring::opcode::Timeout::new(time)
             .count(1)
             .build()

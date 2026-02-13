@@ -15,6 +15,8 @@ mod process_request;
 mod server;
 
 pub use server::H3Server;
+#[cfg(feature = "test-monitor")]
+pub use server::monitor;
 
 // ---------------------------------------------------------------------------
 // Error type
