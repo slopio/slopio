@@ -67,7 +67,6 @@ impl TimeDriver {
 
     pub fn next_deadline(&self) -> Option<Duration> {
         let this = unsafe { &mut *self.inner.get() };
-        dbg!(this.next_deadline());
         match this.next_deadline() {
             Some(Duration::ZERO) => Some(Duration::from_millis(20)),
             other => other,

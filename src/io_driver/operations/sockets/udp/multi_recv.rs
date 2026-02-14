@@ -1,5 +1,4 @@
 use std::{
-    mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
     task::{Context, Poll},
@@ -17,12 +16,34 @@ use crate::io_driver::{
     operations::IoOP,
 };
 
+/// Stable storage for the msghdr template, boxed so it survives moves of the
+/// owning `UdpMultiRecv`.
+struct MsgHdrBox {
+    msghdr: libc::msghdr,
+    addr: libc::sockaddr_in,
+}
+
+impl MsgHdrBox {
+    fn new() -> Box<Self> {
+        let mut b = Box::new(Self {
+            msghdr: unsafe { std::mem::zeroed() },
+            addr: unsafe { std::mem::zeroed() },
+        });
+        b.msghdr.msg_name = &mut b.addr as *mut _ as *mut _;
+        b.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        b
+    }
+
+    fn msghdr_ptr(&self) -> *const libc::msghdr {
+        &self.msghdr as *const _
+    }
+}
+
 pub struct UdpMultiRecv {
     id: Option<usize>,
     fd: i32,
     reads: MultiOpQueue,
-    msghdr: libc::msghdr,
-    addr: libc::sockaddr_in,
+    hdr: Box<MsgHdrBox>,
 }
 
 pub struct UdpDatagram {
@@ -58,19 +79,18 @@ impl Drop for UdpDatagram {
 
 impl UdpMultiRecv {
     pub fn new(fd: i32) -> Self {
-        let mut recv = Self {
+        Self {
             id: None,
             fd,
             reads: Default::default(),
-            msghdr: unsafe { MaybeUninit::zeroed().assume_init() },
-            addr: unsafe { MaybeUninit::zeroed().assume_init() },
-        };
+            hdr: MsgHdrBox::new(),
+        }
+    }
 
-        recv.msghdr.msg_name = &mut recv.addr as *mut _ as *mut _;
-        recv.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
-
-        recv.register_to_driver();
-        recv
+    fn ensure_registered(&mut self) {
+        if self.id.is_none() {
+            self.register_to_driver();
+        }
     }
 
     fn try_parse(&self, event: MultishotCompletionEvent) -> Result<UdpDatagram, ()> {
@@ -82,7 +102,7 @@ impl UdpMultiRecv {
         let bid = buffer_select(event.flags).ok_or(())?;
         let buffer = IO_DRIVER.with(|d| d.get_buffer(bid, len));
 
-        let parsed = RecvMsgOut::parse(buffer.as_ref(), &self.msghdr).map_err(|_| ())?;
+        let parsed = RecvMsgOut::parse(buffer.as_ref(), &self.hdr.msghdr).map_err(|_| ())?;
 
         let name = parsed.name_data();
         if name.len() < std::mem::size_of::<libc::sockaddr_in>() {
@@ -128,6 +148,8 @@ impl Stream for UdpMultiRecv {
     type Item = UdpDatagram;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.ensure_registered();
+
         if let Poll::Ready(result) = self.try_drain_one() {
             return Poll::Ready(result);
         }
@@ -167,7 +189,7 @@ impl IoOP for UdpMultiRecv {
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMsgMulti::new(Fd(self.fd), &self.msghdr as *const _, 0).build()
+        opcode::RecvMsgMulti::new(Fd(self.fd), self.hdr.msghdr_ptr(), 0).build()
     }
 
     fn driver_cleanup(&mut self) {}
