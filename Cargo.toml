@@ -15,6 +15,7 @@ required-features = ["tls"]
 io-uring = "0.7.11"
 libc = "0.2.178"
 io_uring_rb = { git = "https://github.com/saucisoupe/io_uring_rb" }
+runtime_ebpf_balancer = { git = "https://github.com/saucisoupe/runtime_ebpf_balancer" }
 async_timers =  { git = "https://github.com/saucisoupe/async_timers" }
 runtime-streams =  { git = "https://github.com/saucisoupe/runtime-streams" }
 rustls = { version = "0.23.36", optional = true }

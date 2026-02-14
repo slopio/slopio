@@ -18,7 +18,6 @@ pub mod tls;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub fn main_thread<F: Future>(f: F) -> F::Output {
-    // tls::builder::serv_static_init();
     let rt = runtime::RuntimeInner::default();
     rt.block_on(f, None)
 }
