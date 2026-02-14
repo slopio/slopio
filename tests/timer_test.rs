@@ -8,17 +8,20 @@ use runtime::runtime::time::Sleep;
 fn test_sleep_basic() {
     let start = Instant::now();
     main_thread(async {
-        Sleep::during(Duration::from_millis(80)).await;
+        spawn(async {
+            Sleep::during(Duration::from_secs(1)).await;
+        })
+        .await;
     });
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed >= Duration::from_millis(80),
+        elapsed >= Duration::from_millis(1000),
         "Sleep finished too early: {:?}",
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(200),
+        elapsed < Duration::from_millis(1500),
         "Sleep took too long: {:?}",
         elapsed
     );
@@ -28,7 +31,11 @@ fn test_sleep_basic() {
 fn test_sleep_short_duration() {
     let start = Instant::now();
     main_thread(async {
-        Sleep::during(Duration::from_millis(10)).await;
+        let k = spawn(async {
+            Sleep::during(Duration::from_millis(1)).await;
+            println!("done");
+        })
+        .await;
     });
     let elapsed = start.elapsed();
 

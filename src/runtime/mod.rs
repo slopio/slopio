@@ -44,6 +44,7 @@ impl RuntimeInner {
                             self.time_driver.tick();
                             //TODO limit activity
                             while let Some(item) = self.tasks.pop() {
+                                println!("task popped");
                                 item.poll();
                             }
 
@@ -59,10 +60,12 @@ impl RuntimeInner {
                             }
                         }
                         if let Some(delay) = self.time_driver.next_deadline() {
+                            println!("pushing timer");
                             self.io_driver.push_wakeup_timeout(delay);
                         }
                         self.io_driver.submit_and_wait();
                         self.io_driver.process_completion_queue();
+                        println!("woken");
                     }
                 })
             })

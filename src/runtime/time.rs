@@ -1,19 +1,10 @@
-use std::{cell::Cell, cell::UnsafeCell, task::Waker, time::Duration};
+use std::{cell::UnsafeCell, task::Waker, time::Duration};
 
 use crate::runtime::TIME_DRIVER;
 
+#[derive(Default)]
 pub(crate) struct TimeDriver {
     inner: UnsafeCell<async_timers::TimeWheel>,
-    active_count: Cell<usize>,
-}
-
-impl Default for TimeDriver {
-    fn default() -> Self {
-        Self {
-            inner: UnsafeCell::new(async_timers::TimeWheel::new()),
-            active_count: Cell::new(0),
-        }
-    }
 }
 
 pub struct Sleep {
@@ -62,37 +53,23 @@ impl TimeDriver {
     }
     fn register(&self, duration: Duration, waker: &Waker) -> Option<usize> {
         let this = unsafe { &mut *self.inner.get() };
-        let id = this.init_timer(duration, waker).ok();
-        if id.is_some() {
-            self.active_count.set(self.active_count.get() + 1);
-        }
-        id
+        this.init_timer(duration, waker).ok()
     }
     fn drop(&self, id: usize) {
         let this = unsafe { &mut *self.inner.get() };
         this.drop(id);
-        self.active_count
-            .set(self.active_count.get().saturating_sub(1));
     }
 
     fn poll(&self, id: usize, waker: &Waker) -> std::task::Poll<()> {
         let this = unsafe { &mut *self.inner.get() };
-        let result = this.poll(id, waker);
-        if result.is_ready() {
-            self.active_count
-                .set(self.active_count.get().saturating_sub(1));
-        }
-        result
+        this.poll(id, waker)
     }
 
     pub fn next_deadline(&self) -> Option<Duration> {
         let this = unsafe { &mut *self.inner.get() };
+        dbg!(this.next_deadline());
         match this.next_deadline() {
-            // The underlying TimeWheel returns None both when there are no timers
-            // AND when a timer sits in the current bucket (i==0). In the latter
-            // case we must not block indefinitely — return a minimal duration so
-            // the event loop wakes up and ticks again.
-            None if self.active_count.get() > 0 => Some(Duration::from_millis(10)),
+            Some(Duration::ZERO) => Some(Duration::from_millis(20)),
             other => other,
         }
     }
