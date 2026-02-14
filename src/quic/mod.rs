@@ -14,9 +14,10 @@ use crate::io_driver::IO_DRIVER;
 mod process_request;
 mod server;
 
-pub use server::H3Server;
 #[cfg(feature = "test-monitor")]
-pub use server::monitor;
+pub mod monitor;
+
+pub use server::H3Server;
 
 // ---------------------------------------------------------------------------
 // Error type

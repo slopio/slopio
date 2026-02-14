@@ -114,10 +114,36 @@ impl H3Server {
         use tquic::PacketInfo;
 
         use crate::io_driver::operations::sockets::udp::UdpMultiRecv;
+        use crate::runtime::select::{SelectResult, select};
+        use crate::runtime::time::Sleep;
 
         let mut recv = UdpMultiRecv::new(self.socket.fd());
         loop {
-            let Some(datagram) = recv.next().await else {
+            let timeout_dur =
+                with_state(|state| state.endpoint.as_ref().and_then(|ep| ep.timeout()));
+
+            let got_datagram = match timeout_dur {
+                Some(dur) => {
+                    match select(recv.next(), Sleep::during(dur)).await {
+                        SelectResult::First(datagram) => datagram,
+                        SelectResult::Second(()) => {
+                            // Timeout fired — drive the endpoint's timers.
+                            with_state(|state| {
+                                let Some(endpoint) = &mut state.endpoint else {
+                                    return;
+                                };
+                                endpoint.on_timeout(Instant::now());
+                                let _ = endpoint.process_connections();
+                                state.handler.process_http3(endpoint);
+                            });
+                            continue;
+                        }
+                    }
+                }
+                None => recv.next().await,
+            };
+
+            let Some(datagram) = got_datagram else {
                 break;
             };
 
@@ -300,6 +326,8 @@ async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: Conn
 
     let response = route(&request).await;
     send_response(connection_id, stream_id, response);
+    #[cfg(feature = "test-monitor")]
+    super::monitor::record_request_served();
     task_done(connection_id);
 }
 
@@ -327,6 +355,8 @@ impl TransportHandler for HandlerBridge {
             match H3Connection::try_new(conn, h3_config) {
                 Ok(h3) => {
                     state.handler.connections.insert(h3.connection_id, h3);
+                    #[cfg(feature = "test-monitor")]
+                    super::monitor::record_connection_opened();
                 }
                 Err(_) => eprintln!("Failed to create HTTP/3 connection"),
             }
@@ -343,6 +373,8 @@ impl TransportHandler for HandlerBridge {
                 for (_, slab_id) in h3.connection_streams.iter() {
                     super::process_request::on_connection_lost(*slab_id);
                 }
+                #[cfg(feature = "test-monitor")]
+                super::monitor::record_connection_closed();
             }
         });
     }

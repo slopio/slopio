@@ -7,6 +7,8 @@ use runtime::quic::monitor;
 use runtime::quic::{H3Server, Http3ServerConfig};
 use std::net::SocketAddr;
 use std::process::Command;
+#[cfg(feature = "test-monitor")]
+use std::time::Duration;
 
 fn curl_http3(port: u16, path: &str) -> (u16, String) {
     let url = format!("https://localhost:{port}{path}");
@@ -75,8 +77,6 @@ fn test_http3_not_found() {
 #[test]
 #[cfg(feature = "test-monitor")]
 fn test_http3_idle_timeout() {
-    monitor::reset();
-
     let config = Http3ServerConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 4506)),
         idle_timeout: Duration::from_millis(500),
@@ -84,27 +84,32 @@ fn test_http3_idle_timeout() {
     };
     let _handle = start_server_with_config(config);
 
+    // Capture baseline — other tests may run in parallel on shared counters.
+    let base_opened = monitor::connections_opened();
+    let base_served = monitor::requests_served();
+    let base_closed = monitor::connections_closed();
+
     // First request succeeds, connection established.
     let (status, body) = curl_http3(4506, "/");
     assert_eq!(status, 200);
     assert_eq!(body, "Hello from HTTP/3!");
 
-    assert_eq!(monitor::connections_opened(), 1);
-    assert_eq!(monitor::requests_served(), 1);
-    assert_eq!(monitor::connections_closed(), 0);
+    assert!(monitor::connections_opened() >= base_opened + 1);
+    assert!(monitor::requests_served() >= base_served + 1);
+    assert_eq!(monitor::connections_closed(), base_closed);
 
     // Wait for idle timeout to fire and QUIC close handshake to complete.
     std::thread::sleep(Duration::from_secs(2));
 
-    assert_eq!(monitor::connections_closed(), 1);
+    assert!(monitor::connections_closed() >= base_closed + 1);
 
     // Server still accepts new connections after the timeout path ran.
     let (status, body) = curl_http3(4506, "/");
     assert_eq!(status, 200);
     assert_eq!(body, "Hello from HTTP/3!");
 
-    assert_eq!(monitor::connections_opened(), 2);
-    assert_eq!(monitor::requests_served(), 2);
+    assert!(monitor::connections_opened() >= base_opened + 2);
+    assert!(monitor::requests_served() >= base_served + 2);
 }
 
 #[test]
