@@ -29,8 +29,10 @@ socket2 = { version = "0.6.1", features = ["all"] }
 tquic = { version = "1.6.0", features = ["h3"] }
 bytes = "1"
 
+[dependencies.rand]
+version = "0.8"
+
 [dev-dependencies]
-rand = "0.8"
 
 [build]
 features = ["tls"]

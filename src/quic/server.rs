@@ -1,6 +1,7 @@
 use std::{
     cell::UnsafeCell,
     collections::{HashMap, VecDeque},
+    io,
     rc::Rc,
 };
 
@@ -81,11 +82,23 @@ impl H3Server {
     pub fn build(server_config: Http3ServerConfig) -> Result<Self, super::Http3ServerError> {
         let udp = UdpSocket::bind(server_config.bind_addr.port())?;
 
+        let multithread = server_config.num_threads > 1;
+
+        // Register this thread's socket with the global eBPF balancer (multi-thread only)
+        if multithread && super::balancer::is_initialised() {
+            super::balancer::register_socket(server_config.thread_id as u32, udp.fd()).map_err(
+                |e| {
+                    super::Http3ServerError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                },
+            )?;
+        }
+
         let mut config = Box::new(tquic::Config::new()?);
         let tls = super::Tls::new(&server_config.cert_path, &server_config.key_path)?;
 
         config.set_max_idle_timeout(server_config.idle_timeout.as_millis() as u64);
         config.set_initial_max_streams_bidi(server_config.max_concurrent_streams);
+        config.set_cid_len(8);
         config.set_tls_config_selector(std::sync::Arc::new(tls));
 
         let server_config = Rc::new(server_config);
@@ -96,7 +109,17 @@ impl H3Server {
         });
 
         let sender = Rc::new(super::Sender { fd: udp.fd() });
-        let endpoint = Endpoint::new(config, true, Box::new(HandlerBridge), sender);
+        let mut endpoint = Endpoint::new(config, true, Box::new(HandlerBridge), sender);
+
+        if multithread {
+            let cid_gen = super::balancer::CidGenerator(
+                runtime_ebpf_balancer::id_generation::ThreadAwareCidGenerator::new(
+                    server_config.thread_id as u8,
+                    8,
+                ),
+            );
+            endpoint.set_cid_generator(Box::new(cid_gen));
+        }
 
         with_state(|state| {
             state.endpoint = Some(endpoint);

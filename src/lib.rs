@@ -110,7 +110,7 @@ fn spawn_worker_on<F: Future<Output = ()> + Send + 'static>(
         // if get_numa_node_count() != 1 {
         //     numa_allocs(n);
         // }
-        let rt = runtime::RuntimeInner::default();
+        let rt = runtime::RuntimeInner::with_thread_id(n);
         rt.block_on(f, Some(event_fd))
     })
 }

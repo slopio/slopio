@@ -16,58 +16,73 @@ pub mod time;
 
 scoped_thread_local!(pub(crate) static TASK_LIST: TaskList);
 scoped_thread_local!(pub(crate) static TIME_DRIVER: TimeDriver);
+scoped_thread_local!(static THREAD_ID: usize);
 
 #[derive(Default)]
 pub struct RuntimeInner {
     pub tasks: TaskList,
     io_driver: IODriver,
     time_driver: TimeDriver,
+    thread_id: usize,
 }
 
 impl RuntimeInner {
+    pub fn with_thread_id(thread_id: usize) -> Self {
+        Self {
+            thread_id,
+            ..Default::default()
+        }
+    }
+
     pub fn block_on<F: Future>(self, f: F, event_fd: Option<RawFd>) -> F::Output {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
-        self.io_driver.with(|| {
-            TASK_LIST.set(&self.tasks, || {
-                TIME_DRIVER.set(&self.time_driver, || {
-                    if let Some(fd) = event_fd {
-                        runtime::eventfd::register_eventfd_read(fd);
-                    }
-                    let mut pinned_f = pin!(f);
-                    loop {
-                        if self.io_driver.shutdown() {
-                            //TODO graceful
-                            panic!("shutdown");
+        THREAD_ID.set(&self.thread_id, || {
+            self.io_driver.with(|| {
+                TASK_LIST.set(&self.tasks, || {
+                    TIME_DRIVER.set(&self.time_driver, || {
+                        if let Some(fd) = event_fd {
+                            runtime::eventfd::register_eventfd_read(fd);
                         }
+                        let mut pinned_f = pin!(f);
                         loop {
-                            self.time_driver.tick();
-                            //TODO limit activity
-                            while let Some(item) = self.tasks.pop() {
-                                item.poll();
+                            if self.io_driver.shutdown() {
+                                //TODO graceful
+                                panic!("shutdown");
                             }
-
-                            let pinned = pinned_f.as_mut();
-                            match pinned.poll(&mut context) {
-                                std::task::Poll::Ready(output) => {
-                                    return output;
+                            loop {
+                                self.time_driver.tick();
+                                //TODO limit activity
+                                while let Some(item) = self.tasks.pop() {
+                                    item.poll();
                                 }
-                                std::task::Poll::Pending => {}
+
+                                let pinned = pinned_f.as_mut();
+                                match pinned.poll(&mut context) {
+                                    std::task::Poll::Ready(output) => {
+                                        return output;
+                                    }
+                                    std::task::Poll::Pending => {}
+                                }
+                                if self.tasks.is_empty() {
+                                    break;
+                                }
                             }
-                            if self.tasks.is_empty() {
-                                break;
+                            if let Some(delay) = self.time_driver.next_deadline() {
+                                self.io_driver.push_wakeup_timeout(delay);
                             }
+                            self.io_driver.submit_and_wait();
+                            self.io_driver.process_completion_queue();
                         }
-                        if let Some(delay) = self.time_driver.next_deadline() {
-                            self.io_driver.push_wakeup_timeout(delay);
-                        }
-                        self.io_driver.submit_and_wait();
-                        self.io_driver.process_completion_queue();
-                    }
+                    })
                 })
             })
         })
     }
+}
+
+pub fn thread_id() -> usize {
+    THREAD_ID.with(|id| *id)
 }
 
 pub fn spawn<F: Future>(f: F) -> Handle<F::Output> {
@@ -76,27 +91,6 @@ pub fn spawn<F: Future>(f: F) -> Handle<F::Output> {
         ctx.push(task);
     });
     handle
-}
-
-/// Yields execution so other spawned tasks can run.
-/// Returns `Pending` once, then `Ready` on the next poll.
-pub async fn yield_now() {
-    struct YieldNow(bool);
-
-    impl Future for YieldNow {
-        type Output = ();
-        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<()> {
-            if self.0 {
-                std::task::Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        }
-    }
-
-    YieldNow(false).await;
 }
 
 #[derive(Default)]

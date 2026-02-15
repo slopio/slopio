@@ -9,10 +9,16 @@ use std::{
 
 use tquic::{PacketInfo, PacketSendHandler, TlsConfig, TlsConfigSelector, h3::Http3Error};
 
-use crate::io_driver::IO_DRIVER;
+use crate::{io_driver::IO_DRIVER, runtime::thread_id};
 
+mod balancer;
 mod process_request;
 mod server;
+
+pub use balancer::{
+    init_quic_balancer, is_initialised as is_balancer_initialised,
+    register_socket as register_balancer_socket, registered_threads as balancer_registered_threads,
+};
 
 #[cfg(feature = "test-monitor")]
 pub mod monitor;
@@ -71,6 +77,8 @@ pub struct Http3ServerConfig {
     pub idle_timeout: Duration,
     pub max_concurrent_streams: u64,
     pub max_body_size: usize,
+    pub thread_id: usize,
+    pub num_threads: usize,
 }
 
 impl Default for Http3ServerConfig {
@@ -82,6 +90,8 @@ impl Default for Http3ServerConfig {
             idle_timeout: Duration::from_secs(30),
             max_concurrent_streams: 100,
             max_body_size: 8 * 1024 * 1024, // 8 MiB
+            thread_id: thread_id(),
+            num_threads: 1,
         }
     }
 }
