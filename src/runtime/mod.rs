@@ -16,7 +16,7 @@ pub mod time;
 
 scoped_thread_local!(pub(crate) static TASK_LIST: TaskList);
 scoped_thread_local!(pub(crate) static TIME_DRIVER: TimeDriver);
-scoped_thread_local!(static THREAD_ID: usize);
+thread_local!(static THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
 
 #[derive(Default)]
 pub struct RuntimeInner {
@@ -37,52 +37,55 @@ impl RuntimeInner {
     pub fn block_on<F: Future>(self, f: F, event_fd: Option<RawFd>) -> F::Output {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
-        THREAD_ID.set(&self.thread_id, || {
-            self.io_driver.with(|| {
-                TASK_LIST.set(&self.tasks, || {
-                    TIME_DRIVER.set(&self.time_driver, || {
-                        if let Some(fd) = event_fd {
-                            runtime::eventfd::register_eventfd_read(fd);
+        set_thread_id(self.thread_id);
+        self.io_driver.with(|| {
+            TASK_LIST.set(&self.tasks, || {
+                TIME_DRIVER.set(&self.time_driver, || {
+                    if let Some(fd) = event_fd {
+                        runtime::eventfd::register_eventfd_read(fd);
+                    }
+                    let mut pinned_f = pin!(f);
+                    loop {
+                        if self.io_driver.shutdown() {
+                            //TODO graceful
+                            panic!("shutdown");
                         }
-                        let mut pinned_f = pin!(f);
                         loop {
-                            if self.io_driver.shutdown() {
-                                //TODO graceful
-                                panic!("shutdown");
+                            self.time_driver.tick();
+                            //TODO limit activity
+                            while let Some(item) = self.tasks.pop() {
+                                item.poll();
                             }
-                            loop {
-                                self.time_driver.tick();
-                                //TODO limit activity
-                                while let Some(item) = self.tasks.pop() {
-                                    item.poll();
-                                }
 
-                                let pinned = pinned_f.as_mut();
-                                match pinned.poll(&mut context) {
-                                    std::task::Poll::Ready(output) => {
-                                        return output;
-                                    }
-                                    std::task::Poll::Pending => {}
+                            let pinned = pinned_f.as_mut();
+                            match pinned.poll(&mut context) {
+                                std::task::Poll::Ready(output) => {
+                                    return output;
                                 }
-                                if self.tasks.is_empty() {
-                                    break;
-                                }
+                                std::task::Poll::Pending => {}
                             }
-                            if let Some(delay) = self.time_driver.next_deadline() {
-                                self.io_driver.push_wakeup_timeout(delay);
+                            if self.tasks.is_empty() {
+                                break;
                             }
-                            self.io_driver.submit_and_wait();
-                            self.io_driver.process_completion_queue();
                         }
-                    })
+                        if let Some(delay) = self.time_driver.next_deadline() {
+                            self.io_driver.push_wakeup_timeout(delay);
+                        }
+                        self.io_driver.submit_and_wait();
+                        self.io_driver.process_completion_queue();
+                    }
                 })
             })
         })
     }
 }
 
+pub fn set_thread_id(id: usize) {
+    THREAD_ID.with(|cell| cell.set(id));
+}
+
 pub fn thread_id() -> usize {
-    THREAD_ID.with(|id| *id)
+    THREAD_ID.with(|cell| cell.get())
 }
 
 pub fn spawn<F: Future>(f: F) -> Handle<F::Output> {

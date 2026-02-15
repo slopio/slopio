@@ -5,8 +5,11 @@ use runtime::main_thread;
 #[cfg(feature = "test-monitor")]
 use runtime::quic::monitor;
 use runtime::quic::{H3Server, Http3ServerConfig};
+
 use std::net::SocketAddr;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "test-monitor")]
 use std::time::Duration;
 
@@ -72,6 +75,97 @@ fn test_http3_not_found() {
     let (status, body) = curl_http3(4502, "/nonexistent");
     assert_eq!(status, 404);
     assert_eq!(body, "Not Found");
+}
+
+#[test]
+#[cfg(feature = "test-monitor")]
+fn test_http3_multithread_stress() {
+    use runtime::quic::monitor;
+    use runtime::runtime::thread_id;
+    use runtime::thread_per_core;
+    use std::pin::Pin;
+
+    const PORT: u16 = 4510;
+    const NUM_REQUESTS: usize = 50;
+
+    // Safety: each future is created on the main thread and moved to exactly
+    // one worker thread where it is polled exclusively. It is never shared.
+    struct SendFuture(Pin<Box<dyn Future<Output = ()>>>);
+    unsafe impl Send for SendFuture {}
+    impl Future for SendFuture {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            self.0.as_mut().poll(cx)
+        }
+    }
+
+    let num_threads = std::thread::available_parallelism().unwrap().get();
+    let ready_count = Arc::new(AtomicUsize::new(0));
+    let (cv_server, cv_client) = Cv::new();
+
+    let ready = ready_count.clone();
+    let cv = cv_server.clone();
+    let _runtime_thread = std::thread::spawn(move || {
+        thread_per_core(move || {
+            let ready = ready.clone();
+            let cv = cv.clone();
+            SendFuture(Box::pin(async move {
+                let config = Http3ServerConfig {
+                    bind_addr: SocketAddr::from(([127, 0, 0, 1], PORT)),
+                    thread_id: thread_id(),
+                    num_threads,
+                    ..Default::default()
+                };
+                let server = H3Server::build(config).unwrap();
+                if ready.fetch_add(1, Ordering::SeqCst) + 1 == num_threads {
+                    cv.notify();
+                }
+                server.run().await;
+            }))
+        });
+    });
+
+    cv_client.wait();
+
+    // Capture baselines (other tests may run in parallel).
+    let base_served = monitor::requests_served();
+    let base_per_thread: Vec<_> = (0..num_threads)
+        .map(|tid| monitor::requests_served_by_thread(tid))
+        .collect();
+
+    // Fire many concurrent requests.
+    let request_handles: Vec<_> = (0..NUM_REQUESTS)
+        .map(|_| std::thread::spawn(|| curl_http3(PORT, "/")))
+        .collect();
+
+    let mut ok_count = 0;
+    for h in request_handles {
+        let (status, body) = h.join().unwrap();
+        assert_eq!(status, 200, "expected 200, got {status}");
+        assert_eq!(body, "Hello from HTTP/3!");
+        ok_count += 1;
+    }
+    assert_eq!(ok_count, NUM_REQUESTS);
+
+    // Verify all requests were served.
+    let served = monitor::requests_served() - base_served;
+    assert!(
+        served >= NUM_REQUESTS,
+        "expected at least {NUM_REQUESTS} served, got {served}"
+    );
+
+    // Verify that more than one thread served requests.
+    let mut threads_with_requests = 0;
+    for tid in 0..num_threads {
+        let thread_served = monitor::requests_served_by_thread(tid) - base_per_thread[tid];
+        if thread_served > 0 {
+            threads_with_requests += 1;
+        }
+    }
+    assert!(
+        threads_with_requests > 1,
+        "expected requests on multiple threads, but only {threads_with_requests} thread(s) served traffic"
+    );
 }
 
 #[test]
