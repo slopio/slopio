@@ -1,7 +1,6 @@
 use std::{
     cell::UnsafeCell,
     collections::{HashMap, VecDeque},
-    io,
     rc::Rc,
 };
 
@@ -84,13 +83,16 @@ impl H3Server {
 
         let multithread = server_config.num_threads > 1;
 
-        // Register this thread's socket with the global eBPF balancer (multi-thread only)
-        if multithread && super::balancer::is_initialised() {
-            super::balancer::register_socket(server_config.thread_id as u32, udp.fd()).map_err(
-                |e| {
-                    super::Http3ServerError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-                },
-            )?;
+        // Try to register this thread's socket with the eBPF balancer (multi-thread only).
+        // Falls back to kernel SO_REUSEPORT round-robin if eBPF is unavailable.
+        if multithread {
+            if let Err(e) = super::balancer::register_socket(
+                server_config.thread_id as u32,
+                server_config.num_threads as u32,
+                udp.fd(),
+            ) {
+                eprintln!("eBPF balancer unavailable, falling back to SO_REUSEPORT: {e}");
+            }
         }
 
         let mut config = Box::new(tquic::Config::new()?);
@@ -111,7 +113,7 @@ impl H3Server {
         let sender = Rc::new(super::Sender { fd: udp.fd() });
         let mut endpoint = Endpoint::new(config, true, Box::new(HandlerBridge), sender);
 
-        if multithread {
+        if multithread && super::balancer::is_initialised() {
             let cid_gen = super::balancer::CidGenerator(
                 runtime_ebpf_balancer::id_generation::ThreadAwareCidGenerator::new(
                     server_config.thread_id as u8,

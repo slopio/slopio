@@ -15,10 +15,7 @@ mod balancer;
 mod process_request;
 mod server;
 
-pub use balancer::{
-    init_quic_balancer, is_initialised as is_balancer_initialised,
-    register_socket as register_balancer_socket, registered_threads as balancer_registered_threads,
-};
+pub use balancer::register_socket as register_balancer_socket;
 
 #[cfg(feature = "test-monitor")]
 pub mod monitor;

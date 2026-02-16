@@ -31,7 +31,7 @@ fn test_sleep_basic() {
 fn test_sleep_short_duration() {
     let start = Instant::now();
     main_thread(async {
-        let k = spawn(async {
+        let _ = spawn(async {
             Sleep::during(Duration::from_millis(1)).await;
             println!("done");
         })

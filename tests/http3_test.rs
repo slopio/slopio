@@ -8,7 +8,9 @@ use runtime::quic::{H3Server, Http3ServerConfig};
 
 use std::net::SocketAddr;
 use std::process::Command;
+#[cfg(feature = "test-monitor")]
 use std::sync::Arc;
+#[cfg(feature = "test-monitor")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "test-monitor")]
 use std::time::Duration;
