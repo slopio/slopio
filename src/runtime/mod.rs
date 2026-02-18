@@ -46,10 +46,6 @@ impl RuntimeInner {
                     }
                     let mut pinned_f = pin!(f);
                     loop {
-                        if self.io_driver.shutdown() {
-                            //TODO graceful
-                            panic!("shutdown");
-                        }
                         loop {
                             self.time_driver.tick();
                             //TODO limit activity

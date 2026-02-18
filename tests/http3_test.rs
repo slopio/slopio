@@ -83,23 +83,10 @@ fn test_http3_not_found() {
 #[cfg(feature = "test-monitor")]
 fn test_http3_multithread_stress() {
     use runtime::quic::monitor;
-    use runtime::runtime::thread_id;
     use runtime::thread_per_core;
-    use std::pin::Pin;
 
     const PORT: u16 = 4510;
     const NUM_REQUESTS: usize = 50;
-
-    // Safety: each future is created on the main thread and moved to exactly
-    // one worker thread where it is polled exclusively. It is never shared.
-    struct SendFuture(Pin<Box<dyn Future<Output = ()>>>);
-    unsafe impl Send for SendFuture {}
-    impl Future for SendFuture {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-            self.0.as_mut().poll(cx)
-        }
-    }
 
     let num_threads = std::thread::available_parallelism().unwrap().get();
     let ready_count = Arc::new(AtomicUsize::new(0));
@@ -108,14 +95,14 @@ fn test_http3_multithread_stress() {
     let ready = ready_count.clone();
     let cv = cv_server.clone();
     let _runtime_thread = std::thread::spawn(move || {
-        thread_per_core(move || {
+        thread_per_core(move |ctx| {
             let ready = ready.clone();
             let cv = cv.clone();
-            SendFuture(Box::pin(async move {
+            Box::pin(async move {
                 let config = Http3ServerConfig {
                     bind_addr: SocketAddr::from(([127, 0, 0, 1], PORT)),
-                    thread_id: thread_id(),
-                    num_threads,
+                    thread_id: ctx.thread_id,
+                    num_threads: ctx.num_threads,
                     ..Default::default()
                 };
                 let server = H3Server::build(config).unwrap();
@@ -123,7 +110,7 @@ fn test_http3_multithread_stress() {
                     cv.notify();
                 }
                 server.run().await;
-            }))
+            })
         });
     });
 

@@ -373,6 +373,13 @@ impl TransportHandler for HandlerBridge {
     fn on_conn_created(&mut self, _conn: &mut Connection) {}
 
     fn on_conn_established(&mut self, conn: &mut Connection) {
+        use crate::io_driver::IO_DRIVER;
+
+        if IO_DRIVER.with(|d| d.shutdown()) {
+            let _ = conn.close(true, 0, b"shutting down");
+            return;
+        }
+
         with_state(|state| {
             let Some(h3_config) = &state.handler.h3_config else {
                 return;

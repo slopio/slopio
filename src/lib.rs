@@ -1,4 +1,5 @@
 use core::panic;
+use std::pin::Pin;
 use std::thread::JoinHandle;
 
 use libc::cpu_set_t;
@@ -48,26 +49,36 @@ fn setup_sig_handling(fds: Vec<i32>) {
         for fd in fds {
             eventfd::signal_eventfd(fd, sig as u64);
         }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::process::exit(1);
     });
 }
 
-pub fn thread_per_core<F, Fut>(f: F)
+pub struct WorkerContext {
+    pub thread_id: usize,
+    pub num_threads: usize,
+}
+
+pub fn thread_per_core<F>(f: F)
 where
-    F: Fn() -> Fut,
-    Fut: Future<Output = ()> + Send + 'static,
+    F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
     block_signals_for_thread();
-    let cores_num = std::thread::available_parallelism().unwrap().into();
-    let fds = (0..cores_num)
+    let num_threads: usize = std::thread::available_parallelism().unwrap().into();
+    let fds = (0..num_threads)
         .map(|_| eventfd::create_eventfd())
         .collect::<Vec<_>>();
 
     setup_sig_handling(fds.clone());
 
+    let f = std::sync::Arc::new(f);
     let handles = fds
         .iter()
-        .zip(0..cores_num)
-        .map(|(sig_handler_fd, n)| spawn_worker_on(n, f(), *sig_handler_fd))
+        .zip(0..num_threads)
+        .map(|(sig_handler_fd, n)| {
+            let f = f.clone();
+            spawn_worker_on(n, num_threads, f, *sig_handler_fd)
+        })
         .collect::<Vec<_>>();
 
     for handle in handles {
@@ -100,17 +111,23 @@ mod numa {
     }
 }
 
-fn spawn_worker_on<F: Future<Output = ()> + Send + 'static>(
+fn spawn_worker_on<F>(
     n: usize,
-    f: F,
+    num_threads: usize,
+    f: std::sync::Arc<F>,
     event_fd: i32,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
+{
     std::thread::spawn(move || {
         pin_core(n);
-        // if get_numa_node_count() != 1 {
-        //     numa_allocs(n);
-        // }
+        let ctx = WorkerContext {
+            thread_id: n,
+            num_threads,
+        };
+        let fut = f(ctx);
         let rt = runtime::RuntimeInner::with_thread_id(n);
-        rt.block_on(f, Some(event_fd))
+        rt.block_on(fut, Some(event_fd))
     })
 }

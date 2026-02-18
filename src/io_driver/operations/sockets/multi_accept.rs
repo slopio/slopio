@@ -12,6 +12,7 @@ use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
     IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
+    completion_events::MULTI_OP_FLAG,
     operations::{IoOP, sockets::SocketWrapper},
 };
 
@@ -19,6 +20,7 @@ pub struct MultiAccept {
     id: Option<usize>,
     fd: i32,
     sockets: MultiOpQueue,
+    cancel_sent: bool,
 }
 
 #[derive(Debug)]
@@ -68,6 +70,7 @@ impl MultiAccept {
             id: None,
             fd,
             sockets: Default::default(),
+            cancel_sent: false,
         };
         multi_accept.register_to_driver();
         Ok(multi_accept)
@@ -100,6 +103,15 @@ impl Stream for MultiAccept {
     type Item = SocketWrapper;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let shutting_down = IO_DRIVER.with(|d| d.shutdown());
+
+        // On shutdown, ask io_uring to cancel the multishot accept (once).
+        if shutting_down && !self.cancel_sent {
+            self.cancel_sent = true;
+            let id = self.id.unwrap();
+            IO_DRIVER.with(|d| d.send_multiop_cancel_event((id as u64) | MULTI_OP_FLAG));
+        }
+
         if let Poll::Ready(result) = self.try_drain_one() {
             return Poll::Ready(result);
         }
@@ -109,8 +121,23 @@ impl Stream for MultiAccept {
 
         match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.sockets)) {
             MultiPollResult::Pending => Poll::Pending,
-            MultiPollResult::Ready => self.try_drain_one(),
+            MultiPollResult::Ready => {
+                let drained = self.try_drain_one();
+                // If shutting down and nothing left, we're done.
+                if shutting_down && matches!(drained, Poll::Pending) {
+                    return Poll::Ready(None);
+                }
+                drained
+            }
             MultiPollResult::NeedsResubmit => {
+                // Drain any remaining sockets queued before the pause.
+                if let Poll::Ready(result) = self.try_drain_one() {
+                    return Poll::Ready(result);
+                }
+                // During shutdown, don't resubmit — the stream is done.
+                if shutting_down {
+                    return Poll::Ready(None);
+                }
                 let entry = self.to_entry();
                 IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
                 Poll::Pending
