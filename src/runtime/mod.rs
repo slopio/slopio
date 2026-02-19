@@ -7,6 +7,7 @@ use std::task::{Context, Waker};
 use crate::io_driver::IODriver;
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
+use crate::tracing::{TRACE_MANAGER, TraceManager};
 use crate::{runtime, scoped_thread_local};
 
 pub mod eventfd;
@@ -38,38 +39,42 @@ impl RuntimeInner {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         set_thread_id(self.thread_id);
+        let trace_manager = TraceManager::init();
         self.io_driver.with(|| {
             TASK_LIST.set(&self.tasks, || {
                 TIME_DRIVER.set(&self.time_driver, || {
-                    if let Some(fd) = event_fd {
-                        runtime::eventfd::register_eventfd_read(fd);
-                    }
-                    let mut pinned_f = pin!(f);
-                    loop {
+                    TRACE_MANAGER.set(&trace_manager, || {
+                        if let Some(fd) = event_fd {
+                            runtime::eventfd::register_eventfd_read(fd);
+                        }
+                        let mut pinned_f = pin!(f);
                         loop {
-                            self.time_driver.tick();
-                            //TODO limit activity
-                            while let Some(item) = self.tasks.pop() {
-                                item.poll();
-                            }
-
-                            let pinned = pinned_f.as_mut();
-                            match pinned.poll(&mut context) {
-                                std::task::Poll::Ready(output) => {
-                                    return output;
+                            loop {
+                                self.time_driver.tick();
+                                //TODO limit activity
+                                while let Some(item) = self.tasks.pop() {
+                                    item.poll();
                                 }
-                                std::task::Poll::Pending => {}
+
+                                let pinned = pinned_f.as_mut();
+                                match pinned.poll(&mut context) {
+                                    std::task::Poll::Ready(output) => {
+                                        return output;
+                                    }
+                                    std::task::Poll::Pending => {}
+                                }
+                                if self.tasks.is_empty() {
+                                    break;
+                                }
                             }
-                            if self.tasks.is_empty() {
-                                break;
+                            if let Some(delay) = self.time_driver.next_deadline() {
+                                self.io_driver.push_wakeup_timeout(delay);
                             }
+                            trace_manager.flush();
+                            self.io_driver.submit_and_wait();
+                            self.io_driver.process_completion_queue();
                         }
-                        if let Some(delay) = self.time_driver.next_deadline() {
-                            self.io_driver.push_wakeup_timeout(delay);
-                        }
-                        self.io_driver.submit_and_wait();
-                        self.io_driver.process_completion_queue();
-                    }
+                    })
                 })
             })
         })

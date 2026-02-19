@@ -1,9 +1,12 @@
 use std::{cell::Cell, mem};
 
-use crate::task::{
-    TypeAgnosticTask,
-    handle::Handle,
-    inner_parts::typed_task::{TypedTask, Vtable},
+use crate::{
+    task::{
+        TypeAgnosticTask,
+        handle::Handle,
+        inner_parts::typed_task::{TypedTask, Vtable},
+    },
+    tracing::TracingMetadata,
 };
 
 pub(crate) mod type_agnostic_task;
@@ -12,6 +15,7 @@ pub(crate) mod typed_task;
 pub struct Metadata {
     detached_mode: Cell<bool>,
     vtable: &'static Vtable,
+    tracing: TracingMetadata,
 }
 
 enum State<T: Future> {

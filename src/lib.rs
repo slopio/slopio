@@ -14,6 +14,7 @@ pub mod runtime;
 mod task;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod tracing;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

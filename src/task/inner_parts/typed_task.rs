@@ -8,6 +8,7 @@ use std::{
 use crate::{
     runtime::TASK_LIST,
     task::inner_parts::{Data, Metadata, State, type_agnostic_task::TypeAgnosticTask},
+    tracing::TracingMetadata,
 };
 
 #[repr(C)]
@@ -103,6 +104,7 @@ impl<F: Future> TypedTask<F> {
             header: Metadata {
                 vtable: table::<F>(),
                 detached_mode: Cell::new(false),
+                tracing: TracingMetadata::new(0),
             },
             data: Data {
                 state: State::Running(future),

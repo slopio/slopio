@@ -1,6 +1,6 @@
 use std::{ptr::NonNull, task::Waker};
 
-use crate::task::inner_parts::Metadata;
+use crate::{task::inner_parts::Metadata, tracing::set_span};
 
 #[derive(Debug)]
 pub struct TypeAgnosticTask {
@@ -36,8 +36,9 @@ impl TypeAgnosticTask {
     }
 
     pub fn poll(self) {
-        let vtable = self.header().vtable;
-        unsafe { (vtable.poll)(self.ptr) }
+        let header = self.header();
+        set_span(header.tracing.id());
+        unsafe { (header.vtable.poll)(self.ptr) }
     }
 
     pub fn get_ouput(self, dst: *mut (), waker: &Waker) {
