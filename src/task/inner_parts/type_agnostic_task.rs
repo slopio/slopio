@@ -37,7 +37,7 @@ impl TypeAgnosticTask {
 
     pub fn poll(self) {
         let header = self.header();
-        set_span(header.tracing.id());
+        // set_span(header.tracing);
         unsafe { (header.vtable.poll)(self.ptr) }
     }
 

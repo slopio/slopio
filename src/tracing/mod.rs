@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::ffi::CString;
 
 use io_uring::opcode;
@@ -18,18 +19,15 @@ struct TraceBuf {
     data: Box<[u8; BUFFER_SIZE]>,
     len: usize,
 }
+#[derive(Default)]
 pub struct TracingMetadata {
-    id: u64,
+    spans: VecDeque<Span>,
 }
 
-impl TracingMetadata {
-    pub fn new(id: u64) -> Self {
-        Self { id }
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
-    }
+struct Span {
+    trace_id: u128,
+    span_id: u64,
+    parent_span_id: u64,
 }
 
 impl TraceBuf {

@@ -104,7 +104,7 @@ impl<F: Future> TypedTask<F> {
             header: Metadata {
                 vtable: table::<F>(),
                 detached_mode: Cell::new(false),
-                tracing: TracingMetadata::new(0),
+                tracing: TracingMetadata::default(),
             },
             data: Data {
                 state: State::Running(future),
