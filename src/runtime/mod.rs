@@ -7,7 +7,8 @@ use std::task::{Context, Waker};
 use crate::io_driver::IODriver;
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
-use crate::tracing::{TRACE_MANAGER, TraceManager};
+use crate::tracing::TraceWriter;
+use crate::tracing::{TRACE_COLLECTOR, TraceCollector};
 use crate::{runtime, scoped_thread_local};
 
 pub mod eventfd;
@@ -39,11 +40,11 @@ impl RuntimeInner {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         set_thread_id(self.thread_id);
-        let trace_manager = TraceManager::init();
+        let trace_manager = TraceCollector::init();
         self.io_driver.with(|| {
             TASK_LIST.set(&self.tasks, || {
                 TIME_DRIVER.set(&self.time_driver, || {
-                    TRACE_MANAGER.set(&trace_manager, || {
+                    TRACE_COLLECTOR.set(&trace_manager, || {
                         if let Some(fd) = event_fd {
                             runtime::eventfd::register_eventfd_read(fd);
                         }

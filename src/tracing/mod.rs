@@ -1,173 +1,118 @@
-use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::ffi::CString;
 
-use io_uring::opcode;
-use io_uring::types::Fd;
+use crate::{scoped_thread_local, tracing::span::SpanMetadata};
 
-use crate::io_driver::IO_DRIVER;
+mod span;
+mod writer;
+pub use writer::TraceCollector;
 
-// Same bit as IGNORED_FLAG in io_driver — CQEs with this user_data are discarded.
-const IGNORED_FLAG: u64 = 1u64 << 62;
-use crate::runtime::thread_id;
-use crate::scoped_thread_local;
+scoped_thread_local!(pub(crate) static TRACE_COLLECTOR: TraceCollector);
 
-const BUFFER_SIZE: usize = 64 * 1024;
+thread_local!(
+    static CURRENT_TASK_TRACING: std::cell::Cell<*mut TracingMetadata> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) }
+);
 
-/// One buffer that can be handed to io_uring while the other is being written into.
-struct TraceBuf {
-    data: Box<[u8; BUFFER_SIZE]>,
-    len: usize,
-}
 #[derive(Default)]
 pub struct TracingMetadata {
-    spans: VecDeque<Span>,
+    spans: VecDeque<SpanMetadata>,
 }
 
-struct Span {
-    trace_id: u128,
-    span_id: u64,
-    parent_span_id: u64,
-}
-
-impl TraceBuf {
-    fn new() -> Self {
-        Self {
-            data: Box::new([0u8; BUFFER_SIZE]),
-            len: 0,
-        }
-    }
-
-    fn remaining(&self) -> usize {
-        BUFFER_SIZE - self.len
-    }
-
-    fn append(&mut self, s: &str) {
-        let bytes = s.as_bytes();
-        self.data[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        self.len += bytes.len();
-    }
-
-    fn reset(&mut self) {
-        self.len = 0;
-    }
-}
-
-/// Per-thread double-buffered trace manager.
-/// Call `TraceManager::init()` once per thread before tracing.
-/// Call `TraceManager::trace(s)` to append a trace entry.
-/// Call `TraceManager::flush()` to submit whatever is left to io_uring.
-pub struct TraceManager {
-    /// The two buffers (active index is `active`).
-    bufs: UnsafeCell<[TraceBuf; 2]>,
-    /// Which buffer index is currently being written into.
-    active: UnsafeCell<usize>,
-    /// File descriptor for `logs-{thread_id}`.
-    fd: i32,
-}
-
-impl TraceManager {
-    /// Opens `logs-{thread_id}` and returns a new `TraceManager`.
-    pub fn init() -> Self {
-        let tid = thread_id();
-        let path = CString::new(format!("logs-{tid}")).expect("CString::new");
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-                0o644,
-            )
+impl TracingMetadata {
+    pub fn create_new_span(&mut self, name: &'static str) -> u64 {
+        let (trace_id, parent_span_id) = match self.spans.back() {
+            Some(top) => (top.trace_id, Some(top.span_id)),
+            None => (rand::random(), None),
         };
-        if fd < 0 {
-            panic!(
-                "TraceManager: failed to open logs-{tid}: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        Self {
-            bufs: UnsafeCell::new([TraceBuf::new(), TraceBuf::new()]),
-            active: UnsafeCell::new(0),
-            fd,
-        }
-    }
 
-    /// Append `s` to the active buffer.
-    /// If `s` would overflow the active buffer, the current buffer is
-    /// submitted to io_uring first and the write continues into the other
-    /// (now-idle) buffer.
-    pub fn trace(&self, s: &str) {
-        if s.len() > BUFFER_SIZE {
-            // Can't fit even in a fresh buffer; drop silently.
-            return;
-        }
-        let bufs = unsafe { &mut *self.bufs.get() };
-        let active = unsafe { &mut *self.active.get() };
+        let span = SpanMetadata::new(trace_id, parent_span_id, name);
+        let span_id = span.span_id;
 
-        if bufs[*active].remaining() < s.len() {
-            self.submit_active_buffer(bufs, active);
-        }
-
-        bufs[*active].append(s);
-    }
-
-    /// Flush the active buffer to io_uring (useful on shutdown).
-    pub fn flush(&self) {
-        let bufs = unsafe { &mut *self.bufs.get() };
-        let active = unsafe { &mut *self.active.get() };
-        if bufs[*active].len > 0 {
-            self.submit_active_buffer(bufs, active);
-        }
-    }
-
-    /// Submit the active buffer to io_uring as a fire-and-forget write,
-    /// then swap active to the other buffer and reset it for new traces.
-    fn submit_active_buffer(&self, bufs: &mut [TraceBuf; 2], active: &mut usize) {
-        let len = bufs[*active].len;
-        if len == 0 {
-            return;
-        }
-        let ptr = bufs[*active].data.as_ptr();
-        let entry = opcode::Write::new(Fd(self.fd), ptr, len as u32)
-            .build()
-            .user_data(IGNORED_FLAG);
-        IO_DRIVER.with(|d| d.push_anon_op(entry));
-
-        // Swap to the other buffer and clear it for new data.
-        *active ^= 1;
-        bufs[*active].reset();
+        self.spans.push_back(span);
+        TRACE_COLLECTOR.try_with(|opt| {
+            if let Some(manager) = opt {
+                manager.trace(name);
+            }
+        });
+        span_id
     }
 }
 
-scoped_thread_local!(pub(crate) static TRACE_MANAGER: TraceManager);
-
-thread_local!(static CURRENT_SPAN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) });
-
-pub fn current_span() -> u64 {
-    CURRENT_SPAN.with(|c| c.get())
+/// Set the active task's tracing metadata.
+pub fn set_current_task_tracing(ptr: *mut TracingMetadata) {
+    CURRENT_TASK_TRACING.with(|c| c.set(ptr));
 }
 
-pub fn set_span(span: u64) {
-    CURRENT_SPAN.with(|c| c.set(span));
+/// Set the active task's tracing metadata, returning the previous pointer.
+/// Call with `null_mut()` to clear after polling.
+pub fn swap_current_task_tracing(ptr: *mut TracingMetadata) -> *mut TracingMetadata {
+    CURRENT_TASK_TRACING.with(|c| {
+        let prev = c.get();
+        c.set(ptr);
+        prev
+    })
+}
+
+/// Access the current task's `TracingMetadata` mutably.
+/// Returns `None` if called outside of a task poll.
+pub fn with_current_task_tracing<R>(f: impl FnOnce(&mut TracingMetadata) -> R) -> Option<R> {
+    CURRENT_TASK_TRACING.with(|c| {
+        let ptr = c.get();
+        if ptr.is_null() {
+            None
+        } else {
+            Some(f(unsafe { &mut *ptr }))
+        }
+    })
+}
+
+/// RAII guard that pops its span from the current task's stack when dropped.
+pub struct SpanGuard {
+    span_id: u64,
+    name: &'static str,
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        let span = with_current_task_tracing(|tracing| {
+            if let Some(pos) = tracing
+                .spans
+                .iter()
+                .rposition(|s| s.span_id == self.span_id)
+            {
+                tracing.spans.remove(pos)
+            } else {
+                None
+            }
+        })
+        .flatten();
+
+        TRACE_COLLECTOR.try_with(|opt| {
+            if let Some(manager) = opt {
+                if let Some(span) = span {
+                    manager.push_ended_span(span);
+                } else {
+                    unreachable!()
+                }
+            }
+        });
+    }
+}
+
+/// Create a new span in the current task, returning a `SpanGuard` that pops it on drop.
+/// Returns `None` if called outside of a task poll.
+pub fn new_span(name: &'static str) -> Option<SpanGuard> {
+    with_current_task_tracing(|tracing| SpanGuard {
+        span_id: tracing.create_new_span(name),
+        name,
+    })
 }
 
 /// Append a trace string on the current thread.
 /// No-op if called outside of a runtime context.
-pub fn trace(s: &str) {
-    TRACE_MANAGER.try_with(|opt| {
-        if let Some(manager) = opt {
-            manager.trace(s);
-        }
-    });
-}
+pub fn event(message: &str) {}
 
-impl Drop for TraceManager {
-    fn drop(&mut self) {
-        // Best-effort flush — io_uring may not be live at this point.
-        IO_DRIVER.try_with(|opt| {
-            if opt.is_some() {
-                self.flush();
-            }
-        });
-        unsafe { libc::close(self.fd) };
-    }
+pub trait TraceWriter: Drop {
+    fn write_span(&self, span: SpanMetadata);
+    fn flush(&self);
 }
