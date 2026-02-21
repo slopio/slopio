@@ -1,4 +1,0 @@
-first span
-some second span
-span end trace_id=50116b01712302f6bc339445c04846ac span_id=360a230c500506cb name=some second span
-span end trace_id=409237b6c0eeaa5db20c64cb12d75225 span_id=a512210bfb628240 name=first span

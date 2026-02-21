@@ -4,7 +4,18 @@ use common::Cv;
 use runtime::main_thread;
 #[cfg(feature = "test-monitor")]
 use runtime::quic::monitor;
-use runtime::quic::{H3Server, Http3ServerConfig};
+use runtime::quic::{H3Server, Http3ServerConfig, HttpRequest, HttpResponse};
+
+async fn handle(req: HttpRequest) -> HttpResponse {
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/") => HttpResponse::new(200)
+            .header("content-type", "text/plain")
+            .body("Hello from HTTP/3!"),
+        _ => HttpResponse::new(404)
+            .header("content-type", "text/plain")
+            .body("Not Found"),
+    }
+}
 
 use std::net::SocketAddr;
 use std::process::Command;
@@ -52,15 +63,15 @@ fn start_server(port: u16) -> std::thread::JoinHandle<()> {
 
 fn start_server_with_config(config: Http3ServerConfig) -> std::thread::JoinHandle<()> {
     let (cv_server, cv_client) = Cv::new();
-    let handle = std::thread::spawn(move || {
+    let join = std::thread::spawn(move || {
         main_thread(async move {
             let server = H3Server::build(config).unwrap();
             cv_server.notify();
-            server.run().await;
+            server.run(handle).await;
         });
     });
     cv_client.wait();
-    handle
+    join
 }
 
 #[test]
@@ -109,7 +120,7 @@ fn test_http3_multithread_stress() {
                 if ready.fetch_add(1, Ordering::SeqCst) + 1 == num_threads {
                     cv.notify();
                 }
-                server.run().await;
+                server.run(handle).await;
             })
         });
     });

@@ -1,21 +1,21 @@
 use runtime::{
     main_thread,
-    quic::{H3Server, Http3ServerConfig},
-    runtime::spawn,
-    tracing::{event, new_span},
+    quic::{H3Server, Http3ServerConfig, HttpRequest, HttpResponse},
 };
+
+async fn handle(req: HttpRequest) -> HttpResponse {
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/") => HttpResponse::new(200)
+            .header("content-type", "text/plain")
+            .body("Hello from HTTP/3!"),
+        _ => HttpResponse::new(404)
+            .header("content-type", "text/plain")
+            .body("Not Found"),
+    }
+}
 
 fn main() {
     main_thread(async {
-        spawn(async {
-            let span1 = new_span("first span").unwrap();
-            let owo = spawn(async {
-                let span2 = new_span("some second span").unwrap();
-                event("hahahaha");
-            });
-            event("uwu");
-            owo.await;
-        });
         let config = Http3ServerConfig::default();
         let server = match H3Server::build(config) {
             Ok(server) => server,
@@ -25,6 +25,6 @@ fn main() {
             }
         };
         println!("HTTP/3 server listening on :4433");
-        server.run().await;
+        server.run(handle).await;
     });
 }

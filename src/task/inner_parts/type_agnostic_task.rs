@@ -1,9 +1,6 @@
 use std::{ptr::NonNull, task::Waker};
 
-use crate::{
-    task::inner_parts::Metadata,
-    tracing::{set_current_task_tracing, swap_current_task_tracing},
-};
+use crate::{task::inner_parts::Metadata, tracing::set_current_task_tracing};
 
 #[derive(Debug)]
 pub struct TypeAgnosticTask {

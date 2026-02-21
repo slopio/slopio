@@ -21,6 +21,7 @@ pub use balancer::register_socket as register_balancer_socket;
 pub mod monitor;
 
 pub use server::H3Server;
+pub use server::RequestHandler;
 
 // ---------------------------------------------------------------------------
 // Error type

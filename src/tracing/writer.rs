@@ -41,6 +41,9 @@ impl TraceWriter for TraceCollector {
 
     async fn flush(&self) {
         let spans = unsafe { &mut *self.spans.get() };
+        if spans.is_empty() {
+            return;
+        }
         let mut new = Vec::new();
         mem::swap(&mut new, spans);
         self.span_exporter.export(new).await.unwrap();

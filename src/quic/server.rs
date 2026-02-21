@@ -1,6 +1,8 @@
 use std::{
     cell::UnsafeCell,
     collections::{HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
     rc::Rc,
 };
 
@@ -13,8 +15,10 @@ use tquic::{
 
 use crate::{
     io_driver::operations::sockets::udp::UdpSocket,
-    quic::{Http3ServerConfig, HttpResponse},
+    quic::{Http3ServerConfig, HttpRequest, HttpResponse},
 };
+
+pub type RequestHandler = Rc<dyn Fn(HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse>>>>;
 
 type ConnectionId = u64;
 type StreamId = u64;
@@ -22,6 +26,7 @@ type StreamId = u64;
 struct H3State {
     handler: H3Handler,
     endpoint: Option<Endpoint>,
+    request_handler: Option<RequestHandler>,
 }
 
 impl H3State {
@@ -29,6 +34,7 @@ impl H3State {
         Self {
             handler: H3Handler::new(),
             endpoint: None,
+            request_handler: None,
         }
     }
 }
@@ -133,7 +139,17 @@ impl H3Server {
         })
     }
 
-    pub async fn run(self) {
+    pub async fn run<H, Fut>(self, handler: H)
+    where
+        H: Fn(HttpRequest) -> Fut + 'static,
+        Fut: Future<Output = HttpResponse> + 'static,
+    {
+        let handler: RequestHandler = Rc::new(move |req| Box::pin(handler(req)));
+        with_state(|state| state.request_handler = Some(handler));
+        self.run_inner().await;
+    }
+
+    async fn run_inner(self) {
         use runtime_streams::StreamExt;
         use std::time::Instant;
         use tquic::PacketInfo;
@@ -349,22 +365,17 @@ async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: Conn
     };
     super::process_request::remove(slab_id);
 
-    let response = route(&request).await;
+    let handler = with_state(|state| state.request_handler.clone());
+    let response = match handler {
+        Some(h) => h(request).await,
+        None => HttpResponse::new(500)
+            .header("content-type", "text/plain")
+            .body("no handler registered"),
+    };
     send_response(connection_id, stream_id, response);
     #[cfg(feature = "test-monitor")]
     super::monitor::record_request_served();
     task_done(connection_id);
-}
-
-async fn route(request: &super::HttpRequest) -> HttpResponse {
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => HttpResponse::new(200)
-            .header("content-type", "text/plain")
-            .body("Hello from HTTP/3!"),
-        _ => HttpResponse::new(404)
-            .header("content-type", "text/plain")
-            .body("Not Found"),
-    }
 }
 
 struct HandlerBridge;
