@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use ::opentelemetry::SpanId;
+use ::opentelemetry::TraceId;
 use ::opentelemetry::trace::Event;
 use ::opentelemetry_sdk::trace::SpanData;
 
@@ -23,16 +24,24 @@ thread_local!(
 #[derive(Default)]
 pub struct TaskTelemetry {
     spans: VecDeque<SpanData>,
+    inherited_trace_id: Option<TraceId>,
 }
 
 impl TaskTelemetry {
+    pub fn with_trace_id(trace_id: TraceId) -> Self {
+        Self {
+            spans: VecDeque::new(),
+            inherited_trace_id: Some(trace_id),
+        }
+    }
+
     pub fn create_new_span(&mut self, name: &'static str) -> SpanId {
         let (trace_id, parent_span_id) = match self.spans.back() {
             Some(top) => (
                 top.span_context.trace_id(),
                 Some(top.span_context.span_id()),
             ),
-            None => (random_trace_id(), None),
+            None => (self.inherited_trace_id.unwrap_or_else(random_trace_id), None),
         };
 
         let span = new_span_data(trace_id, parent_span_id, name);
@@ -104,6 +113,12 @@ impl Drop for SpanGuard {
     }
 }
 
+/// Get the trace_id of the current active span, if any.
+pub fn current_trace_id() -> Option<TraceId> {
+    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.span_context.trace_id()))
+        .flatten()
+}
+
 /// Create a new span in the current task, returning a `SpanGuard` that pops it on drop.
 /// Returns `None` if called outside of a task poll.
 pub fn new_span(name: &'static str) -> Option<SpanGuard> {
@@ -127,5 +142,5 @@ pub fn event(message: &str) {
 
 pub trait TraceWriter: Drop {
     fn write_span(&self, span: SpanData);
-    fn flush(&self);
+    async fn flush(&self);
 }

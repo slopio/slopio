@@ -1,5 +1,6 @@
 use std::cell::UnsafeCell;
 use std::future::Future;
+use std::mem;
 use std::pin::pin;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -38,7 +39,12 @@ impl TraceWriter for TraceCollector {
         self.push_ended_span(span);
     }
 
-    fn flush(&self) {}
+    async fn flush(&self) {
+        let spans = unsafe { &mut *self.spans.get() };
+        let mut new = Vec::new();
+        mem::swap(&mut new, spans);
+        self.span_exporter.export(new).await.unwrap();
+    }
 }
 
 impl Drop for TraceCollector {

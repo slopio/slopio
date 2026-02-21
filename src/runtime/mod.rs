@@ -71,7 +71,8 @@ impl RuntimeInner {
                             if let Some(delay) = self.time_driver.next_deadline() {
                                 self.io_driver.push_wakeup_timeout(delay);
                             }
-                            trace_manager.flush();
+                            let mut f = pin!(trace_manager.flush());
+                            let _ = f.as_mut().poll(&mut context);
                             self.io_driver.submit_and_wait();
                             self.io_driver.process_completion_queue();
                         }
