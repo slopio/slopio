@@ -1,6 +1,4 @@
 first span
-uwu
 some second span
-hahahaha
-span end trace_id=5f566e2cccac8a54dfe412b05f6c6807 span_id=cb27fdfdc94c0dd3 name=some second span
-span end trace_id=608e8e2407e8ff222e6f6234926e451b span_id=521dd90e07564671 name=first span
+span end trace_id=50116b01712302f6bc339445c04846ac span_id=360a230c500506cb name=some second span
+span end trace_id=409237b6c0eeaa5db20c64cb12d75225 span_id=a512210bfb628240 name=first span

@@ -6,7 +6,7 @@ use crate::{
         handle::Handle,
         inner_parts::typed_task::{TypedTask, Vtable},
     },
-    tracing::TracingMetadata,
+    tracing::TaskTelemetry,
 };
 
 pub(crate) mod type_agnostic_task;
@@ -15,7 +15,7 @@ pub(crate) mod typed_task;
 pub struct Metadata {
     detached_mode: Cell<bool>,
     vtable: &'static Vtable,
-    tracing: TracingMetadata,
+    tracing: TaskTelemetry,
 }
 
 enum State<T: Future> {

@@ -1,51 +1,56 @@
 use std::collections::VecDeque;
 
-use crate::{scoped_thread_local, tracing::span::SpanMetadata};
+use ::opentelemetry::SpanId;
+use ::opentelemetry::trace::Event;
+use ::opentelemetry_sdk::trace::SpanData;
 
+use crate::scoped_thread_local;
+use crate::tracing::span::{new_span_data, random_trace_id};
+
+mod opentelemetry;
 mod span;
 mod writer;
+
 pub use writer::TraceCollector;
 
 scoped_thread_local!(pub(crate) static TRACE_COLLECTOR: TraceCollector);
 
 thread_local!(
-    static CURRENT_TASK_TRACING: std::cell::Cell<*mut TracingMetadata> =
+    static CURRENT_TASK_TRACING: std::cell::Cell<*mut TaskTelemetry> =
         const { std::cell::Cell::new(std::ptr::null_mut()) }
 );
 
 #[derive(Default)]
-pub struct TracingMetadata {
-    spans: VecDeque<SpanMetadata>,
+pub struct TaskTelemetry {
+    spans: VecDeque<SpanData>,
 }
 
-impl TracingMetadata {
-    pub fn create_new_span(&mut self, name: &'static str) -> u64 {
+impl TaskTelemetry {
+    pub fn create_new_span(&mut self, name: &'static str) -> SpanId {
         let (trace_id, parent_span_id) = match self.spans.back() {
-            Some(top) => (top.trace_id, Some(top.span_id)),
-            None => (rand::random(), None),
+            Some(top) => (
+                top.span_context.trace_id(),
+                Some(top.span_context.span_id()),
+            ),
+            None => (random_trace_id(), None),
         };
 
-        let span = SpanMetadata::new(trace_id, parent_span_id, name);
-        let span_id = span.span_id;
+        let span = new_span_data(trace_id, parent_span_id, name);
+        let span_id = span.span_context.span_id();
 
         self.spans.push_back(span);
-        TRACE_COLLECTOR.try_with(|opt| {
-            if let Some(manager) = opt {
-                manager.trace(name);
-            }
-        });
         span_id
     }
 }
 
 /// Set the active task's tracing metadata.
-pub fn set_current_task_tracing(ptr: *mut TracingMetadata) {
+pub fn set_current_task_tracing(ptr: *mut TaskTelemetry) {
     CURRENT_TASK_TRACING.with(|c| c.set(ptr));
 }
 
 /// Set the active task's tracing metadata, returning the previous pointer.
 /// Call with `null_mut()` to clear after polling.
-pub fn swap_current_task_tracing(ptr: *mut TracingMetadata) -> *mut TracingMetadata {
+pub fn swap_current_task_tracing(ptr: *mut TaskTelemetry) -> *mut TaskTelemetry {
     CURRENT_TASK_TRACING.with(|c| {
         let prev = c.get();
         c.set(ptr);
@@ -55,7 +60,7 @@ pub fn swap_current_task_tracing(ptr: *mut TracingMetadata) -> *mut TracingMetad
 
 /// Access the current task's `TracingMetadata` mutably.
 /// Returns `None` if called outside of a task poll.
-pub fn with_current_task_tracing<R>(f: impl FnOnce(&mut TracingMetadata) -> R) -> Option<R> {
+pub fn with_current_task_tracing<R>(f: impl FnOnce(&mut TaskTelemetry) -> R) -> Option<R> {
     CURRENT_TASK_TRACING.with(|c| {
         let ptr = c.get();
         if ptr.is_null() {
@@ -68,7 +73,7 @@ pub fn with_current_task_tracing<R>(f: impl FnOnce(&mut TracingMetadata) -> R) -
 
 /// RAII guard that pops its span from the current task's stack when dropped.
 pub struct SpanGuard {
-    span_id: u64,
+    span_id: SpanId,
     name: &'static str,
 }
 
@@ -78,7 +83,7 @@ impl Drop for SpanGuard {
             if let Some(pos) = tracing
                 .spans
                 .iter()
-                .rposition(|s| s.span_id == self.span_id)
+                .rposition(|s| s.span_context.span_id() == self.span_id)
             {
                 tracing.spans.remove(pos)
             } else {
@@ -108,11 +113,19 @@ pub fn new_span(name: &'static str) -> Option<SpanGuard> {
     })
 }
 
-/// Append a trace string on the current thread.
-/// No-op if called outside of a runtime context.
-pub fn event(message: &str) {}
+/// Add an event to the current span.
+/// No-op if called outside of a task poll or when no span is active.
+pub fn event(message: &str) {
+    with_current_task_tracing(|tracing| {
+        if let Some(span) = tracing.spans.back_mut() {
+            span.events
+                .events
+                .push(Event::with_name(message.to_owned()));
+        }
+    });
+}
 
 pub trait TraceWriter: Drop {
-    fn write_span(&self, span: SpanMetadata);
+    fn write_span(&self, span: SpanData);
     fn flush(&self);
 }

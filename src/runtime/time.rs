@@ -1,4 +1,8 @@
-use std::{cell::UnsafeCell, task::Waker, time::Duration};
+use std::{
+    cell::UnsafeCell,
+    task::Waker,
+    time::{Duration, Instant},
+};
 
 use crate::runtime::TIME_DRIVER;
 
@@ -47,6 +51,11 @@ impl Drop for Sleep {
 }
 
 impl TimeDriver {
+    pub fn now(&self) -> Instant {
+        let this = unsafe { &mut *self.inner.get() };
+        this.now()
+    }
+
     pub fn tick(&self) {
         let this = unsafe { &mut *self.inner.get() };
         this.tick();
