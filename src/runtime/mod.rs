@@ -7,8 +7,7 @@ use std::task::{Context, Waker};
 use crate::io_driver::IODriver;
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
-use crate::tracing::TraceWriter;
-use crate::tracing::{TRACE_COLLECTOR, TraceCollector};
+use crate::tracing::{TRACING_SINK, TraceCollector, init_trace_sink};
 use crate::{runtime, scoped_thread_local};
 
 pub mod eventfd;
@@ -40,11 +39,11 @@ impl RuntimeInner {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         set_thread_id(self.thread_id);
-        let trace_manager = TraceCollector::init();
         self.io_driver.with(|| {
             TASK_LIST.set(&self.tasks, || {
+                let tracing_sink = init_trace_sink::<TraceCollector>();
                 TIME_DRIVER.set(&self.time_driver, || {
-                    TRACE_COLLECTOR.set(&trace_manager, || {
+                    TRACING_SINK.set(&tracing_sink, || {
                         if let Some(fd) = event_fd {
                             runtime::eventfd::register_eventfd_read(fd);
                         }
@@ -71,8 +70,6 @@ impl RuntimeInner {
                             if let Some(delay) = self.time_driver.next_deadline() {
                                 self.io_driver.push_wakeup_timeout(delay);
                             }
-                            let mut f = pin!(trace_manager.flush());
-                            let _ = f.as_mut().poll(&mut context);
                             self.io_driver.submit_and_wait();
                             self.io_driver.process_completion_queue();
                         }

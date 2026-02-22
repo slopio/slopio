@@ -12,7 +12,8 @@ pub const SEND_BUFFER_SIZE: usize = 1500;
 pub struct SendingBuffer {
     data: [MaybeUninit<u8>; SEND_BUFFER_SIZE],
     len: usize,
-    addr: libc::sockaddr_in,
+    addr: libc::sockaddr_storage,
+    addr_len: libc::socklen_t,
     iovec: MaybeUninit<libc::iovec>,
     msghdr: MaybeUninit<libc::msghdr>,
 }
@@ -23,12 +24,8 @@ impl SendingBuffer {
             // SAFETY: MaybeUninit doesn't require initialization
             data: unsafe { MaybeUninit::uninit().assume_init() },
             len: 0,
-            addr: libc::sockaddr_in {
-                sin_family: libc::AF_INET as u16,
-                sin_port: 0,
-                sin_addr: libc::in_addr { s_addr: 0 },
-                sin_zero: [0; 8],
-            },
+            addr: unsafe { std::mem::zeroed() },
+            addr_len: 0,
             iovec: MaybeUninit::uninit(),
             msghdr: MaybeUninit::uninit(),
         }
@@ -66,19 +63,63 @@ impl SendingBuffer {
     pub fn set_dest(&mut self, dest: SocketAddr) {
         match dest {
             SocketAddr::V4(v4) => {
-                self.addr.sin_family = libc::AF_INET as u16;
-                self.addr.sin_port = v4.port().to_be();
-                self.addr.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                let addr_in = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from(*v4.ip()).to_be(),
+                    },
+                    sin_zero: [0; 8],
+                };
+                // SAFETY: sockaddr_storage is large enough to hold sockaddr_in
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &addr_in as *const _ as *const u8,
+                        &mut self.addr as *mut _ as *mut u8,
+                        std::mem::size_of::<libc::sockaddr_in>(),
+                    );
+                }
+                self.addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
             }
-            SocketAddr::V6(_) => panic!("IPv6 not yet supported"),
+            SocketAddr::V6(v6) => {
+                let addr_in6 = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as u16,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    },
+                    sin6_scope_id: v6.scope_id(),
+                };
+                // SAFETY: sockaddr_storage is large enough to hold sockaddr_in6
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &addr_in6 as *const _ as *const u8,
+                        &mut self.addr as *mut _ as *mut u8,
+                        std::mem::size_of::<libc::sockaddr_in6>(),
+                    );
+                }
+                self.addr_len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+            }
         }
     }
 
     #[inline]
     pub fn set_dest_raw(&mut self, ip_be: u32, port: u16) {
-        self.addr.sin_family = libc::AF_INET as u16;
-        self.addr.sin_port = port.to_be();
-        self.addr.sin_addr.s_addr = ip_be;
+        let addr_in = libc::sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr { s_addr: ip_be },
+            sin_zero: [0; 8],
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &addr_in as *const _ as *const u8,
+                &mut self.addr as *mut _ as *mut u8,
+                std::mem::size_of::<libc::sockaddr_in>(),
+            );
+        }
+        self.addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     }
 
     fn prepare_msghdr(&mut self) {
@@ -89,7 +130,7 @@ impl SendingBuffer {
 
         self.msghdr.write(libc::msghdr {
             msg_name: &mut self.addr as *mut _ as *mut _,
-            msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as u32,
+            msg_namelen: self.addr_len,
             msg_iov: self.iovec.as_mut_ptr(),
             msg_iovlen: 1,
             msg_control: std::ptr::null_mut(),

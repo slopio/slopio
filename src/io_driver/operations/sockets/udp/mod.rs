@@ -8,7 +8,7 @@ pub use send::UdpSendTo;
 
 use std::{
     mem::MaybeUninit,
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::IntoRawFd,
 };
 
@@ -22,8 +22,19 @@ pub struct UdpSocket {
 
 impl UdpSocket {
     pub fn bind(port: u16) -> std::io::Result<Self> {
-        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-        let socket = S::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        Self::bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+    }
+
+    pub fn bind_v6(port: u16) -> std::io::Result<Self> {
+        Self::bind_addr(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+    }
+
+    pub fn bind_addr(addr: SocketAddr) -> std::io::Result<Self> {
+        let domain = match addr {
+            SocketAddr::V4(_) => Domain::IPV4,
+            SocketAddr::V6(_) => Domain::IPV6,
+        };
+        let socket = S::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_port(true)?;
         socket.set_nonblocking(true)?;
         socket.bind(&addr.into())?;

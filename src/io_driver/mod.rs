@@ -245,9 +245,7 @@ impl IODriver {
                         self.send_multiop_cancel_event(user_data);
                     }
                     MultiProcessResult::FullyPaused => {}
-                    MultiProcessResult::InvalidState(msg) => {
-                        eprintln!("multishot CQE invalid state: {}", msg);
-                    }
+                    MultiProcessResult::InvalidState(msg) => {}
                 }
             }
             Event::SingleShot(data) => {
@@ -259,9 +257,7 @@ impl IODriver {
                     SingleProcessResult::Shutdown => {
                         self.shutting_down.replace(true);
                     }
-                    SingleProcessResult::InvalidState(msg) => {
-                        eprintln!("singleshot CQE invalid state: {}", msg);
-                    }
+                    SingleProcessResult::InvalidState(msg) => {}
                     SingleProcessResult::CancelledRecycling { id, len } => {
                         let b = self.get_buffer(id, len as usize);
                         self.recycle_buffer(&b);

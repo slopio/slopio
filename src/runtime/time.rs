@@ -1,7 +1,7 @@
 use std::{
     cell::UnsafeCell,
     task::Waker,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::runtime::TIME_DRIVER;
@@ -51,7 +51,7 @@ impl Drop for Sleep {
 }
 
 impl TimeDriver {
-    pub fn now(&self) -> Instant {
+    pub fn now(&self) -> SystemTime {
         let this = unsafe { &mut *self.inner.get() };
         this.now()
     }

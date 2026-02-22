@@ -1,55 +1,23 @@
-use std::cell::UnsafeCell;
-use std::future::Future;
-use std::mem;
-use std::pin::pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
 use opentelemetry_sdk::trace::{SpanData, SpanExporter as _};
 use opentelemetry_stdout::SpanExporter;
 
-use crate::tracing::TraceWriter;
+pub trait SpanProcessor: Sized {
+    fn init() -> Self;
+    fn process(&self, batch: Vec<SpanData>) -> impl Future<Output = ()>;
+}
 
-/// Per-thread collector that accumulates ended spans for batch export.
 pub struct TraceCollector {
-    spans: UnsafeCell<Vec<SpanData>>,
     span_exporter: SpanExporter,
 }
 
-impl TraceCollector {
-    pub fn init() -> Self {
+impl SpanProcessor for TraceCollector {
+    fn init() -> Self {
         Self {
-            spans: UnsafeCell::new(Vec::new()),
             span_exporter: SpanExporter::default(),
         }
     }
 
-    pub(super) fn push_ended_span(&self, span: SpanData) {
-        unsafe { &mut *self.spans.get() }.push(span);
+    async fn process(&self, batch: Vec<SpanData>) {
+        let _ = self.span_exporter.export(batch).await;
     }
-
-    /// Drain all collected spans, returning them as a batch ready for export.
-    pub fn drain(&self) -> Vec<SpanData> {
-        let spans = unsafe { &mut *self.spans.get() };
-        std::mem::take(spans)
-    }
-}
-
-impl TraceWriter for TraceCollector {
-    fn write_span(&self, span: SpanData) {
-        self.push_ended_span(span);
-    }
-
-    async fn flush(&self) {
-        let spans = unsafe { &mut *self.spans.get() };
-        if spans.is_empty() {
-            return;
-        }
-        let mut new = Vec::new();
-        mem::swap(&mut new, spans);
-        self.span_exporter.export(new).await.unwrap();
-    }
-}
-
-impl Drop for TraceCollector {
-    fn drop(&mut self) {}
 }

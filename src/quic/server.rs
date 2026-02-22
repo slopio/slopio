@@ -16,9 +16,10 @@ use tquic::{
 use crate::{
     io_driver::operations::sockets::udp::UdpSocket,
     quic::{Http3ServerConfig, HttpRequest, HttpResponse},
+    tracing::new_trace,
 };
 
-pub type RequestHandler = Rc<dyn Fn(HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse>>>>;
+type RequestHandler = Box<dyn Fn(HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse>>>>;
 
 type ConnectionId = u64;
 type StreamId = u64;
@@ -85,20 +86,19 @@ pub struct H3Server {
 
 impl H3Server {
     pub fn build(server_config: Http3ServerConfig) -> Result<Self, super::Http3ServerError> {
-        let udp = UdpSocket::bind(server_config.bind_addr.port())?;
+        let udp = UdpSocket::bind_addr(server_config.bind_addr)?;
 
         let multithread = server_config.num_threads > 1;
 
         // Try to register this thread's socket with the eBPF balancer (multi-thread only).
         // Falls back to kernel SO_REUSEPORT round-robin if eBPF is unavailable.
-        if multithread {
-            if let Err(e) = super::balancer::register_socket(
-                server_config.thread_id as u32,
-                server_config.num_threads as u32,
-                udp.fd(),
-            ) {
-                eprintln!("eBPF balancer unavailable, falling back to SO_REUSEPORT: {e}");
-            }
+        if let Err(e) = super::balancer::register_socket(
+            server_config.thread_id as u32,
+            server_config.num_threads as u32,
+            udp.fd(),
+        ) && multithread
+        {
+            eprintln!("eBPF balancer unavailable, falling back to SO_REUSEPORT: {e}");
         }
 
         let mut config = Box::new(tquic::Config::new()?);
@@ -116,7 +116,7 @@ impl H3Server {
             state.handler.h3_config = Http3Config::new().ok();
         });
 
-        let sender = Rc::new(super::Sender { fd: udp.fd() });
+        let sender = Rc::new(super::QuicOutput { fd: udp.fd() });
         let mut endpoint = Endpoint::new(config, true, Box::new(HandlerBridge), sender);
 
         if multithread && super::balancer::is_initialised() {
@@ -144,7 +144,7 @@ impl H3Server {
         H: Fn(HttpRequest) -> Fut + 'static,
         Fut: Future<Output = HttpResponse> + 'static,
     {
-        let handler: RequestHandler = Rc::new(move |req| Box::pin(handler(req)));
+        let handler: RequestHandler = Box::new(move |req| Box::pin(handler(req)));
         with_state(|state| state.request_handler = Some(handler));
         self.run_inner().await;
     }
@@ -358,6 +358,7 @@ impl H3Connection {
 }
 
 async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: ConnectionId) {
+    let _span = new_trace("http3 request");
     let Some(request) = super::process_request::Http3Request::new(slab_id).await else {
         super::process_request::remove(slab_id);
         task_done(connection_id);
@@ -365,9 +366,9 @@ async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: Conn
     };
     super::process_request::remove(slab_id);
 
-    let handler = with_state(|state| state.request_handler.clone());
-    let response = match handler {
-        Some(h) => h(request).await,
+    let fut = with_state(|state| state.request_handler.as_ref().map(|h| h(request)));
+    let response = match fut {
+        Some(f) => f.await,
         None => HttpResponse::new(500)
             .header("content-type", "text/plain")
             .body("no handler registered"),

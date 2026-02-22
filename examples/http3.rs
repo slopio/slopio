@@ -1,9 +1,11 @@
 use runtime::{
     main_thread,
     quic::{H3Server, Http3ServerConfig, HttpRequest, HttpResponse},
+    tracing::new_span,
 };
 
 async fn handle(req: HttpRequest) -> HttpResponse {
+    let _span = new_span("handling the request");
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => HttpResponse::new(200)
             .header("content-type", "text/plain")

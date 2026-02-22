@@ -21,11 +21,6 @@ pub use balancer::register_socket as register_balancer_socket;
 pub mod monitor;
 
 pub use server::H3Server;
-pub use server::RequestHandler;
-
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub enum Http3ServerError {
@@ -64,10 +59,6 @@ impl From<Http3Error> for Http3ServerError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
 pub struct Http3ServerConfig {
     pub bind_addr: SocketAddr,
     pub cert_path: PathBuf,
@@ -93,10 +84,6 @@ impl Default for Http3ServerConfig {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// HTTP request/response types
-// ---------------------------------------------------------------------------
 
 pub struct HttpRequest {
     pub method: String,
@@ -131,10 +118,6 @@ impl HttpResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TLS
-// ---------------------------------------------------------------------------
-
 struct Tls {
     config: Arc<TlsConfig>,
 }
@@ -168,15 +151,11 @@ impl TlsConfigSelector for Tls {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Packet sender
-// ---------------------------------------------------------------------------
-
-struct Sender {
+struct QuicOutput {
     fd: RawFd,
 }
 
-impl PacketSendHandler for Sender {
+impl PacketSendHandler for QuicOutput {
     fn on_packets_send(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> tquic::Result<usize> {
         if pkts.is_empty() {
             return Ok(0);

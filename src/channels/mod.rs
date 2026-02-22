@@ -124,10 +124,46 @@ impl<'a, T> Future for RecvFuture<'a, T> {
     }
 }
 
+pub struct RecvAllFuture<'a, T> {
+    shared: &'a Shared<T>,
+}
+
+impl<'a, T> Future for RecvAllFuture<'a, T> {
+    type Output = Option<Vec<T>>;
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let state = unsafe { &mut *(*self.shared.0).get() };
+
+        if !state.data.is_empty() {
+            let items = state.data.drain(..).collect();
+            return Poll::Ready(Some(items));
+        }
+
+        if state.sender_dropped {
+            return Poll::Ready(None);
+        }
+
+        match &state.waker {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => state.waker = Some(cx.waker().clone()),
+        }
+
+        Poll::Pending
+    }
+}
+
 impl<T> Receiver<T> {
     #[inline]
     pub fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture {
+            shared: &self.shared,
+        }
+    }
+
+    #[inline]
+    pub fn recv_all(&self) -> RecvAllFuture<'_, T> {
+        RecvAllFuture {
             shared: &self.shared,
         }
     }
