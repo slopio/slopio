@@ -1,5 +1,3 @@
-use std::time::SystemTime;
-
 use opentelemetry::trace::{SpanContext, SpanKind, Status, TraceState};
 use opentelemetry::{InstrumentationScope, SpanId, TraceFlags, TraceId};
 use opentelemetry_sdk::trace::{SpanData, SpanEvents, SpanLinks};

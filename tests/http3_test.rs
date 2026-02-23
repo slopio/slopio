@@ -4,11 +4,12 @@ use common::Cv;
 use runtime::main_thread;
 #[cfg(feature = "test-monitor")]
 use runtime::quic::monitor;
+use runtime::http::Method;
 use runtime::quic::{H3Server, Http3ServerConfig, HttpRequest, HttpResponse};
 
 async fn handle(req: HttpRequest) -> HttpResponse {
-    match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => HttpResponse::new(200)
+    match (req.method, req.path()) {
+        (Method::Get, "/") => HttpResponse::new(200)
             .header("content-type", "text/plain")
             .body("Hello from HTTP/3!"),
         _ => HttpResponse::new(404)

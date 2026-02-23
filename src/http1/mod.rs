@@ -81,7 +81,7 @@ impl HttpConnection {
                     ParseState::RequestLine { headers } => {
                         let (m, p) = parse_request_line(line)?;
                         ParseState::Headers {
-                            method: Method::from_str(m)?,
+                            method: Method::from_str(m).ok_or(ParseError::UnknownMethod)?,
                             path: self.arena.alloc_str(p) as &str,
                             headers,
                         }

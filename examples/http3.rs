@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use runtime::{
+    http::Method,
     main_thread,
     quic::{H3Server, Http3ServerConfig, HttpRequest, HttpResponse},
     runtime::time::Sleep,
@@ -10,8 +11,8 @@ use runtime::{
 async fn handle(req: HttpRequest) -> HttpResponse {
     let _span = new_span("handling the request");
     Sleep::during(Duration::from_millis(50)).await;
-    match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => HttpResponse::new(200)
+    match (req.method, req.path()) {
+        (Method::Get, "/") => HttpResponse::new(200)
             .header("content-type", "text/plain")
             .body("Hello from HTTP/3!"),
         _ => HttpResponse::new(404)

@@ -15,7 +15,10 @@ use tquic::{
 
 use crate::{
     io_driver::operations::sockets::udp::UdpSocket,
-    quic::{Http3ServerConfig, HttpRequest, HttpResponse},
+    quic::{
+        Http3ServerConfig, HttpRequest, HttpResponse, process_request::stream_slab,
+        stream::BodyType,
+    },
     tracing::new_trace,
 };
 
@@ -248,32 +251,20 @@ impl H3Handler {
             loop {
                 match h3.h3_conn.poll(conn) {
                     Ok((stream_id, Http3Event::Headers { headers, fin })) => {
-                        let slab_id = super::process_request::insert(&headers, fin);
-                        h3.connection_streams.insert(stream_id, slab_id);
-                        h3.in_flight += 1;
-
-                        crate::runtime::spawn(handle_request(slab_id, stream_id, conn_id));
+                        match super::process_request::try_insert(&headers, fin) {
+                            Some(id) => {
+                                h3.connection_streams.insert(stream_id, id);
+                                h3.in_flight += 1;
+                                crate::runtime::spawn(handle_request(id, stream_id, conn_id));
+                            }
+                            None => {
+                                //refuse
+                            }
+                        }
                     }
                     Ok((stream_id, Http3Event::Data)) => {
                         if let Some(&slab_id) = h3.connection_streams.get(&stream_id) {
-                            let mut buf = [0u8; 4096];
-                            while let Ok(len) = h3.h3_conn.recv_body(conn, stream_id, &mut buf) {
-                                if len == 0 {
-                                    break;
-                                }
-                                if !super::process_request::on_data(
-                                    slab_id,
-                                    &buf[..len],
-                                    max_body_size,
-                                ) {
-                                    eprintln!(
-                                        "Stream {stream_id}: body exceeds max size, rejecting"
-                                    );
-                                    h3.connection_streams.remove(&stream_id);
-                                    super::process_request::on_connection_lost(slab_id);
-                                    break;
-                                }
-                            }
+                            recv_body_into_stream(&mut h3.h3_conn, conn, stream_id, slab_id);
                         }
                     }
                     Ok((stream_id, Http3Event::Finished)) => {
@@ -355,6 +346,33 @@ impl H3Connection {
             eprintln!("Failed to send body: {e}");
         }
     }
+}
+
+fn recv_body_into_stream(
+    h3_conn: &mut Http3Connection,
+    conn: &mut Connection,
+    stream_id: StreamId,
+    slab_id: usize,
+) {
+    stream_slab(|slab| {
+        let Some(stream) = slab.get_mut(slab_id) else {
+            return;
+        };
+        let Some(body) = stream.body() else {
+            return;
+        };
+        match body {
+            BodyType::Alloc(alloc) => {
+                while let Ok(len) = h3_conn.recv_body(conn, stream_id, alloc.unfilled()) {
+                    if len == 0 {
+                        break;
+                    }
+                    alloc.advance(len);
+                }
+            }
+            BodyType::Streamed => unimplemented!(),
+        }
+    });
 }
 
 async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: ConnectionId) {

@@ -1,3 +1,5 @@
+pub use crate::http::Method;
+
 pub struct Request<'arena> {
     pub method: Method,
     pub path: &'arena str,
@@ -60,48 +62,3 @@ impl From<std::io::Error> for ParseError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Method {
-    Get,
-    Post,
-    Put,
-    Delete,
-    Patch,
-    Head,
-    Options,
-    Trace,
-    Connect,
-}
-
-impl std::fmt::Display for Method {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Method::Get => f.write_str("GET"),
-            Method::Post => f.write_str("POST"),
-            Method::Put => f.write_str("PUT"),
-            Method::Delete => f.write_str("DELETE"),
-            Method::Patch => f.write_str("PATCH"),
-            Method::Head => f.write_str("HEAD"),
-            Method::Options => f.write_str("OPTIONS"),
-            Method::Trace => f.write_str("TRACE"),
-            Method::Connect => f.write_str("CONNECT"),
-        }
-    }
-}
-
-impl Method {
-    pub(crate) fn from_str(s: &str) -> Result<Self, ParseError> {
-        match s {
-            "GET" => Ok(Method::Get),
-            "POST" => Ok(Method::Post),
-            "PUT" => Ok(Method::Put),
-            "DELETE" => Ok(Method::Delete),
-            "PATCH" => Ok(Method::Patch),
-            "HEAD" => Ok(Method::Head),
-            "OPTIONS" => Ok(Method::Options),
-            "TRACE" => Ok(Method::Trace),
-            "CONNECT" => Ok(Method::Connect),
-            _ => Err(ParseError::UnknownMethod),
-        }
-    }
-}

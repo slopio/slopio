@@ -21,6 +21,7 @@ pub use balancer::register_socket as register_balancer_socket;
 pub mod monitor;
 
 pub use server::H3Server;
+pub mod stream;
 
 #[derive(Debug)]
 pub enum Http3ServerError {
@@ -85,11 +86,35 @@ impl Default for Http3ServerConfig {
     }
 }
 
+pub use crate::http::Method;
+
 pub struct HttpRequest {
-    pub method: String,
-    pub path: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    #[allow(dead_code)]
+    arena: Box<bumpalo::Bump>,
+    pub method: Method,
+    path_ptr: *const str,
+    header_ptrs: Vec<(*const str, *const str)>,
+    pub body: Option<HttpBody>,
+}
+
+// SAFETY: HttpRequest is only ever used on a single thread (the thread-local
+// slab that produced it). The raw pointers are valid for the lifetime of the
+// arena which is owned by this struct.
+unsafe impl Send for HttpRequest {}
+
+impl HttpRequest {
+    pub fn path(&self) -> &str {
+        unsafe { &*self.path_ptr }
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.header_ptrs.iter().map(|&(k, v)| unsafe { (&*k, &*v) })
+    }
+}
+
+pub enum HttpBody {
+    /// Body data was received and fully buffered.
+    Buffered(Vec<u8>),
 }
 
 pub struct HttpResponse {
