@@ -5,16 +5,17 @@ use ::opentelemetry::TraceId;
 use ::opentelemetry::trace::Event;
 use ::opentelemetry_sdk::trace::SpanData;
 
+use crate::runtime::TIME_DRIVER;
 use crate::scoped_thread_local;
 use crate::tracing::span::{new_span_data, random_trace_id};
 
+mod collector;
 mod opentelemetry;
 pub mod proto;
 mod span;
-mod writer;
 
+pub use collector::{Collector, TempoExporter, TraceCollector};
 pub(crate) use opentelemetry::{TraceSink, init_trace_sink};
-pub use writer::{SpanProcessor, TraceCollector};
 
 scoped_thread_local!(pub(crate) static TRACING_SINK : TraceSink);
 
@@ -105,7 +106,8 @@ impl Drop for SpanGuard {
         })
         .flatten();
 
-        if let Some(span) = span {
+        if let Some(mut span) = span {
+            span.end_time = TIME_DRIVER.with(|d| d.now());
             TRACING_SINK.with(|output| output.push_span(span))
         }
     }

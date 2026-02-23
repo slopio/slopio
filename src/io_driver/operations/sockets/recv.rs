@@ -46,8 +46,6 @@ pub fn socket_recv<'a>(
     ClassicRecv::<'a>::from_socket(socket, buffer, len)
 }
 
-/// Convenience wrapper that accepts an initialized `[u8]` slice.
-/// Use `socket_recv` with `MaybeUninit` for zero-cost uninitialized buffers.
 pub fn socket_recv_init<'a>(
     socket: &SocketWrapper,
     buffer: &'a mut [u8],

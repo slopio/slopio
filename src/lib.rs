@@ -7,6 +7,7 @@ use libc::cpu_set_t;
 use crate::runtime::eventfd;
 
 pub mod channels;
+pub mod http1;
 pub mod io_driver;
 mod macros;
 pub mod quic;

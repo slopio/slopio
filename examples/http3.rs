@@ -1,11 +1,15 @@
+use std::time::Duration;
+
 use runtime::{
     main_thread,
     quic::{H3Server, Http3ServerConfig, HttpRequest, HttpResponse},
+    runtime::time::Sleep,
     tracing::new_span,
 };
 
 async fn handle(req: HttpRequest) -> HttpResponse {
     let _span = new_span("handling the request");
+    Sleep::during(Duration::from_millis(50)).await;
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => HttpResponse::new(200)
             .header("content-type", "text/plain")

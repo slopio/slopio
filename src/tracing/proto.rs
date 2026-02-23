@@ -1,3 +1,4 @@
+use opentelemetry::KeyValue;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema;
 use opentelemetry_proto::transform::trace::tonic::group_spans_by_resource_and_scope;
@@ -14,7 +15,9 @@ pub struct ProtoEncodeBuffer {
 
 impl Default for ProtoEncodeBuffer {
     fn default() -> Self {
-        let resource = Resource::builder_empty().build();
+        let resource = Resource::builder_empty()
+            .with_attribute(KeyValue::new("service.name", "my-runtime"))
+            .build();
         Self {
             buf: Vec::with_capacity(ENCODE_BUFFER_CAPACITY),
             resource: (&resource).into(),
@@ -52,7 +55,6 @@ mod tests {
     fn empty_batch_encodes_to_valid_proto() {
         let mut buf = ProtoEncodeBuffer::default();
         let bytes = buf.encode(vec![]);
-        // Must decode without error; no spans in any scope
         let decoded = ExportTraceServiceRequest::decode(bytes).unwrap();
         let total_spans: usize = decoded
             .resource_spans

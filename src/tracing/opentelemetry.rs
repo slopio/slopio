@@ -3,7 +3,7 @@ use opentelemetry_sdk::trace::SpanData;
 use crate::{
     channels::{Sender, unbounded_channel},
     runtime::spawn,
-    tracing::writer::SpanProcessor,
+    tracing::collector::Collector,
 };
 
 pub(crate) struct TraceSink {
@@ -16,10 +16,10 @@ impl TraceSink {
     }
 }
 
-pub(crate) fn init_trace_sink<P: SpanProcessor + 'static>() -> TraceSink {
+pub(crate) fn init_trace_sink<P: Collector + 'static>() -> TraceSink {
     let (sender, recv) = unbounded_channel();
     spawn(async move {
-        let processor = P::init();
+        let mut processor = P::init();
         while let Some(batch) = recv.recv_all().await {
             processor.process(batch).await;
         }
