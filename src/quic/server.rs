@@ -16,8 +16,12 @@ use tquic::{
 use crate::{
     io_driver::operations::sockets::udp::UdpSocket,
     quic::{
-        Http3ServerConfig, HttpRequest, HttpResponse, process_request::stream_slab,
-        stream::BodyType,
+        Http3ServerConfig, HttpRequest, HttpResponse,
+        config::{QuicOutput, Tls},
+        stream::{
+            BodyType, Http3Request, StreamState, on_connection_lost, on_finished, remove,
+            stream_slab,
+        },
     },
     tracing::new_trace,
 };
@@ -105,7 +109,7 @@ impl H3Server {
         }
 
         let mut config = Box::new(tquic::Config::new()?);
-        let tls = super::Tls::new(&server_config.cert_path, &server_config.key_path)?;
+        let tls = Tls::new(&server_config.cert_path, &server_config.key_path)?;
 
         config.set_max_idle_timeout(server_config.idle_timeout.as_millis() as u64);
         config.set_initial_max_streams_bidi(server_config.max_concurrent_streams);
@@ -119,7 +123,7 @@ impl H3Server {
             state.handler.h3_config = Http3Config::new().ok();
         });
 
-        let sender = Rc::new(super::QuicOutput { fd: udp.fd() });
+        let sender = Rc::new(QuicOutput { fd: udp.fd() });
         let mut endpoint = Endpoint::new(config, true, Box::new(HandlerBridge), sender);
 
         if multithread && super::balancer::is_initialised() {
@@ -238,8 +242,6 @@ impl H3Handler {
             config,
             ..
         } = self;
-        let max_body_size = config.as_ref().map_or(8 * 1024 * 1024, |c| c.max_body_size);
-
         while let Some(conn_id) = connections_to_check.pop_front() {
             let Some(h3) = connections.get_mut(&conn_id) else {
                 continue;
@@ -251,7 +253,7 @@ impl H3Handler {
             loop {
                 match h3.h3_conn.poll(conn) {
                     Ok((stream_id, Http3Event::Headers { headers, fin })) => {
-                        match super::process_request::try_insert(&headers, fin) {
+                        match try_insert(&headers, fin) {
                             Some(id) => {
                                 h3.connection_streams.insert(stream_id, id);
                                 h3.in_flight += 1;
@@ -264,18 +266,30 @@ impl H3Handler {
                     }
                     Ok((stream_id, Http3Event::Data)) => {
                         if let Some(&slab_id) = h3.connection_streams.get(&stream_id) {
-                            recv_body_into_stream(&mut h3.h3_conn, conn, stream_id, slab_id);
+                            if recv_body_into_stream(&mut h3.h3_conn, conn, stream_id, slab_id) {
+                                // Body exceeded Content-Length — drop the stream.
+                                if let Some(slab_id) = h3.connection_streams.remove(&stream_id) {
+                                    on_connection_lost(slab_id);
+                                }
+                                let _ = h3.h3_conn.send_headers(
+                                    conn,
+                                    stream_id,
+                                    &[tquic::h3::Header::new(b":status", b"413")],
+                                    true,
+                                );
+                            }
                         }
                     }
                     Ok((stream_id, Http3Event::Finished)) => {
+                        println!("finisheed");
                         if let Some(slab_id) = h3.connection_streams.remove(&stream_id) {
-                            super::process_request::on_finished(slab_id);
+                            on_finished(slab_id);
                         }
                     }
                     Ok((stream_id, Http3Event::Reset(err))) => {
                         eprintln!("Stream {stream_id} reset: {err}");
                         if let Some(slab_id) = h3.connection_streams.remove(&stream_id) {
-                            super::process_request::on_connection_lost(slab_id);
+                            on_connection_lost(slab_id);
                         }
                     }
                     Ok((_, Http3Event::GoAway)) => {
@@ -348,41 +362,48 @@ impl H3Connection {
     }
 }
 
+/// Returns `true` if the body buffer overflowed (client sent more than Content-Length).
 fn recv_body_into_stream(
     h3_conn: &mut Http3Connection,
     conn: &mut Connection,
     stream_id: StreamId,
     slab_id: usize,
-) {
+) -> bool {
     stream_slab(|slab| {
         let Some(stream) = slab.get_mut(slab_id) else {
-            return;
+            return false;
         };
-        let Some(body) = stream.body() else {
-            return;
+        let Some(ref mut body) = stream.body else {
+            return false;
         };
         match body {
             BodyType::Alloc(alloc) => {
-                while let Ok(len) = h3_conn.recv_body(conn, stream_id, alloc.unfilled()) {
-                    if len == 0 {
-                        break;
+                loop {
+                    if alloc.unfilled().is_empty() {
+                        // Buffer full but tquic still has data — client sent more than
+                        // Content-Length, treat as overflow.
+                        return true;
                     }
-                    alloc.advance(len);
+                    match h3_conn.recv_body(conn, stream_id, alloc.unfilled()) {
+                        Ok(0) | Err(_) => break,
+                        Ok(len) => alloc.advance(len),
+                    }
                 }
+                false
             }
             BodyType::Streamed => unimplemented!(),
         }
-    });
+    })
 }
 
 async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: ConnectionId) {
     let _span = new_trace("http3 request");
-    let Some(request) = super::process_request::Http3Request::new(slab_id).await else {
-        super::process_request::remove(slab_id);
+    let Some(request) = Http3Request::new(slab_id).await else {
+        remove(slab_id);
         task_done(connection_id);
         return;
     };
-    super::process_request::remove(slab_id);
+    remove(slab_id);
 
     let fut = with_state(|state| state.request_handler.as_ref().map(|h| h(request)));
     let response = match fut {
@@ -433,7 +454,7 @@ impl TransportHandler for HandlerBridge {
             if let Some(h3) = state.handler.connections.get_mut(&conn_index) {
                 h3.alive = false;
                 for (_, slab_id) in h3.connection_streams.iter() {
-                    super::process_request::on_connection_lost(*slab_id);
+                    on_connection_lost(*slab_id);
                 }
                 #[cfg(feature = "test-monitor")]
                 super::monitor::record_connection_closed();
@@ -468,4 +489,9 @@ impl TransportHandler for HandlerBridge {
     }
 
     fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}
+}
+
+pub(super) fn try_insert(headers: &[Header], fin: bool) -> Option<usize> {
+    let pr = StreamState::try_from((headers, fin)).ok()?;
+    Some(stream_slab(|slab| slab.insert(pr)))
 }

@@ -1,12 +1,20 @@
-use std::{mem::MaybeUninit, task::Waker};
+use std::{
+    cell::UnsafeCell,
+    future::Future,
+    mem::MaybeUninit,
+    pin::Pin,
+    task::{Context, Poll, Waker},
+};
 
 use bumpalo::Bump;
+use slab::Slab;
 use tquic::h3::{Header, NameValue};
 
-use crate::quic::Method;
+use crate::quic::{HttpRequest, InvalidRequest, Method};
 
-#[derive(Debug)]
-pub struct InvalidRequest;
+thread_local! {
+    static STREAM_SLAB: UnsafeCell<Slab<StreamState>> = const { UnsafeCell::new(Slab::new()) };
+}
 
 pub struct AllocBody {
     buf: Box<[MaybeUninit<u8>]>,
@@ -51,28 +59,14 @@ pub enum BodyType {
 }
 
 pub struct StreamState {
-    arena: Box<Bump>,
-    method: Method,
-    path_ptr: *const str,
-    header_ptrs: Vec<(*const str, *const str)>,
-    body: Option<BodyType>,
-    fin_on_headers: bool,
-    status: StreamStatus,
-    pub waker: Option<Waker>,
-}
-
-impl StreamState {
-    pub fn status(&self) -> StreamStatus {
-        self.status
-    }
-
-    pub fn body(&mut self) -> Option<&mut BodyType> {
-        self.body.as_mut()
-    }
-
-    pub fn set_status(&mut self, status: StreamStatus) {
-        self.status = status;
-    }
+    pub(crate) arena: Box<Bump>,
+    pub(crate) method: Method,
+    pub(crate) path_ptr: *const str,
+    pub(crate) header_ptrs: Vec<(*const str, *const str)>,
+    pub(crate) body: Option<BodyType>,
+    pub(crate) fin: bool,
+    pub(crate) status: StreamStatus,
+    pub(crate) waker: Option<Waker>,
 }
 
 impl TryFrom<(&[Header], bool)> for StreamState {
@@ -120,7 +114,7 @@ impl TryFrom<(&[Header], bool)> for StreamState {
             path_ptr,
             header_ptrs,
             body,
-            fin_on_headers: fin,
+            fin,
             status: if fin {
                 StreamStatus::Complete
             } else {
@@ -136,4 +130,74 @@ pub enum StreamStatus {
     Waiting,
     Complete,
     ConnectionLost,
+}
+
+pub fn stream_slab<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Slab<StreamState>) -> R,
+{
+    STREAM_SLAB.with(|cell| f(unsafe { &mut *cell.get() }))
+}
+
+pub(super) fn on_finished(id: usize) {
+    stream_slab(|slab| {
+        let state = &mut slab[id];
+        state.status = StreamStatus::Complete;
+        if let Some(w) = state.waker.take() {
+            w.wake();
+        }
+    });
+}
+
+pub(super) fn on_connection_lost(id: usize) {
+    stream_slab(|slab| {
+        let state = &mut slab[id];
+        state.status = StreamStatus::ConnectionLost;
+        if let Some(w) = state.waker.take() {
+            w.wake();
+        }
+    });
+}
+
+pub(super) fn remove(id: usize) {
+    stream_slab(|slab| {
+        slab.remove(id);
+    });
+}
+
+pub(super) struct Http3Request {
+    id: usize,
+}
+
+impl Http3Request {
+    pub fn new(id: usize) -> Self {
+        Self { id }
+    }
+}
+
+impl Future for Http3Request {
+    type Output = Option<HttpRequest>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        stream_slab(|slab| {
+            let state = &mut slab[self.id];
+            match state.status {
+                StreamStatus::Waiting => {
+                    state.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+                StreamStatus::Complete => {
+                    let arena = std::mem::replace(&mut state.arena, Box::new(Bump::new()));
+                    Poll::Ready(Some(HttpRequest {
+                        arena,
+                        method: state.method,
+                        path_ptr: state.path_ptr,
+                        header_ptrs: std::mem::take(&mut state.header_ptrs),
+                        body: state.body.take(),
+                    }))
+                }
+                StreamStatus::ConnectionLost => Poll::Ready(None),
+            }
+        })
+    }
 }

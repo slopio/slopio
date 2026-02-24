@@ -14,8 +14,7 @@ fn main() {
                 let mut conn = HttpConnection::new(socket);
                 loop {
                     match conn.recv().await {
-                        Ok(Some(req)) => {
-                            println!("{} {}", req.method, req.path);
+                        Ok(Some(_req)) => {
                             let resp = Response::new(conn.arena(), 200, "OK")
                                 .header("Content-Type", "text/plain")
                                 .body(b"Hello from runtime!\n");

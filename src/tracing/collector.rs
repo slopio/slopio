@@ -53,7 +53,6 @@ impl Collector for TempoExporter {
     }
 
     async fn process(&mut self, batch: Vec<SpanData>) {
-        println!("sending: {batch:?}");
         let body = self.encode_buf.encode(batch);
 
         let request = format!(
