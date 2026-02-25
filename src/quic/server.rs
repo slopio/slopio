@@ -1,8 +1,6 @@
 use std::{
     cell::UnsafeCell,
     collections::{HashMap, VecDeque},
-    future::Future,
-    pin::Pin,
     rc::Rc,
 };
 
@@ -16,17 +14,15 @@ use tquic::{
 use crate::{
     io_driver::operations::sockets::udp::UdpSocket,
     quic::{
-        Http3ServerConfig, HttpRequest, HttpResponse,
+        BodyKind, Http3ServerConfig, HttpHandler, HttpResponse,
         config::{QuicOutput, Tls},
         stream::{
-            BodyType, Http3Request, StreamState, on_connection_lost, on_finished, remove,
-            stream_slab,
+            BodyType, StreamState, WaitForBody, WaitForHeaders, on_connection_lost, on_finished,
+            remove, stream_slab,
         },
     },
     tracing::new_trace,
 };
-
-type RequestHandler = Box<dyn Fn(HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse>>>>;
 
 type ConnectionId = u64;
 type StreamId = u64;
@@ -34,7 +30,7 @@ type StreamId = u64;
 struct H3State {
     handler: H3Handler,
     endpoint: Option<Endpoint>,
-    request_handler: Option<RequestHandler>,
+    request_handler: Option<Box<dyn HttpHandler>>,
 }
 
 impl H3State {
@@ -83,6 +79,9 @@ fn send_response(connection_id: ConnectionId, stream_id: StreamId, response: Htt
             return;
         };
         h3.send_response(conn, stream_id, response);
+        if let Err(e) = endpoint.process_connections() {
+            eprintln!("process_connections after send_response: {e}");
+        }
     });
 }
 
@@ -146,13 +145,11 @@ impl H3Server {
         })
     }
 
-    pub async fn run<H, Fut>(self, handler: H)
+    pub async fn run<H>(self, handler: H)
     where
-        H: Fn(HttpRequest) -> Fut + 'static,
-        Fut: Future<Output = HttpResponse> + 'static,
+        H: HttpHandler,
     {
-        let handler: RequestHandler = Box::new(move |req| Box::pin(handler(req)));
-        with_state(|state| state.request_handler = Some(handler));
+        with_state(|state| state.request_handler = Some(Box::new(handler)));
         self.run_inner().await;
     }
 
@@ -305,6 +302,8 @@ impl H3Handler {
             }
         }
     }
+
+    fn init_new_stream(&mut self) {}
 }
 
 struct H3Connection {
@@ -398,20 +397,70 @@ fn recv_body_into_stream(
 
 async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: ConnectionId) {
     let _span = new_trace("http3 request");
-    let Some(request) = Http3Request::new(slab_id).await else {
+
+    // Phase 1: headers are immediately available.
+    let Some(head) = (WaitForHeaders { id: slab_id }).await else {
         remove(slab_id);
         task_done(connection_id);
         return;
     };
-    remove(slab_id);
 
-    let fut = with_state(|state| state.request_handler.as_ref().map(|h| h(request)));
-    let response = match fut {
-        Some(f) => f.await,
-        None => HttpResponse::new(500)
-            .header("content-type", "text/plain")
-            .body("no handler registered"),
+    // Phase 2: on_headers — can reject early.
+    let headers_fut =
+        with_state(|state| state.request_handler.as_ref().map(|h| h.on_headers(&head)));
+    let Some(headers_fut) = headers_fut else {
+        remove(slab_id);
+        send_response(connection_id, stream_id, HttpResponse::new(500));
+        task_done(connection_id);
+        return;
     };
+    if let Err(response) = headers_fut.await {
+        remove(slab_id);
+        send_response(connection_id, stream_id, response);
+        task_done(connection_id);
+        return;
+    }
+
+    // Phase 3: dispatch on body kind.
+    let response = match head.body_kind {
+        BodyKind::None => {
+            let fut = with_state(|state| state.request_handler.as_ref().map(|h| h.no_body(head)));
+            remove(slab_id);
+            match fut {
+                Some(f) => f.await,
+                None => HttpResponse::new(500),
+            }
+        }
+        BodyKind::Buffered { .. } => {
+            let body = match (WaitForBody { id: slab_id }).await {
+                Some(b) => b,
+                None => {
+                    remove(slab_id);
+                    task_done(connection_id);
+                    return;
+                }
+            };
+            let fut = with_state(|state| {
+                state
+                    .request_handler
+                    .as_ref()
+                    .map(|h| h.buffered_body(head, body))
+            });
+            remove(slab_id);
+            match fut {
+                Some(f) => f.await,
+                None => HttpResponse::new(500),
+            }
+        }
+        BodyKind::Streamed => {
+            remove(slab_id);
+            HttpResponse::new(501)
+                .header("content-type", "text/plain")
+                .body("streamed body not supported")
+        }
+    };
+    println!("XD");
+
     send_response(connection_id, stream_id, response);
     #[cfg(feature = "test-monitor")]
     super::monitor::record_request_served();

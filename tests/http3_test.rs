@@ -1,20 +1,51 @@
 mod common;
 
+use std::pin::Pin;
+
 use common::Cv;
 use runtime::main_thread;
 #[cfg(feature = "test-monitor")]
 use runtime::quic::monitor;
 use runtime::http::Method;
-use runtime::quic::{H3Server, Http3ServerConfig, HttpRequest, HttpResponse};
+use runtime::quic::{H3Server, Http3ServerConfig, HttpHandler, HttpResponse, RequestHead};
 
-async fn handle(req: HttpRequest) -> HttpResponse {
-    match (req.method, req.path()) {
-        (Method::Get, "/") => HttpResponse::new(200)
-            .header("content-type", "text/plain")
-            .body("Hello from HTTP/3!"),
-        _ => HttpResponse::new(404)
-            .header("content-type", "text/plain")
-            .body("Not Found"),
+struct Handler;
+
+impl HttpHandler for Handler {
+    fn on_headers(
+        &self,
+        _head: &RequestHead,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), HttpResponse>> + 'static>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn no_body(
+        &self,
+        head: RequestHead,
+    ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
+        Box::pin(async move {
+            match (head.method, head.path()) {
+                (Method::Get, "/") => HttpResponse::new(200)
+                    .header("content-type", "text/plain")
+                    .body("Hello from HTTP/3!"),
+                _ => HttpResponse::new(404)
+                    .header("content-type", "text/plain")
+                    .body("Not Found"),
+            }
+        })
+    }
+
+    fn buffered_body(
+        &self,
+        head: RequestHead,
+        _body: Box<[u8]>,
+    ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
+        Box::pin(async move {
+            let _ = head;
+            HttpResponse::new(404)
+                .header("content-type", "text/plain")
+                .body("Not Found")
+        })
     }
 }
 
@@ -68,7 +99,7 @@ fn start_server_with_config(config: Http3ServerConfig) -> std::thread::JoinHandl
         main_thread(async move {
             let server = H3Server::build(config).unwrap();
             cv_server.notify();
-            server.run(handle).await;
+            server.run(Handler).await;
         });
     });
     cv_client.wait();
@@ -121,7 +152,7 @@ fn test_http3_multithread_stress() {
                 if ready.fetch_add(1, Ordering::SeqCst) + 1 == num_threads {
                     cv.notify();
                 }
-                server.run(handle).await;
+                server.run(Handler).await;
             })
         });
     });

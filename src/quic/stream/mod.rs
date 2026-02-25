@@ -10,7 +10,9 @@ use bumpalo::Bump;
 use slab::Slab;
 use tquic::h3::{Header, NameValue};
 
-use crate::quic::{HttpRequest, InvalidRequest, Method};
+use crate::quic::{BodyKind, InvalidRequest, Method, RequestHead};
+
+pub(crate) mod request_handling;
 
 thread_local! {
     static STREAM_SLAB: UnsafeCell<Slab<StreamState>> = const { UnsafeCell::new(Slab::new()) };
@@ -39,6 +41,14 @@ impl AllocBody {
 
     pub fn advance(&mut self, n: usize) {
         self.filled += n;
+    }
+
+    pub fn filled(&self) -> usize {
+        self.filled
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
     }
 
     /// Consumes the buffer, returning the initialized portion as a `Box<[u8]>`.
@@ -115,20 +125,22 @@ impl TryFrom<(&[Header], bool)> for StreamState {
             header_ptrs,
             body,
             fin,
-            status: if fin {
-                StreamStatus::Complete
-            } else {
-                StreamStatus::Waiting
-            },
+            // Headers are immediately available — wake the task right away.
+            status: StreamStatus::HeadersReady,
             waker: None,
         })
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StreamStatus {
-    Waiting,
+    /// Headers just arrived, task not yet woken.
+    HeadersReady,
+    /// Body is being received, waiting for Finished event.
+    WaitingBody,
+    /// Body fully received (or no body).
     Complete,
+    /// Connection was lost before the stream finished.
     ConnectionLost,
 }
 
@@ -165,38 +177,106 @@ pub(super) fn remove(id: usize) {
     });
 }
 
-pub(super) struct Http3Request {
-    id: usize,
+/// Resolves as soon as headers are available, yielding a `RequestHead`.
+/// Returns `None` if the connection was lost.
+pub(super) struct WaitForHeaders {
+    pub id: usize,
 }
 
-impl Http3Request {
-    pub fn new(id: usize) -> Self {
-        Self { id }
-    }
-}
-
-impl Future for Http3Request {
-    type Output = Option<HttpRequest>;
+impl Future for WaitForHeaders {
+    type Output = Option<RequestHead>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         stream_slab(|slab| {
-            let state = &mut slab[self.id];
+            let Some(state) = slab.get_mut(self.id) else {
+                return Poll::Ready(None);
+            };
+            println!("{:?}", state.status);
             match state.status {
-                StreamStatus::Waiting => {
-                    state.waker = Some(cx.waker().clone());
-                    Poll::Pending
-                }
-                StreamStatus::Complete => {
+                StreamStatus::HeadersReady => {
+                    println!("headers xD");
+                    // Move arena + header data into RequestHead, leaving a
+                    // fresh Bump in place so the slab entry remains valid.
                     let arena = std::mem::replace(&mut state.arena, Box::new(Bump::new()));
-                    Poll::Ready(Some(HttpRequest {
+                    let body_kind = match &state.body {
+                        None => BodyKind::None,
+                        Some(BodyType::Alloc(a)) => BodyKind::Buffered {
+                            content_length: a.filled + a.buf.len() - a.filled,
+                        },
+                        Some(BodyType::Streamed) => BodyKind::Streamed,
+                    };
+                    let head = RequestHead {
                         arena,
                         method: state.method,
                         path_ptr: state.path_ptr,
                         header_ptrs: std::mem::take(&mut state.header_ptrs),
-                        body: state.body.take(),
-                    }))
+                        body_kind,
+                    };
+                    // Transition: if there's no body we're already complete.
+                    state.status = if state.fin {
+                        StreamStatus::Complete
+                    } else {
+                        StreamStatus::WaitingBody
+                    };
+                    Poll::Ready(Some(head))
                 }
                 StreamStatus::ConnectionLost => Poll::Ready(None),
+                // Body arrived (and possibly finished) before the task was first polled.
+                // Headers are still available — consume them the same way.
+                StreamStatus::WaitingBody | StreamStatus::Complete => {
+                    let arena = std::mem::replace(&mut state.arena, Box::new(Bump::new()));
+                    let body_kind = match &state.body {
+                        None => BodyKind::None,
+                        Some(BodyType::Alloc(a)) => BodyKind::Buffered {
+                            content_length: a.capacity(),
+                        },
+                        Some(BodyType::Streamed) => BodyKind::Streamed,
+                    };
+                    let head = RequestHead {
+                        arena,
+                        method: state.method,
+                        path_ptr: state.path_ptr,
+                        header_ptrs: std::mem::take(&mut state.header_ptrs),
+                        body_kind,
+                    };
+                    Poll::Ready(Some(head))
+                }
+            }
+        })
+    }
+}
+
+/// Resolves once the body is fully received.
+/// Returns `None` if the connection was lost before body completion.
+pub(super) struct WaitForBody {
+    pub id: usize,
+}
+
+impl Future for WaitForBody {
+    type Output = Option<Box<[u8]>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        stream_slab(|slab| {
+            let Some(state) = slab.get_mut(self.id) else {
+                return Poll::Ready(None);
+            };
+            match state.status {
+                StreamStatus::WaitingBody => {
+                    state.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+                StreamStatus::Complete => {
+                    let body = match state.body.take() {
+                        Some(BodyType::Alloc(alloc)) => alloc.into_bytes(),
+                        _ => Box::default(),
+                    };
+                    Poll::Ready(Some(body))
+                }
+                StreamStatus::ConnectionLost => Poll::Ready(None),
+                StreamStatus::HeadersReady => {
+                    state.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
             }
         })
     }

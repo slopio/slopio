@@ -1,4 +1,4 @@
-use crate::quic::stream::BodyType;
+use std::{future::Future, pin::Pin};
 
 mod balancer;
 mod config;
@@ -17,21 +17,23 @@ pub mod stream;
 
 pub use crate::http::Method;
 
-pub struct HttpRequest {
+/// Headers and metadata available immediately when a request arrives,
+/// before any body data is read.
+pub struct RequestHead {
     #[allow(dead_code)]
     arena: Box<bumpalo::Bump>,
     pub method: Method,
     path_ptr: *const str,
     header_ptrs: Vec<(*const str, *const str)>,
-    pub body: Option<BodyType>,
+    pub body_kind: BodyKind,
 }
 
-// SAFETY: HttpRequest is only ever used on a single thread (the thread-local
+// SAFETY: RequestHead is only ever used on a single thread (the thread-local
 // slab that produced it). The raw pointers are valid for the lifetime of the
 // arena which is owned by this struct.
-unsafe impl Send for HttpRequest {}
+unsafe impl Send for RequestHead {}
 
-impl HttpRequest {
+impl RequestHead {
     pub fn path(&self) -> &str {
         unsafe { &*self.path_ptr }
     }
@@ -41,9 +43,33 @@ impl HttpRequest {
     }
 }
 
-pub enum HttpBody {
-    /// Body data was received and fully buffered.
-    Buffered(Vec<u8>),
+/// Describes what body (if any) will follow the headers.
+pub enum BodyKind {
+    /// No body — request is complete (e.g. GET, or fin=true on headers).
+    None,
+    /// Body will be buffered in full before the handler is called.
+    Buffered { content_length: usize },
+    /// Body is streamed — not yet implemented.
+    Streamed,
+}
+
+pub trait HttpHandler: 'static {
+    /// Called immediately when headers arrive.
+    /// Return `Err(response)` to reject early without reading the body.
+    fn on_headers(
+        &self,
+        head: &RequestHead,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HttpResponse>> + 'static>>;
+
+    /// Called when the request has no body.
+    fn no_body(&self, head: RequestHead) -> Pin<Box<dyn Future<Output = HttpResponse> + 'static>>;
+
+    /// Called when the full body has been buffered.
+    fn buffered_body(
+        &self,
+        head: RequestHead,
+        body: Box<[u8]>,
+    ) -> Pin<Box<dyn Future<Output = HttpResponse> + 'static>>;
 }
 
 pub struct HttpResponse {
