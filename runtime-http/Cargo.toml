@@ -1,0 +1,10 @@
+[package]
+name = "runtime-http"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+runtime-core = { path = "../runtime-core" }
+httparse = "1"
+memchr = "2.8.0"
+bumpalo = { version = "3.20.2", features = ["collections"] }

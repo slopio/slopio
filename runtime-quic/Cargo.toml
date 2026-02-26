@@ -1,0 +1,19 @@
+[package]
+name = "runtime-quic"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tracing = ["runtime-core/tracing"]
+test-monitor = []
+
+[dependencies]
+runtime-core = { path = "../runtime-core" }
+runtime-http = { path = "../runtime-http" }
+tquic = { version = "1.6.0", features = ["h3"] }
+bytes = "1"
+bumpalo = { version = "3.20.2", features = ["collections"] }
+slab = "0.4.11"
+rand = "0.8"
+runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }
+runtime_ebpf_balancer = { git = "https://github.com/saucisoupe/runtime_ebpf_balancer" }

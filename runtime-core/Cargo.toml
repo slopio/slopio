@@ -1,0 +1,25 @@
+[package]
+name = "runtime-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tracing = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-stdout", "dep:prost"]
+
+[dependencies]
+io-uring = "0.7.11"
+libc = "0.2.178"
+io_uring_rb = { git = "https://github.com/saucisoupe/io_uring_rb" }
+runtime_ebpf_balancer = { git = "https://github.com/saucisoupe/runtime_ebpf_balancer" }
+async_timers = { git = "https://github.com/saucisoupe/async_timers" }
+runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }
+mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
+pin-project = "1.1.10"
+slab = "0.4.11"
+socket2 = { version = "0.6.1", features = ["all"] }
+bumpalo = { version = "3.20.2", features = ["collections"] }
+rand = "0.8"
+opentelemetry_sdk = { version = "0.31.0", optional = true }
+opentelemetry = { version = "0.31.0", optional = true }
+opentelemetry-stdout = { version = "0.31.0", optional = true }
+prost = { version = "0.14", optional = true }

@@ -1,0 +1,38 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tls             = ["dep:rustls", "dep:rustls-pemfile"]
+tracing         = ["runtime-core/tracing"]
+http            = []
+http1           = ["http", "dep:runtime-http"]
+quic            = ["http", "dep:runtime-quic"]
+quic-tracing    = ["quic", "tracing", "runtime-quic/tracing"]
+test-monitor    = ["quic", "runtime-quic/test-monitor"]
+
+[[example]]
+name = "tls"
+required-features = ["tls"]
+
+[[example]]
+name = "http"
+required-features = ["http1"]
+
+[[example]]
+name = "http3"
+required-features = ["quic"]
+
+[dependencies]
+runtime-core = { path = "../runtime-core" }
+runtime-http = { path = "../runtime-http", optional = true }
+runtime-quic = { path = "../runtime-quic", optional = true }
+libc = "0.2.178"
+rustls = { version = "0.23.36", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
+
+[dev-dependencies]
+runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }
+rand = "0.8"

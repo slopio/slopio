@@ -828,14 +828,26 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "mimalloc",
+ "rand 0.8.5",
+ "runtime-core",
+ "runtime-http",
+ "runtime-quic",
+ "runtime-streams",
+ "rustls",
+ "rustls-pemfile",
+]
+
+[[package]]
+name = "runtime-core"
+version = "0.1.0"
+dependencies = [
  "async_timers",
  "bumpalo",
- "bytes",
- "httparse",
  "io-uring",
  "io_uring_rb",
  "libc",
- "memchr",
  "mimalloc",
  "opentelemetry",
  "opentelemetry-stdout",
@@ -845,10 +857,32 @@ dependencies = [
  "rand 0.8.5",
  "runtime-streams",
  "runtime_ebpf_balancer",
- "rustls",
- "rustls-pemfile",
  "slab",
  "socket2",
+]
+
+[[package]]
+name = "runtime-http"
+version = "0.1.0"
+dependencies = [
+ "bumpalo",
+ "httparse",
+ "memchr",
+ "runtime-core",
+]
+
+[[package]]
+name = "runtime-quic"
+version = "0.1.0"
+dependencies = [
+ "bumpalo",
+ "bytes",
+ "rand 0.8.5",
+ "runtime-core",
+ "runtime-http",
+ "runtime-streams",
+ "runtime_ebpf_balancer",
+ "slab",
  "tquic",
 ]
 
