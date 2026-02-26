@@ -14,19 +14,19 @@ struct Handler;
 impl HttpHandler for Handler {
     fn on_headers(
         &self,
-        _head: &RequestHead,
+        _head: &RequestHead<'static>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), HttpResponse>> + 'static>> {
         Box::pin(async { Ok(()) })
     }
 
     fn no_body(
         &self,
-        head: RequestHead,
+        head: RequestHead<'static>,
     ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
         Box::pin(async move {
             let _span = new_span("handling the request");
             Sleep::during(Duration::from_millis(50)).await;
-            match (head.method, head.path()) {
+            match (head.method, head.path) {
                 (Method::Get, "/") => HttpResponse::new(200)
                     .header("content-type", "text/plain")
                     .body("Hello from HTTP/3!"),
@@ -39,7 +39,7 @@ impl HttpHandler for Handler {
 
     fn buffered_body(
         &self,
-        head: RequestHead,
+        head: RequestHead<'static>,
         _body: Box<[u8]>,
     ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
         Box::pin(async move {

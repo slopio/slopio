@@ -1,5 +1,8 @@
 use crate::{
-    quic::{BodyKind, HttpHandler, HttpResponse, RequestHead, stream::{WaitForBody, take_meta}},
+    quic::{
+        BodyKind, HttpHandler, HttpResponse, RequestHead,
+        stream::{WaitForBody, take_meta},
+    },
     tracing::new_trace,
 };
 
@@ -20,7 +23,11 @@ pub(super) fn task_done(connection_id: ConnectionId) {
     });
 }
 
-pub(super) fn send_response(connection_id: ConnectionId, stream_id: StreamId, response: HttpResponse) {
+pub(super) fn send_response(
+    connection_id: ConnectionId,
+    stream_id: StreamId,
+    response: HttpResponse,
+) {
     with_state(|state| {
         let Some(endpoint) = &mut state.endpoint else {
             return;
@@ -38,7 +45,11 @@ pub(super) fn send_response(connection_id: ConnectionId, stream_id: StreamId, re
     });
 }
 
-pub(super) async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: ConnectionId) {
+pub(super) async fn handle_request(
+    slab_id: usize,
+    stream_id: StreamId,
+    connection_id: ConnectionId,
+) {
     let _span = new_trace("http3 request");
 
     let Some(meta) = take_meta(slab_id) else {

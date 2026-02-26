@@ -3,10 +3,10 @@ mod common;
 use std::pin::Pin;
 
 use common::Cv;
+use runtime::http::Method;
 use runtime::main_thread;
 #[cfg(feature = "test-monitor")]
 use runtime::quic::monitor;
-use runtime::http::Method;
 use runtime::quic::{H3Server, Http3ServerConfig, HttpHandler, HttpResponse, RequestHead};
 
 struct Handler;
@@ -21,10 +21,10 @@ impl HttpHandler for Handler {
 
     fn no_body(
         &self,
-        head: RequestHead,
+        head: RequestHead<'static>,
     ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
         Box::pin(async move {
-            match (head.method, head.path()) {
+            match (head.method, head.path) {
                 (Method::Get, "/") => HttpResponse::new(200)
                     .header("content-type", "text/plain")
                     .body("Hello from HTTP/3!"),

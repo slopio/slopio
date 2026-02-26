@@ -72,17 +72,23 @@ pub struct RequestMeta {
     pub(crate) arena: Box<Bump>,
     pub(crate) method: Method,
     pub(crate) path_ptr: *const str,
-    pub(crate) header_ptrs: Vec<(*const str, *const str)>,
+    pub(crate) header_ptrs: bumpalo::collections::Vec<'static, (*const str, *const str)>,
     pub(crate) body_kind: BodyKind,
 }
 
-impl From<RequestMeta> for RequestHead {
+impl From<RequestMeta> for RequestHead<'static> {
     fn from(m: RequestMeta) -> Self {
+        let path = unsafe { &*m.path_ptr };
+        let headers = unsafe {
+            let raw: bumpalo::collections::Vec<'static, (&'static str, &'static str)> =
+                std::mem::transmute(m.header_ptrs);
+            raw
+        };
         RequestHead {
             arena: m.arena,
             method: m.method,
-            path_ptr: m.path_ptr,
-            header_ptrs: m.header_ptrs,
+            path,
+            headers,
             body_kind: m.body_kind,
         }
     }
@@ -104,7 +110,8 @@ impl TryFrom<(&[Header], bool)> for StreamState {
 
         let mut method = Method::Get;
         let mut path_ptr: *const str = arena.alloc_str("");
-        let mut header_ptrs: Vec<(*const str, *const str)> = Vec::new();
+        let mut header_ptrs: bumpalo::collections::Vec<'static, (*const str, *const str)> =
+            bumpalo::collections::Vec::new_in(unsafe { &*(&*arena as *const Bump) });
         let mut content_length: Option<usize> = None;
 
         for h in headers {
@@ -119,9 +126,9 @@ impl TryFrom<(&[Header], bool)> for StreamState {
                         .and_then(|s| s.parse().ok());
                 }
                 n if !n.starts_with(b":") => {
-                    let name = std::str::from_utf8(h.name()).unwrap_or("");
-                    let value = std::str::from_utf8(h.value()).unwrap_or("");
-                    header_ptrs.push((arena.alloc_str(name), arena.alloc_str(value)));
+                    let name = arena.alloc_str(std::str::from_utf8(h.name()).unwrap_or(""));
+                    let value = arena.alloc_str(std::str::from_utf8(h.value()).unwrap_or(""));
+                    header_ptrs.push((name, value));
                 }
                 _ => {}
             }

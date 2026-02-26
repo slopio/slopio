@@ -21,29 +21,19 @@ pub use crate::http::Method;
 
 /// Headers and metadata available immediately when a request arrives,
 /// before any body data is read.
-pub struct RequestHead {
+pub struct RequestHead<'arena> {
     #[allow(dead_code)]
     arena: Box<bumpalo::Bump>,
     pub method: Method,
-    path_ptr: *const str,
-    header_ptrs: Vec<(*const str, *const str)>,
+    pub path: &'arena str,
+    pub headers: bumpalo::collections::Vec<'arena, (&'arena str, &'arena str)>,
     pub body_kind: BodyKind,
 }
 
 // SAFETY: RequestHead is only ever used on a single thread (the thread-local
-// slab that produced it). The raw pointers are valid for the lifetime of the
-// arena which is owned by this struct.
-unsafe impl Send for RequestHead {}
-
-impl RequestHead {
-    pub fn path(&self) -> &str {
-        unsafe { &*self.path_ptr }
-    }
-
-    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.header_ptrs.iter().map(|&(k, v)| unsafe { (&*k, &*v) })
-    }
-}
+// slab that produced it). The arena is owned by this struct and all references
+// into it are valid for 'arena which is bounded by the struct's lifetime.
+unsafe impl Send for RequestHead<'_> {}
 
 /// Describes what body (if any) will follow the headers.
 pub enum BodyKind {
@@ -60,16 +50,19 @@ pub trait HttpHandler: 'static {
     /// Return `Err(response)` to reject early without reading the body.
     fn on_headers(
         &self,
-        head: &RequestHead,
+        head: &RequestHead<'static>,
     ) -> Pin<Box<dyn Future<Output = Result<(), HttpResponse>> + 'static>>;
 
     /// Called when the request has no body.
-    fn no_body(&self, head: RequestHead) -> Pin<Box<dyn Future<Output = HttpResponse> + 'static>>;
+    fn no_body(
+        &self,
+        head: RequestHead<'static>,
+    ) -> Pin<Box<dyn Future<Output = HttpResponse> + 'static>>;
 
     /// Called when the full body has been buffered.
     fn buffered_body(
         &self,
-        head: RequestHead,
+        head: RequestHead<'static>,
         body: Box<[u8]>,
     ) -> Pin<Box<dyn Future<Output = HttpResponse> + 'static>>;
 }
