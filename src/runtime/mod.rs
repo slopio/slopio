@@ -7,8 +7,6 @@ use std::task::{Context, Waker};
 use crate::io_driver::IODriver;
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
-#[cfg(feature = "tracing")]
-use crate::tracing::{TRACING_SINK, TempoExporter, init_trace_sink};
 use crate::{runtime, scoped_thread_local};
 
 pub mod eventfd;
@@ -36,16 +34,19 @@ impl RuntimeInner {
         }
     }
 
-    pub fn block_on<F: Future>(self, f: F, event_fd: Option<RawFd>) -> F::Output {
+    pub fn block_on<F: Future>(
+        self,
+        f: F,
+        event_fd: Option<RawFd>,
+        wrap: impl FnOnce(Box<dyn FnOnce() -> F::Output + '_>) -> F::Output,
+    ) -> F::Output {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         set_thread_id(self.thread_id);
         self.io_driver.with(|| {
             TASK_LIST.set(&self.tasks, || {
-                #[cfg(feature = "tracing")]
-                let tracing_sink = init_trace_sink::<TempoExporter>();
                 TIME_DRIVER.set(&self.time_driver, || {
-                    let run = || {
+                    let run: Box<dyn FnOnce() -> F::Output + '_> = Box::new(|| {
                         if let Some(fd) = event_fd {
                             runtime::eventfd::register_eventfd_read(fd);
                         }
@@ -75,11 +76,8 @@ impl RuntimeInner {
                             self.io_driver.submit_and_wait();
                             self.io_driver.process_completion_queue();
                         }
-                    };
-                    #[cfg(feature = "tracing")]
-                    return TRACING_SINK.set(&tracing_sink, run);
-                    #[cfg(not(feature = "tracing"))]
-                    run()
+                    });
+                    wrap(run)
                 })
             })
         })

@@ -27,7 +27,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub fn main_thread<F: Future>(f: F) -> F::Output {
     let rt = runtime::RuntimeInner::default();
-    rt.block_on(f, None)
+    #[cfg(feature = "tracing")]
+    return rt.block_on(f, None, |run| {
+        use tracing::{TRACING_SINK, TempoExporter, init_trace_sink};
+        let sink = init_trace_sink::<TempoExporter>();
+        TRACING_SINK.set(&sink, || run())
+    });
+    #[cfg(not(feature = "tracing"))]
+    rt.block_on(f, None, |run| run())
 }
 
 fn block_signals_for_thread() {
@@ -135,6 +142,13 @@ where
         };
         let fut = f(ctx);
         let rt = runtime::RuntimeInner::with_thread_id(n);
-        rt.block_on(fut, Some(event_fd))
+        #[cfg(feature = "tracing")]
+        return rt.block_on(fut, Some(event_fd), |run| {
+            use tracing::{TRACING_SINK, TempoExporter, init_trace_sink};
+            let sink = init_trace_sink::<TempoExporter>();
+            TRACING_SINK.set(&sink, || run())
+        });
+        #[cfg(not(feature = "tracing"))]
+        rt.block_on(fut, Some(event_fd), |run| run())
     })
 }
