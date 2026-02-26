@@ -1,10 +1,10 @@
 use opentelemetry::KeyValue;
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema;
-use opentelemetry_proto::transform::trace::tonic::group_spans_by_resource_and_scope;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SpanData;
 use prost::Message;
+
+use crate::tracing::otlp::proto::collector::trace::ExportTraceServiceRequest;
+use crate::tracing::otlp::transform::{ResourceAttributesWithSchema, group_spans_by_resource_and_scope};
 
 const ENCODE_BUFFER_CAPACITY: usize = 64 * 1024;
 

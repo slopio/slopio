@@ -11,6 +11,7 @@ use crate::tracing::span::{new_span_data, random_trace_id};
 
 mod collector;
 mod opentelemetry;
+pub(crate) mod otlp;
 pub mod proto;
 mod span;
 
