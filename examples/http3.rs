@@ -14,9 +14,19 @@ struct Handler;
 impl HttpHandler for Handler {
     fn on_headers(
         &self,
-        _head: &RequestHead<'static>,
+        head: &RequestHead<'static>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), HttpResponse>> + 'static>> {
-        Box::pin(async { Ok(()) })
+        let authorized = head
+            .headers
+            .iter()
+            .any(|&(k, v)| k == "password" && v == "uwu");
+        Box::pin(async move {
+            if authorized {
+                Ok(())
+            } else {
+                Err(HttpResponse::new(401))
+            }
+        })
     }
 
     fn no_body(
