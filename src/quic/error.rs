@@ -41,3 +41,13 @@ impl From<Http3Error> for Http3ServerError {
 
 #[derive(Debug)]
 pub struct InvalidRequest;
+
+#[derive(Debug)]
+pub enum RecvBodyError {
+    /// Received body data but no body was expected for this stream.
+    UnexpectedBody,
+    /// The stream no longer exists in the slab.
+    StreamNotFound,
+    /// Client sent more data than the declared Content-Length.
+    Overflow,
+}

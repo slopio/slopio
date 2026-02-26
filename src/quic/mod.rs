@@ -2,7 +2,9 @@ use std::{future::Future, pin::Pin};
 
 mod balancer;
 mod config;
+mod connection;
 mod error;
+mod handler;
 mod server;
 
 pub use balancer::register_socket as register_balancer_socket;

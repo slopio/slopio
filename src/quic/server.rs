@@ -1,36 +1,19 @@
-use std::{
-    cell::UnsafeCell,
-    collections::{HashMap, VecDeque},
-    rc::Rc,
-};
+use std::{cell::UnsafeCell, rc::Rc};
 
-use bytes::Bytes;
-
-use tquic::{
-    Connection, Endpoint, TransportHandler,
-    h3::{Header, Http3Config, Http3Error, Http3Event, connection::Http3Connection},
-};
+use tquic::h3::Http3Config;
 
 use crate::{
     io_driver::operations::sockets::udp::UdpSocket,
-    quic::{
-        BodyKind, Http3ServerConfig, HttpHandler, HttpResponse,
-        config::{QuicOutput, Tls},
-        stream::{
-            BodyType, StreamState, WaitForBody, WaitForHeaders, on_connection_lost, on_finished,
-            remove, stream_slab,
-        },
-    },
-    tracing::new_trace,
+    quic::{Http3ServerConfig, HttpHandler, stream::StreamState, stream::stream_slab},
+    quic::config::{QuicOutput, Tls},
 };
 
-type ConnectionId = u64;
-type StreamId = u64;
+use super::connection::{ConnectionId, H3Connection, H3Handler, HandlerBridge};
 
-struct H3State {
-    handler: H3Handler,
-    endpoint: Option<Endpoint>,
-    request_handler: Option<Box<dyn HttpHandler>>,
+pub(super) struct H3State {
+    pub(super) handler: H3Handler,
+    pub(super) endpoint: Option<tquic::Endpoint>,
+    pub(super) request_handler: Option<Box<dyn HttpHandler>>,
 }
 
 impl H3State {
@@ -47,42 +30,11 @@ thread_local! {
     static H3_STATE: UnsafeCell<H3State> = UnsafeCell::new(H3State::new());
 }
 
-fn with_state<F, R>(f: F) -> R
+pub(super) fn with_state<F, R>(f: F) -> R
 where
     F: FnOnce(&mut H3State) -> R,
 {
     H3_STATE.with(|cell| f(unsafe { &mut *cell.get() }))
-}
-
-/// Decrement in-flight counter and remove the connection if it's dead and drained.
-fn task_done(connection_id: ConnectionId) {
-    with_state(|state| {
-        let Some(h3) = state.handler.connections.get_mut(&connection_id) else {
-            return;
-        };
-        h3.in_flight -= 1;
-        if !h3.alive && h3.in_flight == 0 {
-            state.handler.connections.remove(&connection_id);
-        }
-    });
-}
-
-fn send_response(connection_id: ConnectionId, stream_id: StreamId, response: HttpResponse) {
-    with_state(|state| {
-        let Some(endpoint) = &mut state.endpoint else {
-            return;
-        };
-        let Some(h3) = state.handler.connections.get_mut(&connection_id) else {
-            return;
-        };
-        let Some(conn) = endpoint.conn_get_mut(connection_id) else {
-            return;
-        };
-        h3.send_response(conn, stream_id, response);
-        if let Err(e) = endpoint.process_connections() {
-            eprintln!("process_connections after send_response: {e}");
-        }
-    });
 }
 
 pub struct H3Server {
@@ -96,8 +48,6 @@ impl H3Server {
 
         let multithread = server_config.num_threads > 1;
 
-        // Try to register this thread's socket with the eBPF balancer (multi-thread only).
-        // Falls back to kernel SO_REUSEPORT round-robin if eBPF is unavailable.
         if let Err(e) = super::balancer::register_socket(
             server_config.thread_id as u32,
             server_config.num_threads as u32,
@@ -123,7 +73,7 @@ impl H3Server {
         });
 
         let sender = Rc::new(QuicOutput { fd: udp.fd() });
-        let mut endpoint = Endpoint::new(config, true, Box::new(HandlerBridge), sender);
+        let mut endpoint = tquic::Endpoint::new(config, true, Box::new(HandlerBridge), sender);
 
         if multithread && super::balancer::is_initialised() {
             let cid_gen = super::balancer::CidGenerator(
@@ -172,7 +122,6 @@ impl H3Server {
                     match select(recv.next(), Sleep::during(dur)).await {
                         SelectResult::First(datagram) => datagram,
                         SelectResult::Second(()) => {
-                            // Timeout fired — drive the endpoint's timers.
                             with_state(|state| {
                                 let Some(endpoint) = &mut state.endpoint else {
                                     return;
@@ -215,332 +164,7 @@ impl H3Server {
     }
 }
 
-struct H3Handler {
-    h3_config: Option<Http3Config>,
-    config: Option<Rc<Http3ServerConfig>>,
-    connections: HashMap<ConnectionId, H3Connection>,
-    connections_to_check: VecDeque<ConnectionId>,
-}
-
-impl H3Handler {
-    fn new() -> Self {
-        Self {
-            h3_config: None,
-            config: None,
-            connections: HashMap::new(),
-            connections_to_check: VecDeque::new(),
-        }
-    }
-
-    fn process_http3(&mut self, endpoint: &mut Endpoint) {
-        let H3Handler {
-            connections,
-            connections_to_check,
-            config,
-            ..
-        } = self;
-        while let Some(conn_id) = connections_to_check.pop_front() {
-            let Some(h3) = connections.get_mut(&conn_id) else {
-                continue;
-            };
-            let Some(conn) = endpoint.conn_get_mut(conn_id) else {
-                continue;
-            };
-
-            loop {
-                match h3.h3_conn.poll(conn) {
-                    Ok((stream_id, Http3Event::Headers { headers, fin })) => {
-                        match try_insert(&headers, fin) {
-                            Some(id) => {
-                                h3.connection_streams.insert(stream_id, id);
-                                h3.in_flight += 1;
-                                crate::runtime::spawn(handle_request(id, stream_id, conn_id));
-                            }
-                            None => {
-                                //refuse
-                            }
-                        }
-                    }
-                    Ok((stream_id, Http3Event::Data)) => {
-                        if let Some(&slab_id) = h3.connection_streams.get(&stream_id) {
-                            if recv_body_into_stream(&mut h3.h3_conn, conn, stream_id, slab_id) {
-                                // Body exceeded Content-Length — drop the stream.
-                                if let Some(slab_id) = h3.connection_streams.remove(&stream_id) {
-                                    on_connection_lost(slab_id);
-                                }
-                                let _ = h3.h3_conn.send_headers(
-                                    conn,
-                                    stream_id,
-                                    &[tquic::h3::Header::new(b":status", b"413")],
-                                    true,
-                                );
-                            }
-                        }
-                    }
-                    Ok((stream_id, Http3Event::Finished)) => {
-                        println!("finisheed");
-                        if let Some(slab_id) = h3.connection_streams.remove(&stream_id) {
-                            on_finished(slab_id);
-                        }
-                    }
-                    Ok((stream_id, Http3Event::Reset(err))) => {
-                        eprintln!("Stream {stream_id} reset: {err}");
-                        if let Some(slab_id) = h3.connection_streams.remove(&stream_id) {
-                            on_connection_lost(slab_id);
-                        }
-                    }
-                    Ok((_, Http3Event::GoAway)) => {
-                        eprintln!("GoAway received");
-                    }
-                    Ok((_, Http3Event::PriorityUpdate)) => {}
-                    Err(Http3Error::Done) => break,
-                    Err(e) => {
-                        eprintln!("HTTP/3 poll error: {e}");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    fn init_new_stream(&mut self) {}
-}
-
-struct H3Connection {
-    h3_conn: Http3Connection,
-    connection_id: ConnectionId,
-    connection_streams: HashMap<StreamId, usize>,
-    in_flight: usize,
-    alive: bool,
-}
-
-impl H3Connection {
-    fn try_new(conn: &mut Connection, h3_config: &Http3Config) -> Result<Self, ()> {
-        let connection_id = conn.index().ok_or(())?;
-        let h3_conn = Http3Connection::new_with_quic_conn(conn, h3_config).map_err(|_| ())?;
-        Ok(Self {
-            h3_conn,
-            connection_id,
-            connection_streams: HashMap::new(),
-            in_flight: 0,
-            alive: true,
-        })
-    }
-
-    fn send_response(
-        &mut self,
-        conn: &mut Connection,
-        stream_id: StreamId,
-        response: HttpResponse,
-    ) {
-        let mut headers = vec![Header::new(
-            b":status",
-            response.status.to_string().as_bytes(),
-        )];
-        for (name, value) in &response.headers {
-            headers.push(Header::new(name.as_bytes(), value.as_bytes()));
-        }
-
-        let has_body = !response.body.is_empty();
-
-        if let Err(e) = self
-            .h3_conn
-            .send_headers(conn, stream_id, &headers, !has_body)
-        {
-            eprintln!("Failed to send headers: {e}");
-            return;
-        }
-
-        if let Err(e) = self
-            .h3_conn
-            .send_body(conn, stream_id, Bytes::from(response.body), true)
-            && has_body
-        {
-            eprintln!("Failed to send body: {e}");
-        }
-    }
-}
-
-/// Returns `true` if the body buffer overflowed (client sent more than Content-Length).
-fn recv_body_into_stream(
-    h3_conn: &mut Http3Connection,
-    conn: &mut Connection,
-    stream_id: StreamId,
-    slab_id: usize,
-) -> bool {
-    stream_slab(|slab| {
-        let Some(stream) = slab.get_mut(slab_id) else {
-            return false;
-        };
-        let Some(ref mut body) = stream.body else {
-            return false;
-        };
-        match body {
-            BodyType::Alloc(alloc) => {
-                loop {
-                    if alloc.unfilled().is_empty() {
-                        // Buffer full but tquic still has data — client sent more than
-                        // Content-Length, treat as overflow.
-                        return true;
-                    }
-                    match h3_conn.recv_body(conn, stream_id, alloc.unfilled()) {
-                        Ok(0) | Err(_) => break,
-                        Ok(len) => alloc.advance(len),
-                    }
-                }
-                false
-            }
-            BodyType::Streamed => unimplemented!(),
-        }
-    })
-}
-
-async fn handle_request(slab_id: usize, stream_id: StreamId, connection_id: ConnectionId) {
-    let _span = new_trace("http3 request");
-
-    // Phase 1: headers are immediately available.
-    let Some(head) = (WaitForHeaders { id: slab_id }).await else {
-        remove(slab_id);
-        task_done(connection_id);
-        return;
-    };
-
-    // Phase 2: on_headers — can reject early.
-    let headers_fut =
-        with_state(|state| state.request_handler.as_ref().map(|h| h.on_headers(&head)));
-    let Some(headers_fut) = headers_fut else {
-        remove(slab_id);
-        send_response(connection_id, stream_id, HttpResponse::new(500));
-        task_done(connection_id);
-        return;
-    };
-    if let Err(response) = headers_fut.await {
-        remove(slab_id);
-        send_response(connection_id, stream_id, response);
-        task_done(connection_id);
-        return;
-    }
-
-    // Phase 3: dispatch on body kind.
-    let response = match head.body_kind {
-        BodyKind::None => {
-            let fut = with_state(|state| state.request_handler.as_ref().map(|h| h.no_body(head)));
-            remove(slab_id);
-            match fut {
-                Some(f) => f.await,
-                None => HttpResponse::new(500),
-            }
-        }
-        BodyKind::Buffered { .. } => {
-            let body = match (WaitForBody { id: slab_id }).await {
-                Some(b) => b,
-                None => {
-                    remove(slab_id);
-                    task_done(connection_id);
-                    return;
-                }
-            };
-            let fut = with_state(|state| {
-                state
-                    .request_handler
-                    .as_ref()
-                    .map(|h| h.buffered_body(head, body))
-            });
-            remove(slab_id);
-            match fut {
-                Some(f) => f.await,
-                None => HttpResponse::new(500),
-            }
-        }
-        BodyKind::Streamed => {
-            remove(slab_id);
-            HttpResponse::new(501)
-                .header("content-type", "text/plain")
-                .body("streamed body not supported")
-        }
-    };
-    println!("XD");
-
-    send_response(connection_id, stream_id, response);
-    #[cfg(feature = "test-monitor")]
-    super::monitor::record_request_served();
-    task_done(connection_id);
-}
-
-struct HandlerBridge;
-
-impl TransportHandler for HandlerBridge {
-    fn on_conn_created(&mut self, _conn: &mut Connection) {}
-
-    fn on_conn_established(&mut self, conn: &mut Connection) {
-        use crate::io_driver::IO_DRIVER;
-
-        if IO_DRIVER.with(|d| d.shutdown()) {
-            let _ = conn.close(true, 0, b"shutting down");
-            return;
-        }
-
-        with_state(|state| {
-            let Some(h3_config) = &state.handler.h3_config else {
-                return;
-            };
-            match H3Connection::try_new(conn, h3_config) {
-                Ok(h3) => {
-                    state.handler.connections.insert(h3.connection_id, h3);
-                    #[cfg(feature = "test-monitor")]
-                    super::monitor::record_connection_opened();
-                }
-                Err(_) => eprintln!("Failed to create HTTP/3 connection"),
-            }
-        });
-    }
-
-    fn on_conn_closed(&mut self, conn: &mut Connection) {
-        with_state(|state| {
-            let Some(conn_index) = conn.index() else {
-                return;
-            };
-            if let Some(h3) = state.handler.connections.get_mut(&conn_index) {
-                h3.alive = false;
-                for (_, slab_id) in h3.connection_streams.iter() {
-                    on_connection_lost(*slab_id);
-                }
-                #[cfg(feature = "test-monitor")]
-                super::monitor::record_connection_closed();
-            }
-        });
-    }
-
-    fn on_stream_created(&mut self, _conn: &mut Connection, _stream_id: u64) {}
-
-    fn on_stream_readable(&mut self, conn: &mut Connection, _stream_id: u64) {
-        with_state(|state| {
-            let Some(conn_index) = conn.index() else {
-                return;
-            };
-            if !state.handler.connections_to_check.contains(&conn_index) {
-                state.handler.connections_to_check.push_back(conn_index);
-            }
-        });
-    }
-
-    fn on_stream_writable(&mut self, _conn: &mut Connection, _stream_id: u64) {}
-
-    fn on_stream_closed(&mut self, conn: &mut Connection, stream_id: u64) {
-        with_state(|state| {
-            let Some(conn_index) = conn.index() else {
-                return;
-            };
-            if let Some(h3) = state.handler.connections.get_mut(&conn_index) {
-                h3.connection_streams.remove(&stream_id);
-            }
-        });
-    }
-
-    fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}
-}
-
-pub(super) fn try_insert(headers: &[Header], fin: bool) -> Option<usize> {
-    let pr = StreamState::try_from((headers, fin)).ok()?;
-    Some(stream_slab(|slab| slab.insert(pr)))
+pub(super) fn try_store_headers(headers: &[tquic::h3::Header], fin: bool) -> Option<usize> {
+    let state = StreamState::try_from((headers, fin)).ok()?;
+    Some(stream_slab(|slab| slab.insert(state)))
 }
