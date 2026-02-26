@@ -6,7 +6,6 @@ use runtime::{
     main_thread,
     quic::{H3Server, Http3ServerConfig, HttpHandler, HttpResponse, RequestHead},
     runtime::time::Sleep,
-    tracing::new_span,
 };
 
 struct Handler;
@@ -34,7 +33,6 @@ impl HttpHandler for Handler {
         head: RequestHead<'static>,
     ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
         Box::pin(async move {
-            let _span = new_span("handling the request");
             Sleep::during(Duration::from_millis(50)).await;
             match (head.method, head.path) {
                 (Method::Get, "/") => HttpResponse::new(200)
@@ -53,7 +51,6 @@ impl HttpHandler for Handler {
         body: Box<[u8]>,
     ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
         Box::pin(async move {
-            let _span = new_span("handling the request");
             HttpResponse::new(200)
                 .header("content-type", "application/octet-stream")
                 .body(body.into_vec())

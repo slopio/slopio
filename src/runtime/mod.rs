@@ -7,6 +7,7 @@ use std::task::{Context, Waker};
 use crate::io_driver::IODriver;
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
+#[cfg(feature = "tracing")]
 use crate::tracing::{TRACING_SINK, TempoExporter, init_trace_sink};
 use crate::{runtime, scoped_thread_local};
 
@@ -41,9 +42,10 @@ impl RuntimeInner {
         set_thread_id(self.thread_id);
         self.io_driver.with(|| {
             TASK_LIST.set(&self.tasks, || {
+                #[cfg(feature = "tracing")]
                 let tracing_sink = init_trace_sink::<TempoExporter>();
                 TIME_DRIVER.set(&self.time_driver, || {
-                    TRACING_SINK.set(&tracing_sink, || {
+                    let run = || {
                         if let Some(fd) = event_fd {
                             runtime::eventfd::register_eventfd_read(fd);
                         }
@@ -73,7 +75,11 @@ impl RuntimeInner {
                             self.io_driver.submit_and_wait();
                             self.io_driver.process_completion_queue();
                         }
-                    })
+                    };
+                    #[cfg(feature = "tracing")]
+                    return TRACING_SINK.set(&tracing_sink, run);
+                    #[cfg(not(feature = "tracing"))]
+                    run()
                 })
             })
         })

@@ -1,13 +1,12 @@
 use std::{cell::Cell, mem};
 
-use crate::{
-    task::{
-        TypeAgnosticTask,
-        handle::Handle,
-        inner_parts::typed_task::{TypedTask, Vtable},
-    },
-    tracing::TaskTelemetry,
+use crate::task::{
+    TypeAgnosticTask,
+    handle::Handle,
+    inner_parts::typed_task::{TypedTask, Vtable},
 };
+#[cfg(feature = "tracing")]
+use crate::tracing::TaskTelemetry;
 
 pub(crate) mod type_agnostic_task;
 pub(crate) mod typed_task;
@@ -15,7 +14,8 @@ pub(crate) mod typed_task;
 pub struct Metadata {
     detached_mode: Cell<bool>,
     vtable: &'static Vtable,
-    tracing: TaskTelemetry,
+    #[cfg(feature = "tracing")]
+    pub(crate) tracing: TaskTelemetry,
 }
 
 enum State<T: Future> {

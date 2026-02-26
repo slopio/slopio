@@ -1,3 +1,4 @@
+#![cfg(feature = "quic")]
 mod common;
 
 use std::pin::Pin;

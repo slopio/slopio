@@ -8,8 +8,9 @@ use std::{
 use crate::{
     runtime::TASK_LIST,
     task::inner_parts::{Data, Metadata, State, type_agnostic_task::TypeAgnosticTask},
-    tracing::{TaskTelemetry, current_trace_id},
 };
+#[cfg(feature = "tracing")]
+use crate::tracing::{TaskTelemetry, current_trace_id};
 
 #[repr(C)]
 pub struct TypedTaskInner<F: Future> {
@@ -100,15 +101,15 @@ impl<F: Future> TypedTask<F> {
     }
 
     pub fn new(future: F) -> Self {
-        let tracing = match current_trace_id() {
-            Some(trace_id) => TaskTelemetry::with_trace_id(trace_id),
-            None => TaskTelemetry::default(),
-        };
         let ptr = Box::into_raw(Box::new(TypedTaskInner::<F> {
             header: Metadata {
                 vtable: table::<F>(),
                 detached_mode: Cell::new(false),
-                tracing,
+                #[cfg(feature = "tracing")]
+                tracing: match current_trace_id() {
+                    Some(trace_id) => TaskTelemetry::with_trace_id(trace_id),
+                    None => TaskTelemetry::default(),
+                },
             },
             data: Data {
                 state: State::Running(future),

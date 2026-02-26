@@ -7,15 +7,19 @@ use libc::cpu_set_t;
 use crate::runtime::eventfd;
 
 pub mod channels;
+#[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http1")]
 pub mod http1;
 pub mod io_driver;
 mod macros;
+#[cfg(feature = "quic")]
 pub mod quic;
 pub mod runtime;
 mod task;
 #[cfg(feature = "tls")]
 pub mod tls;
+#[cfg(feature = "tracing")]
 pub mod tracing;
 
 #[global_allocator]

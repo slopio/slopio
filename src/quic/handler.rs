@@ -1,12 +1,11 @@
 use tquic::Shutdown;
 
-use crate::{
-    quic::{
-        BodyKind, HttpHandler, HttpResponse, RequestHead,
-        stream::{WaitForBody, remove, take_meta},
-    },
-    tracing::new_trace,
+use crate::quic::{
+    BodyKind, HttpHandler, HttpResponse, RequestHead,
+    stream::{WaitForBody, remove, take_meta},
 };
+#[cfg(feature = "tracing")]
+use crate::tracing::new_trace;
 
 use super::{
     connection::{ConnectionId, StreamId},
@@ -52,6 +51,7 @@ pub(super) async fn handle_request(
     stream_id: StreamId,
     connection_id: ConnectionId,
 ) {
+    #[cfg(feature = "tracing")]
     let _span = new_trace("http3 request");
 
     let Some(meta) = take_meta(slab_id) else {
