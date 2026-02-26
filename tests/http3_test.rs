@@ -58,10 +58,97 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "test-monitor")]
 use std::time::Duration;
 
-fn curl_http3(port: u16, path: &str) -> (u16, String) {
-    let url = format!("https://localhost:{port}{path}");
-    let output = Command::new("/snap/bin/curl")
-        .args([
+enum RequestBody {
+    /// -d <data>  →  curl sets content-length automatically
+    Data(String),
+    /// --data-binary @-  with stdin  →  curl sets content-length
+    Binary(Vec<u8>),
+    /// -H "Transfer-Encoding: chunked" + -d  →  no content-length
+    Chunked(String),
+    /// --data-binary with a body >= 8000 bytes  →  triggers Streamed path
+    Large(Vec<u8>),
+}
+
+struct CurlRequest {
+    port: u16,
+    path: String,
+    method: Option<String>,
+    headers: Vec<(String, String)>,
+    body: Option<RequestBody>,
+}
+
+impl CurlRequest {
+    fn get(port: u16, path: &str) -> Self {
+        Self {
+            port,
+            path: path.to_string(),
+            method: None,
+            headers: vec![],
+            body: None,
+        }
+    }
+
+    fn post(port: u16, path: &str) -> Self {
+        Self {
+            port,
+            path: path.to_string(),
+            method: Some("POST".into()),
+            headers: vec![],
+            body: None,
+        }
+    }
+
+    fn header(mut self, key: &str, value: &str) -> Self {
+        self.headers.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Small text body — curl sends with content-length → Buffered path
+    fn data(mut self, data: &str) -> Self {
+        self.body = Some(RequestBody::Data(data.to_string()));
+        self
+    }
+
+    /// Raw binary body with content-length → Buffered path
+    fn binary(mut self, data: Vec<u8>) -> Self {
+        self.body = Some(RequestBody::Binary(data));
+        self
+    }
+
+    /// Chunked transfer (no content-length) → Streamed path
+    fn chunked(mut self, data: &str) -> Self {
+        self.body = Some(RequestBody::Chunked(data.to_string()));
+        self
+    }
+
+    /// Body >= 8000 bytes (no content-length inferred) → Streamed path
+    fn large(mut self, data: Vec<u8>) -> Self {
+        self.body = Some(RequestBody::Large(data));
+        self
+    }
+
+    fn send(self) -> (u16, String) {
+        let (status, bytes) = self.send_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn send_bytes(self) -> (u16, Vec<u8>) {
+        for attempt in 0..10 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let (status, bytes) = self.do_send();
+            if status != 0 {
+                return (status, bytes);
+            }
+        }
+        (0, vec![])
+    }
+
+    fn do_send(&self) -> (u16, Vec<u8>) {
+        let url = format!("https://localhost:{}{}", self.port, self.path);
+        let mut cmd = Command::new("/snap/bin/curl");
+        cmd.args([
             "--http3",
             "-k",
             "-s",
@@ -71,15 +158,55 @@ fn curl_http3(port: u16, path: &str) -> (u16, String) {
             "\n%{http_code}",
             "--max-time",
             "5",
-            &url,
-        ])
-        .output()
-        .expect("failed to run curl");
+        ]);
+        if let Some(method) = &self.method {
+            cmd.args(["-X", method]);
+        }
+        for (k, v) in &self.headers {
+            cmd.args(["-H", &format!("{k}: {v}")]);
+        }
+        match &self.body {
+            None => {}
+            Some(RequestBody::Data(s)) => {
+                cmd.args(["-d", s]);
+            }
+            Some(RequestBody::Binary(_)) | Some(RequestBody::Large(_)) => {
+                cmd.args(["--data-binary", "@-"]);
+            }
+            Some(RequestBody::Chunked(s)) => {
+                cmd.args(["-H", "Transfer-Encoding: chunked", "-d", s]);
+            }
+        }
+        cmd.arg(&url);
+        let stdin_data: Option<Vec<u8>> = match &self.body {
+            Some(RequestBody::Binary(b)) | Some(RequestBody::Large(b)) => Some(b.clone()),
+            _ => None,
+        };
+        if stdin_data.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("failed to spawn curl");
+        if let Some(data) = stdin_data {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(&data).unwrap();
+        }
+        let output = child.wait_with_output().expect("failed to wait for curl");
+        let stdout = output.stdout;
+        // The last line is the http_code written by -w "\n%{http_code}"
+        let split_pos = stdout.iter().rposition(|&b| b == b'\n').unwrap_or(0);
+        let (body, status_line) = stdout.split_at(split_pos);
+        let status: u16 = String::from_utf8_lossy(&status_line[1..])
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        (status, body.to_vec())
+    }
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let (body, status_line) = stdout.rsplit_once('\n').unwrap_or(("", &stdout));
-    let status: u16 = status_line.trim().parse().unwrap_or(0);
-    (status, body.to_string())
+fn curl_http3(port: u16, path: &str) -> (u16, String) {
+    CurlRequest::get(port, path).send()
 }
 
 fn server_config(port: u16) -> Http3ServerConfig {
@@ -270,30 +397,170 @@ fn test_http3_concurrent_connections() {
 fn test_http3_post_request() {
     let _handle = start_server(4505);
 
-    let url = "https://localhost:4505/";
-    let output = Command::new("/snap/bin/curl")
-        .args([
-            "--http3",
-            "-k",
-            "-s",
-            "-X",
-            "POST",
-            "-d",
-            "hello",
-            "-o",
-            "-",
-            "-w",
-            "\n%{http_code}",
-            "--max-time",
-            "5",
-            url,
-        ])
-        .output()
-        .expect("failed to run curl");
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let (body, status_line) = stdout.rsplit_once('\n').unwrap_or(("", &stdout));
-    let status: u16 = status_line.trim().parse().unwrap_or(0);
+    let (status, body) = CurlRequest::post(4505, "/").data("hello").send();
     assert_eq!(status, 404);
     assert_eq!(body, "Not Found");
+}
+
+// --- Auth handler (mirrors the http3 example) ---
+
+struct AuthHandler;
+
+impl HttpHandler for AuthHandler {
+    fn on_headers(
+        &self,
+        head: &RequestHead,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), HttpResponse>> + 'static>> {
+        let authorized = head
+            .headers
+            .iter()
+            .any(|&(k, v)| k == "password" && v == "uwu");
+        Box::pin(async move {
+            if authorized {
+                Ok(())
+            } else {
+                Err(HttpResponse::new(401))
+            }
+        })
+    }
+
+    fn no_body(
+        &self,
+        head: RequestHead<'static>,
+    ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
+        Box::pin(async move {
+            match (head.method, head.path) {
+                (Method::Get, "/") => HttpResponse::new(200)
+                    .header("content-type", "text/plain")
+                    .body("Hello from HTTP/3!"),
+                _ => HttpResponse::new(404)
+                    .header("content-type", "text/plain")
+                    .body("Not Found"),
+            }
+        })
+    }
+
+    fn buffered_body(
+        &self,
+        _head: RequestHead<'static>,
+        _body: Box<[u8]>,
+    ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
+        Box::pin(async { HttpResponse::new(404).body("Not Found") })
+    }
+}
+
+fn start_auth_server(port: u16) -> std::thread::JoinHandle<()> {
+    let (cv_server, cv_client) = Cv::new();
+    let join = std::thread::spawn(move || {
+        main_thread(async move {
+            let config = Http3ServerConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                ..Default::default()
+            };
+            let server = H3Server::build(config).unwrap();
+            cv_server.notify();
+            server.run(AuthHandler).await;
+        });
+    });
+    cv_client.wait();
+    join
+}
+
+#[test]
+fn test_auth_missing_password_returns_401() {
+    let _handle = start_auth_server(4520);
+
+    let (status, _) = CurlRequest::get(4520, "/").send();
+    assert_eq!(status, 401);
+}
+
+#[test]
+fn test_auth_wrong_password_returns_401() {
+    let _handle = start_auth_server(4521);
+
+    let (status, _) = CurlRequest::get(4521, "/")
+        .header("password", "wrong")
+        .send();
+    assert_eq!(status, 401);
+}
+
+#[test]
+fn test_auth_correct_password_returns_200() {
+    let _handle = start_auth_server(4522);
+
+    let (status, body) = CurlRequest::get(4522, "/").header("password", "uwu").send();
+    assert_eq!(status, 200);
+    assert_eq!(body, "Hello from HTTP/3!");
+}
+
+// --- Echo handler ---
+
+struct EchoHandler;
+
+impl HttpHandler for EchoHandler {
+    fn on_headers(
+        &self,
+        _head: &RequestHead,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), HttpResponse>> + 'static>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn no_body(
+        &self,
+        _head: RequestHead<'static>,
+    ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
+        Box::pin(async { HttpResponse::new(200).body("") })
+    }
+
+    fn buffered_body(
+        &self,
+        _head: RequestHead<'static>,
+        body: Box<[u8]>,
+    ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
+        Box::pin(async move {
+            HttpResponse::new(200)
+                .header("content-type", "application/octet-stream")
+                .body(body.into_vec())
+        })
+    }
+}
+
+fn start_echo_server(port: u16) -> std::thread::JoinHandle<()> {
+    let (cv_server, cv_client) = Cv::new();
+    let join = std::thread::spawn(move || {
+        main_thread(async move {
+            let config = Http3ServerConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                ..Default::default()
+            };
+            let server = H3Server::build(config).unwrap();
+            cv_server.notify();
+            server.run(EchoHandler).await;
+        });
+    });
+    cv_client.wait();
+    join
+}
+
+#[test]
+fn test_echo_body() {
+    let _handle = start_echo_server(4530);
+
+    let (status, body) = CurlRequest::post(4530, "/")
+        .data("hello from the test")
+        .send();
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello from the test");
+}
+
+#[test]
+fn test_echo_binary_body() {
+    let _handle = start_echo_server(4531);
+
+    let payload: Vec<u8> = (0u8..=255).collect();
+    let (status, body) = CurlRequest::post(4531, "/")
+        .binary(payload.clone())
+        .send_bytes();
+    assert_eq!(status, 200);
+    assert_eq!(body, payload);
 }

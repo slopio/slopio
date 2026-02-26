@@ -1,7 +1,9 @@
+use tquic::Shutdown;
+
 use crate::{
     quic::{
         BodyKind, HttpHandler, HttpResponse, RequestHead,
-        stream::{WaitForBody, take_meta},
+        stream::{WaitForBody, remove, take_meta},
     },
     tracing::new_trace,
 };
@@ -72,6 +74,12 @@ pub(super) async fn handle_request(
 
     if let Err(response) = handler.on_headers(&head).await {
         send_response(connection_id, stream_id, response);
+        with_state(|state| {
+            if let Some(conn) = state.endpoint.as_mut().and_then(|ep| ep.conn_get_mut(connection_id)) {
+                let _ = conn.stream_shutdown(stream_id, Shutdown::Read, 0);
+            }
+        });
+        remove(slab_id);
         task_done(connection_id);
         return;
     }
@@ -81,6 +89,7 @@ pub(super) async fn handle_request(
         BodyKind::Buffered { .. } => match (WaitForBody { id: slab_id }).await {
             Ok(Some(body)) => handler.buffered_body(head, body).await,
             _ => {
+                remove(slab_id);
                 task_done(connection_id);
                 return;
             }
@@ -88,6 +97,7 @@ pub(super) async fn handle_request(
         BodyKind::Streamed => unimplemented!(),
     };
 
+    remove(slab_id);
     send_response(connection_id, stream_id, response);
     #[cfg(feature = "test-monitor")]
     super::monitor::record_request_served();

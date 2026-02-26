@@ -49,16 +49,14 @@ impl HttpHandler for Handler {
 
     fn buffered_body(
         &self,
-        head: RequestHead<'static>,
-        _body: Box<[u8]>,
+        _head: RequestHead<'static>,
+        body: Box<[u8]>,
     ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
         Box::pin(async move {
             let _span = new_span("handling the request");
-            Sleep::during(Duration::from_millis(50)).await;
-            let _ = head;
-            HttpResponse::new(404)
-                .header("content-type", "text/plain")
-                .body("Not Found")
+            HttpResponse::new(200)
+                .header("content-type", "application/octet-stream")
+                .body(body.into_vec())
         })
     }
 }

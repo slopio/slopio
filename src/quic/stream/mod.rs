@@ -150,6 +150,12 @@ impl TryFrom<(&[Header], bool)> for StreamState {
             Some(BodyType::Streamed) => BodyKind::Streamed,
         };
 
+        let status = if body.is_none() {
+            StreamStatus::Complete
+        } else {
+            StreamStatus::WaitingBody
+        };
+
         Ok(StreamState {
             meta: Some(RequestMeta {
                 arena,
@@ -160,7 +166,7 @@ impl TryFrom<(&[Header], bool)> for StreamState {
             }),
             body,
             fin,
-            status: StreamStatus::WaitingBody,
+            status,
             waker: None,
         })
     }

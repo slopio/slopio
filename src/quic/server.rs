@@ -67,9 +67,10 @@ impl H3Server {
 
         let server_config = Rc::new(server_config);
 
+        let h3_config = Http3Config::new().map_err(super::Http3ServerError::from)?;
         with_state(|state| {
             state.handler.config = Some(server_config.clone());
-            state.handler.h3_config = Http3Config::new().ok();
+            state.handler.h3_config = Some(h3_config);
         });
 
         let sender = Rc::new(QuicOutput { fd: udp.fd() });
