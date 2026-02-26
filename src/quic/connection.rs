@@ -13,7 +13,7 @@ use crate::quic::{
 };
 
 use super::handler::{handle_request, task_done};
-use super::server::{with_state, try_store_headers};
+use super::server::{try_store_headers, with_state};
 
 pub(super) type ConnectionId = u64;
 pub(super) type StreamId = u64;
@@ -62,8 +62,7 @@ impl H3Handler {
                         if let Some(&slab_id) = h3.connection_streams.get(&stream_id) {
                             match recv_data(&mut h3.h3_conn, conn, stream_id, slab_id) {
                                 Err(RecvBodyError::Overflow) => {
-                                    if let Some(slab_id) =
-                                        h3.connection_streams.remove(&stream_id)
+                                    if let Some(slab_id) = h3.connection_streams.remove(&stream_id)
                                     {
                                         on_connection_lost(slab_id);
                                     }
