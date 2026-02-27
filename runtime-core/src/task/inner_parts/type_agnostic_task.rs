@@ -46,6 +46,7 @@ impl TypeAgnosticTask {
         swap_current_task_tracing(prev);
     }
 
+    ///# Safety
     pub unsafe fn get_ouput(self, dst: *mut (), waker: &Waker) {
         let vtable = self.header().vtable;
         unsafe { (vtable.get_output)(self.ptr, dst, waker) };

@@ -9,10 +9,10 @@ use tquic::{
 use crate::quic::{
     HttpResponse,
     error::RecvBodyError,
-    stream::{BodyType, StreamState, on_connection_lost, on_finished, stream_slab, take_meta},
+    stream::{BodyType, on_connection_lost, on_finished, stream_slab},
 };
 
-use super::handler::{handle_request, task_done};
+use super::handler::handle_request;
 use super::server::{try_store_headers, with_state};
 
 pub(super) type ConnectionId = u64;
@@ -55,7 +55,9 @@ impl H3Handler {
                         if let Some(slab_id) = try_store_headers(&headers, fin) {
                             h3.connection_streams.insert(stream_id, slab_id);
                             h3.in_flight += 1;
-                            runtime_core::runtime::spawn(handle_request(slab_id, stream_id, conn_id));
+                            runtime_core::runtime::spawn(handle_request(
+                                slab_id, stream_id, conn_id,
+                            ));
                         }
                     }
                     Ok((stream_id, Http3Event::Data)) => {

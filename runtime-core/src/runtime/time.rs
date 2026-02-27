@@ -1,7 +1,7 @@
 use std::{
     cell::UnsafeCell,
     task::Waker,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 use crate::runtime::TIME_DRIVER;

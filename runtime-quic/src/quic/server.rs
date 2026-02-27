@@ -2,13 +2,13 @@ use std::{cell::UnsafeCell, rc::Rc};
 
 use tquic::h3::Http3Config;
 
-use runtime_core::io_driver::operations::sockets::udp::UdpSocket;
 use crate::{
-    quic::{Http3ServerConfig, HttpHandler, stream::StreamState, stream::stream_slab},
     quic::config::{QuicOutput, Tls},
+    quic::{Http3ServerConfig, HttpHandler, stream::StreamState, stream::stream_slab},
 };
+use runtime_core::io_driver::operations::sockets::udp::UdpSocket;
 
-use super::connection::{ConnectionId, H3Connection, H3Handler, HandlerBridge};
+use super::connection::{H3Handler, HandlerBridge};
 
 pub(super) struct H3State {
     pub(super) handler: H3Handler,
@@ -119,22 +119,20 @@ impl H3Server {
                 with_state(|state| state.endpoint.as_ref().and_then(|ep| ep.timeout()));
 
             let got_datagram = match timeout_dur {
-                Some(dur) => {
-                    match select(recv.next(), Sleep::during(dur)).await {
-                        SelectResult::First(datagram) => datagram,
-                        SelectResult::Second(()) => {
-                            with_state(|state| {
-                                let Some(endpoint) = &mut state.endpoint else {
-                                    return;
-                                };
-                                endpoint.on_timeout(Instant::now());
-                                let _ = endpoint.process_connections();
-                                state.handler.process_http3(endpoint);
-                            });
-                            continue;
-                        }
+                Some(dur) => match select(recv.next(), Sleep::during(dur)).await {
+                    SelectResult::First(datagram) => datagram,
+                    SelectResult::Second(()) => {
+                        with_state(|state| {
+                            let Some(endpoint) = &mut state.endpoint else {
+                                return;
+                            };
+                            endpoint.on_timeout(Instant::now());
+                            let _ = endpoint.process_connections();
+                            state.handler.process_http3(endpoint);
+                        });
+                        continue;
                     }
-                }
+                },
                 None => recv.next().await,
             };
 
