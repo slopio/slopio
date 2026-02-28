@@ -402,6 +402,17 @@ impl IODriver {
         res
     }
 
+    pub(crate) fn submit(&self) {
+        let ring = unsafe { &mut *self.ring.get() };
+        match ring.inner.submit() {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                panic!("io_uring submit failed: {:?}", e);
+            }
+        }
+    }
+
     pub(crate) fn submit_and_wait(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         match ring.inner.submit_and_wait(1) {

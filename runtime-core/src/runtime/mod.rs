@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::pin::pin;
 use std::task::{Context, Waker};
+use std::time::Duration;
 
 use crate::io_driver::IODriver;
 use crate::runtime::time::TimeDriver;
@@ -70,10 +71,23 @@ impl RuntimeInner {
                                     break;
                                 }
                             }
-                            if let Some(delay) = self.time_driver.next_deadline() {
-                                self.io_driver.push_wakeup_timeout(delay);
+                            match self.time_driver.next_deadline() {
+                                Some(delay) if !delay.is_zero() => {
+                                    self.io_driver.push_wakeup_timeout(delay);
+                                    self.io_driver.submit_and_wait();
+                                }
+                                Some(_) => {
+                                    // Timer is in the current wheel bucket but not yet fired:
+                                    // process_single_tick() fires the current bucket then advances
+                                    // the index, so the timer will fire on the next tick.
+                                    // Wait one tick period (10ms) so tick() can advance.
+                                    self.io_driver.push_wakeup_timeout(Duration::from_millis(10));
+                                    self.io_driver.submit_and_wait();
+                                }
+                                None => {
+                                    self.io_driver.submit_and_wait();
+                                }
                             }
-                            self.io_driver.submit_and_wait();
                             self.io_driver.process_completion_queue();
                         }
                     });

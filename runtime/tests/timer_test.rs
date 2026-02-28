@@ -8,20 +8,17 @@ use runtime::runtime::time::Sleep;
 fn test_sleep_basic() {
     let start = Instant::now();
     main_thread(async {
-        spawn(async {
-            Sleep::during(Duration::from_secs(1)).await;
-        })
-        .await;
+        Sleep::during(Duration::from_millis(20)).await;
     });
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed >= Duration::from_millis(1000),
+        elapsed >= Duration::from_millis(20),
         "Sleep finished too early: {:?}",
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(1500),
+        elapsed < Duration::from_millis(40),
         "Sleep took too long: {:?}",
         elapsed
     );

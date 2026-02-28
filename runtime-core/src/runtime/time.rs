@@ -17,6 +17,7 @@ pub struct Sleep {
 }
 
 impl Sleep {
+    ///can be 10ms late
     pub fn during(duration: Duration) -> Self {
         Self { duration, id: None }
     }
@@ -77,7 +78,7 @@ impl TimeDriver {
     pub fn next_deadline(&self) -> Option<Duration> {
         let this = unsafe { &mut *self.inner.get() };
         match this.next_deadline() {
-            Some(Duration::ZERO) => Some(Duration::from_millis(20)),
+            Some(Duration::ZERO) => Some(Duration::ZERO),
             other => other,
         }
     }
