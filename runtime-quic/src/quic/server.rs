@@ -110,10 +110,11 @@ impl H3Server {
         use tquic::PacketInfo;
 
         use runtime_core::io_driver::operations::sockets::udp::UdpMultiRecv;
+        use runtime_core::io_driver::BufGroup;
         use runtime_core::runtime::select::{SelectResult, select};
         use runtime_core::runtime::time::Sleep;
 
-        let mut recv = UdpMultiRecv::new(self.socket.fd());
+        let mut recv = UdpMultiRecv::new(self.socket.fd(), BufGroup::Small);
         loop {
             let timeout_dur =
                 with_state(|state| state.endpoint.as_ref().and_then(|ep| ep.timeout()));

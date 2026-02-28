@@ -12,7 +12,7 @@ use io_uring::{
 use runtime_streams::Stream;
 
 use crate::io_driver::{
-    BUFFER_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
+    BorrowedBuffer, BufGroup, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     operations::IoOP,
 };
 
@@ -42,12 +42,13 @@ impl MsgHdrBox {
 pub struct UdpMultiRecv {
     id: Option<usize>,
     fd: i32,
+    bgid: u16,
     reads: MultiOpQueue,
     hdr: Box<MsgHdrBox>,
 }
 
 pub struct UdpDatagram {
-    buffer: io_uring_rb::buffer::Buffer<BUFFER_SIZE>,
+    buffer: BorrowedBuffer,
     payload_offset: usize,
     payload_len: usize,
     addr: SocketAddr,
@@ -55,7 +56,8 @@ pub struct UdpDatagram {
 
 impl UdpDatagram {
     pub fn payload(&self) -> &[u8] {
-        &self.buffer.as_ref()[self.payload_offset..self.payload_offset + self.payload_len]
+        let data = self.buffer.as_ref();
+        &data[self.payload_offset..self.payload_offset + self.payload_len]
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -71,17 +73,12 @@ impl UdpDatagram {
     }
 }
 
-impl Drop for UdpDatagram {
-    fn drop(&mut self) {
-        IO_DRIVER.with(|d| d.recycle_buffer(&self.buffer))
-    }
-}
-
 impl UdpMultiRecv {
-    pub fn new(fd: i32) -> Self {
+    pub fn new(fd: i32, group: BufGroup) -> Self {
         Self {
             id: None,
             fd,
+            bgid: group.bgid(),
             reads: Default::default(),
             hdr: MsgHdrBox::new(),
         }
@@ -100,7 +97,7 @@ impl UdpMultiRecv {
 
         let len = event.result as usize;
         let bid = buffer_select(event.flags).ok_or(())?;
-        let buffer = IO_DRIVER.with(|d| d.get_buffer(bid, len));
+        let buffer = IO_DRIVER.with(|d| d.get_buffer(self.bgid, bid, len));
 
         let parsed = RecvMsgOut::parse(buffer.as_ref(), &self.hdr.msghdr).map_err(|_| ())?;
 
@@ -189,7 +186,7 @@ impl IoOP for UdpMultiRecv {
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMsgMulti::new(Fd(self.fd), self.hdr.msghdr_ptr(), 0).build()
+        opcode::RecvMsgMulti::new(Fd(self.fd), self.hdr.msghdr_ptr(), self.bgid).build()
     }
 
     fn driver_cleanup(&mut self) {}

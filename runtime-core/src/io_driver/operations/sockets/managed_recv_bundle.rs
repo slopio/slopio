@@ -6,29 +6,31 @@ use std::{
 use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
-    IO_DRIVER,
-    operations::sockets::{SocketWrapper, multi_recv::BorrowedBuffer},
+    BorrowedBuffer, BufGroup, IO_DRIVER,
+    operations::sockets::SocketWrapper,
 };
 
 pub struct ManagedRecvBundle {
     id: Option<usize>,
     fd: i32,
+    bgid: u16,
 }
 
-pub fn socket_managed_recv_bundle(socket: &SocketWrapper) -> ManagedRecvBundle {
-    ManagedRecvBundle::from_socket(socket)
+pub fn socket_managed_recv_bundle(socket: &SocketWrapper, group: BufGroup) -> ManagedRecvBundle {
+    ManagedRecvBundle::from_socket(socket, group)
 }
 
 impl ManagedRecvBundle {
-    fn from_socket(socket: &SocketWrapper) -> Self {
+    fn from_socket(socket: &SocketWrapper, group: BufGroup) -> Self {
         Self {
             id: None,
             fd: socket.fd(),
+            bgid: group.bgid(),
         }
     }
 
     fn register_to_driver(&mut self) {
-        let entry = opcode::RecvBundle::new(Fd(self.fd), 0).build();
+        let entry = opcode::RecvBundle::new(Fd(self.fd), self.bgid).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token as usize);
     }
@@ -49,7 +51,14 @@ impl Future for ManagedRecvBundle {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
-                Poll::Ready(BorrowedBuffer::try_from(io_result))
+                if io_result.result <= 0 {
+                    Poll::Ready(Err(std::io::Error::from_raw_os_error(-io_result.result)))
+                } else {
+                    use io_uring::cqueue::buffer_select;
+                    let len = io_result.result as usize;
+                    let buffer_id = buffer_select(io_result.flags).unwrap();
+                    Poll::Ready(Ok(IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, len))))
+                }
             }
         }
     }
@@ -58,7 +67,7 @@ impl Future for ManagedRecvBundle {
 impl Drop for ManagedRecvBundle {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id))
+            IO_DRIVER.with(|d| d.cancel_single_op(id, Some(self.bgid)))
         }
     }
 }

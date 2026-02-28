@@ -77,11 +77,9 @@ impl RuntimeInner {
                                     self.io_driver.submit_and_wait();
                                 }
                                 Some(_) => {
-                                    // Timer is in the current wheel bucket but not yet fired:
-                                    // process_single_tick() fires the current bucket then advances
-                                    // the index, so the timer will fire on the next tick.
-                                    // Wait one tick period (10ms) so tick() can advance.
-                                    self.io_driver.push_wakeup_timeout(Duration::from_millis(10));
+                                    //10 ms = next timewheel tick
+                                    self.io_driver
+                                        .push_wakeup_timeout(Duration::from_millis(10));
                                     self.io_driver.submit_and_wait();
                                 }
                                 None => {

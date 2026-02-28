@@ -61,7 +61,7 @@ impl<'a> Future for WriteSocket<'a> {
 impl<'a> Drop for WriteSocket<'a> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id))
+            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
         }
     }
 }

@@ -94,7 +94,7 @@ impl<'a> Future for UdpSendTo<'a> {
 impl Drop for UdpSendTo<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id))
+            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
         }
     }
 }

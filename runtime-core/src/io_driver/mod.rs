@@ -13,10 +13,10 @@ use io_uring::{
     opcode, squeue,
     types::{Fd, Timespec},
 };
-use io_uring_rb::{RingBuffer, buffer::Buffer};
 use slab::Slab;
 
 use crate::{
+    define_buffer_rings,
     io_driver::{
         completion_events::{
             CompletionEvent, Event, IGNORED_FLAG, MULTI_OP_FLAG, MultiProcessResult,
@@ -32,8 +32,7 @@ mod sending_buffers;
 
 pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
-pub const RING_SIZE: u16 = 1024;
-pub const BUFFER_SIZE: u32 = 4096;
+include!(concat!(env!("OUT_DIR"), "/ring_config.rs"));
 
 const QUEUE_PAUSE_THRESHOLD: usize = 2;
 
@@ -207,11 +206,11 @@ impl Default for Ring {
             .setup_defer_taskrun()
             .build(4096)
             .unwrap();
-        let buf_ring = io_uring_rb::RingBuffer::new(&ring, 0, 0).unwrap();
+        let buffer_rings = MultiRing::new(&ring);
 
         Self {
-            buffer_ring: buf_ring,
-            inner: { ring },
+            buffer_rings,
+            inner: ring,
         }
     }
 }
@@ -245,7 +244,7 @@ impl IODriver {
                         self.send_multiop_cancel_event(user_data);
                     }
                     MultiProcessResult::FullyPaused => {}
-                    MultiProcessResult::InvalidState(msg) => {}
+                    MultiProcessResult::InvalidState(_msg) => {}
                 }
             }
             Event::SingleShot(data) => {
@@ -257,9 +256,9 @@ impl IODriver {
                     SingleProcessResult::Shutdown => {
                         self.shutting_down.replace(true);
                     }
-                    SingleProcessResult::InvalidState(msg) => {}
-                    SingleProcessResult::CancelledRecycling { id, len } => {
-                        let b = self.get_buffer(id, len as usize);
+                    SingleProcessResult::InvalidState(_msg) => {}
+                    SingleProcessResult::CancelledRecycling { id, len, bgid } => {
+                        let b = self.get_buffer(bgid, id, len as usize);
                         self.recycle_buffer(&b);
                         slab.remove(completion_event.slab_index); //will never be polled
                     }
@@ -281,14 +280,14 @@ impl IODriver {
         IO_DRIVER.set(self, f)
     }
 
-    fn get_buffer(&self, id: u16, len: usize) -> Buffer<BUFFER_SIZE> {
+    pub(crate) fn get_buffer(&self, bgid: u16, id: u16, len: usize) -> BorrowedBuffer {
         let ring_inner = unsafe { &*self.ring.get() };
-        ring_inner.buffer_ring.get_buffer(id, len).unwrap()
+        ring_inner.buffer_rings.get_buffer(bgid, id, len)
     }
 
-    fn recycle_buffer(&self, buffer: &Buffer<BUFFER_SIZE>) {
+    pub(crate) fn recycle_buffer(&self, buffer: &BorrowedBuffer) {
         let ring_inner = unsafe { &*self.ring.get() };
-        ring_inner.buffer_ring.recycle_buffer(buffer);
+        ring_inner.buffer_rings.recycle_buffer(buffer);
     }
 
     pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> IoDriverToken {
@@ -433,9 +432,12 @@ impl IODriver {
         }
     }
 
-    pub fn cancel_single_op(&self, id: usize) {
+    /// Cancel a single-shot operation. `bgid` must be `Some` if the operation
+    /// used provided buffers (so the buffer can be recycled on late completion),
+    /// or `None` for operations that manage their own buffers.
+    pub fn cancel_single_op(&self, id: usize, bgid: Option<u16>) {
         let slab = unsafe { &mut *self.slab.get() };
-        *slab.get_mut(id).unwrap() = SingleOpState::Cancelled;
+        *slab.get_mut(id).unwrap() = SingleOpState::Cancelled { bgid };
         self.send_singleop_cancel_event(id as u64);
     }
 
@@ -495,12 +497,16 @@ enum SingleOpState {
     Sent(Waker),
     Ended(OpMetadata),
     Signal(Box<[u8; 8]>),
-    Cancelled,
+    /// The operation was cancelled. `bgid` is set when the op used provided
+    /// buffers so a late-arriving completion can recycle the buffer.
+    Cancelled {
+        bgid: Option<u16>,
+    },
 }
 
 struct Ring {
     inner: IoUring,
-    buffer_ring: RingBuffer<BUFFER_SIZE, RING_SIZE>,
+    buffer_rings: MultiRing,
 }
 
 impl Ring {

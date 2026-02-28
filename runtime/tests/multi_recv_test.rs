@@ -12,6 +12,7 @@ use std::{
 };
 
 use runtime::{
+    io_driver::BufGroup,
     io_driver::operations::sockets::{multi_accept::MultiAccept, multi_recv::MultiRecv},
     main_thread,
 };
@@ -31,7 +32,7 @@ fn test_stream_stops_on_close() {
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
-                let mut multi_recv = MultiRecv::new(socket.fd);
+                let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
                 while let Some(_data) = multi_recv.next().await {
                     recv_count += 1;
                 }
@@ -60,7 +61,7 @@ fn test_stream_stops_on_abrupt_close_rst() {
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
-                let mut multi_recv = MultiRecv::new(socket.fd);
+                let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
                 while let Some(_data) = multi_recv.next().await {
                     recv_count += 1;
                 }
@@ -103,7 +104,7 @@ fn test_stream_stops_on_process_kill() {
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
-                let mut multi_recv = MultiRecv::new(socket.fd);
+                let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
                 while let Some(_data) = multi_recv.next().await {
                     recv_count += 1;
                 }
@@ -146,7 +147,7 @@ fn byte_per_byte() {
 
             if let Some(socket) = multiaccept.next().await {
                 let mut received: Vec<u8> = Vec::new();
-                let mut multirecv = MultiRecv::new(socket.fd);
+                let mut multirecv = MultiRecv::new(socket.fd, BufGroup::Small);
                 while let Some(data) = multirecv.next().await {
                     received.extend_from_slice(data.as_ref());
                 }
@@ -187,7 +188,7 @@ fn test_slow_consumer_triggers_pause() {
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut received: Vec<u8> = Vec::new();
-                let mut multirecv = MultiRecv::new(socket.fd);
+                let mut multirecv = MultiRecv::new(socket.fd, BufGroup::Small);
                 let mut recv_count = 0;
 
                 while let Some(data) = multirecv.next().await {
@@ -264,7 +265,7 @@ fn test_fast_drain_triggers_resume() {
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut received = Vec::new();
-                let mut multirecv = MultiRecv::new(socket.fd);
+                let mut multirecv = MultiRecv::new(socket.fd, BufGroup::Small);
                 let mut recv_count = 0;
                 let mut slow_phase_count = 0;
 

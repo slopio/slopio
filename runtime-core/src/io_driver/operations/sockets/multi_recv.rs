@@ -1,5 +1,4 @@
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
-use io_uring_rb::buffer::Buffer;
 use runtime_streams::Stream;
 use std::{
     pin::Pin,
@@ -7,13 +6,14 @@ use std::{
 };
 
 use crate::io_driver::{
-    BUFFER_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
+    BorrowedBuffer, BufGroup, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     operations::IoOP,
 };
 
 pub struct MultiRecv {
     id: Option<usize>,
     fd: i32,
+    bgid: u16,
     reads: MultiOpQueue,
 }
 
@@ -49,51 +49,30 @@ impl CompletionError {
     }
 }
 
-impl TryFrom<MultishotCompletionEvent> for BorrowedBuffer {
-    type Error = CompletionError;
+impl MultiRecv {
+    pub fn new(fd: i32, group: BufGroup) -> Self {
+        let bgid = group.bgid();
+        let mut multi_recv = Self {
+            id: None,
+            fd,
+            bgid,
+            reads: Default::default(),
+        };
+        multi_recv.register_to_driver();
+        multi_recv
+    }
 
-    fn try_from(event: MultishotCompletionEvent) -> Result<Self, Self::Error> {
+    fn try_parse(
+        &self,
+        event: MultishotCompletionEvent,
+    ) -> Result<BorrowedBuffer, CompletionError> {
         if event.result <= 0 {
             return Err(CompletionError::from_code(event.result, event.flags));
         }
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
-        let inner = IO_DRIVER.with(|d| d.get_buffer(buffer_id, len));
-        Ok(BorrowedBuffer { inner })
-    }
-}
-
-pub struct BorrowedBuffer {
-    inner: Buffer<BUFFER_SIZE>,
-}
-
-impl BorrowedBuffer {
-    pub fn from_buffer(inner: Buffer<BUFFER_SIZE>) -> Self {
-        Self { inner }
-    }
-}
-
-impl AsRef<[u8]> for BorrowedBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self.inner.as_ref()
-    }
-}
-
-impl AsMut<[u8]> for BorrowedBuffer {
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.inner.as_mut()
-    }
-}
-
-impl MultiRecv {
-    pub fn new(fd: i32) -> Self {
-        let mut multi_recv = Self {
-            id: None,
-            fd,
-            reads: Default::default(),
-        };
-        multi_recv.register_to_driver();
-        multi_recv
+        let buf = IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, len));
+        Ok(buf)
     }
 }
 
@@ -108,8 +87,8 @@ impl Unpin for MultiRecv {}
 impl MultiRecv {
     fn try_drain_one(&mut self) -> Poll<Option<BorrowedBuffer>> {
         while let Some(completion_event) = self.reads.pop() {
-            match completion_event.try_into() {
-                Ok(r) => return Poll::Ready(Some(r)),
+            match self.try_parse(completion_event) {
+                Ok(buf) => return Poll::Ready(Some(buf)),
                 Err(e) if e.can_continue() => continue,
                 Err(_) => return Poll::Ready(None),
             }
@@ -164,14 +143,8 @@ impl IoOP for MultiRecv {
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMulti::new(Fd(self.fd), 0).build()
+        opcode::RecvMulti::new(Fd(self.fd), self.bgid).build()
     }
 
     fn driver_cleanup(&mut self) {}
-}
-
-impl Drop for BorrowedBuffer {
-    fn drop(&mut self) {
-        IO_DRIVER.with(|d| d.recycle_buffer(&self.inner))
-    }
 }
