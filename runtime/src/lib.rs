@@ -6,7 +6,7 @@ use libc::cpu_set_t;
 use runtime_core::runtime::eventfd;
 
 // Re-export core
-pub use runtime_core::runtime::{RuntimeInner, spawn};
+pub use runtime_core::runtime::{RuntimeInner, spawn, yield_now};
 pub use runtime_core::task::{Handle, new_task};
 pub use runtime_core::{channels, io_driver, runtime, task};
 

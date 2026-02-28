@@ -15,6 +15,38 @@ pub mod join;
 pub mod select;
 pub mod time;
 
+/// Yields control back to the scheduler for one iteration, then resumes.
+///
+/// Useful inside CPU-bound async tasks to avoid starving other tasks on the
+/// same thread. Equivalent to `tokio::task::yield_now()`.
+///
+/// ```rust,ignore
+/// async fn heavy(data: &[u8]) {
+///     for chunk in data.chunks(10_000) {
+///         process(chunk);
+///         yield_now().await;
+///     }
+/// }
+/// ```
+pub async fn yield_now() {
+    struct YieldNow(bool);
+
+    impl Future for YieldNow {
+        type Output = ();
+
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if self.0 {
+                return std::task::Poll::Ready(());
+            }
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    YieldNow(false).await
+}
+
 scoped_thread_local!(pub(crate) static TASK_LIST: TaskList);
 scoped_thread_local!(pub static TIME_DRIVER: TimeDriver);
 thread_local!(static THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });

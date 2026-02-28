@@ -1,5 +1,5 @@
 use runtime::main_thread;
-use runtime::runtime::spawn;
+use runtime::runtime::{spawn, yield_now};
 use std::sync::{Arc, Mutex};
 
 #[test]
@@ -56,4 +56,24 @@ fn test_parallel_task_results() {
     });
 
     assert_eq!(results, vec![0, 2, 4, 6, 8]);
+}
+
+#[test]
+fn test_yield_now_interleaves_tasks() {
+    let order = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let order2 = order.clone();
+
+    main_thread(async move {
+        let handle = spawn(async move {
+            order2.lock().unwrap().push(2);
+        });
+
+        order.lock().unwrap().push(1);
+        yield_now().await;
+        // The spawned task ran during the yield, so 2 is already in the vec
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+
+        handle.await;
+        order.lock().unwrap().push(3);
+    });
 }
