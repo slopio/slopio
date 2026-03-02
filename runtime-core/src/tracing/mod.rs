@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 
 use ::opentelemetry::SpanId;
 use ::opentelemetry::TraceId;
@@ -23,11 +24,57 @@ pub use opentelemetry::{TraceSink, init_trace_sink};
 
 scoped_thread_local!(pub static TRACING_SINK : TraceSink);
 
+/// Resource attributes describing this service/process. Set once before starting the runtime.
+pub struct ResourceConfig {
+    pub service_name: &'static str,
+    pub service_version: &'static str,
+    /// Hostname of the machine (e.g. `tracing::hostname()`).
+    pub host_name: Option<String>,
+}
+
+impl Default for ResourceConfig {
+    fn default() -> Self {
+        Self {
+            service_name: "my-runtime",
+            service_version: "",
+            host_name: None,
+        }
+    }
+}
+
+static RESOURCE: OnceLock<ResourceConfig> = OnceLock::new();
+
+/// Set the resource attributes for this process. Call before `main_thread` / `thread_per_core`.
+/// Has no effect if called more than once.
+pub fn set_resource(config: ResourceConfig) {
+    let _ = RESOURCE.set(config);
+}
+
+pub(crate) fn resource_config() -> &'static ResourceConfig {
+    RESOURCE.get_or_init(ResourceConfig::default)
+}
+
+/// Read the machine hostname from `/etc/hostname`.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 thread_local!(
     static CURRENT_TASK_TRACING: Cell<*mut TaskTelemetry> =
         const { Cell::new(std::ptr::null_mut()) };
     static MAX_LEVEL: Cell<Level> = const { Cell::new(Level::Info) };
+    static THREAD_ID: Cell<Option<usize>> = const { Cell::new(None) };
 );
+
+pub fn set_thread_id(n: usize) {
+    THREAD_ID.with(|c| c.set(Some(n)));
+}
+
+pub(crate) fn thread_id() -> Option<usize> {
+    THREAD_ID.with(|c| c.get())
+}
 
 /// Verbosity level for span filtering. Spans below the current max level are dropped.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -170,14 +217,22 @@ pub struct Span(Option<SpanGuard>);
 impl Span {
     /// Set the [`SpanKind`] for this span.
     pub fn kind(self, kind: SpanKind) -> Self {
-        if let Some(ref guard) = self.0 {
+        if self.0.is_some() {
             with_current_task_tracing(|tracing| {
-                if let Some(span) = tracing
-                    .spans
-                    .iter_mut()
-                    .rfind(|s| s.span_context.span_id() == guard.span_id)
-                {
+                if let Some(span) = tracing.spans.back_mut() {
                     span.span_kind = kind;
+                }
+            });
+        }
+        self
+    }
+
+    /// Add an attribute to this span.
+    pub fn attr(self, kv: KeyValue) -> Self {
+        if self.0.is_some() {
+            with_current_task_tracing(|tracing| {
+                if let Some(span) = tracing.spans.back_mut() {
+                    span.attributes.push(kv);
                 }
             });
         }
@@ -214,11 +269,7 @@ pub fn new_trace(name: &'static str, level: Level) -> Span {
 }
 
 /// Start a new trace rooted at a remote parent (extracted from e.g. a `traceparent` header).
-pub fn new_trace_with_parent(
-    name: &'static str,
-    level: Level,
-    parent: (TraceId, SpanId),
-) -> Span {
+pub fn new_trace_with_parent(name: &'static str, level: Level, parent: (TraceId, SpanId)) -> Span {
     if !level_enabled(level) {
         return Span(None);
     }

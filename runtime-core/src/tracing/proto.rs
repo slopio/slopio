@@ -15,8 +15,20 @@ pub struct ProtoEncodeBuffer {
 
 impl Default for ProtoEncodeBuffer {
     fn default() -> Self {
-        let resource = Resource::builder_empty()
-            .with_attribute(KeyValue::new("service.name", "my-runtime"))
+        let cfg = crate::tracing::resource_config();
+        let mut attrs = vec![KeyValue::new("service.name", cfg.service_name)];
+        if !cfg.service_version.is_empty() {
+            attrs.push(KeyValue::new("service.version", cfg.service_version));
+        }
+        if let Some(ref h) = cfg.host_name {
+            attrs.push(KeyValue::new("host.name", h.clone()));
+        }
+        if let Some(id) = crate::tracing::thread_id() {
+            attrs.push(KeyValue::new("service.instance.id", id as i64));
+        }
+        let resource = attrs
+            .into_iter()
+            .fold(Resource::builder_empty(), |b, kv| b.with_attribute(kv))
             .build();
         Self {
             buf: Vec::with_capacity(ENCODE_BUFFER_CAPACITY),
