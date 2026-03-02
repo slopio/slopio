@@ -22,7 +22,7 @@ required-features = ["http1"]
 
 [[example]]
 name = "http3"
-required-features = ["quic"]
+required-features = ["quic-tracing"]
 
 [dependencies]
 runtime-core = { path = "../runtime-core" }

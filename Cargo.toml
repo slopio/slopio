@@ -5,7 +5,6 @@ members = [
     "runtime-quic",
     "runtime-iggy",
     "runtime",
-    "tokio-bench",
 ]
 resolver = "2"
 

@@ -13,6 +13,7 @@ pub fn new_span_data(
     trace_id: TraceId,
     parent_span_id: Option<SpanId>,
     name: &'static str,
+    kind: SpanKind,
 ) -> SpanData {
     let span_id: SpanId = rand::thread_rng().r#gen::<u64>().into();
     let span_context = SpanContext::new(
@@ -27,7 +28,7 @@ pub fn new_span_data(
         span_context,
         parent_span_id: parent_span_id.unwrap_or(SpanId::INVALID),
         parent_span_is_remote: false,
-        span_kind: SpanKind::Internal,
+        span_kind: kind,
         name: name.into(),
         start_time: time,
         end_time: time,

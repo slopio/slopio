@@ -5,5 +5,5 @@ pub mod wire;
 
 pub use client::IggyClient;
 pub use error::IggyError;
-pub use wire::state::ClientState;
 pub use types::{Identifier, IggyMessage, ReceivedMessage};
+pub use wire::state::ClientState;

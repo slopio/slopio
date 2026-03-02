@@ -5,7 +5,7 @@ use crate::quic::{
     stream::{WaitForBody, remove, take_meta},
 };
 #[cfg(feature = "tracing")]
-use runtime_core::tracing::new_trace;
+use runtime_core::tracing::{Level, SpanKind, new_trace};
 
 use super::{
     connection::{ConnectionId, StreamId},
@@ -52,7 +52,7 @@ pub(super) async fn handle_request(
     connection_id: ConnectionId,
 ) {
     #[cfg(feature = "tracing")]
-    let _span = new_trace("http3 request");
+    let _span = new_trace("http3 request", Level::Info).kind(SpanKind::Server);
 
     let Some(meta) = take_meta(slab_id) else {
         task_done(connection_id);
@@ -75,7 +75,11 @@ pub(super) async fn handle_request(
     if let Err(response) = handler.on_headers(&head).await {
         send_response(connection_id, stream_id, response);
         with_state(|state| {
-            if let Some(conn) = state.endpoint.as_mut().and_then(|ep| ep.conn_get_mut(connection_id)) {
+            if let Some(conn) = state
+                .endpoint
+                .as_mut()
+                .and_then(|ep| ep.conn_get_mut(connection_id))
+            {
                 let _ = conn.stream_shutdown(stream_id, Shutdown::Read, 0);
             }
         });
