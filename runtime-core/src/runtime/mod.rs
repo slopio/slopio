@@ -34,7 +34,10 @@ pub async fn yield_now() {
     impl Future for YieldNow {
         type Output = ();
 
-        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
             if self.0 {
                 return std::task::Poll::Ready(());
             }
@@ -87,9 +90,15 @@ impl RuntimeInner {
                         loop {
                             loop {
                                 self.time_driver.tick();
-                                //TODO limit activity
                                 while let Some(item) = self.tasks.pop() {
                                     item.poll();
+                                }
+
+                                // Only flush if tasks actually submitted IO operations.
+                                // Avoids a syscall on pure task/channel workloads.
+                                if self.io_driver.has_pending_sqes() {
+                                    self.io_driver.submit();
+                                    self.io_driver.process_completion_queue();
                                 }
 
                                 let pinned = pinned_f.as_mut();
@@ -103,13 +112,14 @@ impl RuntimeInner {
                                     break;
                                 }
                             }
+                            // Queue is empty and no completions arrived — block
+                            // until the kernel has at least one event for us.
                             match self.time_driver.next_deadline() {
                                 Some(delay) if !delay.is_zero() => {
                                     self.io_driver.push_wakeup_timeout(delay);
                                     self.io_driver.submit_and_wait();
                                 }
                                 Some(_) => {
-                                    //10 ms = next timewheel tick
                                     self.io_driver
                                         .push_wakeup_timeout(Duration::from_millis(10));
                                     self.io_driver.submit_and_wait();
@@ -138,6 +148,10 @@ pub fn thread_id() -> usize {
 
 pub fn main_thread<F: Future>(f: F) -> F::Output {
     RuntimeInner::default().block_on(f, None, |run| run())
+}
+
+pub fn now() -> std::time::SystemTime {
+    TIME_DRIVER.with(|d| d.now())
 }
 
 pub fn spawn<F: Future>(f: F) -> Handle<F::Output> {

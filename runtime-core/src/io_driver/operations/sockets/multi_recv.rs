@@ -90,6 +90,10 @@ impl MultiRecv {
             match self.try_parse(completion_event) {
                 Ok(buf) => return Poll::Ready(Some(buf)),
                 Err(e) if e.can_continue() => continue,
+                Err(CompletionError::Other(r)) if r == -libc::ENOBUFS => {
+                    eprintln!("[MultiRecv fd={}] ENOBUFS: buffer ring exhausted", self.fd);
+                    return Poll::Ready(None);
+                }
                 Err(_) => return Poll::Ready(None),
             }
         }
@@ -118,6 +122,7 @@ impl Stream for MultiRecv {
                         if let MultiPollResult::NeedsResubmit =
                             IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads))
                         {
+                            eprintln!("[MultiRecv fd={}] paused, resubmitting", self.fd);
                             let entry = self.to_entry();
                             IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
                         }
@@ -126,6 +131,7 @@ impl Stream for MultiRecv {
                 }
             }
             MultiPollResult::NeedsResubmit => {
+                eprintln!("[MultiRecv fd={}] paused, resubmitting", self.fd);
                 let entry = self.to_entry();
                 IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
                 Poll::Pending

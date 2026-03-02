@@ -36,3 +36,4 @@ mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 [dev-dependencies]
 runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }
 rand = "0.8"
+socket2 = "0.5"

@@ -211,6 +211,7 @@ impl Default for Ring {
         Self {
             buffer_rings,
             inner: ring,
+            pending: 0,
         }
     }
 }
@@ -401,8 +402,14 @@ impl IODriver {
         res
     }
 
+    pub(crate) fn has_pending_sqes(&self) -> bool {
+        let ring = unsafe { &*self.ring.get() };
+        ring.pending > 0
+    }
+
     pub(crate) fn submit(&self) {
         let ring = unsafe { &mut *self.ring.get() };
+        ring.pending = 0;
         match ring.inner.submit() {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -414,6 +421,7 @@ impl IODriver {
 
     pub(crate) fn submit_and_wait(&self) {
         let ring = unsafe { &mut *self.ring.get() };
+        ring.pending = 0;
         match ring.inner.submit_and_wait(1) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -507,6 +515,7 @@ enum SingleOpState {
 struct Ring {
     inner: IoUring,
     buffer_rings: MultiRing,
+    pending: u32,
 }
 
 impl Ring {
@@ -514,5 +523,6 @@ impl Ring {
         unsafe {
             self.inner.submission().push(entry).unwrap();
         }
+        self.pending += 1;
     }
 }

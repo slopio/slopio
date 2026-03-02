@@ -3,6 +3,14 @@ members = [
     "runtime-core",
     "runtime-http",
     "runtime-quic",
+    "runtime-iggy",
     "runtime",
+    "tokio-bench",
 ]
 resolver = "2"
+
+[profile.release]
+debug = true  # ou dans [profile.bench]
+
+[profile.bench]
+debug = true
