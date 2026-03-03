@@ -125,7 +125,7 @@ impl From<SpanData> for Span {
                 .map(|e| span::Event {
                     time_unix_nano: to_nanos(e.timestamp),
                     name: e.name.to_owned(),
-                    attributes: vec![],
+                    attributes: attrs_to_proto(e.attributes),
                     dropped_attributes_count: 0,
                 })
                 .collect(),

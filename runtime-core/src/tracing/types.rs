@@ -111,11 +111,13 @@ impl KeyValue {
 
 // ─── Events ──────────────────────────────────────────────────────────────────
 
-/// `name` is `&'static str` — either truly static or arena-allocated via `SpanBuf::event_dyn`.
-#[derive(Clone, Copy, Debug)]
+/// `name` and all `Str` attribute values are `&'static str` — either truly static or
+/// arena-allocated via [`SpanWrapper`].
+#[derive(Clone, Debug)]
 pub struct SpanEvent {
     pub name: &'static str,
     pub timestamp: SystemTime,
+    pub attributes: SmallVec<[KeyValue; 4]>,
 }
 
 impl SpanEvent {
@@ -123,6 +125,7 @@ impl SpanEvent {
         Self {
             name,
             timestamp: SystemTime::now(),
+            attributes: SmallVec::new(),
         }
     }
 }

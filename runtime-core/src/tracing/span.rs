@@ -81,6 +81,18 @@ impl SpanWrapper {
         self.data.events.events.push(SpanEvent::new(s));
     }
 
+    /// Add an event with a dynamic name and attributes. All strings (name + attribute values)
+    /// are arena-allocated. Keys must be `&'static str`. Zero heap allocation.
+    pub fn push_event_attrs_dyn(&mut self, message: &str, attrs: &[(&'static str, &str)]) {
+        let name = self.alloc_str(message);
+        let mut event = SpanEvent::new(name);
+        for &(k, v) in attrs {
+            let v = self.alloc_str(v);
+            event.attributes.push(KeyValue::new(k, v));
+        }
+        self.data.events.events.push(event);
+    }
+
     /// Set a dynamic error status, message allocated in the arena. Zero heap allocation.
     pub fn push_status_error_dyn(&mut self, message: &str) {
         let s = self.alloc_str(message);
@@ -235,6 +247,16 @@ pub fn event(message: &str) {
     with_current_task_tracing(|tracing| {
         if let Some(buf) = tracing.spans.back_mut() {
             buf.push_event_dyn(message);
+        }
+    });
+}
+
+/// Add an event with attributes to the current span.
+/// All strings (name + attribute values) are arena-allocated. Keys must be `&'static str`.
+pub fn event_attrs(message: &str, attrs: &[(&'static str, &str)]) {
+    with_current_task_tracing(|tracing| {
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.push_event_attrs_dyn(message, attrs);
         }
     });
 }

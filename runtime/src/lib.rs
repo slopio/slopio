@@ -36,7 +36,7 @@ pub fn main_thread<F: Future>(f: F) -> F::Output {
     return rt.block_on(f, None, |run| {
         use runtime_core::tracing::{TRACING_SINK, TempoExporter, init_trace_sink};
         let sink = init_trace_sink::<TempoExporter>();
-        TRACING_SINK.set(&sink, || run())
+        TRACING_SINK.set(&sink, run)
     });
     #[cfg(not(feature = "tracing"))]
     rt.block_on(f, None, |run| run())
