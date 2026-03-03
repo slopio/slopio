@@ -4,8 +4,8 @@ use std::sync::OnceLock;
 
 use crate::runtime::TIME_DRIVER;
 use crate::scoped_thread_local;
-use crate::tracing::span::{new_span_data, random_trace_id};
-use crate::tracing::types::{SpanData, SpanEvent, SpanId, TraceId};
+use crate::tracing::span::{SpanBuf, new_span_data, random_trace_id};
+use crate::tracing::types::{SpanId, TraceId};
 
 mod collector;
 mod opentelemetry;
@@ -16,7 +16,7 @@ pub mod types;
 
 pub use collector::{Collector, TempoExporter, TraceCollector};
 pub use opentelemetry::{TraceSink, init_trace_sink};
-pub use types::{KeyValue, SpanKind, Status};
+pub use types::{KeyValue, SpanKind, SpanLink, Status};
 
 scoped_thread_local!(pub static TRACING_SINK : TraceSink);
 
@@ -104,7 +104,7 @@ fn level_enabled(level: Level) -> bool {
 
 #[derive(Default)]
 pub struct TaskTelemetry {
-    spans: VecDeque<SpanData>,
+    spans: VecDeque<SpanBuf>,
     inherited_trace_id: Option<TraceId>,
 }
 
@@ -121,7 +121,7 @@ impl TaskTelemetry {
             (random_trace_id(), None)
         } else {
             match self.spans.back() {
-                Some(top) => (top.trace_id, Some(top.span_id)),
+                Some(top) => (top.data.trace_id, Some(top.data.span_id)),
                 None => (
                     self.inherited_trace_id.unwrap_or_else(random_trace_id),
                     None,
@@ -132,7 +132,7 @@ impl TaskTelemetry {
         let mut span = new_span_data(trace_id, parent_span_id, name, SpanKind::Internal);
         span.attributes.push(KeyValue::new("level", level.as_str()));
         let span_id = span.span_id;
-        self.spans.push_back(span);
+        self.spans.push_back(SpanBuf::new(span));
         span_id
     }
 
@@ -146,7 +146,7 @@ impl TaskTelemetry {
         span.parent_span_is_remote = true;
         span.attributes.push(KeyValue::new("level", level.as_str()));
         let span_id = span.span_id;
-        self.spans.push_back(span);
+        self.spans.push_back(SpanBuf::new(span));
         span_id
     }
 }
@@ -181,11 +181,11 @@ struct SpanGuard {
 
 impl Drop for SpanGuard {
     fn drop(&mut self) {
-        let span = with_current_task_tracing(|tracing| {
+        let buf = with_current_task_tracing(|tracing| {
             if let Some(pos) = tracing
                 .spans
                 .iter()
-                .rposition(|s| s.span_id == self.span_id)
+                .rposition(|s| s.data.span_id == self.span_id)
             {
                 tracing.spans.remove(pos)
             } else {
@@ -194,15 +194,15 @@ impl Drop for SpanGuard {
         })
         .flatten();
 
-        if let Some(mut span) = span {
-            span.end_time = TIME_DRIVER.with(|d| d.now());
-            TRACING_SINK.with(|output| output.push_span(span))
+        if let Some(mut buf) = buf {
+            buf.data.end_time = TIME_DRIVER.with(|d| d.now());
+            TRACING_SINK.with(|output| output.push_span(buf))
         }
     }
 }
 
 /// RAII guard for a span. Holds the span open until dropped.
-/// Use the builder methods (`.kind()`, `.attr()`) immediately after creation.
+/// Use the builder methods (`.kind()`, `.attr()`, `.attr_dyn()`) immediately after creation.
 #[must_use = "Span must be held for the duration of the operation"]
 #[derive(Debug)]
 pub struct Span(Option<SpanGuard>);
@@ -212,33 +212,66 @@ impl Span {
     pub fn kind(self, kind: SpanKind) -> Self {
         if self.0.is_some() {
             with_current_task_tracing(|tracing| {
-                if let Some(span) = tracing.spans.back_mut() {
-                    span.span_kind = kind;
+                if let Some(buf) = tracing.spans.back_mut() {
+                    buf.data.span_kind = kind;
                 }
             });
         }
         self
     }
 
-    /// Add an attribute to this span.
+    /// Add a static-string attribute. Zero allocation.
     pub fn attr(self, kv: KeyValue) -> Self {
         if self.0.is_some() {
             with_current_task_tracing(|tracing| {
-                if let Some(span) = tracing.spans.back_mut() {
-                    span.attributes.push(kv);
+                if let Some(buf) = tracing.spans.back_mut() {
+                    buf.data.attributes.push(kv);
                 }
             });
         }
         self
+    }
+
+    /// Add a dynamic string attribute, allocated in the span's arena. Zero heap allocation.
+    pub fn attr_dyn(self, key: &'static str, value: &str) -> Self {
+        if self.0.is_some() {
+            with_current_task_tracing(|tracing| {
+                if let Some(buf) = tracing.spans.back_mut() {
+                    buf.push_attr_dyn(key, value);
+                }
+            });
+        }
+        self
+    }
+
+    /// Add a link to another span (e.g. extracted from an incoming `traceparent`).
+    pub fn link(self, link: SpanLink) -> Self {
+        if self.0.is_some() {
+            with_current_task_tracing(|tracing| {
+                if let Some(buf) = tracing.spans.back_mut() {
+                    buf.push_link(link);
+                }
+            });
+        }
+        self
+    }
+
+    /// Add a link if present. No-op when `None`.
+    pub fn link_opt(self, link: Option<SpanLink>) -> Self {
+        if let Some(link) = link {
+            self.link(link)
+        } else {
+            self
+        }
     }
 }
 
 pub fn current_trace_id() -> Option<TraceId> {
-    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.trace_id)).flatten()
+    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.data.trace_id)).flatten()
 }
 
 pub fn current_span_id() -> Option<SpanId> {
-    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.span_id)).flatten()
+    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.data.span_id)).flatten()
 }
 
 pub fn new_span(name: &'static str, level: Level) -> Span {
@@ -271,32 +304,41 @@ pub fn new_trace_with_parent(name: &'static str, level: Level, parent: (TraceId,
 
 pub fn event(message: &str) {
     with_current_task_tracing(|tracing| {
-        if let Some(span) = tracing.spans.back_mut() {
-            span.events.events.push(SpanEvent::with_name(message.to_owned()));
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.push_event_dyn(message);
         }
     });
 }
 
 pub fn span_set_attribute(kv: KeyValue) {
     with_current_task_tracing(|tracing| {
-        if let Some(span) = tracing.spans.back_mut() {
-            span.attributes.push(kv);
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.data.attributes.push(kv);
         }
     });
 }
 
 pub fn span_set_status(status: Status) {
     with_current_task_tracing(|tracing| {
-        if let Some(span) = tracing.spans.back_mut() {
-            span.status = status;
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.data.status = status;
+        }
+    });
+}
+
+/// Set a dynamic error status, message allocated in the current span's arena.
+pub fn span_set_error(message: &str) {
+    with_current_task_tracing(|tracing| {
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.push_status_error_dyn(message);
         }
     });
 }
 
 pub fn span_set_kind(kind: SpanKind) {
     with_current_task_tracing(|tracing| {
-        if let Some(span) = tracing.spans.back_mut() {
-            span.span_kind = kind;
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.data.span_kind = kind;
         }
     });
 }
@@ -304,9 +346,9 @@ pub fn span_set_kind(kind: SpanKind) {
 /// Serialize the current span context as a W3C `traceparent` header value.
 pub fn inject() -> Option<String> {
     with_current_task_tracing(|tracing| {
-        tracing.spans.back().map(|span| {
-            let trace_id = u128::from_be_bytes(span.trace_id.to_bytes());
-            let span_id = u64::from_be_bytes(span.span_id.to_bytes());
+        tracing.spans.back().map(|buf| {
+            let trace_id = u128::from_be_bytes(buf.data.trace_id.to_bytes());
+            let span_id = u64::from_be_bytes(buf.data.span_id.to_bytes());
             format!("00-{:032x}-{:016x}-01", trace_id, span_id)
         })
     })

@@ -149,7 +149,9 @@ where
         let rt = RuntimeInner::with_thread_id(n);
         #[cfg(feature = "tracing")]
         return rt.block_on(fut, Some(event_fd), |run| {
-            use runtime_core::tracing::{TRACING_SINK, TempoExporter, init_trace_sink, set_thread_id};
+            use runtime_core::tracing::{
+                TRACING_SINK, TempoExporter, init_trace_sink, set_thread_id,
+            };
             set_thread_id(n);
             let sink = init_trace_sink::<TempoExporter>();
             TRACING_SINK.set(&sink, || run())

@@ -1,6 +1,5 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::tracing::types::{KeyValue, SpanData, SpanId, SpanKind, Status, Value};
 use crate::tracing::otlp::proto::common::{
     AnyValue, InstrumentationScope, KeyValue as ProtoKeyValue, any_value,
 };
@@ -8,6 +7,8 @@ use crate::tracing::otlp::proto::resource::Resource as ProtoResource;
 use crate::tracing::otlp::proto::trace::{
     ResourceSpans, ScopeSpans, Span, SpanFlags, Status as ProtoStatus, span, status,
 };
+use crate::tracing::span::SpanBuf;
+use crate::tracing::types::{KeyValue, SpanData, SpanId, SpanKind, SpanLink, Status, Value};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -37,13 +38,12 @@ impl From<Value> for AnyValue {
                 Value::I64(v) => any_value::Value::IntValue(v),
                 Value::F64(v) => any_value::Value::DoubleValue(v),
                 Value::Str(v) => any_value::Value::StringValue(v.to_owned()),
-                Value::String(v) => any_value::Value::StringValue(v),
             }),
         }
     }
 }
 
-fn attrs_to_proto(kvs: Vec<KeyValue>) -> Vec<ProtoKeyValue> {
+fn attrs_to_proto(kvs: impl IntoIterator<Item = KeyValue>) -> Vec<ProtoKeyValue> {
     kvs.into_iter()
         .map(|kv| ProtoKeyValue {
             key: kv.key.to_owned(),
@@ -66,8 +66,8 @@ impl From<SpanKind> for span::SpanKind {
     }
 }
 
-impl From<&Status> for status::StatusCode {
-    fn from(s: &Status) -> Self {
+impl From<Status> for status::StatusCode {
+    fn from(s: Status) -> Self {
         match s {
             Status::Ok => status::StatusCode::Ok,
             Status::Unset => status::StatusCode::Unset,
@@ -76,14 +76,27 @@ impl From<&Status> for status::StatusCode {
     }
 }
 
+// ─── Link conversion ─────────────────────────────────────────────────────────
+
+fn link_to_proto(link: SpanLink) -> span::Link {
+    span::Link {
+        trace_id: link.trace_id.to_bytes().to_vec(),
+        span_id: link.span_id.to_bytes().to_vec(),
+        trace_state: String::new(),
+        attributes: vec![],
+        dropped_attributes_count: 0,
+        flags: 1, // SAMPLED
+    }
+}
+
 // ─── SpanData → proto Span ───────────────────────────────────────────────────
 
 impl From<SpanData> for Span {
     fn from(s: SpanData) -> Self {
         let kind: span::SpanKind = s.span_kind.into();
-        let status_code = status::StatusCode::from(&s.status);
-        let status_message = match &s.status {
-            Status::Error(msg) => msg.clone(),
+        let status_code = status::StatusCode::from(s.status);
+        let status_message = match s.status {
+            Status::Error(msg) => msg.to_owned(),
             _ => String::new(),
         };
 
@@ -111,13 +124,13 @@ impl From<SpanData> for Span {
                 .into_iter()
                 .map(|e| span::Event {
                     time_unix_nano: to_nanos(e.timestamp),
-                    name: e.name,
-                    attributes: attrs_to_proto(e.attributes),
-                    dropped_attributes_count: e.dropped_attributes_count,
+                    name: e.name.to_owned(),
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
                 })
                 .collect(),
-            dropped_links_count: 0,
-            links: vec![],
+            dropped_links_count: s.dropped_links_count,
+            links: s.links.into_iter().map(link_to_proto).collect(),
             status: Some(ProtoStatus {
                 code: status_code.into(),
                 message: status_message,
@@ -128,9 +141,14 @@ impl From<SpanData> for Span {
 
 // ─── Grouping ────────────────────────────────────────────────────────────────
 
-/// All spans share a single instrumentation scope ("my runtime"), so no grouping is needed.
+/// Encode a batch of spans into OTLP `ResourceSpans`.
+///
+/// Each `SpanBuf` is partially moved: `buf.data` is consumed by `From<SpanData>` (which
+/// copies arena strings to owned `String`s), then `buf.arena` drops at end of the closure.
+/// Arena-allocated attribute strings remain valid throughout the `From<SpanData>` call
+/// because the arena is still alive in the same `SpanBuf`.
 pub fn group_spans_by_resource_and_scope(
-    spans: Vec<SpanData>,
+    spans: Vec<SpanBuf>,
     resource_attrs: &[ProtoKeyValue],
 ) -> Vec<ResourceSpans> {
     vec![ResourceSpans {
@@ -147,7 +165,7 @@ pub fn group_spans_by_resource_and_scope(
                 dropped_attributes_count: 0,
             }),
             schema_url: String::new(),
-            spans: spans.into_iter().map(Into::into).collect(),
+            spans: spans.into_iter().map(|buf| buf.data.into()).collect(),
         }],
         schema_url: String::new(),
     }]

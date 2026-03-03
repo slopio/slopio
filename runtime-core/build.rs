@@ -11,10 +11,7 @@ fn main() {
         .unwrap()
         .join("ring_config.rs");
 
-    println!(
-        "cargo:rerun-if-changed={}",
-        workspace_config.display()
-    );
+    println!("cargo:rerun-if-changed={}", workspace_config.display());
 
     if workspace_config.exists() {
         std::fs::copy(&workspace_config, &dest).unwrap();

@@ -1,9 +1,9 @@
 use prost::Message;
 
-use crate::tracing::types::SpanData;
 use crate::tracing::otlp::proto::collector::trace::ExportTraceServiceRequest;
 use crate::tracing::otlp::proto::common::{AnyValue, KeyValue as ProtoKeyValue, any_value};
 use crate::tracing::otlp::transform::group_spans_by_resource_and_scope;
+use crate::tracing::span::SpanBuf;
 
 const ENCODE_BUFFER_CAPACITY: usize = 64 * 1024;
 
@@ -51,7 +51,7 @@ impl Default for ProtoEncodeBuffer {
 }
 
 impl ProtoEncodeBuffer {
-    pub fn encode(&mut self, batch: Vec<SpanData>) -> &[u8] {
+    pub fn encode(&mut self, batch: Vec<SpanBuf>) -> &[u8] {
         let resource_spans = group_spans_by_resource_and_scope(batch, &self.resource_attrs);
         let request = ExportTraceServiceRequest { resource_spans };
         self.buf.clear();

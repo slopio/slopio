@@ -20,11 +20,11 @@ pub enum ClientState {
 impl std::fmt::Display for ClientState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientState::Disconnected   => write!(f, "Disconnected"),
-            ClientState::Connected      => write!(f, "Connected"),
+            ClientState::Disconnected => write!(f, "Disconnected"),
+            ClientState::Connected => write!(f, "Connected"),
             ClientState::Authenticating => write!(f, "Authenticating"),
-            ClientState::Authenticated  => write!(f, "Authenticated"),
-            ClientState::Shutdown       => write!(f, "Shutdown"),
+            ClientState::Authenticated => write!(f, "Authenticated"),
+            ClientState::Shutdown => write!(f, "Shutdown"),
         }
     }
 }
@@ -36,23 +36,23 @@ pub(crate) struct ConnectedData {
 }
 
 pub(crate) struct AuthenticatedData {
-    pub socket:        SocketWrapper,
-    pub user_id:       u32,
-    pub connected_at:  Instant,
+    pub socket: SocketWrapper,
+    pub user_id: u32,
+    pub connected_at: Instant,
     /// Shared with the heartbeat task so it can update the timestamp.
     pub last_activity: Rc<Cell<Instant>>,
     /// Set to `true` while a request/response pair is in flight.
     /// The heartbeat task skips the PING if the socket is busy.
-    pub socket_busy:   Rc<Cell<bool>>,
+    pub socket_busy: Rc<Cell<bool>>,
     /// Cleared to `false` on disconnect/shutdown to stop the heartbeat task.
-    pub alive:         Rc<Cell<bool>>,
+    pub alive: Rc<Cell<bool>>,
 }
 
 /// References shared with the background heartbeat task (all cheaply cloneable).
 pub(crate) struct HeartbeatContext {
-    pub fd:            i32,
-    pub alive:         Rc<Cell<bool>>,
-    pub socket_busy:   Rc<Cell<bool>>,
+    pub fd: i32,
+    pub alive: Rc<Cell<bool>>,
+    pub socket_busy: Rc<Cell<bool>>,
     pub last_activity: Rc<Cell<Instant>>,
 }
 
@@ -86,11 +86,11 @@ impl Connection {
 
     pub fn state(&self) -> ClientState {
         match self {
-            Connection::Disconnected       => ClientState::Disconnected,
-            Connection::Connected(_)       => ClientState::Connected,
-            Connection::Authenticating(_)  => ClientState::Authenticating,
-            Connection::Authenticated(_)   => ClientState::Authenticated,
-            Connection::Shutdown           => ClientState::Shutdown,
+            Connection::Disconnected => ClientState::Disconnected,
+            Connection::Connected(_) => ClientState::Connected,
+            Connection::Authenticating(_) => ClientState::Authenticating,
+            Connection::Authenticated(_) => ClientState::Authenticated,
+            Connection::Shutdown => ClientState::Shutdown,
         }
     }
 
@@ -110,7 +110,7 @@ impl Connection {
         match self {
             Connection::Connected(d) | Connection::Authenticating(d) => Ok(d.socket.fd),
             Connection::Authenticated(d) => Ok(d.socket.fd),
-            Connection::Shutdown    => Err(IggyError::InvalidState("client is shut down")),
+            Connection::Shutdown => Err(IggyError::InvalidState("client is shut down")),
             Connection::Disconnected => Err(IggyError::InvalidState("not connected")),
         }
     }
@@ -119,8 +119,8 @@ impl Connection {
     pub fn require_authenticated(&self) -> Result<(), IggyError> {
         match self {
             Connection::Authenticated(_) => Ok(()),
-            Connection::Shutdown         => Err(IggyError::InvalidState("client is shut down")),
-            _                            => Err(IggyError::InvalidState("not authenticated")),
+            Connection::Shutdown => Err(IggyError::InvalidState("client is shut down")),
+            _ => Err(IggyError::InvalidState("not authenticated")),
         }
     }
 
@@ -147,9 +147,9 @@ impl Connection {
     pub fn heartbeat_context(&self) -> Option<HeartbeatContext> {
         match self {
             Connection::Authenticated(d) => Some(HeartbeatContext {
-                fd:            d.socket.fd,
-                alive:         Rc::clone(&d.alive),
-                socket_busy:   Rc::clone(&d.socket_busy),
+                fd: d.socket.fd,
+                alive: Rc::clone(&d.alive),
+                socket_busy: Rc::clone(&d.socket_busy),
                 last_activity: Rc::clone(&d.last_activity),
             }),
             _ => None,
@@ -194,10 +194,10 @@ impl Connection {
                 *self = Connection::Authenticated(AuthenticatedData {
                     socket,
                     user_id,
-                    connected_at:  now,
+                    connected_at: now,
                     last_activity: Rc::new(Cell::new(now)),
-                    socket_busy:   Rc::new(Cell::new(false)),
-                    alive:         Rc::new(Cell::new(true)),
+                    socket_busy: Rc::new(Cell::new(false)),
+                    alive: Rc::new(Cell::new(true)),
                 });
                 Ok(())
             }

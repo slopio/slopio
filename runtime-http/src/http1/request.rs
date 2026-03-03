@@ -1,6 +1,5 @@
 pub use crate::http::Method;
 
-
 pub struct Request<'arena> {
     pub method: Method,
     pub path: &'arena str,
@@ -62,4 +61,3 @@ impl From<std::io::Error> for ParseError {
         ParseError::Io(e)
     }
 }
-

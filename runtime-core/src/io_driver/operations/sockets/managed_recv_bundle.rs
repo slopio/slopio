@@ -5,10 +5,7 @@ use std::{
 
 use io_uring::{opcode, types::Fd};
 
-use crate::io_driver::{
-    BorrowedBuffer, BufGroup, IO_DRIVER,
-    operations::sockets::SocketWrapper,
-};
+use crate::io_driver::{BorrowedBuffer, BufGroup, IO_DRIVER, operations::sockets::SocketWrapper};
 
 pub struct ManagedRecvBundle {
     id: Option<usize>,
@@ -57,7 +54,9 @@ impl Future for ManagedRecvBundle {
                     use io_uring::cqueue::buffer_select;
                     let len = io_result.result as usize;
                     let buffer_id = buffer_select(io_result.flags).unwrap();
-                    Poll::Ready(Ok(IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, len))))
+                    Poll::Ready(Ok(
+                        IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, len))
+                    ))
                 }
             }
         }

@@ -712,6 +712,7 @@ dependencies = [
  "runtime-streams",
  "runtime_ebpf_balancer",
  "slab",
+ "smallvec",
  "socket2 0.6.2",
 ]
 

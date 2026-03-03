@@ -1,9 +1,9 @@
-use std::time::Duration;
 use std::pin::Pin;
+use std::time::Duration;
 
 use runtime::tracing::event;
 #[cfg(feature = "tracing")]
-use runtime::tracing::{Level, new_span};
+use runtime::tracing::{KeyValue, Level, SpanLink, extract, new_span};
 use runtime::{
     http::Method,
     main_thread,
@@ -23,8 +23,18 @@ impl HttpHandler for Handler {
             .headers
             .iter()
             .any(|&(k, v)| k == "password" && v == "uwu");
+        let header_count = head.headers.len() as i64;
+        let incoming = head
+            .headers
+            .iter()
+            .find(|&&(k, _)| k == "traceparent")
+            .and_then(|&(_, v)| extract(v))
+            .map(|(trace_id, span_id)| SpanLink { trace_id, span_id });
         Box::pin(async move {
-            let _span = new_span("on_headers", Level::Info);
+            let _span = new_span("on_headers", Level::Info)
+                .attr(KeyValue::new("http.authorized", authorized))
+                .attr(KeyValue::new("http.request.header_count", header_count))
+                .link_opt(incoming);
             event("accepted!");
             Sleep::during(Duration::from_millis(1)).await;
             if authorized {
@@ -40,12 +50,25 @@ impl HttpHandler for Handler {
         head: RequestHead<'static>,
     ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
         Box::pin(async move {
+            let incoming = head
+                .headers
+                .iter()
+                .find(|&&(k, _)| k == "traceparent")
+                .and_then(|&(_, v)| extract(v))
+                .map(|(trace_id, span_id)| SpanLink { trace_id, span_id });
+            let _span = new_span("no_body", Level::Info)
+                .attr(KeyValue::new("http.request.method", head.method.as_str()))
+                .attr_dyn("http.request.path", head.path)
+                .link_opt(incoming);
             match (head.method, head.path) {
-                (Method::Get, "/") => HttpResponse::new(200)
-                    .header("content-type", "text/plain")
-                    .body("Hello from HTTP/3!"),
+                (Method::Get, "/") => {
+                    span_set_status(runtime::tracing::Status::Ok);
+                    HttpResponse::new(200)
+                        .header("content-type", "text/plain")
+                        .body("Hello from HTTP/3!")
+                }
                 _ => {
-                    span_set_status(runtime::tracing::Status::Error("404".to_owned()));
+                    span_set_status(runtime::tracing::Status::Error("404"));
                     HttpResponse::new(404)
                         .header("content-type", "text/plain")
                         .body("Not Found")
@@ -56,11 +79,22 @@ impl HttpHandler for Handler {
 
     fn buffered_body(
         &self,
-        _head: RequestHead<'static>,
+        head: RequestHead<'static>,
         body: Box<[u8]>,
     ) -> Pin<Box<dyn std::future::Future<Output = HttpResponse> + 'static>> {
         Box::pin(async move {
-            let _span = new_span("on body", Level::Info).kind(runtime::tracing::SpanKind::Server);
+            let incoming = head
+                .headers
+                .iter()
+                .find(|&&(k, _)| k == "traceparent")
+                .and_then(|&(_, v)| extract(v))
+                .map(|(trace_id, span_id)| SpanLink { trace_id, span_id });
+            let _span = new_span("on body", Level::Info)
+                .kind(runtime::tracing::SpanKind::Server)
+                .attr(KeyValue::new("http.request.method", head.method.as_str()))
+                .attr_dyn("http.request.path", head.path)
+                .attr(KeyValue::new("http.request.body_size", body.len() as i64))
+                .link_opt(incoming);
             Sleep::during(Duration::from_millis(1)).await;
             HttpResponse::new(200)
                 .header("content-type", "application/octet-stream")

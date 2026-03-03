@@ -1,5 +1,7 @@
 use std::time::SystemTime;
 
+use smallvec::SmallVec;
+
 // ─── Trace / Span IDs ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -48,23 +50,24 @@ pub enum SpanKind {
     Consumer,
 }
 
-#[derive(Clone, Debug, Default)]
+/// All string variants are `&'static str` — either truly static or arena-allocated via `SpanBuf`.
+#[derive(Clone, Copy, Debug, Default)]
 pub enum Status {
     #[default]
     Unset,
     Ok,
-    Error(String),
+    Error(&'static str),
 }
 
 // ─── Attributes ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+/// All variants are `Copy`. Dynamic strings must be arena-allocated via `SpanBuf::attr_dyn`.
+#[derive(Clone, Copy, Debug)]
 pub enum Value {
     Bool(bool),
     I64(i64),
     F64(f64),
     Str(&'static str),
-    String(String),
 }
 
 impl From<bool> for Value {
@@ -91,13 +94,7 @@ impl From<&'static str> for Value {
     }
 }
 
-impl From<String> for Value {
-    fn from(v: String) -> Self {
-        Self::String(v)
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct KeyValue {
     pub key: &'static str,
     pub value: Value,
@@ -114,45 +111,51 @@ impl KeyValue {
 
 // ─── Events ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+/// `name` is `&'static str` — either truly static or arena-allocated via `SpanBuf::event_dyn`.
+#[derive(Clone, Copy, Debug)]
 pub struct SpanEvent {
-    pub name: String,
+    pub name: &'static str,
     pub timestamp: SystemTime,
-    pub attributes: Vec<KeyValue>,
-    pub dropped_attributes_count: u32,
 }
 
 impl SpanEvent {
-    pub fn with_name(name: impl Into<String>) -> Self {
+    pub fn new(name: &'static str) -> Self {
         Self {
-            name: name.into(),
+            name,
             timestamp: SystemTime::now(),
-            attributes: Vec::new(),
-            dropped_attributes_count: 0,
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct SpanEvents {
-    pub events: Vec<SpanEvent>,
+    pub events: SmallVec<[SpanEvent; 4]>,
     pub dropped_count: u32,
 }
 
 impl IntoIterator for SpanEvents {
     type Item = SpanEvent;
-    type IntoIter = std::vec::IntoIter<SpanEvent>;
+    type IntoIter = smallvec::IntoIter<[SpanEvent; 4]>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.events.into_iter()
     }
 }
 
+// ─── Links ───────────────────────────────────────────────────────────────────
+
+/// A reference to another span, used to express relationships that are not
+/// parent-child (e.g. a consumer span linking back to the producer span).
+#[derive(Clone, Copy, Debug)]
+pub struct SpanLink {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+}
+
 // ─── SpanData ────────────────────────────────────────────────────────────────
 
-/// All data for a completed span.
-///
-/// `trace_flags` is always `0x01` (SAMPLED) and `trace_state` is always empty.
+/// All data for a completed span. Contains no heap allocations —
+/// all strings are `&'static str` (truly static or arena-allocated via [`SpanBuf`]).
 #[derive(Clone, Debug)]
 pub struct SpanData {
     pub trace_id: TraceId,
@@ -164,8 +167,10 @@ pub struct SpanData {
     pub span_kind: SpanKind,
     pub start_time: SystemTime,
     pub end_time: SystemTime,
-    pub attributes: Vec<KeyValue>,
+    pub attributes: SmallVec<[KeyValue; 8]>,
     pub dropped_attributes_count: u32,
     pub events: SpanEvents,
+    pub links: SmallVec<[SpanLink; 2]>,
+    pub dropped_links_count: u32,
     pub status: Status,
 }

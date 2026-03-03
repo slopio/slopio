@@ -7,8 +7,7 @@ use std::{
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 
 use crate::io_driver::{
-    BorrowedBuffer, BufGroup, IO_DRIVER, OpMetadata,
-    operations::sockets::SocketWrapper,
+    BorrowedBuffer, BufGroup, IO_DRIVER, OpMetadata, operations::sockets::SocketWrapper,
 };
 
 pub struct ManagedRecv {

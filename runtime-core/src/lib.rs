@@ -6,5 +6,5 @@ pub mod task;
 #[cfg(feature = "tracing")]
 pub mod tracing;
 
-pub use task::{Handle, TypeAgnosticTask, new_task};
 pub use macros::scoped_tls;
+pub use task::{Handle, TypeAgnosticTask, new_task};
