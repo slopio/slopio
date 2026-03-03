@@ -3,9 +3,12 @@ use rand::Rng;
 use smallvec::SmallVec;
 
 use crate::runtime::TIME_DRIVER;
+use crate::tracing::task::{Level, level_enabled, with_current_task_tracing};
 use crate::tracing::types::{
     KeyValue, SpanData, SpanEvent, SpanEvents, SpanId, SpanKind, SpanLink, Status, TraceId,
 };
+
+// ─── Constructors ─────────────────────────────────────────────────────────────
 
 pub fn random_trace_id() -> TraceId {
     TraceId::from(rand::thread_rng().r#gen::<u128>())
@@ -37,18 +40,20 @@ pub fn new_span_data(
     }
 }
 
+// ─── SpanWrapper ──────────────────────────────────────────────────────────────────
+
 /// A span co-located with a bump arena for zero-alloc dynamic string attributes.
 ///
 /// # Drop order
 /// `data` is declared before `arena` — Rust drops fields in declaration order, so
 /// `data` drops first. Arena-allocated strings in `data` are read only during proto
 /// encoding, which happens while this `SpanBuf` is still alive.
-pub struct SpanBuf {
+pub struct SpanWrapper {
     pub data: SpanData,
     pub arena: Bump,
 }
 
-impl SpanBuf {
+impl SpanWrapper {
     pub fn new(data: SpanData) -> Self {
         Self {
             data,
@@ -86,4 +91,183 @@ impl SpanBuf {
     pub fn push_link(&mut self, link: SpanLink) {
         self.data.links.push(link);
     }
+}
+
+// ─── SpanGuard ────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct SpanGuard {
+    span_id: SpanId,
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        let buf = with_current_task_tracing(|tracing| {
+            if let Some(pos) = tracing
+                .spans
+                .iter()
+                .rposition(|s| s.data.span_id == self.span_id)
+            {
+                tracing.spans.remove(pos)
+            } else {
+                None
+            }
+        })
+        .flatten();
+
+        if let Some(mut buf) = buf {
+            buf.data.end_time = TIME_DRIVER.with(|d| d.now());
+            crate::tracing::TRACING_SINK.with(|output| output.push_span(buf))
+        }
+    }
+}
+
+// ─── Span builder ─────────────────────────────────────────────────────────────
+
+/// RAII guard for a span. Holds the span open until dropped.
+/// Use the builder methods (`.kind()`, `.attr()`, `.attr_dyn()`, `.link()`) immediately after creation.
+#[must_use = "Span must be held for the duration of the operation"]
+#[derive(Debug)]
+pub struct Span(Option<SpanGuard>);
+
+impl Span {
+    /// Set the [`SpanKind`] for this span.
+    pub fn kind(self, kind: SpanKind) -> Self {
+        if self.0.is_some() {
+            with_current_task_tracing(|tracing| {
+                if let Some(buf) = tracing.spans.back_mut() {
+                    buf.data.span_kind = kind;
+                }
+            });
+        }
+        self
+    }
+
+    /// Add a static-string attribute. Zero allocation.
+    pub fn attr(self, kv: KeyValue) -> Self {
+        if self.0.is_some() {
+            with_current_task_tracing(|tracing| {
+                if let Some(buf) = tracing.spans.back_mut() {
+                    buf.data.attributes.push(kv);
+                }
+            });
+        }
+        self
+    }
+
+    /// Add a dynamic string attribute, allocated in the span's arena. Zero heap allocation.
+    pub fn attr_dyn(self, key: &'static str, value: &str) -> Self {
+        if self.0.is_some() {
+            with_current_task_tracing(|tracing| {
+                if let Some(buf) = tracing.spans.back_mut() {
+                    buf.push_attr_dyn(key, value);
+                }
+            });
+        }
+        self
+    }
+
+    /// Add a link to another span (e.g. extracted from an incoming `traceparent`).
+    pub fn link(self, link: SpanLink) -> Self {
+        if self.0.is_some() {
+            with_current_task_tracing(|tracing| {
+                if let Some(buf) = tracing.spans.back_mut() {
+                    buf.push_link(link);
+                }
+            });
+        }
+        self
+    }
+
+    /// Add a link if present. No-op when `None`.
+    pub fn link_opt(self, link: Option<SpanLink>) -> Self {
+        if let Some(link) = link {
+            self.link(link)
+        } else {
+            self
+        }
+    }
+}
+
+// ─── Span context queries ─────────────────────────────────────────────────────
+
+pub fn current_trace_id() -> Option<TraceId> {
+    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.data.trace_id)).flatten()
+}
+
+pub fn current_span_id() -> Option<SpanId> {
+    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.data.span_id)).flatten()
+}
+
+// ─── Span constructors ────────────────────────────────────────────────────────
+
+pub fn new_span(name: &'static str, level: Level) -> Span {
+    if !level_enabled(level) {
+        return Span(None);
+    }
+    Span(with_current_task_tracing(|tracing| SpanGuard {
+        span_id: tracing.create_new_span(name, false, level),
+    }))
+}
+
+pub fn new_trace(name: &'static str, level: Level) -> Span {
+    if !level_enabled(level) {
+        return Span(None);
+    }
+    Span(with_current_task_tracing(|tracing| SpanGuard {
+        span_id: tracing.create_new_span(name, true, level),
+    }))
+}
+
+/// Start a new trace rooted at a remote parent (extracted from e.g. a `traceparent` header).
+pub fn new_trace_with_parent(name: &'static str, level: Level, parent: (TraceId, SpanId)) -> Span {
+    if !level_enabled(level) {
+        return Span(None);
+    }
+    Span(with_current_task_tracing(|tracing| SpanGuard {
+        span_id: tracing.create_span_with_remote_parent(name, level, parent),
+    }))
+}
+
+// ─── Span mutations ───────────────────────────────────────────────────────────
+
+pub fn event(message: &str) {
+    with_current_task_tracing(|tracing| {
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.push_event_dyn(message);
+        }
+    });
+}
+
+pub fn span_set_attribute(kv: KeyValue) {
+    with_current_task_tracing(|tracing| {
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.data.attributes.push(kv);
+        }
+    });
+}
+
+pub fn span_set_status(status: Status) {
+    with_current_task_tracing(|tracing| {
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.data.status = status;
+        }
+    });
+}
+
+/// Set a dynamic error status, message allocated in the current span's arena.
+pub fn span_set_error(message: &str) {
+    with_current_task_tracing(|tracing| {
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.push_status_error_dyn(message);
+        }
+    });
+}
+
+pub fn span_set_kind(kind: SpanKind) {
+    with_current_task_tracing(|tracing| {
+        if let Some(buf) = tracing.spans.back_mut() {
+            buf.data.span_kind = kind;
+        }
+    });
 }

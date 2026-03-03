@@ -1,15 +1,15 @@
 use crate::{
     channels::{Sender, unbounded_channel},
     runtime::spawn,
-    tracing::{collector::Collector, span::SpanBuf},
+    tracing::{collector::Collector, span::SpanWrapper},
 };
 
 pub struct TraceSink {
-    sender: Sender<SpanBuf>,
+    sender: Sender<SpanWrapper>,
 }
 
 impl TraceSink {
-    pub fn push_span(&self, buf: SpanBuf) {
+    pub fn push_span(&self, buf: SpanWrapper) {
         self.sender.send(buf);
     }
 }

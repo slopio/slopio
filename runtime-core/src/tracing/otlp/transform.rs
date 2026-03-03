@@ -7,7 +7,7 @@ use crate::tracing::otlp::proto::resource::Resource as ProtoResource;
 use crate::tracing::otlp::proto::trace::{
     ResourceSpans, ScopeSpans, Span, SpanFlags, Status as ProtoStatus, span, status,
 };
-use crate::tracing::span::SpanBuf;
+use crate::tracing::span::SpanWrapper;
 use crate::tracing::types::{KeyValue, SpanData, SpanId, SpanKind, SpanLink, Status, Value};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -148,7 +148,7 @@ impl From<SpanData> for Span {
 /// Arena-allocated attribute strings remain valid throughout the `From<SpanData>` call
 /// because the arena is still alive in the same `SpanBuf`.
 pub fn group_spans_by_resource_and_scope(
-    spans: Vec<SpanBuf>,
+    spans: Vec<SpanWrapper>,
     resource_attrs: &[ProtoKeyValue],
 ) -> Vec<ResourceSpans> {
     vec![ResourceSpans {

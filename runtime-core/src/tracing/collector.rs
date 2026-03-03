@@ -1,11 +1,11 @@
 use crate::{
     io_driver::operations::sockets::{SocketWrapper, connect_tcp, send::socket_send},
-    tracing::{proto::ProtoEncodeBuffer, span::SpanBuf},
+    tracing::{proto::ProtoEncodeBuffer, span::SpanWrapper},
 };
 
 pub trait Collector: Sized {
     fn init() -> Self;
-    fn process(&mut self, batch: Vec<SpanBuf>) -> impl Future<Output = ()>;
+    fn process(&mut self, batch: Vec<SpanWrapper>) -> impl Future<Output = ()>;
 }
 
 pub struct TraceCollector;
@@ -15,7 +15,7 @@ impl Collector for TraceCollector {
         Self
     }
 
-    async fn process(&mut self, batch: Vec<SpanBuf>) {
+    async fn process(&mut self, batch: Vec<SpanWrapper>) {
         for buf in &batch {
             let trace_id = u128::from_be_bytes(buf.data.trace_id.to_bytes());
             let span_id = u64::from_be_bytes(buf.data.span_id.to_bytes());
@@ -52,7 +52,7 @@ impl Collector for TempoExporter {
         Self::new(addr)
     }
 
-    async fn process(&mut self, batch: Vec<SpanBuf>) {
+    async fn process(&mut self, batch: Vec<SpanWrapper>) {
         let body = self.encode_buf.encode(batch);
 
         let request = format!(
