@@ -1,9 +1,6 @@
-use opentelemetry_sdk::trace::{SpanData, SpanExporter as _};
-use opentelemetry_stdout::SpanExporter;
-
 use crate::{
     io_driver::operations::sockets::{SocketWrapper, connect_tcp, send::socket_send},
-    tracing::proto::ProtoEncodeBuffer,
+    tracing::{proto::ProtoEncodeBuffer, types::SpanData},
 };
 
 pub trait Collector: Sized {
@@ -11,19 +8,19 @@ pub trait Collector: Sized {
     fn process(&mut self, batch: Vec<SpanData>) -> impl Future<Output = ()>;
 }
 
-pub struct TraceCollector {
-    span_exporter: SpanExporter,
-}
+pub struct TraceCollector;
 
 impl Collector for TraceCollector {
     fn init() -> Self {
-        Self {
-            span_exporter: SpanExporter::default(),
-        }
+        Self
     }
 
     async fn process(&mut self, batch: Vec<SpanData>) {
-        let _ = self.span_exporter.export(batch).await;
+        for span in &batch {
+            let trace_id = u128::from_be_bytes(span.trace_id.to_bytes());
+            let span_id = u64::from_be_bytes(span.span_id.to_bytes());
+            eprintln!("[trace] {:032x} {:016x} {}", trace_id, span_id, span.name);
+        }
     }
 }
 

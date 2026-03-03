@@ -1,9 +1,7 @@
-use opentelemetry::trace::{SpanContext, SpanKind, Status, TraceState};
-use opentelemetry::{InstrumentationScope, SpanId, TraceFlags, TraceId};
-use opentelemetry_sdk::trace::{SpanData, SpanEvents, SpanLinks};
 use rand::Rng;
 
 use crate::runtime::TIME_DRIVER;
+use crate::tracing::types::{SpanData, SpanEvents, SpanId, SpanKind, Status, TraceId};
 
 pub fn random_trace_id() -> TraceId {
     TraceId::from(rand::thread_rng().r#gen::<u128>())
@@ -16,27 +14,19 @@ pub fn new_span_data(
     kind: SpanKind,
 ) -> SpanData {
     let span_id: SpanId = rand::thread_rng().r#gen::<u64>().into();
-    let span_context = SpanContext::new(
-        trace_id,
-        span_id,
-        TraceFlags::SAMPLED,
-        false,
-        TraceState::NONE,
-    );
     let time = TIME_DRIVER.with(|d| d.now());
     SpanData {
-        span_context,
+        trace_id,
+        span_id,
         parent_span_id: parent_span_id.unwrap_or(SpanId::INVALID),
         parent_span_is_remote: false,
+        name,
         span_kind: kind,
-        name: name.into(),
         start_time: time,
         end_time: time,
         attributes: Vec::new(),
         dropped_attributes_count: 0,
         events: SpanEvents::default(),
-        links: SpanLinks::default(),
         status: Status::Unset,
-        instrumentation_scope: InstrumentationScope::builder("my runtime").build(),
     }
 }

@@ -2,25 +2,21 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
-use ::opentelemetry::SpanId;
-use ::opentelemetry::TraceId;
-use ::opentelemetry::trace::Event;
-use ::opentelemetry_sdk::trace::SpanData;
-
 use crate::runtime::TIME_DRIVER;
 use crate::scoped_thread_local;
 use crate::tracing::span::{new_span_data, random_trace_id};
+use crate::tracing::types::{SpanData, SpanEvent, SpanId, TraceId};
 
 mod collector;
 mod opentelemetry;
 pub(crate) mod otlp;
 pub mod proto;
 mod span;
+pub mod types;
 
-pub use ::opentelemetry::KeyValue;
-pub use ::opentelemetry::trace::{SpanKind, Status};
 pub use collector::{Collector, TempoExporter, TraceCollector};
 pub use opentelemetry::{TraceSink, init_trace_sink};
+pub use types::{KeyValue, SpanKind, Status};
 
 scoped_thread_local!(pub static TRACING_SINK : TraceSink);
 
@@ -125,10 +121,7 @@ impl TaskTelemetry {
             (random_trace_id(), None)
         } else {
             match self.spans.back() {
-                Some(top) => (
-                    top.span_context.trace_id(),
-                    Some(top.span_context.span_id()),
-                ),
+                Some(top) => (top.trace_id, Some(top.span_id)),
                 None => (
                     self.inherited_trace_id.unwrap_or_else(random_trace_id),
                     None,
@@ -138,7 +131,7 @@ impl TaskTelemetry {
 
         let mut span = new_span_data(trace_id, parent_span_id, name, SpanKind::Internal);
         span.attributes.push(KeyValue::new("level", level.as_str()));
-        let span_id = span.span_context.span_id();
+        let span_id = span.span_id;
         self.spans.push_back(span);
         span_id
     }
@@ -152,7 +145,7 @@ impl TaskTelemetry {
         let mut span = new_span_data(parent.0, Some(parent.1), name, SpanKind::Internal);
         span.parent_span_is_remote = true;
         span.attributes.push(KeyValue::new("level", level.as_str()));
-        let span_id = span.span_context.span_id();
+        let span_id = span.span_id;
         self.spans.push_back(span);
         span_id
     }
@@ -192,7 +185,7 @@ impl Drop for SpanGuard {
             if let Some(pos) = tracing
                 .spans
                 .iter()
-                .rposition(|s| s.span_context.span_id() == self.span_id)
+                .rposition(|s| s.span_id == self.span_id)
             {
                 tracing.spans.remove(pos)
             } else {
@@ -209,7 +202,7 @@ impl Drop for SpanGuard {
 }
 
 /// RAII guard for a span. Holds the span open until dropped.
-/// Use the builder methods (`.kind()`) immediately after creation.
+/// Use the builder methods (`.kind()`, `.attr()`) immediately after creation.
 #[must_use = "Span must be held for the duration of the operation"]
 #[derive(Debug)]
 pub struct Span(Option<SpanGuard>);
@@ -241,13 +234,11 @@ impl Span {
 }
 
 pub fn current_trace_id() -> Option<TraceId> {
-    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.span_context.trace_id()))
-        .flatten()
+    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.trace_id)).flatten()
 }
 
 pub fn current_span_id() -> Option<SpanId> {
-    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.span_context.span_id()))
-        .flatten()
+    with_current_task_tracing(|tracing| tracing.spans.back().map(|s| s.span_id)).flatten()
 }
 
 pub fn new_span(name: &'static str, level: Level) -> Span {
@@ -281,9 +272,7 @@ pub fn new_trace_with_parent(name: &'static str, level: Level, parent: (TraceId,
 pub fn event(message: &str) {
     with_current_task_tracing(|tracing| {
         if let Some(span) = tracing.spans.back_mut() {
-            span.events
-                .events
-                .push(Event::with_name(message.to_owned()));
+            span.events.events.push(SpanEvent::with_name(message.to_owned()));
         }
     });
 }
@@ -316,8 +305,8 @@ pub fn span_set_kind(kind: SpanKind) {
 pub fn inject() -> Option<String> {
     with_current_task_tracing(|tracing| {
         tracing.spans.back().map(|span| {
-            let trace_id = u128::from_be_bytes(span.span_context.trace_id().to_bytes());
-            let span_id = u64::from_be_bytes(span.span_context.span_id().to_bytes());
+            let trace_id = u128::from_be_bytes(span.trace_id.to_bytes());
+            let span_id = u64::from_be_bytes(span.span_id.to_bytes());
             format!("00-{:032x}-{:016x}-01", trace_id, span_id)
         })
     })

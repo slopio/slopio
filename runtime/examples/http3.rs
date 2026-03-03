@@ -1,5 +1,5 @@
 use std::time::Duration;
-use std::{borrow::Cow, pin::Pin};
+use std::pin::Pin;
 
 use runtime::tracing::event;
 #[cfg(feature = "tracing")]
@@ -10,7 +10,6 @@ use runtime::{
     quic::{H3Server, Http3ServerConfig, HttpHandler, HttpResponse, RequestHead},
     runtime::time::Sleep,
     tracing::span_set_status,
-    yield_now,
 };
 
 struct Handler;
@@ -46,9 +45,7 @@ impl HttpHandler for Handler {
                     .header("content-type", "text/plain")
                     .body("Hello from HTTP/3!"),
                 _ => {
-                    span_set_status(runtime::tracing::Status::Error {
-                        description: Cow::Borrowed("404"),
-                    });
+                    span_set_status(runtime::tracing::Status::Error("404".to_owned()));
                     HttpResponse::new(404)
                         .header("content-type", "text/plain")
                         .body("Not Found")

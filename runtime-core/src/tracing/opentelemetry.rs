@@ -1,9 +1,7 @@
-use opentelemetry_sdk::trace::SpanData;
-
 use crate::{
     channels::{Sender, unbounded_channel},
     runtime::spawn,
-    tracing::collector::Collector,
+    tracing::{collector::Collector, types::SpanData},
 };
 
 pub struct TraceSink {
@@ -11,8 +9,8 @@ pub struct TraceSink {
 }
 
 impl TraceSink {
-    pub fn push_span(&self, trace: SpanData) {
-        self.sender.send(trace);
+    pub fn push_span(&self, span: SpanData) {
+        self.sender.send(span);
     }
 }
 
