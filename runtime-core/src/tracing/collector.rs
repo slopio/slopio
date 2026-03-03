@@ -1,5 +1,7 @@
 use crate::{
-    io_driver::operations::sockets::{SocketWrapper, connect_tcp, recv::socket_recv_init, send::socket_send},
+    io_driver::operations::sockets::{
+        SocketWrapper, connect_tcp, recv::socket_recv_init, send::socket_send,
+    },
     tracing::{proto::ProtoEncodeBuffer, span::SpanWrapper},
 };
 

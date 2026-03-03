@@ -154,7 +154,7 @@ where
             };
             set_thread_id(n);
             let sink = init_trace_sink::<TempoExporter>();
-            TRACING_SINK.set(&sink, || run())
+            TRACING_SINK.set(&sink, run)
         });
         #[cfg(not(feature = "tracing"))]
         rt.block_on(fut, Some(event_fd), |run| run())

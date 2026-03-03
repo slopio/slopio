@@ -39,7 +39,8 @@ impl SendingBuffer {
     }
 
     /// Returns the data as a slice of the valid length.
-    /// SAFETY: Caller must ensure `len` bytes have been initialized.
+    /// # Safety
+    /// Caller must ensure `len` bytes have been initialized.
     #[inline]
     pub unsafe fn data(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.len) }

@@ -35,9 +35,10 @@ impl HttpHandler for Handler {
                 .attr(KeyValue::new("http.authorized", authorized))
                 .attr(KeyValue::new("http.request.header_count", header_count))
                 .link_opt(incoming);
-            event_attrs("auth.check", &[
-                ("auth.result", if authorized { "ok" } else { "denied" }),
-            ]);
+            event_attrs(
+                "auth.check",
+                &[("auth.result", if authorized { "ok" } else { "denied" })],
+            );
             Sleep::during(Duration::from_millis(1)).await;
             if authorized {
                 Ok(())
@@ -98,9 +99,10 @@ impl HttpHandler for Handler {
                 .attr(KeyValue::new("http.request.body_size", body.len() as i64))
                 .link_opt(incoming);
             let body_size = body.len().to_string();
-            event_attrs("body.received", &[
-                ("http.request.body_size", body_size.as_str()),
-            ]);
+            event_attrs(
+                "body.received",
+                &[("http.request.body_size", body_size.as_str())],
+            );
             Sleep::during(Duration::from_millis(1)).await;
             HttpResponse::new(200)
                 .header("content-type", "application/octet-stream")
