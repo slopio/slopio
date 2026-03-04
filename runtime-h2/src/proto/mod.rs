@@ -10,6 +10,7 @@ macro_rules! ready {
 }
 
 mod connection;
+pub mod connection_slab;
 mod error;
 mod go_away;
 mod peer;
