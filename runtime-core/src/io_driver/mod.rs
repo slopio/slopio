@@ -375,7 +375,7 @@ impl IODriver {
         }
     }
 
-    fn poll_op(&self, id: usize, waker: &Waker) -> std::task::Poll<OpMetadata> {
+    pub fn poll_op(&self, id: usize, waker: &Waker) -> std::task::Poll<OpMetadata> {
         let slab = unsafe { &mut *self.slab.get() };
         let entry = unsafe { slab.get_unchecked_mut(id) };
         let mut id_to_delete = None;
@@ -493,10 +493,10 @@ impl IODriver {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct OpMetadata {
-    result: i32,
+pub struct OpMetadata {
+    pub result: i32,
     #[allow(dead_code)]
-    flags: u32,
+    pub flags: u32,
 }
 
 #[derive(Debug)]
