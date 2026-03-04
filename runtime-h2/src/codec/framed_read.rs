@@ -12,18 +12,17 @@ use bytes::{Buf, BytesMut};
 
 use std::io;
 
+use crate::codec::length_delimited::{FramedRead as InnerFramedRead, LengthDelimitedCodecError};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use tokio::io::AsyncRead;
-use tokio_util::codec::FramedRead as InnerFramedRead;
-use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
 
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
 
 #[derive(Debug)]
 pub struct FramedRead<T> {
-    inner: InnerFramedRead<T, LengthDelimitedCodec>,
+    inner: InnerFramedRead<T>,
 
     // hpack decoder state
     hpack: hpack::Decoder,
@@ -54,7 +53,7 @@ enum Continuable {
 }
 
 impl<T> FramedRead<T> {
-    pub fn new(inner: InnerFramedRead<T, LengthDelimitedCodec>) -> FramedRead<T> {
+    pub fn new(inner: InnerFramedRead<T>) -> FramedRead<T> {
         let max_header_list_size = DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE;
         let max_continuation_frames =
             calc_max_continuation_frames(max_header_list_size, inner.decoder().max_frame_length());

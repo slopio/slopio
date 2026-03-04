@@ -1,6 +1,7 @@
 mod error;
 mod framed_read;
 mod framed_write;
+pub mod length_delimited;
 
 pub use self::error::{SendError, UserError};
 
@@ -16,7 +17,6 @@ use futures_sink::Sink;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_util::codec::length_delimited;
 
 use std::io;
 

@@ -1,6 +1,6 @@
 use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
-use crate::{client, server};
+use crate::server;
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
@@ -10,7 +10,7 @@ use futures_core::Stream;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncRead;
 
@@ -175,12 +175,7 @@ where
         self.inner.streams.num_wired_streams()
     }
 
-    /// Returns `Ready` when the connection is ready to receive a frame.
-    ///
-    /// Returns `Error` as this may raise errors that are caused by delayed
-    /// processing of received frames.
     fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
-        // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
         ready!(
@@ -193,10 +188,6 @@ where
         Poll::Ready(Ok(()))
     }
 
-    /// Send any pending GOAWAY frames.
-    ///
-    /// This will return `Some(reason)` if the connection should be closed
-    /// afterwards. If this is a graceful shutdown, this returns `None`.
     fn poll_go_away(&mut self, cx: &mut Context) -> Poll<Option<io::Result<Reason>>> {
         self.inner.go_away.send_pending_go_away(cx, &mut self.codec)
     }
@@ -218,33 +209,21 @@ where
         match (ours, theirs) {
             (Reason::NO_ERROR, Reason::NO_ERROR) => Ok(()),
             (ours, Reason::NO_ERROR) => Err(Error::GoAway(Bytes::new(), ours, initiator)),
-            // If both sides reported an error, give their
-            // error back to th user. We assume our error
-            // was a consequence of their error, and less
-            // important.
             (_, theirs) => Err(Error::remote_go_away(debug_data, theirs)),
         }
     }
 
-    /// Closes the connection by transitioning to a GOAWAY state
-    /// iff there are no streams or references
     pub fn maybe_close_connection_if_no_streams(&mut self) {
-        // If we poll() and realize that there are no streams or references
-        // then we can close the connection by transitioning to GOAWAY
         if !self.inner.streams.has_streams_or_other_references() {
             self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
         }
     }
 
-    /// Checks if there are any streams
     pub fn has_streams(&self) -> bool {
         self.inner.streams.has_streams()
     }
 
-    /// Checks if there are any streams or references left
     pub fn has_streams_or_other_references(&self) -> bool {
-        // If we poll() and realize that there are no streams or references
-        // then we can close the connection by transitioning to GOAWAY
         self.inner.streams.has_streams_or_other_references()
     }
 
@@ -252,20 +231,13 @@ where
         self.inner.ping_pong.take_user_pings()
     }
 
-    /// Advances the internal state of the connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         loop {
-            // TODO: probably clean up this glob of code
             match self.inner.state {
-                // When open, continue to poll a frame
                 State::Open => {
                     let result = match self.poll2(cx) {
                         Poll::Ready(result) => result,
-                        // The connection is not ready to make progress
                         Poll::Pending => {
-                            // Ensure all window updates have been sent.
-                            //
-                            // This will also handle flushing `self.codec`
                             ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
 
                             if (self.inner.error.is_some()
@@ -283,10 +255,7 @@ where
                     self.inner.as_dyn().handle_poll2_result(result)?
                 }
                 State::Closing(reason, initiator) => {
-                    // Flush/shutdown the codec
                     ready!(self.codec.shutdown(cx))?;
-
-                    // Transition the state to error
                     self.inner.state = State::Closed(reason, initiator);
                 }
                 State::Closed(reason, initiator) => {
@@ -297,28 +266,17 @@ where
     }
 
     fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
-        // This happens outside of the loop to prevent needing to do a clock
-        // check and then comparison of the queue possibly multiple times a
-        // second (and thus, the clock wouldn't have changed enough to matter).
         self.clear_expired_reset_streams();
 
         loop {
-            // First, ensure that the `Connection` is able to receive a frame
-            //
-            // The order here matters:
-            // - poll_go_away may buffer a graceful shutdown GOAWAY frame
-            // - If it has, we've also added a PING to be sent in poll_ready
             if let Some(reason) = ready!(self.poll_go_away(cx)?) {
                 if self.inner.go_away.should_close_now() {
                     if self.inner.go_away.is_user_initiated() {
-                        // A user initiated abrupt shutdown shouldn't return
-                        // the same error back to the user.
                         return Poll::Ready(Ok(()));
                     } else {
                         return Poll::Ready(Err(Error::library_go_away(reason)));
                     }
                 }
-                // Only NO_ERROR should be waiting for idle
                 debug_assert_eq!(
                     reason,
                     Reason::NO_ERROR,
@@ -403,28 +361,19 @@ where
         let last_processed_id = self.streams.last_processed_id();
         let frame = frame::GoAway::new(last_processed_id, e);
         self.go_away.go_away_from_user(frame);
-
-        // Notify all streams of reason we're abruptly closing.
         self.streams.handle_error(Error::user_go_away(e));
     }
 
     fn handle_poll2_result(&mut self, result: Result<(), Error>) -> Result<(), Error> {
         match result {
-            // The connection has shutdown normally
             Ok(()) => {
                 *self.state = State::Closing(Reason::NO_ERROR, Initiator::Library);
                 Ok(())
             }
-            // Attempting to read a frame resulted in a connection level
-            // error. This is handled by setting a GOAWAY frame followed by
-            // terminating the connection.
             Err(Error::GoAway(debug_data, reason, initiator)) => {
                 self.handle_go_away(reason, debug_data, initiator);
                 Ok(())
             }
-            // Attempting to read a frame resulted in a stream level error.
-            // This is handled by resetting the frame then trying to read
-            // another frame.
             Err(Error::Reset(id, reason, initiator)) => {
                 debug_assert_eq!(initiator, Initiator::Library);
                 match self.streams.send_reset(id, reason) {
@@ -435,22 +384,10 @@ where
                 }
                 Ok(())
             }
-            // Attempting to read a frame resulted in an I/O error. All
-            // active streams must be reset.
-            //
-            // TODO: Are I/O errors recoverable?
             Err(Error::Io(kind, inner)) => {
                 let e = Error::Io(kind, inner);
-
-                // Reset all active streams
                 self.streams.handle_error(e.clone());
 
-                // Some client implementations drop the connections without notifying its peer
-                // Attempting to read after the client dropped the connection results in UnexpectedEof
-                // If as a server, we don't have anything more to send, just close the connection
-                // without error
-                //
-                // See https://github.com/hyperium/hyper/issues/3427
                 if self.streams.is_buffer_empty()
                     && matches!(kind, io::ErrorKind::UnexpectedEof)
                     && (self.streams.is_server()
@@ -461,7 +398,6 @@ where
                     return Ok(());
                 }
 
-                // Return the error
                 Err(e)
             }
         }
@@ -470,8 +406,6 @@ where
     fn handle_go_away(&mut self, reason: Reason, debug_data: Bytes, initiator: Initiator) {
         let e = Error::GoAway(debug_data.clone(), reason, initiator);
 
-        // We may have already sent a GOAWAY for this error,
-        // if so, don't send another, just flush and close up.
         if self
             .go_away
             .going_away()
@@ -481,7 +415,6 @@ where
             return;
         }
 
-        // Reset all active streams
         self.streams.handle_error(e);
         self.go_away_now_data(reason, debug_data);
     }
@@ -505,10 +438,6 @@ where
                 return Ok(ReceivedFrame::Settings(frame));
             }
             Some(GoAway(frame)) => {
-                // This should prevent starting new streams,
-                // but should allow continuing to process current streams
-                // until they are all EOS. Once they are, State should
-                // transition to GoAway.
                 self.streams.recv_go_away(&frame)?;
                 *self.error = Some(frame);
             }
@@ -545,16 +474,6 @@ enum ReceivedFrame {
     Done,
 }
 
-impl<T, B> Connection<T, client::Peer, B>
-where
-    T: AsyncRead + AsyncWrite,
-    B: Buf,
-{
-    pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
-        &self.inner.streams
-    }
-}
-
 impl<T, B> Connection<T, server::Peer, B>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -564,28 +483,12 @@ where
         self.inner.streams.next_incoming()
     }
 
-    // Graceful shutdown only makes sense for server peers.
     pub fn go_away_gracefully(&mut self) {
         if self.inner.go_away.is_going_away() {
-            // No reason to start a new one.
             return;
         }
 
-        // According to http://httpwg.org/specs/rfc7540.html#GOAWAY:
-        //
-        // > A server that is attempting to gracefully shut down a connection
-        // > SHOULD send an initial GOAWAY frame with the last stream
-        // > identifier set to 2^31-1 and a NO_ERROR code. This signals to the
-        // > client that a shutdown is imminent and that initiating further
-        // > requests is prohibited. After allowing time for any in-flight
-        // > stream creation (at least one round-trip time), the server can
-        // > send another GOAWAY frame with an updated last stream identifier.
-        // > This ensures that a connection can be cleanly shut down without
-        // > losing requests.
         self.inner.as_dyn().go_away(StreamId::MAX, Reason::NO_ERROR);
-
-        // We take the advice of waiting 1 RTT literally, and wait
-        // for a pong before proceeding.
         self.inner.ping_pong.ping_shutdown();
     }
 }
@@ -596,7 +499,6 @@ where
     B: Buf,
 {
     fn drop(&mut self) {
-        // Ignore errors as this indicates that the mutex is poisoned.
         let _ = self.inner.streams.recv_eof(true);
     }
 }

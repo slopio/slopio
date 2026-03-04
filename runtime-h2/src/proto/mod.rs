@@ -1,3 +1,14 @@
+// proto_err! is defined in lib.rs and visible here via textual scoping.
+
+macro_rules! ready {
+    ($e:expr) => {
+        match $e {
+            ::std::task::Poll::Ready(r) => r,
+            ::std::task::Poll::Pending => return ::std::task::Poll::Pending,
+        }
+    };
+}
+
 mod connection;
 mod error;
 mod go_away;
@@ -6,8 +17,8 @@ mod ping_pong;
 mod settings;
 mod streams;
 
-pub(crate) use self::connection::{Config, Connection};
 pub use self::error::{Error, Initiator};
+pub(crate) use self::connection::{Config, Connection};
 pub(crate) use self::peer::{Dyn as DynPeer, Peer};
 pub(crate) use self::ping_pong::UserPings;
 pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
@@ -41,30 +52,12 @@ pub const DEFAULT_RESET_STREAM_MAX: usize = 50;
 pub const DEFAULT_RESET_STREAM_SECS: u64 = 1;
 pub const DEFAULT_MAX_SEND_BUFFER_SIZE: usize = 1024 * 400;
 
-macro_rules! proto_err {
-    (conn: $($msg:tt)+) => {
-        tracing::debug!("connection error PROTOCOL_ERROR -- {};", format_args!($($msg)+))
-    };
-    (stream: $($msg:tt)+) => {
-        tracing::debug!("stream error PROTOCOL_ERROR -- {};", format_args!($($msg)+))
-    };
-}
-
-macro_rules! ready {
-    ($e:expr) => {
-        match $e {
-            ::std::task::Poll::Ready(r) => r,
-            ::std::task::Poll::Pending => return ::std::task::Poll::Pending,
-        }
-    };
-}
-
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// Creates a future from a function that returns `Poll`.
-fn poll_fn<T, F: FnMut(&mut Context<'_>) -> T>(f: F) -> PollFn<F> {
+pub(crate) fn poll_fn<T, F: FnMut(&mut Context<'_>) -> T>(f: F) -> PollFn<F> {
     PollFn(f)
 }
 

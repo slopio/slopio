@@ -4,12 +4,13 @@ use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{self, Frame, Reason};
+use crate::proto;
 use crate::proto::{Error, Initiator, Open, Peer, WindowSize, peer};
-use crate::{client, proto, server};
+use crate::server;
 
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncWrite;
 
 use std::sync::{Arc, Mutex};

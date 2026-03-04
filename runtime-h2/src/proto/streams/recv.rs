@@ -7,7 +7,7 @@ use http::{HeaderMap, Request, Response};
 
 use std::cmp::Ordering;
 use std::io;
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 #[derive(Debug)]

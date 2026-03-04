@@ -5,11 +5,13 @@ edition = "2024"
 
 [dependencies]
 runtime-core = { path = "../runtime-core" }
+io-uring = "0.7.11"
 bytes = "1"
 http = "1"
 fnv = "1"
 futures-sink = "0.3"
 futures-core = "0.3"
+tokio = { version = "1", features = ["io-util"] }
 atomic-waker = "1"
 slab = "0.4"
 indexmap = "2"

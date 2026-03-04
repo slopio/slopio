@@ -10,7 +10,7 @@ use bytes::buf::Take;
 use std::{
     cmp::{self, Ordering},
     fmt, io, mem,
-    task::{Context, Poll, Waker, ready},
+    task::{Context, Poll, Waker},
 };
 
 /// # Warning
