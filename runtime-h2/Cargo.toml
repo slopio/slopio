@@ -8,6 +8,9 @@ runtime-core = { path = "../runtime-core" }
 bytes = "1"
 http = "1"
 fnv = "1"
+futures-sink = "0.3"
+futures-core = "0.3"
+atomic-waker = "1"
 slab = "0.4"
 indexmap = "2"
 

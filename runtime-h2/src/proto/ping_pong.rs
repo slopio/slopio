@@ -8,7 +8,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use tokio::io::AsyncWrite;
+// use tokio::io::AsyncWrite;
 
 /// Acknowledges ping requests from the remote.
 #[derive(Debug)]

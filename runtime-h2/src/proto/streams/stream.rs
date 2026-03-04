@@ -1,4 +1,4 @@
-use crate::Reason;
+use crate::frame::Reason;
 
 use super::*;
 

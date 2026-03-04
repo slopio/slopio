@@ -1,3 +1,4 @@
+pub mod codec;
 pub mod error;
 pub mod ext;
 pub mod frame;

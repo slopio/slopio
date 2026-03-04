@@ -200,8 +200,9 @@ impl error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
+    use crate::error::Reason;
+
     use super::Error;
-    use crate::Reason;
 
     #[test]
     fn error_from_reason() {
