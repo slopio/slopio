@@ -8,6 +8,7 @@ macro_rules! proto_err {
     };
 }
 
+pub mod client;
 pub mod codec;
 pub mod error;
 pub mod ext;
@@ -19,5 +20,5 @@ pub mod server;
 pub mod share;
 
 pub use error::{Error, Reason};
-pub use share::StreamId;
 pub(crate) use proto::poll_fn;
+pub use share::StreamId;

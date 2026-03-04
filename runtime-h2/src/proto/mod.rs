@@ -17,8 +17,8 @@ mod ping_pong;
 mod settings;
 mod streams;
 
-pub use self::error::{Error, Initiator};
 pub(crate) use self::connection::{Config, Connection};
+pub use self::error::{Error, Initiator};
 pub(crate) use self::peer::{Dyn as DynPeer, Peer};
 pub(crate) use self::ping_pong::UserPings;
 pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
@@ -57,12 +57,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// Creates a future from a function that returns `Poll`.
-pub(crate) fn poll_fn<T, F: FnMut(&mut Context<'_>) -> T>(f: F) -> PollFn<F> {
+pub fn poll_fn<T, F: FnMut(&mut Context<'_>) -> T>(f: F) -> PollFn<F> {
     PollFn(f)
 }
 
 /// The future created by `poll_fn`.
-struct PollFn<F>(F);
+pub struct PollFn<F>(F);
 
 impl<F> Unpin for PollFn<F> {}
 

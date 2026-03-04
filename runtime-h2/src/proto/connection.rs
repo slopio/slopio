@@ -158,6 +158,10 @@ where
         self.inner.settings.send_settings(settings)
     }
 
+    pub(crate) fn streams(&self) -> &Streams<B, P> {
+        &self.inner.streams
+    }
+
     /// Returns the maximum number of concurrent streams that may be initiated
     /// by this peer.
     pub(crate) fn max_send_streams(&self) -> usize {

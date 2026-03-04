@@ -4,9 +4,9 @@ use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{self, Frame, Reason};
-use crate::proto;
 use crate::proto::{Error, Initiator, Open, Peer, WindowSize, peer};
 use crate::server;
+use crate::{client, proto};
 
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};

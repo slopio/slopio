@@ -972,10 +972,13 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "http",
  "libc",
  "mimalloc",
  "rand 0.8.5",
  "runtime-core",
+ "runtime-h2",
  "runtime-http",
  "runtime-quic",
  "runtime-streams",
