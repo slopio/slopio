@@ -733,6 +733,9 @@ dependencies = [
 name = "runtime-h2"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "fnv",
+ "http",
  "runtime-core",
 ]
 
