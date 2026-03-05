@@ -82,6 +82,8 @@ pub(crate) enum MultiProcessResult {
     WakeConsumer,
     PauseRequired(u64),
     FullyPaused,
+    CancelComplete,
+    CancelledRecycling { buffer_id: u16, len: usize, bgid: u16 },
     InvalidState(&'static str),
 }
 
@@ -173,6 +175,38 @@ pub(crate) fn process_multi(
         MultiOpState::Paused { queue, .. } => {
             queue.push(event);
             MultiProcessResult::InvalidState("received CQE while paused")
+        }
+
+        MultiOpState::Cancelled {
+            bgid,
+            ecancelled,
+            last_cqe,
+        } => {
+            if event.result == -ECANCELED {
+                *ecancelled = true;
+            }
+            if !cqueue::more(event.flags) {
+                *last_cqe = true;
+            }
+
+            // Recycle buffer if the kernel consumed one
+            let recycle = if event.result > 0 {
+                buffer_select(event.flags).map(|buffer_id| (buffer_id, event.result as usize, *bgid))
+            } else {
+                None
+            };
+
+            if *ecancelled && *last_cqe {
+                if let Some((buffer_id, len, bgid)) = recycle {
+                    // This last CQE also had a buffer — recycle it, then signal complete
+                    return MultiProcessResult::CancelledRecycling { buffer_id, len, bgid };
+                }
+                MultiProcessResult::CancelComplete
+            } else if let Some((buffer_id, len, bgid)) = recycle {
+                MultiProcessResult::CancelledRecycling { buffer_id, len, bgid }
+            } else {
+                MultiProcessResult::Queued
+            }
         }
     }
 }

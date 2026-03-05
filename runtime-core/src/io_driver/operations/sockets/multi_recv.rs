@@ -152,5 +152,9 @@ impl IoOP for MultiRecv {
         opcode::RecvMulti::new(Fd(self.fd), self.bgid).build()
     }
 
-    fn driver_cleanup(&mut self) {}
+    fn driver_cleanup(&mut self) {
+        if let Some(id) = self.id.take() {
+            IO_DRIVER.with(|d| d.cancel_multishot_op(id, self.bgid));
+        }
+    }
 }

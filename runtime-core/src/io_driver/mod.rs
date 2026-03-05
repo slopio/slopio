@@ -129,6 +129,11 @@ enum MultiOpState {
         fd: i32,
         queue: MultiOpQueue,
     },
+    Cancelled {
+        bgid: u16,
+        last_cqe: bool,
+        ecancelled: bool,
+    },
 }
 
 impl MultiOpState {
@@ -178,6 +183,7 @@ impl MultiOpState {
             }
             MultiOpState::TringToPause { .. } => unreachable!("already"),
             MultiOpState::Paused { .. } => todo!(),
+            MultiOpState::Cancelled { .. } => {}
         }
     }
 
@@ -193,6 +199,7 @@ impl MultiOpState {
             MultiOpState::TringToPause { waker, .. } => {
                 waker.wake_by_ref();
             }
+            MultiOpState::Cancelled { .. } => {}
         }
     }
 }
@@ -245,6 +252,28 @@ impl IODriver {
                         self.send_multiop_cancel_event(user_data);
                     }
                     MultiProcessResult::FullyPaused => {}
+                    MultiProcessResult::CancelComplete => {
+                        slab.remove(clean_index);
+                    }
+                    MultiProcessResult::CancelledRecycling {
+                        buffer_id,
+                        len,
+                        bgid,
+                    } => {
+                        let b = self.get_buffer(bgid, buffer_id, len);
+                        self.recycle_buffer(&b);
+                        // Check if cancel is now complete
+                        if let MultiOpState::Cancelled {
+                            ecancelled,
+                            last_cqe,
+                            ..
+                        } = slab_entry
+                        {
+                            if *ecancelled && *last_cqe {
+                                slab.remove(clean_index);
+                            }
+                        }
+                    }
                     MultiProcessResult::InvalidState(_msg) => {}
                 }
             }
@@ -372,6 +401,7 @@ impl IODriver {
                 std::mem::swap(poller_queue, queue);
                 MultiPollResult::NeedsResubmit
             }
+            MultiOpState::Cancelled { .. } => MultiPollResult::Pending,
         }
     }
 
@@ -455,6 +485,18 @@ impl IODriver {
             .build()
             .user_data(id | IGNORED_FLAG);
         ring_inner.add(&cancel_op);
+    }
+
+    pub fn cancel_multishot_op(&self, id: usize, bgid: u16) {
+        let slab = unsafe { &mut *self.multishot_slab.get() };
+        if let Some(entry) = slab.get_mut(id) {
+            *entry = MultiOpState::Cancelled {
+                bgid,
+                last_cqe: false,
+                ecancelled: false,
+            };
+            self.send_multiop_cancel_event((id as u64) | MULTI_OP_FLAG);
+        }
     }
 
     pub fn send_multiop_cancel_event(&self, id: u64) {
