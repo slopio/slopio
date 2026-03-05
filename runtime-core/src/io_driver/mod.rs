@@ -384,8 +384,8 @@ impl IODriver {
                 *entry = SingleOpState::Sent(waker.clone());
                 std::task::Poll::Pending
             }
-            SingleOpState::Sent(waker) => {
-                waker.wake_by_ref();
+            SingleOpState::Sent(existing) => {
+                existing.clone_from(waker);
                 std::task::Poll::Pending
             }
             SingleOpState::Ended(e) => {

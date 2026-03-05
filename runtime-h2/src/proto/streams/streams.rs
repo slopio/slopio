@@ -1057,11 +1057,9 @@ impl<B> StreamRef<B> {
         let send_buffer = &mut *send_buffer;
 
         me.counts.transition(stream, |counts, stream| {
-            // Create the data frame
             let mut frame = frame::Data::new(stream.id, data);
             frame.set_end_stream(end_stream);
 
-            // Send the data frame
             actions
                 .send
                 .send_data(frame, send_buffer, stream, counts, &mut actions.task)

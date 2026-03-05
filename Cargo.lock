@@ -1025,6 +1025,7 @@ dependencies = [
  "quickcheck_macros",
  "rand 0.8.5",
  "runtime-core",
+ "runtime-streams",
  "serde_json",
  "slab",
  "tokio",

@@ -14,7 +14,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// Size of the internal read buffer. Reads from the socket go here first,
 /// then get copied into whatever `ReadBuf` the caller provides.
 const READ_BUF_SIZE: usize = 8192;
-
 /// Wraps a [`SocketWrapper`] and implements `tokio::io::AsyncRead` and
 /// `tokio::io::AsyncWrite` by driving io_uring ops through the runtime's
 /// `IO_DRIVER`.
@@ -69,6 +68,7 @@ impl AsyncRead for TokioSocket {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        println!("poll_read: remaining={}", buf.remaining());
         loop {
             // 1. Serve buffered data from a previously completed recv.
             if self.read_start < self.read_end {
@@ -94,6 +94,7 @@ impl AsyncRead for TokioSocket {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(OpMetadata { result, .. }) => {
                         self.read_token = None;
+                        println!("poll_read: recv completed, result={}", result);
                         if result < 0 {
                             return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                         }
@@ -122,11 +123,6 @@ impl AsyncWrite for TokioSocket {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // 1. Poll an in-flight send op.
-        //
-        // The caller (h2 codec) always passes the same stable heap buffer
-        // (BytesMut) between polls without advancing it until Ready is returned,
-        // so the pointer we submitted to io_uring remains valid here.
         if let Some(token) = self.write_token {
             match IO_DRIVER.with(|d| d.poll_op(token, cx.waker())) {
                 Poll::Pending => return Poll::Pending,
@@ -141,7 +137,7 @@ impl AsyncWrite for TokioSocket {
             }
         }
 
-        // 2. Submit a new send op and poll it immediately.
+        // Submit a new send op and poll it immediately.
         let entry = opcode::Send::new(Fd(self.inner.fd()), buf.as_ptr(), buf.len() as u32).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         let token = token as usize;

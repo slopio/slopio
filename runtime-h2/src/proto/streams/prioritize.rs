@@ -114,6 +114,7 @@ impl Prioritize {
         stream: &mut store::Ptr,
         task: &mut Option<Waker>,
     ) {
+        println!("hhahah");
         // Queue the frame in the buffer
         stream.pending_send.push_back(buffer, frame);
         self.schedule_send(stream, task);

@@ -18,6 +18,7 @@ pub mod io;
 pub mod proto;
 pub mod server;
 pub mod share;
+pub mod workflow;
 
 pub use error::{Error, Reason};
 pub(crate) use proto::poll_fn;
