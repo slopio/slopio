@@ -736,7 +736,9 @@ dependencies = [
  "bytes",
  "fnv",
  "http",
+ "runtime",
  "runtime-core",
+ "runtime-streams",
 ]
 
 [[package]]

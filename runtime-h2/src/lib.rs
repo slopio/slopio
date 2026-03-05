@@ -1,4 +1,4 @@
 // mod codec;
-mod decoding;
+pub mod decoding;
 mod ext;
-mod h2_types;
+pub mod h2_types;

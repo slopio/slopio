@@ -67,8 +67,8 @@ impl<F: Future> TypedTask<F> {
                     std::task::Poll::Pending => {}
                 }
             }
-            State::Finished(_) => unreachable!("finished"),
-            State::Ended => unreachable!("ended!"),
+            State::Finished(_) => {}
+            State::Ended => {}
         }
     }
 

@@ -8,3 +8,7 @@ bytes = "1.11.1"
 fnv = "1.0.7"
 http = "1.4.0"
 runtime-core = { path = "../runtime-core" }
+
+[dev-dependencies]
+runtime = { path = "../runtime" }
+runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }

@@ -6,7 +6,7 @@ use runtime_core::{
     io_driver::operations::sockets::{SocketWrapper, recv::socket_recv_init},
 };
 
-use crate::h2_types::frame::{self, Frame, Head, Kind, StreamId, HEADER_LEN};
+use crate::h2_types::frame::{self, Frame, HEADER_LEN, Head, Kind, StreamId};
 use crate::h2_types::hpack;
 
 const DEFAULT_SETTINGS_HEADER_TABLE_SIZE: usize = 4096;
@@ -75,10 +75,18 @@ pub enum DecodeError {
     Stream(StreamId, frame::Reason),
 }
 
-pub struct ConnectionFrameReader {
-    buf: BytesMut,
-    socket: SocketWrapper,
-    map: HashMap<StreamId, Sender<Frame>>,
+/// Connection-level events produced by the frame reader.
+pub enum ConnectionEvent {
+    Settings(frame::Settings),
+    Ping(frame::Ping),
+    GoAway(frame::GoAway),
+    WindowUpdate(u32), // connection-level window increment
+}
+
+/// Stateful frame decoder that works on a BytesMut buffer.
+/// No I/O — just feed bytes and pull frames.
+pub struct FrameDecoder {
+    pub buf: BytesMut,
     hpack: hpack::Decoder,
     max_header_list_size: usize,
     max_frame_size: usize,
@@ -86,14 +94,12 @@ pub struct ConnectionFrameReader {
     partial: Option<Partial>,
 }
 
-impl ConnectionFrameReader {
-    pub fn new(socket: SocketWrapper) -> Self {
+impl FrameDecoder {
+    pub fn new() -> Self {
         let max_header_list_size = DEFAULT_MAX_HEADER_LIST_SIZE;
         let max_frame_size = DEFAULT_MAX_FRAME_SIZE;
-        ConnectionFrameReader {
+        FrameDecoder {
             buf: BytesMut::with_capacity(READ_BUF_SIZE),
-            socket,
-            map: HashMap::new(),
             hpack: hpack::Decoder::new(DEFAULT_SETTINGS_HEADER_TABLE_SIZE),
             max_header_list_size,
             max_frame_size,
@@ -105,16 +111,18 @@ impl ConnectionFrameReader {
         }
     }
 
-    /// Peek the 3-byte payload length from the frame header.
     fn peek_payload_len(&self) -> Option<usize> {
         if self.buf.len() < HEADER_LEN {
             return None;
         }
-        Some(((self.buf[0] as usize) << 16) | ((self.buf[1] as usize) << 8) | (self.buf[2] as usize))
+        Some(
+            ((self.buf[0] as usize) << 16) | ((self.buf[1] as usize) << 8) | (self.buf[2] as usize),
+        )
     }
 
     /// Try to decode a complete frame from the buffer.
-    fn try_decode_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
+    /// Returns Ok(None) if more data is needed.
+    pub fn decode(&mut self) -> Result<Option<Frame>, DecodeError> {
         let payload_len = match self.peek_payload_len() {
             Some(len) => len,
             None => return Ok(None),
@@ -129,7 +137,6 @@ impl ConnectionFrameReader {
             return Ok(None);
         }
 
-        // Split off the entire frame (header + payload)
         let frame_data = self.buf.split_to(total);
         let head = Head::parse(&frame_data);
         let payload = frame_data.freeze().slice(HEADER_LEN..);
@@ -139,11 +146,9 @@ impl ConnectionFrameReader {
         }
 
         match head.kind() {
-            Kind::Data => {
-                frame::Data::load(head, payload.clone())
-                    .map(|f| Some(f.into()))
-                    .map_err(|_| DecodeError::Connection(frame::Reason::PROTOCOL_ERROR))
-            }
+            Kind::Data => frame::Data::load(head, payload.clone())
+                .map(|f| Some(f.into()))
+                .map_err(|_| DecodeError::Connection(frame::Reason::PROTOCOL_ERROR)),
 
             Kind::Headers => self.decode_headers(head, BytesMut::from(payload.as_ref())),
 
@@ -304,11 +309,10 @@ impl ConnectionFrameReader {
             partial.buf.extend_from_slice(payload);
         }
 
-        match partial.frame.load_hpack(
-            &mut partial.buf,
-            self.max_header_list_size,
-            &mut self.hpack,
-        ) {
+        match partial
+            .frame
+            .load_hpack(&mut partial.buf, self.max_header_list_size, &mut self.hpack)
+        {
             Ok(_) => {}
             Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {}
             Err(frame::Error::MalformedMessage) => {
@@ -329,10 +333,37 @@ impl ConnectionFrameReader {
             Ok(None)
         }
     }
+}
+
+/// Full connection reader: FrameDecoder + socket I/O + stream dispatch.
+pub struct ConnectionFrameReader {
+    decoder: FrameDecoder,
+    socket: SocketWrapper,
+    streams: HashMap<StreamId, Sender<Frame>>,
+    conn_events: Sender<ConnectionEvent>,
+}
+
+impl ConnectionFrameReader {
+    pub fn new(socket: SocketWrapper, conn_events: Sender<ConnectionEvent>) -> Self {
+        ConnectionFrameReader {
+            decoder: FrameDecoder::new(),
+            socket,
+            streams: HashMap::new(),
+            conn_events,
+        }
+    }
+
+    pub fn register_stream(&mut self, id: StreamId, sender: Sender<Frame>) {
+        self.streams.insert(id, sender);
+    }
+
+    pub fn unregister_stream(&mut self, id: &StreamId) {
+        self.streams.remove(id);
+    }
 
     async fn fill(&mut self) -> Result<(), DecodeError> {
-        self.buf.reserve(READ_BUF_SIZE);
-        let spare = self.buf.spare_capacity_mut();
+        self.decoder.buf.reserve(READ_BUF_SIZE);
+        let spare = self.decoder.buf.spare_capacity_mut();
         let n = socket_recv_init(
             &self.socket,
             unsafe { &mut *(spare as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) },
@@ -348,28 +379,64 @@ impl ConnectionFrameReader {
             )));
         }
 
-        unsafe { self.buf.set_len(self.buf.len() + n) };
+        unsafe { self.decoder.buf.set_len(self.decoder.buf.len() + n) };
         Ok(())
+    }
+
+    /// Read and decode a single frame from the socket.
+    pub async fn next_frame(&mut self) -> Result<Frame, DecodeError> {
+        loop {
+            match self.decoder.decode() {
+                Ok(Some(frame)) => return Ok(frame),
+                Ok(None) => self.fill().await?,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn process(&mut self) -> Result<(), DecodeError> {
         loop {
-            match self.try_decode_frame() {
-                Ok(Some(frame)) => match frame.stream_id() {
-                    Some(ref id) => {
-                        if let Some(sender) = self.map.get(id) {
-                            sender.send(frame);
-                        }
-                    }
-                    None => {
-                        // Connection-level frame (Settings, Ping, GoAway)
-                        // TODO: handle connection-level frames
-                    }
-                },
+            let frame = match self.decoder.decode() {
+                Ok(Some(frame)) => frame,
                 Ok(None) => {
                     self.fill().await?;
+                    continue;
                 }
                 Err(e) => return Err(e),
+            };
+
+            match frame {
+                Frame::Settings(s) => {
+                    self.conn_events.send(ConnectionEvent::Settings(s));
+                }
+                Frame::Ping(p) => {
+                    self.conn_events.send(ConnectionEvent::Ping(p));
+                }
+                Frame::GoAway(ga) => {
+                    self.conn_events.send(ConnectionEvent::GoAway(ga));
+                    return Ok(()); // peer is shutting down, stop reading
+                }
+                Frame::WindowUpdate(wu) if wu.stream_id().is_zero() => {
+                    self.conn_events
+                        .send(ConnectionEvent::WindowUpdate(wu.size_increment()));
+                }
+                // Stream-level frames: dispatch to the registered stream channel
+                frame => {
+                    let end_stream = match &frame {
+                        Frame::Data(d) if d.is_end_stream() => Some(d.stream_id()),
+                        Frame::Headers(h) if h.is_end_stream() => Some(h.stream_id()),
+                        _ => None,
+                    };
+                    if let Some(id) = frame.stream_id() {
+                        if let Some(sender) = self.streams.get(&id) {
+                            sender.send(frame);
+                            if let Some(sid) = end_stream {
+                                sender.send(Frame::EndStream(sid));
+                            }
+                        }
+                        // else: frame for unknown stream — could send RST_STREAM
+                    }
+                }
             }
         }
     }

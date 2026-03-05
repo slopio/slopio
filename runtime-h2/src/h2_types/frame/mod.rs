@@ -87,6 +87,7 @@ pub enum Frame<T = Bytes> {
     GoAway(GoAway),
     WindowUpdate(WindowUpdate),
     Reset(Reset),
+    EndStream(StreamId),
 }
 
 impl<T> Frame<T> {
@@ -106,6 +107,7 @@ impl<T> Frame<T> {
             GoAway(frame) => frame.into(),
             WindowUpdate(frame) => frame.into(),
             Reset(frame) => frame.into(),
+            EndStream(id) => Frame::EndStream(id),
         }
     }
 
@@ -116,6 +118,7 @@ impl<T> Frame<T> {
             Frame::PushPromise(f) => Some(f.stream_id()),
             Frame::WindowUpdate(f) => Some(f.stream_id()),
             Frame::Reset(f) => Some(f.stream_id()),
+            Frame::EndStream(id) => Some(*id),
             _ => None,
         }
     }
@@ -135,6 +138,7 @@ impl<T> fmt::Debug for Frame<T> {
             GoAway(ref frame) => fmt::Debug::fmt(frame, fmt),
             WindowUpdate(ref frame) => fmt::Debug::fmt(frame, fmt),
             Reset(ref frame) => fmt::Debug::fmt(frame, fmt),
+            EndStream(ref id) => write!(fmt, "EndStream({:?})", id),
         }
     }
 }
