@@ -108,6 +108,17 @@ impl<T> Frame<T> {
             Reset(frame) => frame.into(),
         }
     }
+
+    pub fn stream_id(&self) -> Option<StreamId> {
+        match self {
+            Frame::Data(f) => Some(f.stream_id()),
+            Frame::Headers(f) => Some(f.stream_id()),
+            Frame::PushPromise(f) => Some(f.stream_id()),
+            Frame::WindowUpdate(f) => Some(f.stream_id()),
+            Frame::Reset(f) => Some(f.stream_id()),
+            _ => None,
+        }
+    }
 }
 
 impl<T> fmt::Debug for Frame<T> {

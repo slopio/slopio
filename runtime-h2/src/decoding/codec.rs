@@ -5,7 +5,7 @@ use runtime_core::{
     io_driver::operations::sockets::{SocketWrapper, recv::socket_recv_init},
 };
 
-type StreamId = u32;
+use crate::h2_types::frame::{Frame, StreamId};
 
 struct ConnectionFrameReader {
     buffer: [u8; 1024],
@@ -13,14 +13,6 @@ struct ConnectionFrameReader {
     end: usize,
     socket: SocketWrapper,
     map: HashMap<StreamId, Sender<Frame>>,
-}
-
-enum Frame {}
-
-impl Frame {
-    fn stream_id(&self) -> Option<StreamId> {
-        Some(1)
-    }
 }
 
 #[derive(Debug)]
@@ -49,12 +41,10 @@ impl ConnectionFrameReader {
     async fn process(&mut self) {
         loop {
             match self.try_get_frame() {
-                Ok(Some(frame)) => {
-                    //ignoring unknown streams
-                    if let Some(id) = frame.stream_id() {
-                        self.map.get(&id).unwrap().send(frame)
-                    }
-                }
+                Ok(Some(frame)) => match frame.stream_id() {
+                    Some(ref id) => self.map.get(id).unwrap().send(frame),
+                    None => todo!(),
+                },
                 Ok(None) => {
                     self.fill().await.unwrap();
                 }
