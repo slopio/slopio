@@ -260,8 +260,7 @@ impl IODriver {
                         len,
                         bgid,
                     } => {
-                        let b = self.get_buffer(bgid, buffer_id, len);
-                        self.recycle_buffer(&b);
+                        drop(self.get_buffer(bgid, buffer_id, len));
                         // Check if cancel is now complete
                         if let MultiOpState::Cancelled {
                             ecancelled,
