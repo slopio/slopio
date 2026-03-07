@@ -3,9 +3,10 @@ use std::collections::VecDeque;
 use bytes::BytesMut;
 use zerocopy::{FromBytes, Immutable, KnownLayout, network_endian::U32};
 
-use crate::types::{Frame, FrameError, Setting};
-
-mod headers;
+use crate::{
+    hpack::{self, Decoder},
+    types::{Frame, FrameError, Setting},
+};
 
 const FRAME_HEADER_SIZE: usize = 9;
 const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
@@ -87,6 +88,7 @@ fn parse_settings(payload: &[u8]) -> Result<Vec<Setting>, FrameError> {
 }
 
 pub struct FrameDecoder {
+    header_decoder: hpack::Decoder,
     max_frame_size: u32,
     pub frames: VecDeque<Frame>,
     remaining: Vec<u8>,
@@ -95,6 +97,7 @@ pub struct FrameDecoder {
 impl FrameDecoder {
     pub fn new() -> Self {
         Self {
+            header_decoder: Decoder::new(1024),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             frames: VecDeque::new(),
             remaining: Vec::new(),
