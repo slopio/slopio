@@ -1,4 +1,4 @@
-use runtime_h2::codec::decoder::FrameDecoder;
+use runtime_h2::codec::frames::FrameDecoder;
 use runtime_h2::types::{Frame, Setting};
 use std::path::Path;
 
@@ -21,10 +21,7 @@ fn decode_all_frames_from_bin() {
     // 1. SETTINGS with 2 parsed settings
     let f = decoder.frames.pop_front().unwrap();
     match f {
-        Frame::Settings {
-            ack,
-            ref settings,
-        } => {
+        Frame::Settings { ack, ref settings } => {
             assert!(!ack);
             assert_eq!(settings.len(), 2);
             assert_eq!(settings[0], Setting::HeaderTableSize(4096));
@@ -36,10 +33,7 @@ fn decode_all_frames_from_bin() {
     // 2. SETTINGS ACK
     let f = decoder.frames.pop_front().unwrap();
     match f {
-        Frame::Settings {
-            ack,
-            ref settings,
-        } => {
+        Frame::Settings { ack, ref settings } => {
             assert!(ack);
             assert!(settings.is_empty());
         }

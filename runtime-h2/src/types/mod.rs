@@ -1,3 +1,5 @@
+use bytes::BytesMut;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
     HeaderTableSize(u32),
@@ -19,7 +21,7 @@ pub enum Frame {
     Headers {
         stream_id: u32,
         flags: u8,
-        payload: Vec<u8>,
+        payload: BytesMut,
     },
     RstStream {
         stream_id: u32,
@@ -45,7 +47,7 @@ pub enum Frame {
     Continuation {
         stream_id: u32,
         end_headers: bool,
-        payload: Vec<u8>,
+        payload: BytesMut,
     },
 }
 

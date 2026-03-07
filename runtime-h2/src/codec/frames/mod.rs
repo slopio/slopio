@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
 
+use bytes::BytesMut;
 use zerocopy::{FromBytes, Immutable, KnownLayout, network_endian::U32};
 
 use crate::types::{Frame, FrameError, Setting};
+
+mod headers;
 
 const FRAME_HEADER_SIZE: usize = 9;
 const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
@@ -175,7 +178,7 @@ impl FrameDecoder {
                     return Ok(data.len());
                 }
 
-                let mut payload = Vec::with_capacity(length as usize);
+                let mut payload = BytesMut::with_capacity(length as usize);
                 payload.extend_from_slice(&self.remaining[FRAME_HEADER_SIZE..]);
                 payload.extend_from_slice(&data[pos..pos + need_from_data]);
                 pos += need_from_data;
@@ -248,7 +251,7 @@ impl FrameDecoder {
                     flags,
                     stream_id,
                     length,
-                    payload.to_vec(),
+                    BytesMut::from(payload),
                 )? {
                     self.frames.push_back(frame);
                 }
@@ -309,7 +312,7 @@ impl FrameDecoder {
         }
     }
 
-    /// Decode a variable-size frame from its complete payload (already in a Vec).
+    /// Decode a variable-size frame from its complete payload.
     /// Returns None for ignored frame types (Priority, PushPromise, Unknown).
     fn decode_non_constant_len_frame(
         &self,
@@ -317,7 +320,7 @@ impl FrameDecoder {
         flags: u8,
         stream_id: u32,
         length: u32,
-        payload: Vec<u8>,
+        payload: BytesMut,
     ) -> Result<Option<Frame>, FrameError> {
         match kind {
             FrameKind::Data => {
@@ -327,7 +330,7 @@ impl FrameDecoder {
                 Ok(Some(Frame::Data {
                     stream_id,
                     end_stream: flags & 0x1 != 0,
-                    data: payload,
+                    data: payload.to_vec(),
                 }))
             }
             FrameKind::Headers => {
@@ -368,7 +371,7 @@ impl FrameDecoder {
                 Ok(Some(Frame::GoAway {
                     last_stream_id,
                     error_code,
-                    debug_data: payload[8..].to_vec(),
+                    debug_data: payload[8..].into(),
                 }))
             }
             FrameKind::Continuation => {
