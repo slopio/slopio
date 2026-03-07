@@ -729,6 +729,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-h2"
+version = "0.1.0"
+dependencies = [
+ "runtime-core",
+ "zerocopy",
+]
+
+[[package]]
 name = "runtime-http"
 version = "0.1.0"
 dependencies = [

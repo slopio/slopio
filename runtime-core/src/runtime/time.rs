@@ -1,10 +1,21 @@
 use std::{
     cell::UnsafeCell,
+    future::Future,
     task::Waker,
     time::{Duration, SystemTime},
 };
 
+use crate::runtime::select::{select, SelectResult};
 use crate::runtime::TIME_DRIVER;
+
+/// Wraps a future with a timeout. Returns `Ok(output)` if the future completes
+/// before the deadline, or `Err(())` if the timeout fires first.
+pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
+    match select(future, Sleep::during(duration)).await {
+        SelectResult::First(output) => Ok(output),
+        SelectResult::Second(_) => Err(()),
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct TimeDriver {

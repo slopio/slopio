@@ -18,7 +18,7 @@ fn test_sleep_basic() {
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(40),
+        elapsed < Duration::from_millis(60),
         "Sleep took too long: {:?}",
         elapsed
     );

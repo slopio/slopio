@@ -2,6 +2,7 @@
 members = [
     "runtime-core",
     "runtime-http",
+    "runtime-h2",
     "runtime-quic",
     "runtime-iggy",
     "runtime",

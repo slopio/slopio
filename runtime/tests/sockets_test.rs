@@ -3,6 +3,7 @@ use runtime::io_driver::operations::sockets::recv::socket_recv_init as socket_re
 use runtime::io_driver::operations::sockets::send::socket_send;
 use runtime::main_thread;
 use runtime::runtime::spawn;
+use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -247,4 +248,66 @@ fn test_zero_length_recv() {
     let (bytes_recv, zero_recv) = handle.join().unwrap();
     assert_eq!(bytes_recv, 4);
     assert_eq!(zero_recv, 0);
+}
+
+#[test]
+fn test_recv_timeout() {
+    let handle = std::thread::spawn(|| {
+        main_thread(async {
+            let mut ma = MultiAccept::new(8088).unwrap();
+
+            if let Some(socket) = ma.next().await {
+                let mut buf = [0u8; 128];
+
+                // First recv: client sends data quickly, should succeed
+                let first: Result<std::io::Result<usize>, ()> =
+                    timeout(Duration::from_secs(1), socket_recv(&socket, &mut buf, 128)).await;
+                assert!(first.is_ok(), "first recv should not time out");
+                let n = first.unwrap().unwrap();
+                assert_eq!(&buf[..n], b"hello");
+
+                // Signal client that we're about to start the timed recv
+                socket_send(&socket, b"ok").await.unwrap();
+
+                // Second recv: client doesn't send anything, should time out
+                let second: Result<std::io::Result<usize>, ()> = timeout(
+                    Duration::from_millis(150),
+                    socket_recv(&socket, &mut buf, 128),
+                )
+                .await;
+                assert!(second.is_err(), "second recv should time out");
+
+                true
+            } else {
+                false
+            }
+        })
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut client = TcpStream::connect("127.0.0.1:8088").unwrap();
+    client.write_all(b"hello").unwrap();
+
+    // Wait for server ACK — server is now entering the timed recv
+    let mut ack = [0u8; 2];
+    client.read_exact(&mut ack).unwrap();
+    assert_eq!(&ack, b"ok");
+
+    // Measure from outside: how long until the server's timeout fires
+    let before = std::time::Instant::now();
+    let result = handle.join().unwrap();
+    let elapsed = before.elapsed();
+
+    assert!(result);
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "timed out too early: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "timeout took too long: {:?}",
+        elapsed
+    );
 }
