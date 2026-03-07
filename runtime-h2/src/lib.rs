@@ -1,2 +1,2 @@
-mod codec;
-mod types;
+pub mod codec;
+pub mod types;

@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use zerocopy::{FromBytes, Immutable, KnownLayout, network_endian::U32};
 
+use crate::types::{Frame, FrameError, Setting};
+
 const FRAME_HEADER_SIZE: usize = 9;
 const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
 
@@ -57,61 +59,34 @@ impl From<u8> for FrameKind {
     }
 }
 
-#[derive(Debug)]
-pub enum Frame {
-    Data {
-        stream_id: u32,
-        end_stream: bool,
-        data: Vec<u8>,
-    },
-    Headers {
-        stream_id: u32,
-        flags: u8,
-        payload: Vec<u8>,
-    },
-    RstStream {
-        stream_id: u32,
-        error_code: u32,
-    },
-    Settings {
-        ack: bool,
-        payload: Vec<u8>,
-    },
-    Ping {
-        ack: bool,
-        opaque: [u8; 8],
-    },
-    GoAway {
-        last_stream_id: u32,
-        error_code: u32,
-        debug_data: Vec<u8>,
-    },
-    WindowUpdate {
-        stream_id: u32,
-        increment: u32,
-    },
-    Continuation {
-        stream_id: u32,
-        end_headers: bool,
-        payload: Vec<u8>,
-    },
+fn parse_settings(payload: &[u8]) -> Result<Vec<Setting>, FrameError> {
+    if !payload.len().is_multiple_of(6) {
+        return Err(FrameError::FrameSizeError(payload.len() as u32));
+    }
+    let mut settings = Vec::with_capacity(payload.len() / 6);
+    let mut pos = 0;
+    while pos < payload.len() {
+        let id = u16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap());
+        let value = u32::from_be_bytes(payload[pos + 2..pos + 6].try_into().unwrap());
+        let setting = match id {
+            0x1 => Setting::HeaderTableSize(value),
+            0x2 => Setting::EnablePush(value != 0),
+            0x3 => Setting::MaxConcurrentStreams(value),
+            0x4 => Setting::InitialWindowSize(value),
+            0x5 => Setting::MaxFrameSize(value),
+            0x6 => Setting::MaxHeaderListSize(value),
+            _ => Setting::Unknown { id, value },
+        };
+        settings.push(setting);
+        pos += 6;
+    }
+    Ok(settings)
 }
-
-#[derive(Debug)]
-pub enum FrameError {
-    FrameSizeError(u32),
-    ProtocolError(&'static str),
-}
-
-/// Max bytes needed in reassembly for fixed-size frames (header + PING payload)
-const MAX_FIXED_FRAME: usize = FRAME_HEADER_SIZE + 8;
 
 pub struct FrameDecoder {
     max_frame_size: u32,
     pub frames: VecDeque<Frame>,
-    // Small reassembly buffer — only ever holds up to header + largest fixed payload
-    reassembly: [u8; MAX_FIXED_FRAME],
-    reassembly_len: usize,
+    remaining: Vec<u8>,
 }
 
 impl FrameDecoder {
@@ -119,53 +94,47 @@ impl FrameDecoder {
         Self {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             frames: VecDeque::new(),
-            reassembly: [0u8; MAX_FIXED_FRAME],
-            reassembly_len: 0,
+            remaining: Vec::new(),
         }
     }
 
-    /// Feed a buffer into the decoder. Decodes all complete frames,
-    /// stores partial fixed-size frame bytes in reassembly.
-    /// Returns the number of bytes consumed from `data`.
-    pub fn decode(&mut self, data: &[u8]) -> Result<usize, FrameError> {
+    pub fn decode(&mut self, data: &[u8]) -> Result<(), FrameError> {
         let mut pos = 0;
 
-        // Step 1: finish reassembling a partial frame from last call
-        if self.reassembly_len > 0 {
-            pos = self.drain_reassembly(data)?;
-            if self.reassembly_len > 0 {
-                // Still not enough — wait for more data
-                return Ok(pos);
-            }
+        if !self.remaining.is_empty() {
+            pos = self.handle_reassembly(data)?;
         }
 
-        // Step 2: decode complete frames directly from data
-        pos += self.decode_inline(&data[pos..])?;
+        // Decode complete frames directly from the rest of data
+        let consumed = self.decode_buf(&data[pos..])?;
+        let leftover = &data[pos + consumed..];
+        if !leftover.is_empty() {
+            self.remaining.extend_from_slice(leftover);
+        }
 
-        Ok(pos)
+        Ok(())
     }
 
-    /// Try to complete the partial frame sitting in reassembly.
+    /// Complete a partial frame using bytes from `data`.
     /// Returns how many bytes from `data` were consumed.
-    fn drain_reassembly(&mut self, data: &[u8]) -> Result<usize, FrameError> {
+    fn handle_reassembly(&mut self, data: &[u8]) -> Result<usize, FrameError> {
         let mut pos = 0;
 
-        // First: ensure we have the 9-byte header
-        if self.reassembly_len < FRAME_HEADER_SIZE {
-            let need = FRAME_HEADER_SIZE - self.reassembly_len;
+        // Step 1: ensure we have a full 9-byte header in remaining
+        if self.remaining.len() < FRAME_HEADER_SIZE {
+            let need = FRAME_HEADER_SIZE - self.remaining.len();
             let copy = data.len().min(need);
-            self.reassembly[self.reassembly_len..self.reassembly_len + copy]
-                .copy_from_slice(&data[..copy]);
-            self.reassembly_len += copy;
+            self.remaining.extend_from_slice(&data[..copy]);
             pos += copy;
 
-            if self.reassembly_len < FRAME_HEADER_SIZE {
+            if self.remaining.len() < FRAME_HEADER_SIZE {
+                // Still don't have a full header
                 return Ok(pos);
             }
         }
 
-        // We have the header — parse it
-        let (raw, _) = RawFrameHeader::ref_from_prefix(&self.reassembly).unwrap();
+        // Step 2: parse the header
+        let (raw, _) = RawFrameHeader::ref_from_prefix(&self.remaining).unwrap();
         let length = raw.length();
         let kind = FrameKind::from(raw.kind);
         let flags = raw.flags;
@@ -175,80 +144,63 @@ impl FrameDecoder {
             return Err(FrameError::FrameSizeError(length));
         }
 
-        let remaining_data = &data[pos..];
+        let total = FRAME_HEADER_SIZE + length as usize;
 
+        // Step 3: for constant-size frames, copy just enough to complete the frame
         match kind {
-            // Fixed-size frames: copy payload bytes into reassembly
             FrameKind::RstStream | FrameKind::Ping | FrameKind::WindowUpdate => {
-                let total = FRAME_HEADER_SIZE + length as usize;
-                let need = total - self.reassembly_len;
-                let copy = remaining_data.len().min(need);
-                self.reassembly[self.reassembly_len..self.reassembly_len + copy]
-                    .copy_from_slice(&remaining_data[..copy]);
-                self.reassembly_len += copy;
-                pos += copy;
-
-                if self.reassembly_len < total {
-                    return Ok(pos);
+                let need = total - self.remaining.len();
+                let available = data.len() - pos;
+                if available < need {
+                    self.remaining.extend_from_slice(&data[pos..]);
+                    return Ok(data.len());
                 }
+                self.remaining.extend_from_slice(&data[pos..pos + need]);
+                pos += need;
 
-                let payload = &self.reassembly[FRAME_HEADER_SIZE..total];
+                let payload = &self.remaining[FRAME_HEADER_SIZE..total];
                 let frame =
                     self.decode_constant_len_frame(kind, flags, stream_id, length, payload)?;
                 self.frames.push_back(frame);
-                self.reassembly_len = 0;
+                self.remaining.clear();
             }
-            // Variable-size frames: allocate Vec, copy from reassembly + data
             _ => {
-                let payload_len = length as usize;
-                let from_reassembly = self.reassembly_len - FRAME_HEADER_SIZE;
-                let from_data = payload_len - from_reassembly;
+                let payload_in_remaining = self.remaining.len() - FRAME_HEADER_SIZE;
+                let need_from_data = length as usize - payload_in_remaining;
+                let available = data.len() - pos;
 
-                if remaining_data.len() < from_data {
-                    // Not enough data yet — can't complete this frame.
-                    // This shouldn't normally happen since variable-size frames
-                    // only store the header in reassembly, but handle it safely.
-                    return Ok(pos);
+                if available < need_from_data {
+                    // Not enough data yet, copy what we can into remaining
+                    self.remaining.extend_from_slice(&data[pos..]);
+                    return Ok(data.len());
                 }
 
-                let mut payload = Vec::with_capacity(payload_len);
-                // Copy any payload bytes that were in reassembly (after the header)
-                if from_reassembly > 0 {
-                    payload.extend_from_slice(
-                        &self.reassembly[FRAME_HEADER_SIZE..self.reassembly_len],
-                    );
-                }
-                // Copy the rest from the incoming data
-                payload.extend_from_slice(&remaining_data[..from_data]);
-                pos += from_data;
-                self.reassembly_len = 0;
+                let mut payload = Vec::with_capacity(length as usize);
+                payload.extend_from_slice(&self.remaining[FRAME_HEADER_SIZE..]);
+                payload.extend_from_slice(&data[pos..pos + need_from_data]);
+                pos += need_from_data;
 
-                let frame =
-                    self.decode_non_constant_len_frame(kind, flags, stream_id, length, payload)?;
-                if let Some(frame) = frame {
+                if let Some(frame) =
+                    self.decode_non_constant_len_frame(kind, flags, stream_id, length, payload)?
+                {
                     self.frames.push_back(frame);
                 }
+                self.remaining.clear();
             }
         }
 
         Ok(pos)
     }
 
-    /// Decode frames directly from contiguous data (no reassembly needed).
+    /// Decode as many complete frames as possible from `buf`.
     /// Returns the number of bytes consumed.
-    fn decode_inline(&mut self, data: &[u8]) -> Result<usize, FrameError> {
+    fn decode_buf(&mut self, buf: &[u8]) -> Result<usize, FrameError> {
         let mut offset = 0;
 
         loop {
-            let remaining = &data[offset..];
+            let remaining = &buf[offset..];
 
             if remaining.len() < FRAME_HEADER_SIZE {
-                // Partial header — save to reassembly
-                if !remaining.is_empty() {
-                    self.reassembly[..remaining.len()].copy_from_slice(remaining);
-                    self.reassembly_len = remaining.len();
-                    offset += remaining.len();
-                }
                 break;
             }
 
@@ -264,51 +216,45 @@ impl FrameDecoder {
 
             let total = FRAME_HEADER_SIZE + length as usize;
             if remaining.len() < total {
-                // Partial frame — save what we have to reassembly for fixed,
-                // or just the header for variable
-                match kind {
-                    FrameKind::RstStream | FrameKind::Ping | FrameKind::WindowUpdate => {
-                        let save = remaining.len().min(MAX_FIXED_FRAME);
-                        self.reassembly[..save].copy_from_slice(&remaining[..save]);
-                        self.reassembly_len = save;
-                    }
-                    _ => {
-                        // Save just the header
-                        self.reassembly[..FRAME_HEADER_SIZE]
-                            .copy_from_slice(&remaining[..FRAME_HEADER_SIZE]);
-                        self.reassembly_len = FRAME_HEADER_SIZE;
-                    }
-                }
-                offset += remaining.len();
                 break;
             }
 
             let payload = &remaining[FRAME_HEADER_SIZE..total];
-
-            match kind {
-                FrameKind::RstStream | FrameKind::Ping | FrameKind::WindowUpdate => {
-                    let frame =
-                        self.decode_constant_len_frame(kind, flags, stream_id, length, payload)?;
-                    self.frames.push_back(frame);
-                }
-                _ => {
-                    let frame = self.decode_non_constant_len_frame(
-                        kind,
-                        flags,
-                        stream_id,
-                        length,
-                        payload.to_vec(),
-                    )?;
-                    if let Some(frame) = frame {
-                        self.frames.push_back(frame);
-                    }
-                }
-            }
-
+            self.decode_frame(kind, flags, stream_id, length, payload)?;
             offset += total;
         }
 
         Ok(offset)
+    }
+
+    /// Decode a single complete frame and push it to the queue.
+    fn decode_frame(
+        &mut self,
+        kind: FrameKind,
+        flags: u8,
+        stream_id: u32,
+        length: u32,
+        payload: &[u8],
+    ) -> Result<(), FrameError> {
+        match kind {
+            FrameKind::RstStream | FrameKind::Ping | FrameKind::WindowUpdate => {
+                let frame =
+                    self.decode_constant_len_frame(kind, flags, stream_id, length, payload)?;
+                self.frames.push_back(frame);
+            }
+            _ => {
+                if let Some(frame) = self.decode_non_constant_len_frame(
+                    kind,
+                    flags,
+                    stream_id,
+                    length,
+                    payload.to_vec(),
+                )? {
+                    self.frames.push_back(frame);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Decode a fixed-size frame from its complete payload.
@@ -400,10 +346,12 @@ impl FrameDecoder {
                         "SETTINGS frame with non-zero stream ID",
                     ));
                 }
-                Ok(Some(Frame::Settings {
-                    ack: flags & 0x1 != 0,
-                    payload,
-                }))
+                let ack = flags & 0x1 != 0;
+                if ack && !payload.is_empty() {
+                    return Err(FrameError::FrameSizeError(payload.len() as u32));
+                }
+                let settings = parse_settings(&payload)?;
+                Ok(Some(Frame::Settings { ack, settings }))
             }
             FrameKind::GoAway => {
                 if stream_id != 0 {
@@ -438,5 +386,11 @@ impl FrameDecoder {
             // Priority, PushPromise, Unknown — skip
             _ => Ok(None),
         }
+    }
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
