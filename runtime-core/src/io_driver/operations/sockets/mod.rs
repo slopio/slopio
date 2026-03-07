@@ -7,6 +7,7 @@ pub mod multi_accept;
 pub mod multi_recv;
 pub mod recv;
 pub mod send;
+pub mod send_vectored;
 pub mod udp;
 
 #[derive(Debug)]

@@ -700,7 +700,6 @@ dependencies = [
  "mimalloc",
  "rand",
  "runtime-core",
- "runtime-h2",
  "runtime-http",
  "runtime-quic",
  "runtime-streams",
@@ -727,18 +726,6 @@ dependencies = [
  "slab",
  "smallvec",
  "socket2 0.6.2",
-]
-
-[[package]]
-name = "runtime-h2"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "fnv",
- "http",
- "runtime",
- "runtime-core",
- "runtime-streams",
 ]
 
 [[package]]

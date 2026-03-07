@@ -8,7 +8,6 @@ tls             = ["dep:rustls", "dep:rustls-pemfile"]
 tracing         = ["runtime-core/tracing"]
 http            = []
 http1           = ["http", "dep:runtime-http"]
-h2              = ["dep:runtime-h2"]
 quic            = ["http", "dep:runtime-quic"]
 quic-tracing    = ["quic", "tracing", "runtime-quic/tracing"]
 test-monitor    = ["quic", "runtime-quic/test-monitor"]
@@ -22,10 +21,6 @@ name = "http"
 required-features = ["http1"]
 
 [[example]]
-name = "h2"
-required-features = ["h2"]
-
-[[example]]
 name = "http3"
 required-features = ["quic-tracing"]
 
@@ -33,7 +28,6 @@ required-features = ["quic-tracing"]
 runtime-core = { path = "../runtime-core" }
 runtime-http = { path = "../runtime-http", optional = true }
 runtime-quic = { path = "../runtime-quic", optional = true }
-runtime-h2 = { path = "../runtime-h2", optional = true }
 libc = "0.2.178"
 rustls = { version = "0.23.36", optional = true }
 rustls-pemfile = { version = "2", optional = true }

@@ -16,9 +16,6 @@ pub use runtime_core::tracing;
 #[cfg(feature = "http1")]
 pub use runtime_http::{http, http1};
 
-#[cfg(feature = "h2")]
-pub use runtime_h2;
-
 #[cfg(feature = "quic")]
 pub use runtime_quic::quic;
 

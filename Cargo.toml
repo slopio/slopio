@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "runtime-core",
-    "runtime-h2",
     "runtime-http",
     "runtime-quic",
     "runtime-iggy",
