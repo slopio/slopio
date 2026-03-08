@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use runtime_core::channels::{Receiver, Sender};
 use runtime_core::io_driver::operations::sockets::{
     SocketWrapper, multi_accept::MultiAccept, recv::socket_recv_init, send::socket_send,
@@ -7,7 +5,6 @@ use runtime_core::io_driver::operations::sockets::{
 use runtime_core::runtime::spawn;
 use runtime_streams::StreamExt;
 
-use crate::codec::frames::FrameDecoder;
 use crate::codec::frames::headers::Headers;
 use crate::server::connection::Connection;
 use crate::types::Frame;
@@ -33,7 +30,7 @@ pub(crate) const SETTINGS_ACK: &[u8] = &[
     0, 0, 0, 0, // stream_id = 0
 ];
 
-pub struct Server {
+pub struct H2Server {
     port: u16,
 }
 
@@ -47,7 +44,9 @@ pub struct H2Stream {
     headers: Headers,
 }
 
-impl Server {
+impl H2Stream {}
+
+impl H2Server {
     pub fn new(port: u16) -> Self {
         Self { port }
     }
@@ -66,93 +65,14 @@ impl Server {
 }
 
 async fn handle_connection(socket: SocketWrapper) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Read client connection preface (24 bytes magic)
     let mut preface_buf = [0u8; 24];
     recv_exact(&socket, &mut preface_buf).await?;
     if &preface_buf[..] != CLIENT_PREFACE {
         return Err("invalid client preface".into());
     }
-
-    // 2. Send server SETTINGS
     send_all(&socket, SERVER_SETTINGS).await?;
     let mut connection = Connection::new(socket);
     connection.run().await.unwrap();
-
-    // loop {
-    //     let len = buf.len();
-    //     let n = socket_recv_init(&socket, &mut buf, len).await?;
-    //     if n == 0 {
-    //         break; // EOF
-    //     }
-
-    //     decoder.decode(&buf[..n]).map_err(|e| format!("{e:?}"))?;
-
-    //     while let Some(frame) = decoder.frames.pop_front() {
-    //         match frame {
-    //             Frame::Settings { ack, ref settings } => {
-    //                 if !ack {
-    //                     // ACK the client's SETTINGS
-    //                     println!("sending settings");
-    //                     send_all(&socket, SETTINGS_ACK).await?;
-    //                 }
-    //             }
-    //             Frame::Ping { ack, opaque } => {
-    //                 if !ack {
-    //                     // Respond with PING ACK
-    //                     let mut pong = [0u8; 17];
-    //                     pong[3] = 0x06; // type = PING
-    //                     pong[4] = 0x01; // flags = ACK
-    //                     // length = 8
-    //                     pong[2] = 8;
-    //                     pong[9..17].copy_from_slice(&opaque);
-    //                     println!("sending ping");
-    //                     send_all(&socket, &pong).await?;
-    //                 }
-    //             }
-    //             Frame::Headers(ref h) => {
-    //                 let stream_id = u32::from(h.stream_id());
-    //                 let pseudo = h.pseudo();
-    //                 eprintln!(
-    //                     "stream {stream_id}: {} {} {}",
-    //                     pseudo.method.as_ref().map(|m| m.as_str()).unwrap_or("?"),
-    //                     pseudo.scheme.as_ref().map(|s| &**s).unwrap_or("?"),
-    //                     pseudo.path.as_ref().map(|p| &**p).unwrap_or("?"),
-    //                 );
-    //                 if let Some(ref authority) = pseudo.authority {
-    //                     eprintln!("  :authority {}", &**authority);
-    //                 }
-    //                 for (name, value) in h.fields() {
-    //                     eprintln!("  {}: {}", name, value.to_str().unwrap_or("<binary>"));
-    //                 }
-    //                 // TODO: dispatch to request handler
-    //             }
-    //             Frame::GoAway { .. } => {
-    //                 println!("go away");
-    //                 break;
-    //             }
-    //             Frame::Data {
-    //                 stream_id,
-    //                 end_stream,
-    //                 data,
-    //             } => {
-    //                 println!("received data");
-    //             }
-    //             Frame::RstStream {
-    //                 stream_id,
-    //                 error_code,
-    //             } => {
-    //                 println!("reset");
-    //             }
-    //             Frame::WindowUpdate {
-    //                 stream_id,
-    //                 increment,
-    //             } => {
-    //                 println!("received window {stream_id} {increment}");
-    //             }
-    //         }
-    //     }
-    // }
-
     Ok(())
 }
 

@@ -35,7 +35,7 @@ impl Connection {
             },
             decoder: FrameDecoder::new(),
             streams: HashMap::new(),
-            alive: false,
+            alive: true,
         }
     }
 
