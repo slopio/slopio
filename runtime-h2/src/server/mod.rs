@@ -42,6 +42,7 @@ pub struct StreamSendingEnd {
 pub struct H2Stream {
     receiver: Receiver<Frame>,
     headers: Headers,
+    output: std::rc::Rc<Sender<Frame>>,
 }
 
 impl H2Stream {}
