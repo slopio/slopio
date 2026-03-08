@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use runtime_core::io_driver::operations::sockets::{
     SocketWrapper, multi_recv::MultiRecv, send::socket_send,
@@ -22,6 +22,12 @@ pub struct Connection {
     decoder: FrameDecoder,
     streams: HashMap<StreamId, StreamSendingEnd>,
     alive: bool,
+}
+
+enum WindowAction {
+    Ok,
+    StreamOverflow,
+    GlobalOverflow,
 }
 
 impl Connection {
@@ -51,6 +57,18 @@ impl Connection {
         }
     }
 
+    fn handle_data_window(data_len: u32, global_window: u32, stream_window: u32) -> WindowAction {
+        if data_len > global_window {
+            // Connection-level flow control violation → GOAWAY + close
+            WindowAction::GlobalOverflow
+        } else if data_len > stream_window {
+            // Stream-level flow control violation → RST_STREAM on that stream
+            WindowAction::StreamOverflow
+        } else {
+            WindowAction::Ok
+        }
+    }
+
     pub async fn run(&mut self) -> Result<(), FrameError> {
         while let Some(v) = self.socket.recv.next().await {
             self.decoder.decode(v.as_ref())?;
@@ -61,12 +79,41 @@ impl Connection {
                             .entry(headers.stream_id())
                             .or_insert(new_stream(headers));
                     }
-                    crate::types::Frame::Data { stream_id, .. } => self
-                        .streams
-                        .get(&stream_id)
-                        .ok_or(FrameError::ProtocolError("no such stream"))?
-                        .sender
-                        .send(frame),
+                    crate::types::Frame::Data {
+                        stream_id,
+                        data,
+                        end_stream,
+                    } => {
+                        let stream = self
+                            .streams
+                            .get_mut(&stream_id)
+                            .ok_or(FrameError::ProtocolError("no such stream"))?;
+                        let data_len = data.len() as u32;
+                        match Self::handle_data_window(data_len, self.window, stream.window) {
+                            WindowAction::Ok => {
+                                self.window -= data_len;
+                                stream.window -= data_len;
+                                stream.sender.send(crate::types::Frame::Data {
+                                    stream_id,
+                                    end_stream,
+                                    data,
+                                });
+                            }
+                            WindowAction::StreamOverflow => {
+                                self.window -= data_len;
+                                stream.sender.send(crate::types::Frame::RstStream {
+                                    stream_id,
+                                    error_code: 0x3, // FLOW_CONTROL_ERROR
+                                });
+                            }
+                            WindowAction::GlobalOverflow => {
+                                // FLOW_CONTROL_ERROR on the connection → GOAWAY
+                                return Err(FrameError::ProtocolError(
+                                    "connection flow control overflow",
+                                ));
+                            }
+                        }
+                    }
                     crate::types::Frame::RstStream { stream_id, .. } => self
                         .streams
                         .get(&stream_id)
@@ -92,10 +139,9 @@ impl Connection {
                             self.window += increment;
                         } else {
                             self.streams
-                                .get(&stream_id)
+                                .get_mut(&stream_id)
                                 .ok_or(FrameError::ProtocolError("no such stream"))?
-                                .sender
-                                .send(frame);
+                                .window += increment;
                         }
                     }
                 }

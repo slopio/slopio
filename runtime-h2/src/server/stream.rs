@@ -8,13 +8,12 @@ use crate::{
 
 pub fn new_stream(headers: Headers) -> StreamSendingEnd {
     let (sender, receiver) = channels::unbounded_channel::<Frame>();
-    let stream = H2Stream {
-        headers,
-        receiver,
-        window: 4096,
-    };
+    let stream = H2Stream { headers, receiver };
     spawn(process_stream(stream));
-    StreamSendingEnd { sender }
+    StreamSendingEnd {
+        sender,
+        window: 65000,
+    }
 }
 
 async fn process_stream(mut stream: H2Stream) {
@@ -29,9 +28,6 @@ async fn process_stream(mut stream: H2Stream) {
             }
             Frame::Headers(_) => unimplemented!(),
             Frame::RstStream { .. } => break,
-            Frame::WindowUpdate { increment, .. } => {
-                stream.window += increment;
-            }
             _ => {}
         }
     }

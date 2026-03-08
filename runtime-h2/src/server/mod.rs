@@ -35,12 +35,12 @@ pub struct H2Server {
 }
 
 pub struct StreamSendingEnd {
+    window: u32,
     sender: Sender<Frame>,
 }
 
 pub struct H2Stream {
     receiver: Receiver<Frame>,
-    window: u32,
     headers: Headers,
 }
 
