@@ -9,6 +9,7 @@ fnv = "1"
 hex = "0.4"
 http = "1"
 runtime-core = { path = "../runtime-core" }
+runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }
 zerocopy = { version = "0.8", features = ["derive"] }
 
 [dev-dependencies]

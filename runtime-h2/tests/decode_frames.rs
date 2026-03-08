@@ -10,11 +10,11 @@ fn decode_all_frames_from_bin() {
     let mut decoder = FrameDecoder::new();
     decoder.decode(&data).unwrap();
 
-    // 15 frames total, minus 1 PRIORITY (skipped) = 14 decoded frames
+    // 15 wire frames, minus 1 PRIORITY (skipped), minus 1 CONTINUATION (merged) = 13
     assert_eq!(
         decoder.frames.len(),
-        14,
-        "expected 14 frames, got {}",
+        13,
+        "expected 13 frames, got {}",
         decoder.frames.len()
     );
 
@@ -53,26 +53,30 @@ fn decode_all_frames_from_bin() {
         other => panic!("expected WindowUpdate, got {:?}", other),
     }
 
-    // 4. HEADERS stream 1, END_HEADERS
+    // 4. HEADERS stream 1, END_STREAM, decoded: GET / https
     let f = decoder.frames.pop_front().unwrap();
     match f {
-        Frame::Headers {
-            stream_id, flags, ..
-        } => {
-            assert_eq!(stream_id, 1);
-            assert_eq!(flags & 0x4, 0x4); // END_HEADERS
+        Frame::Headers(ref h) => {
+            assert_eq!(u32::from(h.stream_id()), 1);
+            assert!(h.is_end_stream());
+            let pseudo = h.pseudo();
+            assert_eq!(pseudo.method.as_ref().unwrap(), "GET");
+            assert_eq!(&**pseudo.path.as_ref().unwrap(), "/");
+            assert_eq!(&**pseudo.scheme.as_ref().unwrap(), "https");
         }
         other => panic!("expected Headers, got {:?}", other),
     }
 
-    // 5. HEADERS stream 1, END_HEADERS|END_STREAM
+    // 5. HEADERS stream 3, no END_STREAM, decoded: GET / http
     let f = decoder.frames.pop_front().unwrap();
     match f {
-        Frame::Headers {
-            stream_id, flags, ..
-        } => {
-            assert_eq!(stream_id, 1);
-            assert_eq!(flags & 0x5, 0x5);
+        Frame::Headers(ref h) => {
+            assert_eq!(u32::from(h.stream_id()), 3);
+            assert!(!h.is_end_stream());
+            let pseudo = h.pseudo();
+            assert_eq!(pseudo.method.as_ref().unwrap(), "GET");
+            assert_eq!(&**pseudo.path.as_ref().unwrap(), "/");
+            assert_eq!(&**pseudo.scheme.as_ref().unwrap(), "http");
         }
         other => panic!("expected Headers, got {:?}", other),
     }
@@ -168,32 +172,18 @@ fn decode_all_frames_from_bin() {
         other => panic!("expected GoAway, got {:?}", other),
     }
 
-    // 13. CONTINUATION stream 3, no END_HEADERS
+    // 13. HEADERS stream 5 (from HEADERS + CONTINUATION), decoded: POST / https
     let f = decoder.frames.pop_front().unwrap();
     match f {
-        Frame::Continuation {
-            stream_id,
-            end_headers,
-            ..
-        } => {
-            assert_eq!(stream_id, 3);
-            assert!(!end_headers);
+        Frame::Headers(ref h) => {
+            assert_eq!(u32::from(h.stream_id()), 5);
+            assert!(!h.is_end_stream());
+            let pseudo = h.pseudo();
+            assert_eq!(pseudo.method.as_ref().unwrap(), "POST");
+            assert_eq!(&**pseudo.path.as_ref().unwrap(), "/");
+            assert_eq!(&**pseudo.scheme.as_ref().unwrap(), "https");
         }
-        other => panic!("expected Continuation, got {:?}", other),
-    }
-
-    // 14. CONTINUATION stream 3, END_HEADERS
-    let f = decoder.frames.pop_front().unwrap();
-    match f {
-        Frame::Continuation {
-            stream_id,
-            end_headers,
-            ..
-        } => {
-            assert_eq!(stream_id, 3);
-            assert!(end_headers);
-        }
-        other => panic!("expected Continuation END_HEADERS, got {:?}", other),
+        other => panic!("expected Headers from continuation, got {:?}", other),
     }
 }
 
@@ -209,5 +199,5 @@ fn decode_frames_one_byte_at_a_time() {
         decoder.decode(std::slice::from_ref(byte)).unwrap();
     }
 
-    assert_eq!(decoder.frames.len(), 14);
+    assert_eq!(decoder.frames.len(), 13);
 }

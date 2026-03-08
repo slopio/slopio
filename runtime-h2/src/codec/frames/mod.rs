@@ -4,9 +4,18 @@ use bytes::BytesMut;
 use zerocopy::{FromBytes, Immutable, KnownLayout, network_endian::U32};
 
 use crate::{
-    hpack::{self, Decoder},
+    codec::frames::{
+        head::{Head, Kind},
+        headers::Headers,
+        stream_id::StreamId,
+    },
+    hpack,
     types::{Frame, FrameError, Setting},
 };
+
+mod head;
+pub mod headers;
+pub mod stream_id;
 
 const FRAME_HEADER_SIZE: usize = 9;
 const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
@@ -87,20 +96,31 @@ fn parse_settings(payload: &[u8]) -> Result<Vec<Setting>, FrameError> {
     Ok(settings)
 }
 
+/// State for accumulating a header block across HEADERS + CONTINUATION frames.
+struct HeaderBlockState {
+    headers: Headers,
+    buf: BytesMut,
+}
+
 pub struct FrameDecoder {
-    header_decoder: hpack::Decoder,
+    hpack: hpack::Decoder,
     max_frame_size: u32,
+    max_header_list_size: usize,
     pub frames: VecDeque<Frame>,
     remaining: Vec<u8>,
+    /// In-progress header block waiting for END_HEADERS
+    header_block: Option<HeaderBlockState>,
 }
 
 impl FrameDecoder {
     pub fn new() -> Self {
         Self {
-            header_decoder: Decoder::new(1024),
+            hpack: hpack::Decoder::default(),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            max_header_list_size: usize::MAX,
             frames: VecDeque::new(),
             remaining: Vec::new(),
+            header_block: None,
         }
     }
 
@@ -186,11 +206,7 @@ impl FrameDecoder {
                 payload.extend_from_slice(&data[pos..pos + need_from_data]);
                 pos += need_from_data;
 
-                if let Some(frame) =
-                    self.decode_non_constant_len_frame(kind, flags, stream_id, length, payload)?
-                {
-                    self.frames.push_back(frame);
-                }
+                self.handle_variable_frame(kind, flags, stream_id, length, payload)?;
                 self.remaining.clear();
             }
         }
@@ -249,18 +265,136 @@ impl FrameDecoder {
                 self.frames.push_back(frame);
             }
             _ => {
-                if let Some(frame) = self.decode_non_constant_len_frame(
+                self.handle_variable_frame(
                     kind,
                     flags,
                     stream_id,
                     length,
                     BytesMut::from(payload),
-                )? {
-                    self.frames.push_back(frame);
-                }
+                )?;
             }
         }
         Ok(())
+    }
+
+    /// Handle a variable-length frame: either push directly or accumulate headers.
+    fn handle_variable_frame(
+        &mut self,
+        kind: FrameKind,
+        flags: u8,
+        stream_id: u32,
+        length: u32,
+        payload: BytesMut,
+    ) -> Result<(), FrameError> {
+        // If we're accumulating a header block, only CONTINUATION on the same stream is valid
+        if let Some(ref state) = self.header_block {
+            if kind != FrameKind::Continuation {
+                return Err(FrameError::ProtocolError(
+                    "expected CONTINUATION frame while header block is incomplete",
+                ));
+            }
+            if state.headers.stream_id() != StreamId::from(stream_id) {
+                return Err(FrameError::ProtocolError(
+                    "CONTINUATION frame on different stream than HEADERS",
+                ));
+            }
+        }
+
+        match kind {
+            FrameKind::Headers => {
+                let head = Head::new(Kind::Headers, flags, StreamId::from(stream_id));
+                let (headers, hpack_buf) =
+                    Headers::load(head, payload).map_err(FrameError::Hpack)?;
+                let end_headers = headers.is_end_headers();
+
+                if end_headers {
+                    let headers = self.decode_hpack(headers, hpack_buf)?;
+                    self.frames.push_back(Frame::Headers(headers));
+                } else {
+                    self.header_block = Some(HeaderBlockState {
+                        headers,
+                        buf: hpack_buf,
+                    });
+                }
+            }
+            FrameKind::Continuation => {
+                if stream_id == 0 {
+                    return Err(FrameError::ProtocolError(
+                        "CONTINUATION frame with stream ID 0",
+                    ));
+                }
+
+                let state = self.header_block.as_mut().ok_or(FrameError::ProtocolError(
+                    "CONTINUATION without preceding HEADERS",
+                ))?;
+
+                state.buf.extend_from_slice(&payload);
+                let end_headers = flags & 0x4 != 0;
+
+                if end_headers {
+                    let state = self.header_block.take().unwrap();
+                    let headers = self.decode_hpack(state.headers, state.buf)?;
+                    self.frames.push_back(Frame::Headers(headers));
+                }
+            }
+            FrameKind::Data => {
+                if stream_id == 0 {
+                    return Err(FrameError::ProtocolError("DATA frame with stream ID 0"));
+                }
+                self.frames.push_back(Frame::Data {
+                    stream_id: StreamId::from(stream_id),
+                    end_stream: flags & 0x1 != 0,
+                    data: payload.to_vec(),
+                });
+            }
+            FrameKind::Settings => {
+                if stream_id != 0 {
+                    return Err(FrameError::ProtocolError(
+                        "SETTINGS frame with non-zero stream ID",
+                    ));
+                }
+                let ack = flags & 0x1 != 0;
+                if ack && !payload.is_empty() {
+                    return Err(FrameError::FrameSizeError(payload.len() as u32));
+                }
+                let settings = parse_settings(&payload)?;
+                self.frames.push_back(Frame::Settings { ack, settings });
+            }
+            FrameKind::GoAway => {
+                if stream_id != 0 {
+                    return Err(FrameError::ProtocolError(
+                        "GOAWAY frame with non-zero stream ID",
+                    ));
+                }
+                if length < 8 {
+                    return Err(FrameError::FrameSizeError(length));
+                }
+                let last_stream_id = StreamId::from(
+                    u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7FFF_FFFF,
+                );
+                let error_code = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                self.frames.push_back(Frame::GoAway {
+                    last_stream_id,
+                    error_code,
+                    debug_data: payload[8..].into(),
+                });
+            }
+            // Priority, PushPromise, Unknown — skip
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Run the HPACK decoder on a complete header block and return a fully decoded Headers.
+    fn decode_hpack(
+        &mut self,
+        mut headers: Headers,
+        mut buf: BytesMut,
+    ) -> Result<Headers, FrameError> {
+        headers
+            .load_hpack(&mut buf, self.max_header_list_size, &mut self.hpack)
+            .map_err(FrameError::Hpack)?;
+        Ok(headers)
     }
 
     /// Decode a fixed-size frame from its complete payload.
@@ -283,7 +417,7 @@ impl FrameDecoder {
                     return Err(FrameError::FrameSizeError(length));
                 }
                 Ok(Frame::RstStream {
-                    stream_id,
+                    stream_id: StreamId::from(stream_id),
                     error_code: u32::from_be_bytes(payload[..4].try_into().unwrap()),
                 })
             }
@@ -307,90 +441,11 @@ impl FrameDecoder {
                 }
                 let increment = u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7FFF_FFFF;
                 Ok(Frame::WindowUpdate {
-                    stream_id,
+                    stream_id: StreamId::from(stream_id),
                     increment,
                 })
             }
             _ => unreachable!(),
-        }
-    }
-
-    /// Decode a variable-size frame from its complete payload.
-    /// Returns None for ignored frame types (Priority, PushPromise, Unknown).
-    fn decode_non_constant_len_frame(
-        &self,
-        kind: FrameKind,
-        flags: u8,
-        stream_id: u32,
-        length: u32,
-        payload: BytesMut,
-    ) -> Result<Option<Frame>, FrameError> {
-        match kind {
-            FrameKind::Data => {
-                if stream_id == 0 {
-                    return Err(FrameError::ProtocolError("DATA frame with stream ID 0"));
-                }
-                Ok(Some(Frame::Data {
-                    stream_id,
-                    end_stream: flags & 0x1 != 0,
-                    data: payload.to_vec(),
-                }))
-            }
-            FrameKind::Headers => {
-                if stream_id == 0 {
-                    return Err(FrameError::ProtocolError("HEADERS frame with stream ID 0"));
-                }
-                Ok(Some(Frame::Headers {
-                    stream_id,
-                    flags,
-                    payload,
-                }))
-            }
-            FrameKind::Settings => {
-                if stream_id != 0 {
-                    return Err(FrameError::ProtocolError(
-                        "SETTINGS frame with non-zero stream ID",
-                    ));
-                }
-                let ack = flags & 0x1 != 0;
-                if ack && !payload.is_empty() {
-                    return Err(FrameError::FrameSizeError(payload.len() as u32));
-                }
-                let settings = parse_settings(&payload)?;
-                Ok(Some(Frame::Settings { ack, settings }))
-            }
-            FrameKind::GoAway => {
-                if stream_id != 0 {
-                    return Err(FrameError::ProtocolError(
-                        "GOAWAY frame with non-zero stream ID",
-                    ));
-                }
-                if length < 8 {
-                    return Err(FrameError::FrameSizeError(length));
-                }
-                let last_stream_id =
-                    u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7FFF_FFFF;
-                let error_code = u32::from_be_bytes(payload[4..8].try_into().unwrap());
-                Ok(Some(Frame::GoAway {
-                    last_stream_id,
-                    error_code,
-                    debug_data: payload[8..].into(),
-                }))
-            }
-            FrameKind::Continuation => {
-                if stream_id == 0 {
-                    return Err(FrameError::ProtocolError(
-                        "CONTINUATION frame with stream ID 0",
-                    ));
-                }
-                Ok(Some(Frame::Continuation {
-                    stream_id,
-                    end_headers: flags & 0x4 != 0,
-                    payload,
-                }))
-            }
-            // Priority, PushPromise, Unknown — skip
-            _ => Ok(None),
         }
     }
 }

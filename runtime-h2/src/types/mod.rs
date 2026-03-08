@@ -1,4 +1,6 @@
-use bytes::BytesMut;
+use crate::codec::frames::headers::Headers;
+use crate::codec::frames::stream_id::StreamId;
+use crate::hpack;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
@@ -11,20 +13,18 @@ pub enum Setting {
     Unknown { id: u16, value: u32 },
 }
 
+pub const HEADER_LEN: usize = 9;
+
 #[derive(Debug)]
 pub enum Frame {
     Data {
-        stream_id: u32,
+        stream_id: StreamId,
         end_stream: bool,
         data: Vec<u8>,
     },
-    Headers {
-        stream_id: u32,
-        flags: u8,
-        payload: BytesMut,
-    },
+    Headers(Headers),
     RstStream {
-        stream_id: u32,
+        stream_id: StreamId,
         error_code: u32,
     },
     Settings {
@@ -36,18 +36,13 @@ pub enum Frame {
         opaque: [u8; 8],
     },
     GoAway {
-        last_stream_id: u32,
+        last_stream_id: StreamId,
         error_code: u32,
         debug_data: Vec<u8>,
     },
     WindowUpdate {
-        stream_id: u32,
+        stream_id: StreamId,
         increment: u32,
-    },
-    Continuation {
-        stream_id: u32,
-        end_headers: bool,
-        payload: BytesMut,
     },
 }
 
@@ -55,4 +50,5 @@ pub enum Frame {
 pub enum FrameError {
     FrameSizeError(u32),
     ProtocolError(&'static str),
+    Hpack(hpack::Error),
 }

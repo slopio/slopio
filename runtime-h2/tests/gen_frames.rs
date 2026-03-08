@@ -1,5 +1,5 @@
 /// Generates a binary file containing a sequence of valid HTTP/2 frames
-/// for testing the frame decoder.
+/// for testing the frame decoder with HPACK decoding.
 ///
 /// Run with: cargo test -p runtime-h2 --test gen_frames -- --ignored
 use std::fs;
@@ -9,7 +9,6 @@ use std::path::Path;
 fn frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(9 + payload.len());
-    // 3-byte length
     buf.push((len >> 16) as u8);
     buf.push((len >> 8) as u8);
     buf.push(len as u8);
@@ -43,14 +42,15 @@ fn generate_frames_bin() {
     // --- 3. WINDOW_UPDATE frame (type 0x8), stream 0, increment=65535 ---
     out.extend(frame(0x8, 0x0, 0, &65535u32.to_be_bytes()));
 
-    // --- 4. HEADERS frame (type 0x1), stream 1, END_HEADERS=0x4 ---
-    // Fake HPACK payload (not real headers, just bytes for frame-level testing)
-    let hpack = b"\x82\x86\x84\x41\x8a\x08\x9d\x5c\x0b\x81\x70\xdc\x78\x0f\x03";
-    out.extend(frame(0x1, 0x4, 1, hpack));
+    // --- 4. HEADERS frame (type 0x1), stream 1, END_HEADERS|END_STREAM=0x5 ---
+    // Valid HPACK: :method GET (idx 2), :path / (idx 4), :scheme https (idx 7)
+    let hpack_request = &[0x82, 0x84, 0x87];
+    out.extend(frame(0x1, 0x5, 1, hpack_request));
 
-    // --- 5. HEADERS frame (type 0x1), stream 1, END_HEADERS|END_STREAM=0x5 ---
-    let hpack2 = b"\x82\x86\x84";
-    out.extend(frame(0x1, 0x5, 1, hpack2));
+    // --- 5. HEADERS frame (type 0x1), stream 3, END_HEADERS=0x4 (no END_STREAM) ---
+    // Valid HPACK: :method GET (idx 2), :path / (idx 4), :scheme http (idx 6)
+    let hpack_request2 = &[0x82, 0x84, 0x86];
+    out.extend(frame(0x1, 0x4, 3, hpack_request2));
 
     // --- 6. DATA frame (type 0x0), stream 1, no flags ---
     let body = b"Hello, HTTP/2!";
@@ -74,22 +74,24 @@ fn generate_frames_bin() {
 
     // --- 12. GOAWAY (type 0x7), stream 0, last_stream=1, error=NO_ERROR(0x0) ---
     let mut goaway = Vec::new();
-    goaway.extend_from_slice(&1u32.to_be_bytes()); // last_stream_id
-    goaway.extend_from_slice(&0u32.to_be_bytes()); // error_code
+    goaway.extend_from_slice(&1u32.to_be_bytes());
+    goaway.extend_from_slice(&0u32.to_be_bytes());
     goaway.extend_from_slice(b"server shutting down");
     out.extend(frame(0x7, 0x0, 0, &goaway));
 
-    // --- 13. CONTINUATION (type 0x9), stream 3, no END_HEADERS ---
-    out.extend(frame(0x9, 0x0, 3, b"\x82\x86"));
+    // --- 13-14. HEADERS + CONTINUATION (split header block) ---
+    // HEADERS (type 0x1) stream 5, no END_HEADERS (flags=0x0)
+    // First part: :method POST (idx 3)
+    out.extend(frame(0x1, 0x0, 5, &[0x83]));
+    // CONTINUATION (type 0x9) stream 5, END_HEADERS=0x4
+    // Second part: :path / (idx 4), :scheme https (idx 7)
+    out.extend(frame(0x9, 0x4, 5, &[0x84, 0x87]));
 
-    // --- 14. CONTINUATION (type 0x9), stream 3, END_HEADERS=0x4 ---
-    out.extend(frame(0x9, 0x4, 3, b"\x84"));
-
-    // --- 15. PRIORITY (type 0x2), stream 5 — decoder should skip this ---
+    // --- 15. PRIORITY (type 0x2), stream 7 — decoder should skip this ---
     let mut prio = Vec::new();
-    prio.extend_from_slice(&0u32.to_be_bytes()); // stream dependency
-    prio.push(15); // weight
-    out.extend(frame(0x2, 0x0, 5, &prio));
+    prio.extend_from_slice(&0u32.to_be_bytes());
+    prio.push(15);
+    out.extend(frame(0x2, 0x0, 7, &prio));
 
     let path = dir.join("frames.bin");
     fs::write(&path, &out).unwrap();
