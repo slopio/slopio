@@ -45,6 +45,7 @@ impl<F: Future> TypedTask<F> {
 
     pub fn poll(mut self) {
         let inner = unsafe { self.inner.as_mut() };
+        inner.header.queued.set(false);
         let state = &mut inner.data.state;
         match state {
             State::Running(future) => {
@@ -72,7 +73,12 @@ impl<F: Future> TypedTask<F> {
         }
     }
 
-    pub fn wake_by_val(self) {
+    pub fn wake_by_val(mut self) {
+        let inner = unsafe { self.inner.as_mut() };
+        if inner.header.queued.get() {
+            return;
+        }
+        inner.header.queued.set(true);
         let erased = self.erase_type();
         TASK_LIST.with(|ctx| {
             ctx.push(erased);
@@ -80,6 +86,11 @@ impl<F: Future> TypedTask<F> {
     }
 
     pub fn wake_by_ref(&self) {
+        let inner = unsafe { &*self.inner.as_ptr() };
+        if inner.header.queued.get() {
+            return;
+        }
+        inner.header.queued.set(true);
         let erased = self.erase_type();
         TASK_LIST.with(|ctx| {
             ctx.push(erased);
@@ -103,8 +114,9 @@ impl<F: Future> TypedTask<F> {
     pub fn new(future: F) -> Self {
         let ptr = Box::into_raw(Box::new(TypedTaskInner::<F> {
             header: Metadata {
-                vtable: table::<F>(),
                 detached_mode: Cell::new(false),
+                queued: Cell::new(true),
+                vtable: table::<F>(),
                 #[cfg(feature = "tracing")]
                 tracing: match current_trace_id() {
                     Some(trace_id) => TaskTelemetry::with_trace_id(trace_id),

@@ -13,6 +13,7 @@ pub(crate) mod typed_task;
 
 pub struct Metadata {
     detached_mode: Cell<bool>,
+    pub(crate) queued: Cell<bool>,
     vtable: &'static Vtable,
     #[cfg(feature = "tracing")]
     pub(crate) tracing: TaskTelemetry,

@@ -108,9 +108,10 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let state = unsafe { &mut *(*self.shared.0).get() };
         state.sender_dropped = true;
-        state.wake_recv();
         if state.receiver_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
+        } else {
+            state.wake_recv();
         }
     }
 }
@@ -120,9 +121,10 @@ impl<T> Drop for Receiver<T> {
         let state = unsafe { &mut *(*self.shared.0).get() };
         state.receiver_dropped = true;
         state.data.clear();
-        state.wake_send();
         if state.sender_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
+        } else {
+            state.wake_send();
         }
     }
 }

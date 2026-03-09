@@ -67,9 +67,10 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let state = unsafe { &mut *(*self.shared.0).get() };
         state.sender_dropped = true;
-        state.wake();
         if state.receiver_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
+        } else {
+            state.wake();
         }
     }
 }
@@ -165,6 +166,16 @@ impl<T> Receiver<T> {
     pub fn recv_all(&self) -> RecvAllFuture<'_, T> {
         RecvAllFuture {
             shared: &self.shared,
+        }
+    }
+
+    #[inline]
+    pub fn try_recv_all(&self) -> Option<Vec<T>> {
+        let state = unsafe { &mut *(*self.shared.0).get() };
+        if state.data.is_empty() {
+            None
+        } else {
+            Some(state.data.drain(..).collect())
         }
     }
 }

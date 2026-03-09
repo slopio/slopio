@@ -1,11 +1,10 @@
-use runtime_core::channels::{Receiver, Sender};
+use runtime_core::channels::Sender;
 use runtime_core::io_driver::operations::sockets::{
     SocketWrapper, multi_accept::MultiAccept, recv::socket_recv_init, send::socket_send,
 };
 use runtime_core::runtime::spawn;
 use runtime_streams::StreamExt;
 
-use crate::codec::frames::headers::Headers;
 use crate::server::connection::Connection;
 use crate::types::Frame;
 
@@ -38,14 +37,6 @@ pub struct StreamSendingEnd {
     window: u32,
     sender: Sender<Frame>,
 }
-
-pub struct H2Stream {
-    receiver: Receiver<Frame>,
-    headers: Headers,
-    output: std::rc::Rc<Sender<Frame>>,
-}
-
-impl H2Stream {}
 
 impl H2Server {
     pub fn new(port: u16) -> Self {
