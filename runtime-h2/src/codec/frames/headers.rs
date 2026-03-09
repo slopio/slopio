@@ -164,24 +164,13 @@ impl Headers {
             src.advance(1);
         }
 
-        // // Read the stream dependency
-        // let stream_dep = if flags.is_priority() {
-        //     if src.len() < 5 {
-        //         return Err(Error::MalformedMessage);
-        //     }
-        //     let stream_dep = StreamDependency::load(&src[..5])?;
-
-        //     if stream_dep.dependency_id() == head.stream_id() {
-        //         return Err(Error::InvalidDependencyId);
-        //     }
-
-        //     // Drop the next 5 bytes
-        //     src.advance(5);
-
-        //     Some(stream_dep)
-        // } else {
-        //     None
-        // };
+        // Skip priority data if present (5 bytes: 4-byte stream dependency + 1-byte weight)
+        if flags.is_priority() {
+            if src.len() < 5 {
+                return Err(Error::MalformedMessage);
+            }
+            src.advance(5);
+        }
 
         if pad > 0 {
             if pad > src.len() {

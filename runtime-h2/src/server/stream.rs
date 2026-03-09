@@ -3,7 +3,7 @@ use std::{fmt::Debug, mem};
 use runtime_core::channels::Receiver;
 
 use crate::{codec::frames::headers::Headers, types::Frame};
-use crate::server::connection::SharedOutput;
+use crate::server::output::SharedOutput;
 
 pub struct Stream {
     pub headers: Headers,

@@ -9,6 +9,7 @@ use crate::server::connection::Connection;
 use crate::types::Frame;
 
 mod connection;
+pub(crate) mod output;
 mod stream;
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -60,11 +61,12 @@ async fn handle_connection(socket: SocketWrapper) -> Result<(), Box<dyn std::err
     let mut preface_buf = [0u8; 24];
     recv_exact(&socket, &mut preface_buf).await?;
     if &preface_buf[..] != CLIENT_PREFACE {
+        socket.sync_shutdown();
         return Err("invalid client preface".into());
     }
     send_all(&socket, SERVER_SETTINGS).await?;
     let mut connection = Connection::new(socket);
-    connection.run().await.unwrap();
+    connection.run().await?;
     Ok(())
 }
 

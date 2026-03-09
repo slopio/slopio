@@ -158,12 +158,7 @@ impl FrameEncoder {
         self.buf.extend_from_slice(opaque);
     }
 
-    fn encode_goaway(
-        &mut self,
-        last_stream_id: StreamId,
-        error_code: u32,
-        debug_data: &[u8],
-    ) {
+    fn encode_goaway(&mut self, last_stream_id: StreamId, error_code: u32, debug_data: &[u8]) {
         let len = 8 + debug_data.len() as u32;
         self.write_frame_header(len, GOAWAY, 0, StreamId::ZERO);
         self.buf
@@ -175,5 +170,11 @@ impl FrameEncoder {
     fn encode_window_update(&mut self, stream_id: StreamId, increment: u32) {
         self.write_frame_header(4, WINDOW_UPDATE, 0, stream_id);
         self.buf.extend_from_slice(&increment.to_be_bytes());
+    }
+}
+
+impl Default for FrameEncoder {
+    fn default() -> Self {
+        Self::new()
     }
 }

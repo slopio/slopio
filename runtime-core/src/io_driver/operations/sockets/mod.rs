@@ -73,6 +73,15 @@ impl SocketWrapper {
     }
 }
 
+impl SocketWrapper {
+    pub fn sync_shutdown(self) {
+        unsafe {
+            libc::shutdown(self.fd, libc::SHUT_RDWR);
+        }
+        // self is dropped here, which calls close(fd)
+    }
+}
+
 impl Drop for SocketWrapper {
     fn drop(&mut self) {
         unsafe {

@@ -51,4 +51,24 @@ pub enum FrameError {
     FrameSizeError(u32),
     ProtocolError(&'static str),
     Hpack(hpack::Error),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::FrameSizeError(size) => write!(f, "frame size error: {size}"),
+            FrameError::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
+            FrameError::Hpack(e) => write!(f, "hpack error: {e:?}"),
+            FrameError::Io(e) => write!(f, "io error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+impl From<std::io::Error> for FrameError {
+    fn from(e: std::io::Error) -> Self {
+        FrameError::Io(e)
+    }
 }
