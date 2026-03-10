@@ -158,7 +158,6 @@ impl Connection {
         for frame in frames {
             match frame {
                 OutputFrame::StreamDone(stream_id) => {
-                    println!("removing {stream_id}");
                     self.streams.remove(&stream_id);
                     match self.state {
                         ConnectionState::Alive => {
@@ -392,6 +391,41 @@ impl Connection {
         Ok(())
     }
 
+    fn handle_settings(&mut self, settings: &[Setting]) {
+        for setting in settings {
+            match *setting {
+                Setting::HeaderTableSize(v) => {
+                    self.peer_settings.header_table_size = v;
+                }
+                Setting::EnablePush(v) => {
+                    self.peer_settings.enable_push = v != 0;
+                }
+                Setting::MaxConcurrentStreams(v) => {
+                    self.peer_settings.max_concurrent_streams = v;
+                }
+                Setting::InitialWindowSize(v) => {
+                    let old = self.peer_settings.initial_window_size;
+                    self.peer_settings.initial_window_size = v;
+                    if old != v {
+                        for stream in self.streams.values() {
+                            stream.sender.send(InputStreamEvent::Window(
+                                WindowModification::InitialSizeChange { old, new: v },
+                            ));
+                        }
+                    }
+                }
+                Setting::MaxFrameSize(v) => {
+                    self.peer_settings.max_frame_size = v;
+                }
+                Setting::MaxHeaderListSize(v) => {
+                    self.peer_settings.max_header_list_size = v;
+                }
+                Setting::Unknown { .. } => {}
+            }
+        }
+        self.output.send_settings_ack();
+    }
+
     fn process_incoming(&mut self, data: &[u8]) -> Result<(), FrameError> {
         self.decoder.decode(data)?;
         while let Some(frame) = self.decoder.frames.pop_front() {
@@ -425,41 +459,7 @@ impl Connection {
                 }
                 Frame::Settings { ack, settings } => {
                     if !ack {
-                        for setting in &settings {
-                            match *setting {
-                                Setting::HeaderTableSize(v) => {
-                                    self.peer_settings.header_table_size = v;
-                                }
-                                Setting::EnablePush(v) => {
-                                    self.peer_settings.enable_push = v != 0;
-                                }
-                                Setting::MaxConcurrentStreams(v) => {
-                                    self.peer_settings.max_concurrent_streams = v;
-                                }
-                                Setting::InitialWindowSize(v) => {
-                                    let old = self.peer_settings.initial_window_size;
-                                    self.peer_settings.initial_window_size = v;
-                                    if old != v {
-                                        for stream in self.streams.values() {
-                                            stream.sender.send(InputStreamEvent::Window(
-                                                WindowModification::InitialSizeChange {
-                                                    old,
-                                                    new: v,
-                                                },
-                                            ));
-                                        }
-                                    }
-                                }
-                                Setting::MaxFrameSize(v) => {
-                                    self.peer_settings.max_frame_size = v;
-                                }
-                                Setting::MaxHeaderListSize(v) => {
-                                    self.peer_settings.max_header_list_size = v;
-                                }
-                                Setting::Unknown { .. } => {}
-                            }
-                        }
-                        self.output.send_settings_ack();
+                        self.handle_settings(&settings);
                     }
                 }
             }

@@ -11,7 +11,6 @@ use crate::types::{FLOW_CONTROL_ERROR, PROTOCOL_ERROR};
 
 mod body;
 pub mod events_in;
-mod events_out;
 mod window;
 
 enum StreamError {

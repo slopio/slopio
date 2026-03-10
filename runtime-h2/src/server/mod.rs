@@ -23,10 +23,8 @@ const SERVER_SETTINGS: &[u8] = &[
     0x00, // flags = 0
     0, 0, 0, 0, // stream_id = 0
     // SETTINGS_MAX_CONCURRENT_STREAMS (0x3) = 100
-    0x00, 0x03,
-    0x00, 0x00, 0x00, 0x64,
+    0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
 ];
-
 
 pub struct H2Server {
     port: u16,

@@ -6,8 +6,6 @@ use crate::codec::frames::stream_id::StreamId;
 use crate::hpack::{self, Header};
 use crate::types::Frame;
 
-const FRAME_HEADER_LEN: usize = 9;
-
 // Frame types
 const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
@@ -140,7 +138,7 @@ impl FrameEncoder {
         for setting in settings {
             let (id, value) = match *setting {
                 crate::types::Setting::HeaderTableSize(v) => (0x1, v),
-                crate::types::Setting::EnablePush(v) => (0x2, v as u32),
+                crate::types::Setting::EnablePush(v) => (0x2, v),
                 crate::types::Setting::MaxConcurrentStreams(v) => (0x3, v),
                 crate::types::Setting::InitialWindowSize(v) => (0x4, v),
                 crate::types::Setting::MaxFrameSize(v) => (0x5, v),
