@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use bytes::BytesMut;
 use http::header::HeaderName;
-use runtime_core::channels::{Receiver, Sender, unbounded_channel};
+use runtime_core::channels::Sender;
 use runtime_core::io_driver::operations::sockets::{
     SocketWrapper, send_vectored::socket_send_vectored,
 };
@@ -24,6 +24,7 @@ pub enum OutputFrame {
         increment: u32,
         frame: Vec<u8>,
     },
+    StreamDone(StreamId),
 }
 
 struct SharedOutputInner {
@@ -158,6 +159,11 @@ impl SharedOutput {
         inner.sender.send(OutputFrame::Encoded(buf));
     }
 
+    pub fn send_stream_done(&self, stream_id: StreamId) {
+        let inner = unsafe { &mut *self.0.get() };
+        inner.sender.send(OutputFrame::StreamDone(stream_id));
+    }
+
     pub fn send_ping_ack(&self, opaque: &[u8; 8]) {
         let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + 8);
         Self::write_frame_header(&mut buf, 8, 0x06, 0x01, StreamId::ZERO); // type=PING, flags=ACK
@@ -167,16 +173,10 @@ impl SharedOutput {
     }
 }
 
-pub fn new_output_channel() -> (SharedOutput, Receiver<OutputFrame>) {
-    let (sender, receiver) = unbounded_channel::<OutputFrame>();
-    (SharedOutput::new(sender), receiver)
-}
-
 pub async fn flush_output(
     socket: &SocketWrapper,
     frames: Vec<OutputFrame>,
     window: &mut u32,
-    streams: &mut std::collections::HashMap<StreamId, crate::server::StreamSendingEnd>,
 ) -> std::io::Result<()> {
     let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
     for frame in frames {
@@ -191,11 +191,10 @@ pub async fn flush_output(
             } => {
                 if stream_id == StreamId::ZERO {
                     *window += increment;
-                } else if let Some(stream) = streams.get_mut(&stream_id) {
-                    stream.window += increment;
                 }
                 bufs.push(data);
             }
+            OutputFrame::StreamDone(_) => {}
         }
     }
     if !bufs.is_empty() {

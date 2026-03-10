@@ -83,7 +83,7 @@ fn parse_settings(payload: &[u8]) -> Result<Vec<Setting>, FrameError> {
         let value = u32::from_be_bytes(payload[pos + 2..pos + 6].try_into().unwrap());
         let setting = match id {
             0x1 => Setting::HeaderTableSize(value),
-            0x2 => Setting::EnablePush(value != 0),
+            0x2 => Setting::EnablePush(value),
             0x3 => Setting::MaxConcurrentStreams(value),
             0x4 => Setting::InitialWindowSize(value),
             0x5 => Setting::MaxFrameSize(value),
@@ -172,9 +172,19 @@ impl FrameDecoder {
 
         let total = FRAME_HEADER_SIZE + length as usize;
 
+        // If we're accumulating a header block, only CONTINUATION is valid
+        if self.header_block.is_some() && kind != FrameKind::Continuation {
+            return Err(FrameError::ProtocolError(
+                "expected CONTINUATION frame while header block is incomplete",
+            ));
+        }
+
         // Step 3: for constant-size frames, copy just enough to complete the frame
         match kind {
-            FrameKind::RstStream | FrameKind::Ping | FrameKind::WindowUpdate => {
+            FrameKind::RstStream
+            | FrameKind::Ping
+            | FrameKind::WindowUpdate
+            | FrameKind::Priority => {
                 let need = total - self.remaining.len();
                 let available = data.len() - pos;
                 if available < need {
@@ -185,9 +195,11 @@ impl FrameDecoder {
                 pos += need;
 
                 let payload = &self.remaining[FRAME_HEADER_SIZE..total];
-                let frame =
-                    self.decode_constant_len_frame(kind, flags, stream_id, length, payload)?;
-                self.frames.push_back(frame);
+                if let Some(frame) =
+                    self.decode_constant_len_frame(kind, flags, stream_id, length, payload)?
+                {
+                    self.frames.push_back(frame);
+                }
                 self.remaining.clear();
             }
             _ => {
@@ -258,11 +270,23 @@ impl FrameDecoder {
         length: u32,
         payload: &[u8],
     ) -> Result<(), FrameError> {
+        // If we're accumulating a header block, only CONTINUATION is valid
+        if self.header_block.is_some() && kind != FrameKind::Continuation {
+            return Err(FrameError::ProtocolError(
+                "expected CONTINUATION frame while header block is incomplete",
+            ));
+        }
+
         match kind {
-            FrameKind::RstStream | FrameKind::Ping | FrameKind::WindowUpdate => {
+            FrameKind::RstStream
+            | FrameKind::Ping
+            | FrameKind::WindowUpdate
+            | FrameKind::Priority => {
                 let frame =
                     self.decode_constant_len_frame(kind, flags, stream_id, length, payload)?;
-                self.frames.push_back(frame);
+                if let Some(f) = frame {
+                    self.frames.push_back(f);
+                }
             }
             _ => {
                 self.handle_variable_frame(
@@ -286,18 +310,13 @@ impl FrameDecoder {
         length: u32,
         payload: BytesMut,
     ) -> Result<(), FrameError> {
-        // If we're accumulating a header block, only CONTINUATION on the same stream is valid
-        if let Some(ref state) = self.header_block {
-            if kind != FrameKind::Continuation {
-                return Err(FrameError::ProtocolError(
-                    "expected CONTINUATION frame while header block is incomplete",
-                ));
-            }
-            if state.headers.stream_id() != StreamId::from(stream_id) {
-                return Err(FrameError::ProtocolError(
-                    "CONTINUATION frame on different stream than HEADERS",
-                ));
-            }
+        // CONTINUATION stream ID must match the HEADERS stream ID
+        if let Some(ref state) = self.header_block
+            && state.headers.stream_id() != StreamId::from(stream_id)
+        {
+            return Err(FrameError::ProtocolError(
+                "CONTINUATION frame on different stream than HEADERS",
+            ));
         }
 
         match kind {
@@ -341,10 +360,25 @@ impl FrameDecoder {
                 if stream_id == 0 {
                     return Err(FrameError::ProtocolError("DATA frame with stream ID 0"));
                 }
+                let data = if flags & 0x8 != 0 {
+                    // PADDED flag
+                    if payload.is_empty() {
+                        return Err(FrameError::ProtocolError(
+                            "DATA with PADDED flag but no payload",
+                        ));
+                    }
+                    let pad_len = payload[0] as usize;
+                    if pad_len >= payload.len() {
+                        return Err(FrameError::ProtocolError("DATA pad length exceeds payload"));
+                    }
+                    payload[1..payload.len() - pad_len].to_vec()
+                } else {
+                    payload.to_vec()
+                };
                 self.frames.push_back(Frame::Data {
                     stream_id: StreamId::from(stream_id),
                     end_stream: flags & 0x1 != 0,
-                    data: payload.to_vec(),
+                    data,
                 });
             }
             FrameKind::Settings => {
@@ -379,7 +413,10 @@ impl FrameDecoder {
                     debug_data: payload[8..].into(),
                 });
             }
-            // Priority, PushPromise, Unknown — skip
+            FrameKind::PushPromise => {
+                return Err(FrameError::ProtocolError("PUSH_PROMISE from client"));
+            }
+            // Unknown — skip
             _ => {}
         }
         Ok(())
@@ -393,11 +430,17 @@ impl FrameDecoder {
     ) -> Result<Headers, FrameError> {
         headers
             .load_hpack(&mut buf, self.max_header_list_size, &mut self.hpack)
-            .map_err(FrameError::Hpack)?;
+            .map_err(|e| match e {
+                crate::hpack::Error::MalformedMessage => {
+                    FrameError::ProtocolError("malformed message")
+                }
+                other => FrameError::Hpack(other),
+            })?;
         Ok(headers)
     }
 
     /// Decode a fixed-size frame from its complete payload.
+    /// Returns None for frames that are validated but not emitted (e.g. PRIORITY).
     fn decode_constant_len_frame(
         &self,
         kind: FrameKind,
@@ -405,7 +448,7 @@ impl FrameDecoder {
         stream_id: u32,
         length: u32,
         payload: &[u8],
-    ) -> Result<Frame, FrameError> {
+    ) -> Result<Option<Frame>, FrameError> {
         match kind {
             FrameKind::RstStream => {
                 if stream_id == 0 {
@@ -416,10 +459,10 @@ impl FrameDecoder {
                 if length != 4 {
                     return Err(FrameError::FrameSizeError(length));
                 }
-                Ok(Frame::RstStream {
+                Ok(Some(Frame::RstStream {
                     stream_id: StreamId::from(stream_id),
                     error_code: u32::from_be_bytes(payload[..4].try_into().unwrap()),
-                })
+                }))
             }
             FrameKind::Ping => {
                 if stream_id != 0 {
@@ -430,20 +473,34 @@ impl FrameDecoder {
                 if length != 8 {
                     return Err(FrameError::FrameSizeError(length));
                 }
-                Ok(Frame::Ping {
+                Ok(Some(Frame::Ping {
                     ack: flags & 0x1 != 0,
                     opaque: payload[..8].try_into().unwrap(),
-                })
+                }))
             }
             FrameKind::WindowUpdate => {
                 if length != 4 {
                     return Err(FrameError::FrameSizeError(length));
                 }
                 let increment = u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7FFF_FFFF;
-                Ok(Frame::WindowUpdate {
+                Ok(Some(Frame::WindowUpdate {
                     stream_id: StreamId::from(stream_id),
                     increment,
-                })
+                }))
+            }
+            FrameKind::Priority => {
+                if stream_id == 0 {
+                    return Err(FrameError::ProtocolError("PRIORITY frame with stream ID 0"));
+                }
+                if length != 5 {
+                    return Err(FrameError::FrameSizeError(length));
+                }
+                let (dep_id, _exclusive) = StreamId::parse(&payload[..4]);
+                if dep_id == StreamId::from(stream_id) {
+                    return Err(FrameError::ProtocolError("stream depends on itself"));
+                }
+                // Validated but not emitted — priority is ignored
+                Ok(None)
             }
             _ => unreachable!(),
         }

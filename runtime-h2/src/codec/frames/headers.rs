@@ -20,13 +20,21 @@ pub struct Headers {
     /// The ID of the stream with which this frame is associated.
     stream_id: StreamId,
 
-    // /// The stream dependency information, if any.
-    // stream_dep: Option<StreamDependency>,
+    /// The stream dependency information, if any.
+    stream_dep: Option<StreamDependency>,
+
     /// The header block fragment
     header_block: HeaderBlock,
 
     /// The associated flags
     flags: HeadersFlag,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct StreamDependency {
+    pub dependency_id: StreamId,
+    pub weight: u8,
+    pub exclusive: bool,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -115,7 +123,7 @@ impl Headers {
     pub fn new(stream_id: StreamId, pseudo: Pseudo, fields: HeaderMap) -> Self {
         Headers {
             stream_id,
-            // stream_dep: None,
+            stream_dep: None,
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
@@ -132,6 +140,7 @@ impl Headers {
 
         Headers {
             stream_id,
+            stream_dep: None,
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
@@ -164,13 +173,22 @@ impl Headers {
             src.advance(1);
         }
 
-        // Skip priority data if present (5 bytes: 4-byte stream dependency + 1-byte weight)
-        if flags.is_priority() {
+        // Parse priority data if present (5 bytes: 4-byte stream dependency + 1-byte weight)
+        let stream_dep = if flags.is_priority() {
             if src.len() < 5 {
                 return Err(Error::MalformedMessage);
             }
+            let (dependency_id, exclusive) = StreamId::parse(&src[..4]);
+            let weight = src[4];
             src.advance(5);
-        }
+            Some(StreamDependency {
+                dependency_id,
+                weight,
+                exclusive,
+            })
+        } else {
+            None
+        };
 
         if pad > 0 {
             if pad > src.len() {
@@ -183,7 +201,7 @@ impl Headers {
 
         let headers = Headers {
             stream_id: head.stream_id(),
-            // stream_dep,
+            stream_dep,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
                 field_size: 0,
@@ -207,6 +225,10 @@ impl Headers {
 
     pub fn stream_id(&self) -> StreamId {
         self.stream_id
+    }
+
+    pub fn stream_dep(&self) -> Option<&StreamDependency> {
+        self.stream_dep.as_ref()
     }
 
     pub fn is_end_headers(&self) -> bool {
@@ -233,18 +255,8 @@ impl Headers {
         (self.header_block.pseudo, self.header_block.fields)
     }
 
-    #[cfg(feature = "unstable")]
-    pub fn pseudo_mut(&mut self) -> &mut Pseudo {
-        &mut self.header_block.pseudo
-    }
-
     pub fn pseudo(&self) -> &Pseudo {
         &self.header_block.pseudo
-    }
-
-    /// Whether it has status 1xx
-    pub(crate) fn is_informational(&self) -> bool {
-        self.header_block.pseudo.is_informational()
     }
 
     pub fn fields(&self) -> &HeaderMap {
@@ -276,32 +288,6 @@ impl Headers {
     }
 }
 
-// impl<T> From<Headers> for Frame<T> {
-//     fn from(src: Headers) -> Self {
-//         Frame::Headers(src)
-//     }
-// }
-
-// impl fmt::Debug for Headers {
-//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-//         let mut builder = f.debug_struct("Headers");
-//         builder
-//             .field("stream_id", &self.stream_id)
-//             .field("flags", &self.flags);
-
-//         if let Some(ref protocol) = self.header_block.pseudo.protocol {
-//             builder.field("protocol", protocol);
-//         }
-
-//         if let Some(ref dep) = self.stream_dep {
-//             builder.field("stream_dep", dep);
-//         }
-
-//         // `fields` and `pseudo` purposefully not included
-//         builder.finish()
-//     }
-// }
-
 // ===== util =====
 
 #[derive(Debug, PartialEq, Eq)]
@@ -316,7 +302,7 @@ pub fn parse_u64(src: &[u8]) -> Result<u64, ParseU64Error> {
     let mut ret = 0;
 
     for &d in src {
-        if d < b'0' || d > b'9' {
+        if !d.is_ascii_digit() {
             return Err(ParseU64Error);
         }
 
@@ -385,11 +371,6 @@ impl PushPromise {
 
     pub fn fields(&self) -> &HeaderMap {
         &self.header_block.fields
-    }
-
-    #[cfg(feature = "unstable")]
-    pub fn into_fields(self) -> HeaderMap {
-        self.header_block.fields
     }
 
     /// Loads the push promise frame but doesn't actually do HPACK decoding.
@@ -595,11 +576,6 @@ impl Pseudo {
         }
     }
 
-    #[cfg(feature = "unstable")]
-    pub fn set_status(&mut self, value: StatusCode) {
-        self.status = Some(value);
-    }
-
     pub fn set_scheme(&mut self, scheme: uri::Scheme) {
         let bytes_str = match scheme.as_str() {
             "http" => BytesStr::from_static("http"),
@@ -609,11 +585,6 @@ impl Pseudo {
         self.scheme = Some(bytes_str);
     }
 
-    #[cfg(feature = "unstable")]
-    pub fn set_protocol(&mut self, protocol: Protocol) {
-        self.protocol = Some(protocol);
-    }
-
     pub fn set_authority(&mut self, authority: BytesStr) {
         self.authority = Some(authority);
     }
@@ -621,7 +592,7 @@ impl Pseudo {
     /// Whether it has status 1xx
     pub(crate) fn is_informational(&self) -> bool {
         self.status
-            .map_or(false, |status| status.is_informational())
+            .map_or_else(|| false, |status| status.is_informational())
     }
 }
 

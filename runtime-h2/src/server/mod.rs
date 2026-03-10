@@ -6,7 +6,7 @@ use runtime_core::runtime::spawn;
 use runtime_streams::StreamExt;
 
 use crate::server::connection::Connection;
-use crate::types::Frame;
+use crate::server::stream::events_in::InputStreamEvent;
 
 mod connection;
 pub(crate) mod output;
@@ -14,29 +14,33 @@ mod stream;
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-/// Initial SETTINGS frame: empty (use defaults), no ACK
+pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// Initial SETTINGS frame with MAX_CONCURRENT_STREAMS=100
 const SERVER_SETTINGS: &[u8] = &[
-    0, 0, 0,    // length = 0
+    0, 0, 6,    // length = 6 (one setting: id(2) + value(4))
     0x04, // type = SETTINGS
     0x00, // flags = 0
     0, 0, 0, 0, // stream_id = 0
+    // SETTINGS_MAX_CONCURRENT_STREAMS (0x3) = 100
+    0x00, 0x03,
+    0x00, 0x00, 0x00, 0x64,
 ];
 
-/// SETTINGS ACK frame
-pub(crate) const SETTINGS_ACK: &[u8] = &[
-    0, 0, 0,    // length = 0
-    0x04, // type = SETTINGS
-    0x01, // flags = ACK
-    0, 0, 0, 0, // stream_id = 0
-];
 
 pub struct H2Server {
     port: u16,
 }
 
-pub struct StreamSendingEnd {
-    window: u32,
-    sender: Sender<Frame>,
+pub enum StreamState {
+    Open,
+    HalfClosedRemote,
+    Closed,
+}
+
+pub struct StreamMapState {
+    sender: Sender<InputStreamEvent>,
+    state: StreamState,
 }
 
 impl H2Server {
