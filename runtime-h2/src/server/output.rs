@@ -185,13 +185,11 @@ pub async fn flush_output(
                 bufs.push(data);
             }
             OutputFrame::WindowUpdate {
-                stream_id,
                 increment,
                 frame: data,
+                ..
             } => {
-                if stream_id == StreamId::ZERO {
-                    *window += increment;
-                }
+                *window += increment;
                 bufs.push(data);
             }
             OutputFrame::StreamDone(_) => {}
