@@ -61,6 +61,12 @@ impl<T> Sender<T> {
             state.wake();
         }
     }
+
+    #[inline]
+    pub fn purge(&self) {
+        let state = unsafe { &mut *(*self.shared.0).get() };
+        state.data.clear();
+    }
 }
 
 impl<T> Drop for Sender<T> {

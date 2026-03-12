@@ -357,6 +357,7 @@ impl Connection {
             .streams
             .get_mut(&stream_id)
             .ok_or(FrameError::ProtocolError("RST_STREAM on unknown stream"))?;
+        stream.sender.purge(); //we don't need the other messages anymore
         stream.sender.send(InputStreamEvent::ResetFrame);
         stream.state = StreamState::Closed;
         Ok(())
