@@ -6,11 +6,14 @@ use runtime_core::runtime::spawn;
 use runtime_streams::StreamExt;
 
 use crate::server::connection::Connection;
+use crate::server::stream::Handler;
 use crate::server::stream::events_in::InputStreamEvent;
 
 mod connection;
 pub(crate) mod output;
-mod stream;
+pub mod stream;
+
+pub use stream::{Stream, StreamError};
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -26,8 +29,9 @@ const SERVER_SETTINGS: &[u8] = &[
     0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
 ];
 
-pub struct H2Server {
+pub struct H2Server<H> {
     port: u16,
+    handler: H,
 }
 
 pub enum StreamState {
@@ -41,25 +45,25 @@ pub struct StreamMapState {
     state: StreamState,
 }
 
-impl H2Server {
-    pub fn new(port: u16) -> Self {
-        Self { port }
+impl<H: Handler + Clone + 'static> H2Server<H> {
+    pub fn new(port: u16, handler: H) -> Self {
+        Self { port, handler }
     }
 
     pub async fn run(&self) {
         let mut listener = MultiAccept::new(self.port).unwrap();
 
         while let Some(socket) = listener.next().await {
-            spawn(async move {
-                if let Err(e) = handle_connection(socket).await {
-                    eprintln!("h2 connection error: {e}");
-                }
-            });
+            let handler = self.handler.clone();
+            spawn(async move { handle_connection(socket, handler).await });
         }
     }
 }
 
-async fn handle_connection(socket: SocketWrapper) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_connection<H: Handler + Clone + 'static>(
+    socket: SocketWrapper,
+    handler: H,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut preface_buf = [0u8; 24];
     recv_exact(&socket, &mut preface_buf).await?;
     if &preface_buf[..] != CLIENT_PREFACE {
@@ -67,7 +71,7 @@ async fn handle_connection(socket: SocketWrapper) -> Result<(), Box<dyn std::err
         return Err("invalid client preface".into());
     }
     send_all(&socket, SERVER_SETTINGS).await?;
-    let mut connection = Connection::new(socket);
+    let mut connection = Connection::new(socket, handler);
     connection.run().await?;
     Ok(())
 }

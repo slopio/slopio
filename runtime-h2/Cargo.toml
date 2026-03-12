@@ -13,6 +13,9 @@ runtime-core = { path = "../runtime-core" }
 runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }
 zerocopy = { version = "0.8", features = ["derive"] }
 
+[features]
+tracing = ["runtime-core/tracing"]
+
 [dev-dependencies]
 quickcheck = "1"
 rand = "0.8"

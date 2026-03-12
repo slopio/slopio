@@ -1,9 +1,13 @@
 use std::fmt::Debug;
+use std::future::Future;
+use std::thread::yield_now;
 
 use runtime_core::channels::Receiver;
-use runtime_streams::StreamExt;
 
-use crate::codec::frames::headers::Headers;
+use http::{HeaderMap, StatusCode};
+
+use crate::codec::frames::headers::{Headers, Pseudo};
+use crate::codec::frames::stream_id::StreamId;
 use crate::server::output::SharedOutput;
 use crate::server::stream::events_in::InputStreamEvent;
 use crate::server::stream::window::SendWindow;
@@ -19,12 +23,38 @@ pub enum StreamError {
     Protocol,
 }
 
+pub trait Handler {
+    fn process_headers_only(
+        &self,
+        headers: &Headers,
+    ) -> impl Future<Output = Result<Option<Response>, StreamError>>;
+
+    fn process_accumulated_body(
+        &self,
+        headers: &Headers,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<Option<Response>, StreamError>>;
+
+    fn process_stream(
+        &self,
+        stream: &mut Stream,
+    ) -> impl Future<Output = Result<Option<Response>, StreamError>>;
+}
+
+#[derive(Debug)]
+pub struct Response {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Option<Vec<u8>>,
+}
+
 pub struct Stream {
     pub headers: Headers,
     pub output: SharedOutput,
     receiver: Receiver<InputStreamEvent>,
     send_window: SendWindow,
     state: StreamState,
+    end_of_data: bool,
 }
 
 pub enum StreamState {
@@ -35,6 +65,9 @@ pub enum StreamState {
 
 impl StreamState {
     fn from_headers(headers: &Headers) -> Self {
+        if headers.is_end_stream() {
+            return Self::HeadersOnly;
+        }
         match headers
             .fields()
             .get(http::header::CONTENT_LENGTH)
@@ -69,6 +102,7 @@ impl Stream {
             receiver,
             send_window: SendWindow::init(initial_window_size),
             state,
+            end_of_data: false,
         }
     }
 
@@ -77,14 +111,17 @@ impl Stream {
     /// `Ok(None)` when END_STREAM is received or sender is gone,
     /// `Err` on reset or window overflow.
     pub async fn recv_data(&mut self) -> Result<Option<Vec<u8>>, StreamError> {
+        if self.end_of_data {
+            return Ok(None);
+        }
         loop {
             match self.receiver.recv().await {
                 Some(InputStreamEvent::Data { data, end_stream }) => {
                     if end_stream {
+                        self.end_of_data = true;
                         if data.is_empty() {
                             return Ok(None);
                         }
-                        // TODO: you may want to signal end_stream separately
                         return Ok(Some(data));
                     }
                     return Ok(Some(data));
@@ -97,7 +134,6 @@ impl Stream {
                             self.send_window.adjust_initial(old, new)?
                         }
                     }
-                    // loop again — not a data event
                 }
                 Some(InputStreamEvent::Header { .. }) => {
                     // trailers — treat as end of body
@@ -109,48 +145,129 @@ impl Stream {
         }
     }
 
-    fn write_err(&mut self, error: StreamError) {}
-    fn write_response(&mut self, response: Response) {}
+    fn write_err(&mut self, error: StreamError) {
+        let stream_id = self.headers.stream_id();
+        let error_code = match error {
+            StreamError::Reset => crate::types::CANCEL,
+            StreamError::WindowOverflow => crate::types::FLOW_CONTROL_ERROR,
+            StreamError::ContentLengthMismatch => crate::types::PROTOCOL_ERROR,
+            StreamError::Protocol => crate::types::PROTOCOL_ERROR,
+        };
+        self.output.send_rst_stream(stream_id, error_code);
+        self.output.send_stream_done(stream_id);
+    }
+
+    fn drain_pending_events(&mut self) -> Result<(), StreamError> {
+        if let Some(events) = self.receiver.try_recv_all() {
+            for event in events {
+                match event {
+                    InputStreamEvent::Window(modification) => {
+                        self.apply_window(modification)?;
+                    }
+                    InputStreamEvent::ResetFrame => {
+                        return Err(StreamError::Reset);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_window(
+        &mut self,
+        modification: events_in::WindowModification,
+    ) -> Result<(), StreamError> {
+        use events_in::WindowModification;
+        match modification {
+            WindowModification::Increment(inc) => self.send_window.add(inc),
+            WindowModification::InitialSizeChange { old, new } => {
+                self.send_window.adjust_initial(old, new)
+            }
+        }
+    }
+
+    async fn wait_for_window(&mut self) -> Result<(), StreamError> {
+        loop {
+            if self.send_window.get() > 0 {
+                return Ok(());
+            }
+            match self.receiver.recv().await {
+                Some(InputStreamEvent::Window(modification)) => {
+                    self.apply_window(modification)?;
+                }
+                Some(InputStreamEvent::ResetFrame) => return Err(StreamError::Reset),
+                None => return Err(StreamError::Reset),
+                _ => {}
+            }
+        }
+    }
+
+    async fn write_response(&mut self, response: Response) -> Result<(), StreamError> {
+        self.drain_pending_events()?;
+        let stream_id = self.headers.stream_id();
+        let has_body = response.body.is_some();
+
+        let pseudo = Pseudo::response(response.status);
+        let mut headers = Headers::new(stream_id, pseudo, response.headers);
+        if !has_body {
+            headers.set_end_stream();
+        }
+        self.output.send_headers(&headers);
+
+        if let Some(body) = response.body {
+            let mut offset = 0;
+            while offset < body.len() {
+                self.wait_for_window().await?;
+                let window = self.send_window.get() as usize;
+                let chunk_len = window.min(body.len() - offset);
+                let end_stream = offset + chunk_len == body.len();
+                self.output.send_data(
+                    stream_id,
+                    end_stream,
+                    body[offset..offset + chunk_len].to_vec(),
+                );
+                self.send_window.consume(chunk_len as i64);
+                offset += chunk_len;
+            }
+            if body.is_empty() {
+                self.output.send_data(stream_id, true, Vec::new());
+            }
+        }
+
+        self.output.send_stream_done(stream_id);
+        Ok(())
+    }
 }
 
-pub async fn handle_stream(mut stream: Stream) {
-    let res: Result<Option<Response>, StreamError> = {
-        match stream.state {
-            StreamState::HeadersOnly => process_headers_only(&stream.headers).await,
-            StreamState::StreamingBody => process_stream(&mut stream).await,
-            StreamState::AccumulatingBody { len } => {
-                let mut acc = Vec::with_capacity(len);
-                while let Ok(Some(data)) = stream.recv_data().await {
-                    acc.extend_from_slice(&data);
-                }
-                if len == acc.len() {
-                    process_accumulated_body(&stream.headers, acc).await
-                } else {
-                    Err(StreamError::ContentLengthMismatch)
-                }
+pub async fn handle_stream<H: Handler>(mut stream: Stream, handler: H) {
+    let res: Result<Option<Response>, StreamError> = match &stream.state {
+        StreamState::HeadersOnly => handler.process_headers_only(&stream.headers).await,
+        StreamState::StreamingBody => handler.process_stream(&mut stream).await,
+        StreamState::AccumulatingBody { len } => {
+            let len = *len;
+            stream
+                .output
+                .send_window_update(stream.headers.stream_id(), len as u32);
+            stream.output.send_window_update(StreamId::ZERO, len as u32);
+            let mut acc = Vec::with_capacity(len);
+            while let Ok(Some(data)) = stream.recv_data().await {
+                acc.extend_from_slice(&data);
+            }
+            if len == acc.len() {
+                handler.process_accumulated_body(&stream.headers, acc).await
+            } else {
+                Err(StreamError::ContentLengthMismatch)
             }
         }
     };
     match res {
-        Ok(Some(response)) => stream.write_response(response),
+        Ok(Some(response)) => {
+            if let Err(err) = stream.write_response(response).await {
+                stream.write_err(err);
+            }
+        }
         Ok(None) => {}
         Err(err) => stream.write_err(err),
     }
-}
-
-struct Response;
-
-async fn process_headers_only(stream: &Headers) -> Result<Option<Response>, StreamError> {
-    Ok(None)
-}
-
-async fn process_accumulated_body(
-    headers: &Headers,
-    body: Vec<u8>,
-) -> Result<Option<Response>, StreamError> {
-    Ok(None)
-}
-
-async fn process_stream(stream: &mut Stream) -> Result<Option<Response>, StreamError> {
-    Ok(None)
 }

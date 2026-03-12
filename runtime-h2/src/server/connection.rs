@@ -10,7 +10,7 @@ use crate::codec::frames::headers::Headers;
 use crate::server::StreamMapState;
 use crate::server::output::{OutputFrame, SharedOutput, flush_output};
 use crate::server::stream::events_in::{InputStreamEvent, WindowModification};
-use crate::server::stream::{Stream, handle_stream};
+use crate::server::stream::{Handler, Stream, handle_stream};
 use crate::{
     codec::frames::{FrameDecoder, stream_id::StreamId},
     server::{MAX_CONCURRENT_STREAMS, StreamState},
@@ -55,7 +55,7 @@ impl Default for PeerSettings {
     }
 }
 
-pub struct Connection {
+pub struct Connection<H> {
     connection_window: u32,
     socket: Socket,
     decoder: FrameDecoder,
@@ -66,6 +66,7 @@ pub struct Connection {
     output: SharedOutput,
     state: ConnectionState,
     peer_settings: PeerSettings,
+    handler: H,
 }
 
 fn validate_request_headers(headers: &Headers) -> Result<(), FrameError> {
@@ -132,9 +133,9 @@ fn validate_frame(frame: &Frame) -> Result<(), FrameError> {
     Ok(())
 }
 
-impl Connection {
+impl<H: Handler + Clone + 'static> Connection<H> {
     #[must_use]
-    pub fn new(socket: SocketWrapper) -> Self {
+    pub fn new(socket: SocketWrapper, handler: H) -> Self {
         let (output_sender, output_receiver) = unbounded_channel::<OutputFrame>();
         Self {
             connection_window: DEFAULT_WINDOW_SIZE,
@@ -150,6 +151,7 @@ impl Connection {
             output_receiver,
             state: ConnectionState::Alive,
             peer_settings: PeerSettings::default(),
+            handler,
         }
     }
 
@@ -298,12 +300,16 @@ impl Connection {
                 );
 
                 self.active_streams += 1;
-                spawn(handle_stream(Stream::new(
-                    headers,
-                    self.output.clone(),
-                    receiver,
-                    self.peer_settings.initial_window_size,
-                )));
+                let handler = self.handler.clone();
+                spawn(handle_stream(
+                    Stream::new(
+                        headers,
+                        self.output.clone(),
+                        receiver,
+                        self.peer_settings.initial_window_size,
+                    ),
+                    handler,
+                ));
 
                 Ok(())
             }
