@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 
 use runtime_core::channels::Receiver;
+use runtime_streams::StreamExt;
 
 use crate::codec::frames::headers::Headers;
 use crate::server::output::SharedOutput;
@@ -107,6 +108,9 @@ impl Stream {
             }
         }
     }
+
+    fn write_err(&mut self, error: StreamError) {}
+    fn write_response(&mut self, response: Response) {}
 }
 
 pub async fn handle_stream(mut stream: Stream) {
@@ -127,6 +131,11 @@ pub async fn handle_stream(mut stream: Stream) {
             }
         }
     };
+    match res {
+        Ok(Some(response)) => stream.write_response(response),
+        Ok(None) => {}
+        Err(err) => stream.write_err(err),
+    }
 }
 
 struct Response;
