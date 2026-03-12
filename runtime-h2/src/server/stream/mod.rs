@@ -26,11 +26,9 @@ pub struct Stream {
     state: StreamState,
 }
 
-struct Chunks();
-
 pub enum StreamState {
     HeadersOnly,
-    StreamingBody(Chunks),
+    StreamingBody,
     AccumulatingBody { len: usize },
 }
 
@@ -43,7 +41,7 @@ impl StreamState {
             .and_then(|v| v.parse::<usize>().ok())
         {
             Some(len) => Self::AccumulatingBody { len },
-            None => Self::StreamingBody(Chunks()),
+            None => Self::StreamingBody,
         }
     }
 }
@@ -72,12 +70,78 @@ impl Stream {
             state,
         }
     }
+
+    /// Pulls the next data chunk from the stream.
+    /// Returns `Ok(Some(data))` for each DATA frame,
+    /// `Ok(None)` when END_STREAM is received or sender is gone,
+    /// `Err` on reset or window overflow.
+    pub async fn recv_data(&mut self) -> Result<Option<Vec<u8>>, StreamError> {
+        loop {
+            match self.receiver.recv().await {
+                Some(InputStreamEvent::Data { data, end_stream }) => {
+                    if end_stream {
+                        if data.is_empty() {
+                            return Ok(None);
+                        }
+                        // TODO: you may want to signal end_stream separately
+                        return Ok(Some(data));
+                    }
+                    return Ok(Some(data));
+                }
+                Some(InputStreamEvent::Window(modification)) => {
+                    use events_in::WindowModification;
+                    match modification {
+                        WindowModification::Increment(inc) => self.send_window.add(inc)?,
+                        WindowModification::InitialSizeChange { old, new } => {
+                            self.send_window.adjust_initial(old, new)?
+                        }
+                    }
+                    // loop again — not a data event
+                }
+                Some(InputStreamEvent::Header { .. }) => {
+                    // trailers — treat as end of body
+                    return Ok(None);
+                }
+                Some(InputStreamEvent::ResetFrame) => return Err(StreamError::Reset),
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 pub async fn handle_stream(mut stream: Stream) {
-    match stream.state {
-        StreamState::HeadersOnly => todo!(),
-        StreamState::StreamingBody(chunks) => todo!(),
-        StreamState::AccumulatingBody { len } => todo!(),
-    }
+    let res: Result<Option<Response>, StreamError> = {
+        match stream.state {
+            StreamState::HeadersOnly => process_headers_only(&stream.headers).await,
+            StreamState::StreamingBody => process_stream(&mut stream).await,
+            StreamState::AccumulatingBody { len } => {
+                let mut acc = Vec::with_capacity(len);
+                while let Ok(Some(data)) = stream.recv_data().await {
+                    acc.extend_from_slice(&data);
+                }
+                if len == acc.len() {
+                    process_accumulated_body(&stream.headers, acc).await
+                } else {
+                    Err(StreamError::ContentLengthMismatch)
+                }
+            }
+        }
+    };
+}
+
+struct Response;
+
+async fn process_headers_only(stream: &Headers) -> Result<Option<Response>, StreamError> {
+    Ok(None)
+}
+
+async fn process_accumulated_body(
+    headers: &Headers,
+    body: Vec<u8>,
+) -> Result<Option<Response>, StreamError> {
+    Ok(None)
+}
+
+async fn process_stream(stream: &mut Stream) -> Result<Option<Response>, StreamError> {
+    Ok(None)
 }
