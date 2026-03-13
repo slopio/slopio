@@ -8,6 +8,7 @@ use runtime_core::channels::Sender;
 use crate::codec::frames::headers::Headers;
 use crate::codec::frames::stream_id::StreamId;
 use crate::hpack::{self, Header};
+use crate::types::FrameError;
 
 const FRAME_HEADER_LEN: usize = 9;
 const END_STREAM: u8 = 0x1;
@@ -28,6 +29,7 @@ struct SharedOutputInner {
     hpack: hpack::Encoder,
     hpack_buf: BytesMut,
     sender: Sender<OutputFrame>,
+    send_window: i64,
 }
 
 pub struct SharedOutput(Rc<UnsafeCell<SharedOutputInner>>);
@@ -39,12 +41,31 @@ impl Clone for SharedOutput {
 }
 
 impl SharedOutput {
-    pub fn new(sender: Sender<OutputFrame>) -> Self {
+    pub fn new(sender: Sender<OutputFrame>, initial_window_size: u32) -> Self {
         SharedOutput(Rc::new(UnsafeCell::new(SharedOutputInner {
             hpack: hpack::Encoder::default(),
             hpack_buf: BytesMut::with_capacity(1024),
             sender,
+            send_window: initial_window_size as i64,
         })))
+    }
+
+    pub fn send_window(&self) -> i64 {
+        let inner = unsafe { &*self.0.get() };
+        inner.send_window
+    }
+
+    pub fn add_send_window(&self, increment: u32) -> Result<(), FrameError> {
+        let inner = unsafe { &mut *self.0.get() };
+        match inner.send_window.checked_add(increment as i64) {
+            Some(v) if v <= 0x7FFF_FFFF => {
+                inner.send_window = v;
+                Ok(())
+            }
+            _ => Err(FrameError::FlowControlError(
+                "connection send window overflow",
+            )),
+        }
     }
 
     fn write_frame_header(
@@ -112,11 +133,12 @@ impl SharedOutput {
     }
 
     pub fn send_data(&self, stream_id: StreamId, end_stream: bool, data: Vec<u8>) {
+        let inner = unsafe { &mut *self.0.get() };
+        inner.send_window -= data.len() as i64;
         let flags = if end_stream { END_STREAM } else { 0 };
         let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + data.len());
         Self::write_frame_header(&mut buf, data.len() as u32, 0x0, flags, stream_id);
         buf.extend_from_slice(&data);
-        let inner = unsafe { &mut *self.0.get() };
         inner.sender.send(OutputFrame::EncodedData(buf));
     }
 

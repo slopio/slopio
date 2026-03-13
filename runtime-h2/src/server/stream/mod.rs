@@ -185,9 +185,13 @@ impl Stream {
         }
     }
 
+    fn available_window(&self) -> i64 {
+        self.send_window.get().min(self.output.send_window())
+    }
+
     async fn wait_for_window(&mut self) -> Result<(), StreamError> {
         loop {
-            if self.send_window.get() > 0 {
+            if self.available_window() > 0 {
                 return Ok(());
             }
             match self.receiver.recv().await {
@@ -217,7 +221,7 @@ impl Stream {
             let mut offset = 0;
             while offset < body.len() {
                 self.wait_for_window().await?;
-                let window = self.send_window.get() as usize;
+                let window = self.available_window() as usize;
                 let chunk_len = window.min(body.len() - offset);
                 let end_stream = offset + chunk_len == body.len();
                 self.output.send_data(

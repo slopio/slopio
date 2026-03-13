@@ -59,7 +59,6 @@ impl Default for PeerSettings {
 
 pub struct Connection<H> {
     recv_window: u32,
-    send_window: u32,
     socket: Socket,
     decoder: FrameDecoder,
     streams: HashMap<StreamId, StreamMapState>,
@@ -142,7 +141,6 @@ impl<H: Handler + Clone + 'static> Connection<H> {
         let (output_sender, output_receiver) = unbounded_channel::<OutputFrame>();
         Self {
             recv_window: DEFAULT_WINDOW_SIZE,
-            send_window: DEFAULT_WINDOW_SIZE,
             socket: {
                 let recv = MultiRecv::new(socket.fd(), runtime_core::io_driver::BufGroup::Small);
                 Socket { socket, recv }
@@ -151,7 +149,7 @@ impl<H: Handler + Clone + 'static> Connection<H> {
             streams: HashMap::new(),
             max_stream_id: StreamId::ZERO,
             active_streams: 0,
-            output: SharedOutput::new(output_sender),
+            output: SharedOutput::new(output_sender, DEFAULT_WINDOW_SIZE),
             output_receiver,
             state: ConnectionState::Alive,
             peer_settings: PeerSettings::default(),
@@ -189,11 +187,7 @@ impl<H: Handler + Clone + 'static> Connection<H> {
                 OutputFrame::WindowUpdate { frame: data, .. } => {
                     bufs.push(data);
                 }
-                OutputFrame::EncodedData(data) => {
-                    self.send_window -= (data.len() - 9) as u32;
-                    bufs.push(data);
-                }
-                OutputFrame::EncodedHeaders(data) => {
+                OutputFrame::EncodedData(data) | OutputFrame::EncodedHeaders(data) => {
                     bufs.push(data);
                 }
             }
@@ -407,10 +401,7 @@ impl<H: Handler + Clone + 'static> Connection<H> {
         increment: u32,
     ) -> Result<(), FrameError> {
         if stream_id.is_zero() {
-            self.send_window = self
-                .send_window
-                .checked_add(increment)
-                .ok_or(FrameError::FlowControlError("connection window overflow"))?;
+            self.output.add_send_window(increment)?;
             return Ok(());
         }
         let stream = self
