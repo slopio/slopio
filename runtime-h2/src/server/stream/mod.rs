@@ -1,7 +1,5 @@
 use std::fmt::Debug;
 use std::future::Future;
-use std::thread::yield_now;
-
 use runtime_core::channels::Receiver;
 
 use http::{HeaderMap, StatusCode};

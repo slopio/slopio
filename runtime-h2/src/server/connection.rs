@@ -56,7 +56,8 @@ impl Default for PeerSettings {
 }
 
 pub struct Connection<H> {
-    connection_window: u32,
+    recv_window: u32,
+    send_window: u32,
     socket: Socket,
     decoder: FrameDecoder,
     streams: HashMap<StreamId, StreamMapState>,
@@ -138,7 +139,8 @@ impl<H: Handler + Clone + 'static> Connection<H> {
     pub fn new(socket: SocketWrapper, handler: H) -> Self {
         let (output_sender, output_receiver) = unbounded_channel::<OutputFrame>();
         Self {
-            connection_window: DEFAULT_WINDOW_SIZE,
+            recv_window: DEFAULT_WINDOW_SIZE,
+            send_window: DEFAULT_WINDOW_SIZE,
             socket: {
                 let recv = MultiRecv::new(socket.fd(), runtime_core::io_driver::BufGroup::Small);
                 Socket { socket, recv }
@@ -174,18 +176,29 @@ impl<H: Handler + Clone + 'static> Connection<H> {
                         ConnectionState::Closed => {}
                     }
                 }
+                OutputFrame::WindowUpdate {
+                    stream_id,
+                    increment,
+                    frame: data,
+                } if stream_id.is_zero() => {
+                    self.recv_window += increment;
+                    wire_frames.push(OutputFrame::WindowUpdate {
+                        stream_id,
+                        increment,
+                        frame: data,
+                    });
+                }
+                OutputFrame::EncodedData(ref data) => {
+                    self.send_window -= (data.len() - 9) as u32;
+                    wire_frames.push(frame);
+                }
                 other => wire_frames.push(other),
             }
         }
         if wire_frames.is_empty() {
             return Ok(());
         }
-        flush_output(
-            &self.socket.socket,
-            wire_frames,
-            &mut self.connection_window,
-        )
-        .await
+        flush_output(&self.socket.socket, wire_frames).await
     }
 
     fn start_closing(&mut self) {
@@ -328,12 +341,12 @@ impl<H: Handler + Clone + 'static> Connection<H> {
             .ok_or(FrameError::ProtocolError("DATA on unknown stream"))?;
         match stream.state {
             StreamState::Open => {
-                if data.len() as u32 > self.connection_window {
-                    return Err(FrameError::ProtocolError(
+                if data.len() as u32 > self.recv_window {
+                    return Err(FrameError::FlowControlError(
                         "connection flow control overflow",
                     ));
                 }
-                self.connection_window = self.connection_window.saturating_sub(data.len() as u32);
+                self.recv_window -= data.len() as u32;
 
                 if let Some(f) = InputStreamEvent::from_frame(Frame::Data {
                     stream_id,
@@ -375,8 +388,8 @@ impl<H: Handler + Clone + 'static> Connection<H> {
         increment: u32,
     ) -> Result<(), FrameError> {
         if stream_id.is_zero() {
-            self.connection_window = self
-                .connection_window
+            self.send_window = self
+                .send_window
                 .checked_add(increment)
                 .ok_or(FrameError::FlowControlError("connection window overflow"))?;
             return Ok(());

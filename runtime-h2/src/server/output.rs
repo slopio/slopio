@@ -18,7 +18,8 @@ const END_STREAM: u8 = 0x1;
 const END_HEADERS: u8 = 0x4;
 
 pub enum OutputFrame {
-    Encoded(Vec<u8>),
+    EncodedHeaders(Vec<u8>),
+    EncodedData(Vec<u8>),
     WindowUpdate {
         stream_id: StreamId,
         increment: u32,
@@ -111,7 +112,7 @@ impl SharedOutput {
         );
         buf.extend_from_slice(&inner.hpack_buf);
 
-        inner.sender.send(OutputFrame::Encoded(buf));
+        inner.sender.send(OutputFrame::EncodedHeaders(buf));
     }
 
     pub fn send_data(&self, stream_id: StreamId, end_stream: bool, data: Vec<u8>) {
@@ -120,7 +121,7 @@ impl SharedOutput {
         Self::write_frame_header(&mut buf, data.len() as u32, 0x0, flags, stream_id);
         buf.extend_from_slice(&data);
         let inner = unsafe { &mut *self.0.get() };
-        inner.sender.send(OutputFrame::Encoded(buf));
+        inner.sender.send(OutputFrame::EncodedData(buf));
     }
 
     pub fn send_window_update(&self, stream_id: StreamId, increment: u32) {
@@ -140,7 +141,7 @@ impl SharedOutput {
         Self::write_frame_header(&mut buf, 4, 0x03, 0, stream_id);
         buf.extend_from_slice(&error_code.to_be_bytes());
         let inner = unsafe { &mut *self.0.get() };
-        inner.sender.send(OutputFrame::Encoded(buf));
+        inner.sender.send(OutputFrame::EncodedHeaders(buf));
     }
 
     pub fn send_goaway(&self, last_stream_id: StreamId, error_code: u32) {
@@ -149,14 +150,14 @@ impl SharedOutput {
         buf.extend_from_slice(&u32::from(last_stream_id).to_be_bytes());
         buf.extend_from_slice(&error_code.to_be_bytes());
         let inner = unsafe { &mut *self.0.get() };
-        inner.sender.send(OutputFrame::Encoded(buf));
+        inner.sender.send(OutputFrame::EncodedHeaders(buf));
     }
 
     pub fn send_settings_ack(&self) {
         let mut buf = Vec::with_capacity(FRAME_HEADER_LEN);
         Self::write_frame_header(&mut buf, 0, 0x04, 0x01, StreamId::ZERO); // type=SETTINGS, flags=ACK
         let inner = unsafe { &mut *self.0.get() };
-        inner.sender.send(OutputFrame::Encoded(buf));
+        inner.sender.send(OutputFrame::EncodedHeaders(buf));
     }
 
     pub fn send_stream_done(&self, stream_id: StreamId) {
@@ -169,27 +170,18 @@ impl SharedOutput {
         Self::write_frame_header(&mut buf, 8, 0x06, 0x01, StreamId::ZERO); // type=PING, flags=ACK
         buf.extend_from_slice(opaque);
         let inner = unsafe { &mut *self.0.get() };
-        inner.sender.send(OutputFrame::Encoded(buf));
+        inner.sender.send(OutputFrame::EncodedHeaders(buf));
     }
 }
 
-pub async fn flush_output(
-    socket: &SocketWrapper,
-    frames: Vec<OutputFrame>,
-    window: &mut u32,
-) -> std::io::Result<()> {
+pub async fn flush_output(socket: &SocketWrapper, frames: Vec<OutputFrame>) -> std::io::Result<()> {
     let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
     for frame in frames {
         match frame {
-            OutputFrame::Encoded(data) => {
+            OutputFrame::EncodedHeaders(data) | OutputFrame::EncodedData(data) => {
                 bufs.push(data);
             }
-            OutputFrame::WindowUpdate {
-                increment,
-                frame: data,
-                ..
-            } => {
-                *window += increment;
+            OutputFrame::WindowUpdate { frame: data, .. } => {
                 bufs.push(data);
             }
             OutputFrame::StreamDone(_) => {}
