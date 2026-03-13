@@ -1,6 +1,6 @@
+use runtime_core::channels::Receiver;
 use std::fmt::Debug;
 use std::future::Future;
-use runtime_core::channels::Receiver;
 
 use http::{HeaderMap, StatusCode};
 

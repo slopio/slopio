@@ -1,13 +1,9 @@
 use std::cell::UnsafeCell;
-use std::io::IoSlice;
 use std::rc::Rc;
 
 use bytes::BytesMut;
 use http::header::HeaderName;
 use runtime_core::channels::Sender;
-use runtime_core::io_driver::operations::sockets::{
-    SocketWrapper, send_vectored::socket_send_vectored,
-};
 
 use crate::codec::frames::headers::Headers;
 use crate::codec::frames::stream_id::StreamId;
@@ -172,29 +168,4 @@ impl SharedOutput {
         let inner = unsafe { &mut *self.0.get() };
         inner.sender.send(OutputFrame::EncodedHeaders(buf));
     }
-}
-
-pub async fn flush_output(socket: &SocketWrapper, frames: Vec<OutputFrame>) -> std::io::Result<()> {
-    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
-    for frame in frames {
-        match frame {
-            OutputFrame::EncodedHeaders(data) | OutputFrame::EncodedData(data) => {
-                bufs.push(data);
-            }
-            OutputFrame::WindowUpdate { frame: data, .. } => {
-                bufs.push(data);
-            }
-            OutputFrame::StreamDone(_) => {}
-        }
-    }
-    if !bufs.is_empty() {
-        let slices: Vec<IoSlice<'_>> = bufs.iter().map(|b| IoSlice::new(b)).collect();
-        let total: usize = bufs.iter().map(|b| b.len()).sum();
-        let mut sent = 0;
-        while sent < total {
-            let n = socket_send_vectored(socket, &slices).await?;
-            sent += n;
-        }
-    }
-    Ok(())
 }

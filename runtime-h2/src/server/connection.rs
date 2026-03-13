@@ -8,7 +8,9 @@ use runtime_streams::StreamExt;
 
 use crate::codec::frames::headers::Headers;
 use crate::server::StreamMapState;
-use crate::server::output::{OutputFrame, SharedOutput, flush_output};
+use std::io::IoSlice;
+use runtime_core::io_driver::operations::sockets::send_vectored::socket_send_vectored;
+use crate::server::output::{OutputFrame, SharedOutput};
 use crate::server::stream::events_in::{InputStreamEvent, WindowModification};
 use crate::server::stream::{Handler, Stream, handle_stream};
 use crate::{
@@ -158,7 +160,7 @@ impl<H: Handler + Clone + 'static> Connection<H> {
     }
 
     async fn send_output(&mut self, frames: Vec<OutputFrame>) -> std::io::Result<()> {
-        let mut wire_frames = Vec::with_capacity(frames.len());
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
         for frame in frames {
             match frame {
                 OutputFrame::StreamDone(stream_id) => {
@@ -182,23 +184,40 @@ impl<H: Handler + Clone + 'static> Connection<H> {
                     frame: data,
                 } if stream_id.is_zero() => {
                     self.recv_window += increment;
-                    wire_frames.push(OutputFrame::WindowUpdate {
-                        stream_id,
-                        increment,
-                        frame: data,
-                    });
+                    bufs.push(data);
                 }
-                OutputFrame::EncodedData(ref data) => {
+                OutputFrame::WindowUpdate { frame: data, .. } => {
+                    bufs.push(data);
+                }
+                OutputFrame::EncodedData(data) => {
                     self.send_window -= (data.len() - 9) as u32;
-                    wire_frames.push(frame);
+                    bufs.push(data);
                 }
-                other => wire_frames.push(other),
+                OutputFrame::EncodedHeaders(data) => {
+                    bufs.push(data);
+                }
             }
         }
-        if wire_frames.is_empty() {
+        if bufs.is_empty() {
             return Ok(());
         }
-        flush_output(&self.socket.socket, wire_frames).await
+        let total: usize = bufs.iter().map(|b| b.len()).sum();
+        let mut sent = 0;
+        while sent < total {
+            let mut offset = sent;
+            let mut slices = Vec::new();
+            for buf in &bufs {
+                if offset >= buf.len() {
+                    offset -= buf.len();
+                    continue;
+                }
+                slices.push(IoSlice::new(&buf[offset..]));
+                offset = 0;
+            }
+            let n = socket_send_vectored(&self.socket.socket, &slices).await?;
+            sent += n;
+        }
+        Ok(())
     }
 
     fn start_closing(&mut self) {
