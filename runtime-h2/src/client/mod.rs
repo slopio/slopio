@@ -1,3 +1,5 @@
+pub mod grpc;
+
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
