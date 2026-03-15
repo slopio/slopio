@@ -1,4 +1,6 @@
 pub mod grpc;
+#[cfg(feature = "tracing")]
+pub mod otlp_collector;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;

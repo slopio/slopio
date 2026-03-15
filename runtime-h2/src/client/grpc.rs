@@ -10,6 +10,7 @@ pub struct GrpcResponse {
     pub grpc_message: Option<String>,
 }
 
+#[derive(Debug)]
 pub enum GrpcError {
     Http(FrameError),
     InvalidFrame,
@@ -52,13 +53,8 @@ impl H2Connection {
         headers.insert("content-type", HeaderValue::from_static("application/grpc"));
         headers.insert("te", HeaderValue::from_static("trailers"));
 
-        let mut stream = self
-            .request(Method::POST, path, headers, None)
-            .map_err(GrpcError::Http)?;
-
-        stream
-            .send_data(body, true)
-            .await
+        let stream = self
+            .request(Method::POST, path, headers, Some(body))
             .map_err(GrpcError::Http)?;
 
         let response = stream.recv_response().await.map_err(GrpcError::Http)?;

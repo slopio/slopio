@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 tls             = ["dep:rustls", "dep:rustls-pemfile"]
-tracing         = ["runtime-core/tracing"]
+tracing         = ["runtime-core/tracing", "dep:runtime-h2"]
 http            = []
 http1           = ["http", "dep:runtime-http"]
 quic            = ["http", "dep:runtime-quic"]
@@ -26,6 +26,7 @@ required-features = ["quic-tracing"]
 
 [dependencies]
 runtime-core = { path = "../runtime-core" }
+runtime-h2 = { path = "../runtime-h2", features = ["tracing"], optional = true }
 runtime-http = { path = "../runtime-http", optional = true }
 runtime-quic = { path = "../runtime-quic", optional = true }
 libc = "0.2.178"
