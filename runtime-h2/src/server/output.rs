@@ -190,4 +190,12 @@ impl SharedOutput {
         let inner = unsafe { &mut *self.0.get() };
         inner.sender.send(OutputFrame::EncodedHeaders(buf));
     }
+
+    pub fn send_ping(&self, opaque: &[u8; 8]) {
+        let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + 8);
+        Self::write_frame_header(&mut buf, 8, 0x06, 0x00, StreamId::ZERO); // type=PING, flags=0
+        buf.extend_from_slice(opaque);
+        let inner = unsafe { &mut *self.0.get() };
+        inner.sender.send(OutputFrame::EncodedHeaders(buf));
+    }
 }

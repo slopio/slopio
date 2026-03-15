@@ -1,3 +1,4 @@
+pub mod client;
 pub mod codec;
 pub mod ext;
 pub mod hpack;
