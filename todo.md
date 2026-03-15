@@ -28,3 +28,7 @@ MIMALLOC_EAGER_COMMIT=1 \
 
 
 cancels for different recv and buffer recyling if cancelled when cqe comes.
+
+H2 :
+optimization :
+- add metadata inside the data frame vec to avoid allocating for nothing

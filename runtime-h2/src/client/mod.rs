@@ -74,6 +74,7 @@ enum StreamEvent {
     Headers(Headers),
     Data { data: Vec<u8>, end_stream: bool },
     Reset(u32),
+    WindowIncrement(u32),
 }
 
 // --- Public types ---
@@ -91,8 +92,10 @@ pub struct H2Connection {
 
 pub struct ClientStream {
     stream_id: StreamId,
+    output: SharedOutput,
     streams: SharedStreams,
     receiver: Receiver<StreamEvent>,
+    send_window: i64,
 }
 
 pub struct Response {
@@ -131,6 +134,12 @@ impl H2Client {
             .ok_or(FrameError::ProtocolError("DNS resolution failed"))?;
         self.dns_cache.insert(host.to_string(), addr.ip());
         Ok(addr)
+    }
+}
+
+impl Default for H2Client {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -224,16 +233,18 @@ impl H2Connection {
         }
         self.output.send_headers(&req_headers);
 
-        if let Some(body) = body {
-            if !body.is_empty() {
-                self.output.send_data(stream_id, true, body);
-            }
+        if let Some(body) = body
+            && !body.is_empty()
+        {
+            self.output.send_data(stream_id, true, body);
         }
 
         Ok(ClientStream {
             stream_id,
+            output: self.output.clone(),
             streams: self.streams.clone(),
             receiver,
+            send_window: DEFAULT_WINDOW_SIZE as i64,
         })
     }
 }
@@ -241,7 +252,57 @@ impl H2Connection {
 // --- ClientStream ---
 
 impl ClientStream {
-    pub async fn recv_response(self) -> Result<Response, FrameError> {
+    fn available_window(&self) -> i64 {
+        self.send_window.min(self.output.send_window())
+    }
+
+    async fn wait_for_window(&mut self) -> Result<(), FrameError> {
+        loop {
+            if self.available_window() > 0 {
+                return Ok(());
+            }
+            match self.receiver.recv().await {
+                Some(StreamEvent::WindowIncrement(inc)) => {
+                    self.send_window = self
+                        .send_window
+                        .checked_add(inc as i64)
+                        .filter(|&v| v <= 0x7FFF_FFFF)
+                        .ok_or(FrameError::FlowControlError("stream send window overflow"))?;
+                }
+                Some(StreamEvent::Reset(_)) => {
+                    self.streams.remove(&self.stream_id);
+                    return Err(FrameError::ProtocolError("stream reset by server"));
+                }
+                None => {
+                    return Err(FrameError::ProtocolError("connection closed"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub async fn send_data(&mut self, data: Vec<u8>, end_stream: bool) -> Result<(), FrameError> {
+        let mut offset = 0;
+        while offset < data.len() {
+            self.wait_for_window().await?;
+            let window = self.available_window() as usize;
+            let chunk_len = window.min(data.len() - offset);
+            let is_last = offset + chunk_len == data.len();
+            self.output.send_data(
+                self.stream_id,
+                end_stream && is_last,
+                data[offset..offset + chunk_len].to_vec(),
+            );
+            self.send_window -= chunk_len as i64;
+            offset += chunk_len;
+        }
+        if data.is_empty() && end_stream {
+            self.output.send_data(self.stream_id, true, Vec::new());
+        }
+        Ok(())
+    }
+
+    pub async fn recv_response(mut self) -> Result<Response, FrameError> {
         let mut status = None;
         let mut resp_headers = HeaderMap::new();
         let mut body = Vec::new();
@@ -264,6 +325,13 @@ impl ClientStream {
                 Some(StreamEvent::Reset(_)) => {
                     self.streams.remove(&self.stream_id);
                     return Err(FrameError::ProtocolError("stream reset by server"));
+                }
+                Some(StreamEvent::WindowIncrement(inc)) => {
+                    self.send_window = self
+                        .send_window
+                        .checked_add(inc as i64)
+                        .filter(|&v| v <= 0x7FFF_FFFF)
+                        .ok_or(FrameError::FlowControlError("stream send window overflow"))?;
                 }
                 None => break,
             }
