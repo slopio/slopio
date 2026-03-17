@@ -1,19 +1,16 @@
 use crate::scoped_thread_local;
 use crate::tracing::opentelemetry::TraceSink;
 
-mod collector;
-mod console_collector;
+pub mod collector;
 mod opentelemetry;
-pub(crate) mod otlp;
 mod propagation;
-pub mod proto;
 mod resource;
 mod span;
 mod task;
 pub mod types;
 
 pub use collector::Collector;
-pub use console_collector::ConsoleCollector;
+pub use collector::console::ConsoleCollector;
 pub use opentelemetry::init_trace_sink;
 pub use propagation::{extract, inject};
 pub(crate) use resource::resource_config;

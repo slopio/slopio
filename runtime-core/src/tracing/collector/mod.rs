@@ -1,3 +1,6 @@
+pub mod console;
+pub mod otlp;
+
 use crate::tracing::span::SpanWrapper;
 
 ///the collector receives dropped spans through a channel and processses them

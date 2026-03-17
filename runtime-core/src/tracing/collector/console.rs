@@ -1,4 +1,4 @@
-use crate::tracing::collector::Collector;
+use super::Collector;
 use crate::tracing::span::SpanWrapper;
 
 pub struct ConsoleCollector;

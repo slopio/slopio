@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-tracing = ["dep:prost"]
+tracing = []
 
 [dependencies]
 io-uring = "0.7.11"
@@ -20,4 +20,3 @@ socket2 = { version = "0.6.1", features = ["all"] }
 bumpalo = { version = "3.20.2", features = ["collections"] }
 rand = "0.8"
 smallvec = { version = "1", features = ["union"] }
-prost = { version = "0.14", optional = true }

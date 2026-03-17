@@ -219,6 +219,7 @@ impl Default for Ring {
             buffer_rings,
             inner: ring,
             pending: 0,
+            wakeup_timeout: Timespec::new(),
         }
     }
 }
@@ -267,10 +268,10 @@ impl IODriver {
                             last_cqe,
                             ..
                         } = slab_entry
+                            && *ecancelled
+                            && *last_cqe
                         {
-                            if *ecancelled && *last_cqe {
-                                slab.remove(clean_index);
-                            }
+                            slab.remove(clean_index);
                         }
                     }
                     MultiProcessResult::InvalidState(_msg) => {}
@@ -343,13 +344,12 @@ impl IODriver {
     }
 
     pub fn push_wakeup_timeout(&self, duration: Duration) {
-        let ms = duration.as_millis();
-        let time = Box::leak(Box::new(Timespec::new().nsec((ms * 1_000_000) as u32)));
-        let entry = io_uring::opcode::Timeout::new(time)
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        ring_inner.wakeup_timeout = Timespec::from(duration);
+        let entry = io_uring::opcode::Timeout::new(&ring_inner.wakeup_timeout)
             .count(1)
             .build()
             .user_data(IGNORED_FLAG);
-        let ring_inner = unsafe { &mut *self.ring.get() };
         ring_inner.add(&entry);
     }
 
@@ -557,6 +557,7 @@ struct Ring {
     inner: IoUring,
     buffer_rings: MultiRing,
     pending: u32,
+    wakeup_timeout: Timespec,
 }
 
 impl Ring {

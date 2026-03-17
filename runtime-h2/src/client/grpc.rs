@@ -20,14 +20,6 @@ pub enum GrpcError {
     },
 }
 
-fn encode_grpc_frame(payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(5 + payload.len());
-    buf.push(0); // compressed = false
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(payload);
-    buf
-}
-
 fn decode_grpc_frame(body: &[u8]) -> Result<Vec<u8>, GrpcError> {
     if body.len() < 5 {
         return Err(GrpcError::InvalidFrame);
@@ -41,14 +33,8 @@ fn decode_grpc_frame(body: &[u8]) -> Result<Vec<u8>, GrpcError> {
 
 impl H2Connection {
     /// Send a unary gRPC call. `path` is the gRPC path (e.g. `/package.Service/Method`).
-    /// `payload` is the raw protobuf bytes — no prost needed.
-    pub async fn grpc_unary(
-        &mut self,
-        path: &str,
-        payload: Vec<u8>,
-    ) -> Result<GrpcResponse, GrpcError> {
-        let body = encode_grpc_frame(&payload);
-
+    /// `body` must be a gRPC-framed message: `[0x00][len: u32 BE][protobuf...]`.
+    pub async fn grpc_unary(&mut self, path: &str, body: Vec<u8>) -> Result<GrpcResponse, GrpcError> {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/grpc"));
         headers.insert("te", HeaderValue::from_static("trailers"));

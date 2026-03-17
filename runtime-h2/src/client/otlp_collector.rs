@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use runtime_core::tracing::proto::ProtoEncodeBuffer;
+use runtime_core::tracing::collector::otlp::protobuf_encoder::ProtoEncodeBuffer;
 use runtime_core::tracing::{Collector, SpanWrapper};
 
 use super::H2Connection;
@@ -48,13 +48,15 @@ impl Collector for OtlpCollector {
     }
 
     async fn process(&mut self, batch: Vec<SpanWrapper>) {
-        let payload = self.encode_buf.encode(batch).to_vec();
-
-        let Some(conn) = self.get_connection().await else {
+        // Ensure connection before encoding to avoid borrow conflicts.
+        if self.get_connection().await.is_none() {
             return;
-        };
+        }
+        self.encode_buf.encode(batch);
+        let body = std::mem::take(&mut self.encode_buf.buf);
 
-        match conn.grpc_unary(OTLP_GRPC_PATH, payload).await {
+        let conn = self.conn.as_mut().unwrap();
+        match conn.grpc_unary(OTLP_GRPC_PATH, body).await {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("OtlpCollector: grpc export failed: {e:?}");
