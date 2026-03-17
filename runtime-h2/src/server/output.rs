@@ -142,6 +142,23 @@ impl SharedOutput {
         inner.sender.send(OutputFrame::EncodedData(buf));
     }
 
+    /// Send data where the first 9 bytes are reserved for the H2 frame header.
+    /// Fills the header in-place — zero copy.
+    pub fn send_data_preframed(&self, stream_id: StreamId, end_stream: bool, mut buf: Vec<u8>) {
+        let inner = unsafe { &mut *self.0.get() };
+        let data_len = buf.len() - FRAME_HEADER_LEN;
+        inner.send_window -= data_len as i64;
+        let flags = if end_stream { END_STREAM } else { 0 };
+        let len_bytes = (data_len as u32).to_be_bytes();
+        buf[0] = len_bytes[1];
+        buf[1] = len_bytes[2];
+        buf[2] = len_bytes[3];
+        buf[3] = 0x0; // DATA frame type
+        buf[4] = flags;
+        buf[5..9].copy_from_slice(&u32::from(stream_id).to_be_bytes());
+        inner.sender.send(OutputFrame::EncodedData(buf));
+    }
+
     pub fn send_window_update(&self, stream_id: StreamId, increment: u32) {
         let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + 4);
         Self::write_frame_header(&mut frame, 4, 0x8, 0, stream_id);

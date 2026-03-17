@@ -2,7 +2,7 @@ use http::{HeaderMap, HeaderValue, Method};
 
 use crate::types::FrameError;
 
-use super::H2Connection;
+use super::{Body, H2Connection};
 
 pub struct GrpcResponse {
     pub data: Vec<u8>,
@@ -34,13 +34,17 @@ fn decode_grpc_frame(body: &[u8]) -> Result<Vec<u8>, GrpcError> {
 impl H2Connection {
     /// Send a unary gRPC call. `path` is the gRPC path (e.g. `/package.Service/Method`).
     /// `body` must be a gRPC-framed message: `[0x00][len: u32 BE][protobuf...]`.
-    pub async fn grpc_unary(&mut self, path: &str, body: Vec<u8>) -> Result<GrpcResponse, GrpcError> {
+    pub async fn grpc_unary(
+        &mut self,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<GrpcResponse, GrpcError> {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/grpc"));
         headers.insert("te", HeaderValue::from_static("trailers"));
 
         let stream = self
-            .request(Method::POST, path, headers, Some(body))
+            .request(Method::POST, path, headers, Some(Body::Preframed(body)))
             .map_err(GrpcError::Http)?;
 
         let response = stream.recv_response().await.map_err(GrpcError::Http)?;

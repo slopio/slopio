@@ -28,6 +28,22 @@ use crate::types::{Frame, FrameError, Setting};
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const DEFAULT_WINDOW_SIZE: u32 = 65535;
 
+pub enum Body {
+    /// Raw data — H2 layer prepends the 9-byte frame header (copies).
+    Raw(Vec<u8>),
+    /// First 9 bytes are already reserved for the H2 frame header (zero copy).
+    Preframed(Vec<u8>),
+}
+
+impl Body {
+    fn is_empty(&self) -> bool {
+        match self {
+            Body::Raw(d) => d.is_empty(),
+            Body::Preframed(d) => d.len() <= 9,
+        }
+    }
+}
+
 // --- Shared stream map ---
 
 struct SharedStreamsInner {
@@ -212,7 +228,7 @@ impl H2Connection {
         method: Method,
         path: &str,
         headers: HeaderMap,
-        body: Option<Vec<u8>>,
+        body: Option<Body>,
     ) -> Result<ClientStream, FrameError> {
         let stream_id = self.next_stream_id;
         self.next_stream_id = stream_id
@@ -240,7 +256,10 @@ impl H2Connection {
         if let Some(body) = body
             && !body.is_empty()
         {
-            self.output.send_data(stream_id, true, body);
+            match body {
+                Body::Raw(data) => self.output.send_data(stream_id, true, data),
+                Body::Preframed(data) => self.output.send_data_preframed(stream_id, true, data),
+            }
         }
 
         Ok(ClientStream {

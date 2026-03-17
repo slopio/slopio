@@ -40,20 +40,24 @@ impl Default for ProtoEncodeBuffer {
     }
 }
 
-const GRPC_HEADER_LEN: usize = 5;
+/// 9 bytes H2 DATA frame header + 5 bytes gRPC frame header.
+/// The first 9 bytes are filled by the H2 layer via `send_data_preframed`.
+const FRAME_HEADER_LEN: usize = 14;
+const GRPC_HEADER_OFFSET: usize = 9;
 
 impl ProtoEncodeBuffer {
-    /// Encode a batch of spans as a gRPC-framed protobuf message.
-    /// Returns bytes ready to send as an H2 DATA frame:
-    /// `[0x00][length: u32 BE][protobuf payload...]`
+    /// Encode a batch of spans into a buffer with space for both the H2 frame
+    /// header (9 bytes, filled later by the H2 layer) and the gRPC frame header.
+    /// Layout: `[9 bytes reserved][0x00][grpc_len: u32 BE][protobuf payload...]`
     pub fn encode(&mut self, batch: Vec<SpanWrapper>) -> &[u8] {
         self.buf.clear();
-        // Reserve 5 bytes for the gRPC frame header, filled after encoding.
-        self.buf.extend_from_slice(&[0u8; GRPC_HEADER_LEN]);
+        // Reserve 14 bytes: 9 for H2 frame header + 5 for gRPC frame header.
+        self.buf.extend_from_slice(&[0u8; FRAME_HEADER_LEN]);
         encode_export_request(&mut self.buf, batch, &self.resource_attrs);
-        let proto_len = (self.buf.len() - GRPC_HEADER_LEN) as u32;
-        // byte 0 = 0x00 (no compression), already zero
-        self.buf[1..5].copy_from_slice(&proto_len.to_be_bytes());
+        let proto_len = (self.buf.len() - FRAME_HEADER_LEN) as u32;
+        // byte 9 = 0x00 (no compression), already zero
+        self.buf[GRPC_HEADER_OFFSET + 1..GRPC_HEADER_OFFSET + 5]
+            .copy_from_slice(&proto_len.to_be_bytes());
         &self.buf
     }
 }
