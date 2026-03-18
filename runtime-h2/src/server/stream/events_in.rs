@@ -2,7 +2,7 @@ use crate::{codec::frames::headers::Headers, types::Frame};
 
 #[derive(Debug)]
 pub enum InputStreamEvent {
-    Header { headers: Headers },
+    Header { headers: Box<Headers> },
     Data { end_stream: bool, data: Vec<u8> },
     Window(WindowModification),
     ResetFrame,

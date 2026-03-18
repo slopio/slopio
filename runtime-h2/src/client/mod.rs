@@ -91,7 +91,7 @@ impl SharedStreams {
 // --- Stream events ---
 
 enum StreamEvent {
-    Headers(Headers),
+    Headers(Box<Headers>),
     Data { data: Vec<u8>, end_stream: bool },
     Reset(u32),
     WindowIncrement(u32),
@@ -460,7 +460,7 @@ impl ClientConnection {
         Ok(())
     }
 
-    fn handle_headers(&self, headers: Headers) {
+    fn handle_headers(&self, headers: Box<Headers>) {
         let stream_id = headers.stream_id();
         let end_stream = headers.is_end_stream();
         self.streams

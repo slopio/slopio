@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, mem::ManuallyDrop, pin::Pin};
 
 mod balancer;
 mod config;
@@ -22,12 +22,19 @@ pub use runtime_http::http::Method;
 /// Headers and metadata available immediately when a request arrives,
 /// before any body data is read.
 pub struct RequestHead<'arena> {
-    #[allow(dead_code)]
-    arena: Box<bumpalo::Bump>,
     pub method: Method,
     pub path: &'arena str,
-    pub headers: bumpalo::collections::Vec<'arena, (&'arena str, &'arena str)>,
+    pub headers: ManuallyDrop<bumpalo::collections::Vec<'arena, (&'arena str, &'arena str)>>,
     pub body_kind: BodyKind,
+    arena: Box<bumpalo::Bump>,
+}
+
+impl Drop for RequestHead<'_> {
+    fn drop(&mut self) {
+        // SAFETY: headers borrows from arena, so we must drop headers first.
+        // After this, the compiler drops arena normally.
+        unsafe { ManuallyDrop::drop(&mut self.headers) };
+    }
 }
 
 // SAFETY: RequestHead is only ever used on a single thread (the thread-local

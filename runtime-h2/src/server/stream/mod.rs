@@ -47,7 +47,7 @@ pub struct Response {
 }
 
 pub struct Stream {
-    pub headers: Headers,
+    pub headers: Box<Headers>,
     pub output: SharedOutput,
     receiver: Receiver<InputStreamEvent>,
     send_window: SendWindow,
@@ -88,7 +88,7 @@ impl Debug for Stream {
 
 impl Stream {
     pub fn new(
-        headers: Headers,
+        headers: Box<Headers>,
         output: SharedOutput,
         receiver: Receiver<InputStreamEvent>,
         initial_window_size: u32,

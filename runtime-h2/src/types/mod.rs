@@ -32,7 +32,7 @@ pub enum Frame {
         end_stream: bool,
         data: Vec<u8>,
     },
-    Headers(Headers),
+    Headers(Box<Headers>),
     RstStream {
         stream_id: StreamId,
         error_code: u32,

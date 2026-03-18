@@ -88,7 +88,7 @@ impl From<RequestMeta> for RequestHead<'static> {
             arena: m.arena,
             method: m.method,
             path,
-            headers,
+            headers: std::mem::ManuallyDrop::new(headers),
             body_kind: m.body_kind,
         }
     }

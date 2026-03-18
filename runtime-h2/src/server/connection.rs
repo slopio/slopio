@@ -275,7 +275,7 @@ impl<H: Handler + Clone + 'static> Connection<H> {
         Ok(())
     }
 
-    fn handle_headers_frame(&mut self, headers: Headers) -> Result<(), FrameError> {
+    fn handle_headers_frame(&mut self, headers: Box<Headers>) -> Result<(), FrameError> {
         let end_of_stream = headers.is_end_stream();
         match self.streams.get_mut(&headers.stream_id()) {
             Some(stream) => match stream.state {

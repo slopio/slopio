@@ -328,7 +328,7 @@ impl FrameDecoder {
 
                 if end_headers {
                     let headers = self.decode_hpack(headers, hpack_buf)?;
-                    self.frames.push_back(Frame::Headers(headers));
+                    self.frames.push_back(Frame::Headers(Box::new(headers)));
                 } else {
                     self.header_block = Some(HeaderBlockState {
                         headers,
@@ -353,7 +353,7 @@ impl FrameDecoder {
                 if end_headers {
                     let state = self.header_block.take().unwrap();
                     let headers = self.decode_hpack(state.headers, state.buf)?;
-                    self.frames.push_back(Frame::Headers(headers));
+                    self.frames.push_back(Frame::Headers(Box::new(headers)));
                 }
             }
             FrameKind::Data => {
