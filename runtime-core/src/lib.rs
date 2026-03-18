@@ -1,6 +1,7 @@
 pub mod channels;
 pub mod io_driver;
 pub mod macros;
+pub mod net;
 pub mod runtime;
 pub mod task;
 #[cfg(feature = "tracing")]

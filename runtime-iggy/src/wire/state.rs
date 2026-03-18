@@ -3,7 +3,7 @@ use std::mem;
 use std::rc::Rc;
 use std::time::Instant;
 
-use runtime_core::io_driver::operations::sockets::SocketWrapper;
+use runtime_core::net::SocketWrapper;
 
 use crate::error::IggyError;
 

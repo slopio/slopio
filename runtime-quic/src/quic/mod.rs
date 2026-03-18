@@ -65,8 +65,6 @@ pub trait HttpHandler: 'static {
         &self,
         head: RequestHead<'static>,
     ) -> Pin<Box<dyn Future<Output = HttpResponse> + 'static>>;
-
-    /// Called when the full body has been buffered.
     fn buffered_body(
         &self,
         head: RequestHead<'static>,

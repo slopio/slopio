@@ -1,0 +1,31 @@
+// Public networking API.
+//
+// Protocol crates (runtime-h2, runtime-http, runtime-quic, etc.) should import
+// from this module instead of reaching into `io_driver` internals.
+
+// ── TCP ──
+
+pub use crate::io_driver::operations::sockets::connect_tcp;
+pub use crate::io_driver::operations::sockets::SocketWrapper;
+
+// send
+pub use crate::io_driver::operations::sockets::send::socket_send;
+pub use crate::io_driver::operations::sockets::send_vectored::socket_send_vectored;
+
+// recv
+pub use crate::io_driver::operations::sockets::recv::{socket_recv, socket_recv_init};
+pub use crate::io_driver::operations::sockets::managed_recv::socket_managed_recv;
+
+// streaming (multishot)
+pub use crate::io_driver::operations::sockets::multi_recv::MultiRecv;
+pub use crate::io_driver::operations::sockets::multi_accept::MultiAccept;
+
+// ── UDP ──
+
+pub use crate::io_driver::operations::sockets::udp::UdpSocket;
+pub use crate::io_driver::operations::sockets::udp::UdpMultiRecv;
+
+// ── Buffers ──
+
+pub use crate::io_driver::BufGroup;
+pub use crate::io_driver::BorrowedBuffer;

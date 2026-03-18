@@ -1,7 +1,5 @@
 use runtime_core::channels::Sender;
-use runtime_core::io_driver::operations::sockets::{
-    SocketWrapper, multi_accept::MultiAccept, recv::socket_recv_init, send::socket_send,
-};
+use runtime_core::net::{MultiAccept, SocketWrapper, socket_recv_init, socket_send};
 use runtime_core::runtime::spawn;
 use runtime_streams::StreamExt;
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use runtime_core::channels::{Receiver, unbounded_channel};
-use runtime_core::io_driver::operations::sockets::{SocketWrapper, multi_recv::MultiRecv};
+use runtime_core::net::{BufGroup, MultiRecv, SocketWrapper, socket_send_vectored};
 use runtime_core::runtime::select::{SelectResult, select};
 use runtime_core::runtime::spawn;
 use runtime_streams::StreamExt;
@@ -9,7 +9,6 @@ use runtime_streams::StreamExt;
 use crate::codec::frames::headers::Headers;
 use crate::server::StreamMapState;
 use std::io::IoSlice;
-use runtime_core::io_driver::operations::sockets::send_vectored::socket_send_vectored;
 use crate::server::output::{OutputFrame, SharedOutput};
 use crate::server::stream::events_in::{InputStreamEvent, WindowModification};
 use crate::server::stream::{Handler, Stream, handle_stream};
@@ -142,7 +141,7 @@ impl<H: Handler + Clone + 'static> Connection<H> {
         Self {
             recv_window: DEFAULT_WINDOW_SIZE,
             socket: {
-                let recv = MultiRecv::new(socket.fd(), runtime_core::io_driver::BufGroup::Small);
+                let recv = MultiRecv::new(socket.fd(), BufGroup::Small);
                 Socket { socket, recv }
             },
             decoder: FrameDecoder::new(),

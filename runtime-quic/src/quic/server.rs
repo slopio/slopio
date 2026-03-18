@@ -6,7 +6,7 @@ use crate::{
     quic::config::{QuicOutput, Tls},
     quic::{Http3ServerConfig, HttpHandler, stream::StreamState, stream::stream_slab},
 };
-use runtime_core::io_driver::operations::sockets::udp::UdpSocket;
+use runtime_core::net::UdpSocket;
 
 use super::connection::{H3Handler, HandlerBridge};
 
@@ -109,8 +109,8 @@ impl H3Server {
         use std::time::Instant;
         use tquic::PacketInfo;
 
-        use runtime_core::io_driver::BufGroup;
-        use runtime_core::io_driver::operations::sockets::udp::UdpMultiRecv;
+        use runtime_core::net::BufGroup;
+        use runtime_core::net::UdpMultiRecv;
         use runtime_core::runtime::select::{SelectResult, select};
         use runtime_core::runtime::time::Sleep;
 

@@ -9,9 +9,7 @@ use std::rc::Rc;
 
 use http::{HeaderMap, Method, StatusCode};
 use runtime_core::channels::{Receiver, Sender, unbounded_channel};
-use runtime_core::io_driver::operations::sockets::{
-    SocketWrapper, connect_tcp, multi_recv::MultiRecv, send::socket_send,
-};
+use runtime_core::net::{BufGroup, MultiRecv, SocketWrapper, connect_tcp, socket_send};
 use runtime_core::runtime::select::{SelectResult, select};
 use runtime_core::runtime::spawn;
 use runtime_core::runtime::time::Sleep;
@@ -186,7 +184,7 @@ impl H2Connection {
         let (output_sender, output_receiver) = unbounded_channel::<OutputFrame>();
         let output = SharedOutput::new(output_sender, DEFAULT_WINDOW_SIZE);
         let streams = SharedStreams::new();
-        let recv = MultiRecv::new(socket.fd(), runtime_core::io_driver::BufGroup::Small);
+        let recv = MultiRecv::new(socket.fd(), BufGroup::Small);
 
         let mut conn = ClientConnection {
             recv_window: DEFAULT_WINDOW_SIZE,

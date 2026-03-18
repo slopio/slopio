@@ -1,6 +1,4 @@
-use runtime_core::io_driver::operations::sockets::{
-    SocketWrapper, recv::socket_recv_init, send::socket_send,
-};
+use runtime_core::net::{SocketWrapper, socket_recv_init, socket_send};
 use std::io;
 
 pub async fn send_all(socket: &SocketWrapper, mut data: &[u8]) -> io::Result<()> {

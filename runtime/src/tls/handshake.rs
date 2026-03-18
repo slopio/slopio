@@ -4,10 +4,10 @@ use rustls::server::UnbufferedServerConnection;
 use rustls::unbuffered::EncodeError;
 
 use crate::tls::tls_serv_config;
-use runtime_core::io_driver::operations::sockets::SocketWrapper;
-use runtime_core::io_driver::operations::sockets::multi_recv::BorrowedBuffer;
-use runtime_core::io_driver::operations::sockets::recv::socket_recv;
-use runtime_core::io_driver::operations::sockets::send::socket_send;
+use runtime_core::net::SocketWrapper;
+use runtime_core::net::BorrowedBuffer;
+use runtime_core::net::socket_recv;
+use runtime_core::net::socket_send;
 
 pub struct TlsStream {
     socket: SocketWrapper,

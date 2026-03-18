@@ -2,10 +2,8 @@ use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 use std::time::{Duration, UNIX_EPOCH};
 
-use runtime_core::io_driver::{
-    IO_DRIVER,
-    operations::sockets::{SocketWrapper, connect_tcp},
-};
+use runtime_core::io_driver::IO_DRIVER;
+use runtime_core::net::{SocketWrapper, connect_tcp};
 use runtime_core::runtime::{now, spawn, time::Sleep};
 
 use crate::{
