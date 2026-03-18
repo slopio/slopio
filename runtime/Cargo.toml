@@ -14,10 +14,6 @@ required-features = ["tls"]
 [[example]]
 name = "http"
 
-[[example]]
-name = "http3"
-required-features = ["tracing"]
-
 [dependencies]
 runtime-core = { path = "../runtime-core" }
 runtime-h2 = { path = "../runtime-h2", features = ["tracing"], optional = true }
@@ -28,7 +24,6 @@ mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 
 [dev-dependencies]
 runtime-http = { path = "../runtime-http" }
-runtime-quic = { path = "../runtime-quic", features = ["tracing"] }
 runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }
 bytes = "1"
 http = "1"

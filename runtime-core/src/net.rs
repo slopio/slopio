@@ -1,6 +1,6 @@
 // Public networking API.
 //
-// Protocol crates (runtime-h2, runtime-http, runtime-quic, etc.) should import
+// Protocol crates (runtime-h2, runtime-http, etc.) should import
 // from this module instead of reaching into `io_driver` internals.
 
 // ── TCP ──
