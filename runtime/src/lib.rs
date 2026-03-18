@@ -8,21 +8,10 @@ use runtime_core::runtime::eventfd;
 // Re-export core
 pub use runtime_core::runtime::{RuntimeInner, spawn, yield_now};
 pub use runtime_core::task::{Handle, new_task};
-pub use runtime_core::{channels, io_driver, runtime, task};
+pub use runtime_core::{channels, io_driver, net, runtime, task};
 
 #[cfg(feature = "tracing")]
 pub use runtime_core::tracing;
-
-#[cfg(feature = "http1")]
-pub use runtime_http::{http, http1};
-
-#[cfg(feature = "quic")]
-pub use runtime_quic::quic;
-
-#[cfg(all(feature = "quic", not(feature = "http1")))]
-pub mod http {
-    pub use runtime_quic::quic::Method;
-}
 
 #[cfg(feature = "tls")]
 pub mod tls;

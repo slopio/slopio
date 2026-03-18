@@ -4,13 +4,8 @@ use std::time::Duration;
 use runtime::tracing::event;
 #[cfg(feature = "tracing")]
 use runtime::tracing::{KeyValue, Level, SpanLink, event_attrs, extract, new_span};
-use runtime::{
-    http::Method,
-    main_thread,
-    quic::{H3Server, Http3ServerConfig, HttpHandler, HttpResponse, RequestHead},
-    runtime::time::Sleep,
-    tracing::span_set_status,
-};
+use runtime::{main_thread, runtime::time::Sleep, tracing::span_set_status};
+use runtime_quic::quic::{H3Server, Http3ServerConfig, HttpHandler, HttpResponse, Method, RequestHead};
 
 struct Handler;
 

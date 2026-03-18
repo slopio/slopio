@@ -1,7 +1,7 @@
-use runtime::http1::HttpConnection;
-use runtime::http1::response::Response;
-use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
+use runtime::net::MultiAccept;
 use runtime::runtime::spawn;
+use runtime_http::http1::HttpConnection;
+use runtime_http::http1::response::Response;
 use runtime_streams::StreamExt;
 
 fn main() {
