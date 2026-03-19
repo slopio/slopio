@@ -13,6 +13,9 @@ pub use runtime_core::{channels, io_driver, net, runtime, task};
 #[cfg(feature = "tracing")]
 pub use runtime_core::tracing;
 
+#[cfg(feature = "otlp")]
+mod otlp_collector;
+
 #[cfg(feature = "tls")]
 pub mod tls;
 
@@ -21,11 +24,17 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub fn main_thread<F: Future>(f: F) -> F::Output {
     let rt = RuntimeInner::default();
-    #[cfg(feature = "tracing")]
+    #[cfg(feature = "otlp")]
     return rt.block_on(f, None, |run| {
+        use crate::otlp_collector::OtlpCollector;
         use runtime_core::tracing::{TRACING_SINK, init_trace_sink};
-        use runtime_h2::client::otlp_collector::OtlpCollector;
         let sink = init_trace_sink::<OtlpCollector>();
+        TRACING_SINK.set(&sink, run)
+    });
+    #[cfg(all(feature = "tracing", not(feature = "otlp")))]
+    return rt.block_on(f, None, |run| {
+        use runtime_core::tracing::{ConsoleCollector, TRACING_SINK, init_trace_sink};
+        let sink = init_trace_sink::<ConsoleCollector>();
         TRACING_SINK.set(&sink, run)
     });
     #[cfg(not(feature = "tracing"))]
@@ -137,12 +146,19 @@ where
         };
         let fut = f(ctx);
         let rt = RuntimeInner::with_thread_id(n);
-        #[cfg(feature = "tracing")]
+        #[cfg(feature = "otlp")]
         return rt.block_on(fut, Some(event_fd), |run| {
+            use crate::otlp_collector::OtlpCollector;
             use runtime_core::tracing::{TRACING_SINK, init_trace_sink, set_thread_id};
-            use runtime_h2::client::otlp_collector::OtlpCollector;
             set_thread_id(n);
             let sink = init_trace_sink::<OtlpCollector>();
+            TRACING_SINK.set(&sink, run)
+        });
+        #[cfg(all(feature = "tracing", not(feature = "otlp")))]
+        return rt.block_on(fut, Some(event_fd), |run| {
+            use runtime_core::tracing::{ConsoleCollector, TRACING_SINK, init_trace_sink, set_thread_id};
+            set_thread_id(n);
+            let sink = init_trace_sink::<ConsoleCollector>();
             TRACING_SINK.set(&sink, run)
         });
         #[cfg(not(feature = "tracing"))]

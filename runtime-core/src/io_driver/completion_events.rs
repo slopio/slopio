@@ -8,12 +8,12 @@ pub(crate) const IGNORED_FLAG: u64 = 1u64 << 62;
 pub(crate) const SEND_BUFFER_FLAG: u64 = 1u64 << 61;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Data {
+pub(crate) struct CQEData {
     pub result: i32,
     pub flags: u32,
 }
 
-impl From<Entry> for Data {
+impl From<Entry> for CQEData {
     fn from(entry: Entry) -> Self {
         Self {
             result: entry.result(),
@@ -24,8 +24,8 @@ impl From<Entry> for Data {
 
 #[derive(Debug)]
 pub(crate) enum Event {
-    SingleShot(Data),
-    MultiShot(Data),
+    SingleShot(CQEData),
+    MultiShot(CQEData),
     SendBuffer(i32),
 }
 
@@ -43,7 +43,7 @@ impl CompletionEvent {
             return None;
         }
 
-        let data = Data::from(entry);
+        let data = CQEData::from(entry);
 
         if user_data & SEND_BUFFER_FLAG != 0 {
             Some(CompletionEvent {
@@ -83,11 +83,15 @@ pub(crate) enum MultiProcessResult {
     PauseRequired(u64),
     FullyPaused,
     CancelComplete,
-    CancelledRecycling { buffer_id: u16, len: usize, bgid: u16 },
+    CancelledRecycling {
+        buffer_id: u16,
+        len: usize,
+        bgid: u16,
+    },
     InvalidState(&'static str),
 }
 
-pub(crate) fn process_single(op_state: &mut SingleOpState, data: Data) -> SingleProcessResult {
+pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> SingleProcessResult {
     match op_state {
         SingleOpState::Init => {
             SingleProcessResult::InvalidState("submitted entry shouldn't be in init")
@@ -191,7 +195,8 @@ pub(crate) fn process_multi(
 
             // Recycle buffer if the kernel consumed one
             let recycle = if event.result > 0 {
-                buffer_select(event.flags).map(|buffer_id| (buffer_id, event.result as usize, *bgid))
+                buffer_select(event.flags)
+                    .map(|buffer_id| (buffer_id, event.result as usize, *bgid))
             } else {
                 None
             };
@@ -199,11 +204,19 @@ pub(crate) fn process_multi(
             if *ecancelled && *last_cqe {
                 if let Some((buffer_id, len, bgid)) = recycle {
                     // This last CQE also had a buffer — recycle it, then signal complete
-                    return MultiProcessResult::CancelledRecycling { buffer_id, len, bgid };
+                    return MultiProcessResult::CancelledRecycling {
+                        buffer_id,
+                        len,
+                        bgid,
+                    };
                 }
                 MultiProcessResult::CancelComplete
             } else if let Some((buffer_id, len, bgid)) = recycle {
-                MultiProcessResult::CancelledRecycling { buffer_id, len, bgid }
+                MultiProcessResult::CancelledRecycling {
+                    buffer_id,
+                    len,
+                    bgid,
+                }
             } else {
                 MultiProcessResult::Queued
             }

@@ -1,7 +1,0 @@
-[package]
-name = "runtime-iggy"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-runtime-core = { path = "../runtime-core" }

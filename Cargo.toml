@@ -1,9 +1,11 @@
 [workspace]
 members = [
+    "async_timers",
+    "io_uring_rb",
+    "runtime_ebpf_balancer",
     "runtime-core",
     "runtime-http",
-    "runtime-h2",
-    "runtime-iggy",
+    "runtime-streams",
     "runtime",
 ]
 resolver = "2"

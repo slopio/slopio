@@ -233,19 +233,18 @@ impl IODriver {
 
     fn process_cqe(&self, completion_event: CompletionEvent) {
         match completion_event.event {
-            Event::MultiShot(data) => {
+            Event::MultiShot(cqe_data) => {
                 let clean_index = completion_event.clean_slab_index();
                 let slab = unsafe { &mut *self.multishot_slab.get() };
                 let slab_entry = unsafe { slab.get_unchecked_mut(clean_index) };
-                let user_data = completion_event.slab_index as u64;
 
                 match process_multi(
                     slab_entry,
                     MultishotCompletionEvent {
-                        result: data.result,
-                        flags: data.flags,
+                        result: cqe_data.result,
+                        flags: cqe_data.flags,
                     },
-                    user_data,
+                    clean_index as u64,
                 ) {
                     MultiProcessResult::Queued => {}
                     MultiProcessResult::WakeConsumer => {}
@@ -277,11 +276,11 @@ impl IODriver {
                     MultiProcessResult::InvalidState(_msg) => {}
                 }
             }
-            Event::SingleShot(data) => {
+            Event::SingleShot(cqe_data) => {
                 let slab = unsafe { &mut *self.slab.get() };
                 let slab_entry = unsafe { slab.get_unchecked_mut(completion_event.slab_index) };
 
-                match process_single(slab_entry, data) {
+                match process_single(slab_entry, cqe_data) {
                     SingleProcessResult::Completed => {}
                     SingleProcessResult::Shutdown => {
                         self.shutting_down.replace(true);

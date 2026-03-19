@@ -5,7 +5,8 @@ edition = "2024"
 
 [features]
 tls             = ["dep:rustls", "dep:rustls-pemfile"]
-tracing         = ["runtime-core/tracing", "dep:runtime-h2"]
+tracing         = ["runtime-core/tracing"]
+otlp            = ["tracing", "dep:runtime-h2"]
 
 [[example]]
 name = "tls"
@@ -16,7 +17,7 @@ name = "http"
 
 [dependencies]
 runtime-core = { path = "../runtime-core" }
-runtime-h2 = { path = "../runtime-h2", features = ["tracing"], optional = true }
+runtime-h2 = { package = "popple-h2", git = "ssh://git@github.com/saucisoupe/popple-h2", optional = true }
 libc = "0.2.178"
 rustls = { version = "0.23.36", optional = true }
 rustls-pemfile = { version = "2", optional = true }
@@ -24,7 +25,7 @@ mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 
 [dev-dependencies]
 runtime-http = { path = "../runtime-http" }
-runtime-streams = { git = "https://github.com/saucisoupe/runtime-streams" }
+runtime-streams = { path = "../runtime-streams" }
 bytes = "1"
 http = "1"
 rand = "0.8"
