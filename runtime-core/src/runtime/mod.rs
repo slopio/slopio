@@ -12,6 +12,7 @@ use crate::{runtime, scoped_thread_local};
 
 pub mod eventfd;
 pub mod join;
+pub mod processes;
 pub mod retry;
 pub mod select;
 pub mod time;
