@@ -2,11 +2,11 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use runtime::main_thread;
-use runtime::runtime::retry::retry;
+use runtime::runtime::retry::{RetryError, retry};
 
 #[test]
 fn test_retry_succeeds_first_attempt() {
-    let result: Result<i32, &str> = main_thread(async {
+    let result: Result<i32, RetryError<&str>> = main_thread(async {
         retry(Some(3), Duration::from_millis(10), || async { Ok(42) }, |_| true).await
     });
     assert_eq!(result, Ok(42));
@@ -14,7 +14,7 @@ fn test_retry_succeeds_first_attempt() {
 
 #[test]
 fn test_retry_succeeds_after_failures() {
-    let result: Result<i32, &str> = main_thread(async {
+    let result: Result<i32, RetryError<&str>> = main_thread(async {
         let attempts = Cell::new(0);
         retry(
             Some(5),
@@ -37,7 +37,7 @@ fn test_retry_succeeds_after_failures() {
 
 #[test]
 fn test_retry_exhausts_max() {
-    let result: Result<i32, &str> = main_thread(async {
+    let result: Result<i32, RetryError<&str>> = main_thread(async {
         retry(
             Some(3),
             Duration::from_millis(10),
@@ -46,12 +46,12 @@ fn test_retry_exhausts_max() {
         )
         .await
     });
-    assert_eq!(result, Err("fail"));
+    assert_eq!(result, Err(RetryError::Failed("fail")));
 }
 
 #[test]
 fn test_retry_should_retry_returns_false() {
-    let result: Result<i32, &str> = main_thread(async {
+    let result: Result<i32, RetryError<&str>> = main_thread(async {
         let attempts = Cell::new(0);
         retry(
             Some(10),
@@ -64,12 +64,12 @@ fn test_retry_should_retry_returns_false() {
         )
         .await
     });
-    assert_eq!(result, Err("permanent"));
+    assert_eq!(result, Err(RetryError::Failed("permanent")));
 }
 
 #[test]
 fn test_retry_none_max_retries_until_success() {
-    let result: Result<i32, &str> = main_thread(async {
+    let result: Result<i32, RetryError<&str>> = main_thread(async {
         let attempts = Cell::new(0);
         retry(
             None,
@@ -94,7 +94,7 @@ fn test_retry_none_max_retries_until_success() {
 fn test_retry_respects_delay() {
     main_thread(async {
         let start = Instant::now();
-        let _: Result<i32, &str> = retry(
+        let _: Result<i32, RetryError<&str>> = retry(
             Some(3),
             Duration::from_millis(50),
             || async { Err("fail") },
@@ -119,7 +119,7 @@ fn test_retry_selective_should_retry() {
         Permanent,
     }
 
-    let result: Result<i32, MyErr> = main_thread(async {
+    let result: Result<i32, RetryError<MyErr>> = main_thread(async {
         let attempts = Cell::new(0);
         retry(
             Some(10),
@@ -137,5 +137,5 @@ fn test_retry_selective_should_retry() {
         )
         .await
     });
-    assert_eq!(result, Err(MyErr::Permanent));
+    assert_eq!(result, Err(RetryError::Failed(MyErr::Permanent)));
 }

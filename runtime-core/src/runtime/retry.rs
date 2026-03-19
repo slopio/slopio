@@ -1,13 +1,20 @@
 use std::time::Duration;
 
+use crate::io_driver::IO_DRIVER;
 use crate::runtime::time::Sleep;
+
+#[derive(Debug, PartialEq)]
+pub enum RetryError<E> {
+    Failed(E),
+    Shutdown,
+}
 
 pub async fn retry<T, E, F, Fut, R>(
     max: Option<usize>,
     delay: Duration,
     f: F,
     should_retry: R,
-) -> Result<T, E>
+) -> Result<T, RetryError<E>>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, E>>,
@@ -18,9 +25,10 @@ where
         attempt += 1;
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e) if max == Some(attempt) => return Err(e),
+            Err(e) if max == Some(attempt) => return Err(RetryError::Failed(e)),
+            Err(_) if IO_DRIVER.with(|d| d.shutdown()) => return Err(RetryError::Shutdown),
             Err(e) if should_retry(&e) => Sleep::during(delay).await,
-            Err(e) => return Err(e),
+            Err(e) => return Err(RetryError::Failed(e)),
         }
     }
 }

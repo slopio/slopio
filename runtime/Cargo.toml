@@ -12,9 +12,6 @@ otlp            = ["tracing", "dep:runtime-h2"]
 name = "tls"
 required-features = ["tls"]
 
-[[example]]
-name = "http"
-
 [dependencies]
 runtime-core = { path = "../runtime-core" }
 runtime-h2 = { package = "popple-h2", git = "ssh://git@github.com/saucisoupe/popple-h2", optional = true }

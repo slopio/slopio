@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use runtime_core::runtime::retry::retry;
+use runtime_core::runtime::retry::{RetryError, retry};
 use runtime_core::tracing::collector::otlp::protobuf_encoder::ProtoEncodeBuffer;
 use runtime_core::tracing::{Collector, SpanWrapper};
 
@@ -27,21 +27,24 @@ impl OtlpCollector {
         }
     }
 
-    async fn get_connection(&mut self) -> &mut H2Connection {
+    async fn get_connection(&mut self) -> Option<&mut H2Connection> {
         if self.conn.is_none() {
             let addr = self.addr;
             let authority = self.authority.clone();
-            let conn = retry(
+            match retry(
                 None,
                 Duration::from_secs(5),
                 || H2Connection::connect(addr, authority.clone()),
                 |_| true,
             )
             .await
-            .unwrap(); // None max means it retries forever, so it always succeeds
-            self.conn = Some(conn);
+            {
+                Ok(conn) => self.conn = Some(conn),
+                Err(RetryError::Shutdown) => return None,
+                Err(RetryError::Failed(_)) => unreachable!(),
+            }
         }
-        self.conn.as_mut().unwrap()
+        self.conn.as_mut()
     }
 }
 
@@ -54,7 +57,9 @@ impl Collector for OtlpCollector {
     }
 
     async fn process(&mut self, batch: Vec<SpanWrapper>) {
-        self.get_connection().await;
+        let Some(_) = self.get_connection().await else {
+            return;
+        };
         self.encode_buf.encode(batch);
         let body = std::mem::take(&mut self.encode_buf.buf);
 
