@@ -4,7 +4,7 @@ use io_uring::{
 };
 use std::future::Future;
 
-use crate::io_driver::{IO_DRIVER, operations::sockets::SocketWrapper};
+use crate::io_driver::{IO_DRIVER, operations::{OneshotToken, sockets::SocketWrapper}};
 
 pub fn socket_send<'a>(socket: &SocketWrapper, data: &'a [u8]) -> WriteSocket<'a> {
     WriteSocket::from_socket(socket, data)
@@ -23,13 +23,13 @@ impl<'a> WriteSocket<'a> {
         let entry =
             opcode::Send::new(Fd(self.fd), self.data.as_ptr(), self.data.len() as u32).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        self.id = Some(token as usize);
+        self.id = Some(token);
     }
 }
 
 pub struct WriteSocket<'a> {
     fd: i32,
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     data: &'a [u8],
 }
 
@@ -44,8 +44,8 @@ impl<'a> Future for WriteSocket<'a> {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let id = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        let token = self.id.unwrap();
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(io_result) => {
                 self.id = None;
@@ -60,8 +60,8 @@ impl<'a> Future for WriteSocket<'a> {
 
 impl<'a> Drop for WriteSocket<'a> {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
         }
     }
 }

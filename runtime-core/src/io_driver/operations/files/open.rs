@@ -5,15 +5,15 @@ use std::future::Future;
 use io_uring::{opcode, squeue::Entry};
 
 use crate::io_driver::IO_DRIVER;
-use crate::io_driver::operations::IoDriverToken;
 use crate::io_driver::operations::IoOP;
+use crate::io_driver::operations::OneshotToken;
 use crate::io_driver::operations::files::OpenedFile;
 
 struct OpenFile {
     filename: CString,
     flags: i32,
     mode: u32,
-    id: Option<usize>,
+    id: Option<OneshotToken>,
 }
 
 #[derive(Debug)]
@@ -43,8 +43,8 @@ impl Future for OpenFile {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let waker = cx.waker();
-        let id = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        let token = self.id.unwrap();
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(io_result) => std::task::Poll::Ready(match io_result.result {
                 fd @ 0.. => Ok(OpenedFile { fd }),
@@ -59,11 +59,10 @@ impl Drop for OpenFile {
 }
 
 impl IoOP for OpenFile {
-    fn register_to_driver(&mut self) -> IoDriverToken {
+    fn register_to_driver(&mut self) {
         let entry = self.to_entry();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        self.id = Some(token as usize);
-        token
+        self.id = Some(token);
     }
 
     fn to_entry(&self) -> Entry {

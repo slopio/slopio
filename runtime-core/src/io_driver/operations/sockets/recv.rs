@@ -8,10 +8,11 @@ use std::task::{Context, Poll};
 use crate::io_driver::IO_DRIVER;
 
 use super::SocketWrapper;
+use crate::io_driver::operations::OneshotToken;
 
 pub struct ClassicRecv<'a> {
     fd: i32,
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     buffer: &'a mut [MaybeUninit<u8>],
     len: usize,
 }
@@ -34,7 +35,7 @@ impl<'a> ClassicRecv<'a> {
         )
         .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        self.id = Some(token as usize);
+        self.id = Some(token);
     }
 }
 
@@ -66,9 +67,9 @@ impl<'a> Future for ClassicRecv<'a> {
         }
 
         let waker = cx.waker();
-        let id = self.id.unwrap();
+        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
@@ -83,8 +84,8 @@ impl<'a> Future for ClassicRecv<'a> {
 
 impl Drop for ClassicRecv<'_> {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
         }
     }
 }

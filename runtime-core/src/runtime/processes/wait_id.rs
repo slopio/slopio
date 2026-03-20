@@ -5,6 +5,7 @@ use std::process::Child;
 use io_uring::opcode;
 
 use crate::io_driver::IO_DRIVER;
+use crate::io_driver::operations::OneshotToken;
 
 /// How the kernel identifies which child(ren) to wait for.
 #[repr(u32)]
@@ -118,7 +119,7 @@ pub struct WaitProcess {
     id: u32,
     id_type: IdType,
     options: WaitFlags,
-    token: Option<usize>,
+    token: Option<OneshotToken>,
     siginfo: Box<libc::siginfo_t>,
 }
 
@@ -156,7 +157,7 @@ impl WaitProcess {
         .infop(self.siginfo.as_ref() as *const libc::siginfo_t)
         .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        self.token = Some(token as usize);
+        self.token = Some(token);
     }
 }
 
@@ -171,8 +172,8 @@ impl Future for WaitProcess {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let id = self.token.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        let token = self.token.unwrap();
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(io_result) => {
                 self.token = None;
@@ -201,8 +202,8 @@ impl Future for WaitProcess {
 
 impl Drop for WaitProcess {
     fn drop(&mut self) {
-        if let Some(id) = self.token {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
+        if let Some(token) = self.token {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
         }
     }
 }

@@ -1,10 +1,4 @@
-use bumpalo::Bump;
-
-use crate::{
-    http1::request::{Method, ParseError, Request},
-    http1::response::Response,
-};
-use runtime_core::net::{SocketWrapper, socket_recv_init, socket_send};
+use crate::http1::request::Method;
 
 pub mod request;
 pub mod response;

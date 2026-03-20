@@ -4,7 +4,7 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::files::{AsyncFileRead, OpenedFile},
+    operations::{OneshotToken, files::{AsyncFileRead, OpenedFile}},
 };
 
 impl AsyncFileRead for OpenedFile {
@@ -18,14 +18,14 @@ impl AsyncFileRead for OpenedFile {
         };
         let entry = opcode::Read::new(Fd(rf.fd), buffer.as_mut_ptr(), len).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        rf.id = Some(token as usize);
+        rf.id = Some(token);
         rf
     }
 }
 
 pub struct ReadFile<'a> {
     pub(crate) fd: i32,
-    pub(crate) id: Option<usize>,
+    pub(crate) id: Option<OneshotToken>,
     phantom: PhantomData<&'a ()>,
 }
 
@@ -37,8 +37,8 @@ impl<'a> Future for ReadFile<'a> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let waker = cx.waker();
-        let id = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        let token = self.id.unwrap();
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(io_result) => std::task::Poll::Ready(match io_result.result {
                 bytes_read @ 0.. => Ok(bytes_read as usize),

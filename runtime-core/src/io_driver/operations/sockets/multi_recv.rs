@@ -7,11 +7,11 @@ use std::{
 
 use crate::io_driver::{
     BorrowedBuffer, BufGroup, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
-    operations::IoOP,
+    operations::{IoOP, MultishotToken},
 };
 
 pub struct MultiRecv {
-    id: Option<usize>,
+    id: Option<MultishotToken>,
     fd: i32,
     bgid: u16,
     reads: MultiOpQueue,
@@ -110,9 +110,9 @@ impl Stream for MultiRecv {
         }
 
         let waker = cx.waker();
-        let id = self.id.unwrap();
+        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads)) {
+        match IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.reads)) {
             MultiPollResult::Pending => Poll::Pending,
             MultiPollResult::Ready => {
                 match self.try_drain_one() {
@@ -120,11 +120,11 @@ impl Stream for MultiRecv {
                     Poll::Pending => {
                         // Queue had only skippable errors, check if we need resubmit
                         if let MultiPollResult::NeedsResubmit =
-                            IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.reads))
+                            IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.reads))
                         {
-            
+
                             let entry = self.to_entry();
-                            IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
+                            IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
                         }
                         Poll::Pending
                     }
@@ -133,7 +133,7 @@ impl Stream for MultiRecv {
             MultiPollResult::NeedsResubmit => {
 
                 let entry = self.to_entry();
-                IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
+                IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
                 Poll::Pending
             }
         }
@@ -141,11 +141,10 @@ impl Stream for MultiRecv {
 }
 
 impl IoOP for MultiRecv {
-    fn register_to_driver(&mut self) -> crate::io_driver::operations::IoDriverToken {
+    fn register_to_driver(&mut self) {
         let entry = self.to_entry();
         let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd));
-        self.id = Some(token as usize);
-        token
+        self.id = Some(token);
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
@@ -153,8 +152,8 @@ impl IoOP for MultiRecv {
     }
 
     fn driver_cleanup(&mut self) {
-        if let Some(id) = self.id.take() {
-            IO_DRIVER.with(|d| d.cancel_multishot_op(id, self.bgid));
+        if let Some(token) = self.id.take() {
+            IO_DRIVER.with(|d| d.cancel_multishot_op(token, self.bgid));
         }
     }
 }

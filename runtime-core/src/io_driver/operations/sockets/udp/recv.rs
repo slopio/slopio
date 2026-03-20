@@ -9,10 +9,11 @@ use std::{
 use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::IO_DRIVER;
+use crate::io_driver::operations::OneshotToken;
 
 pub struct UdpRecvFrom<'a> {
     fd: i32,
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     buffer: &'a mut [MaybeUninit<u8>],
     // These must stay pinned for the duration of the operation
     msghdr: MaybeUninit<libc::msghdr>,
@@ -54,7 +55,7 @@ impl<'a> UdpRecvFrom<'a> {
 
         let entry = opcode::RecvMsg::new(Fd(this.fd), this.msghdr.as_mut_ptr()).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        this.id = Some(token as usize);
+        this.id = Some(token);
     }
 }
 
@@ -86,9 +87,9 @@ impl<'a> Future for UdpRecvFrom<'a> {
         }
 
         let waker = cx.waker();
-        let id = self.id.unwrap();
+        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
@@ -111,8 +112,8 @@ impl<'a> Future for UdpRecvFrom<'a> {
 
 impl Drop for UdpRecvFrom<'_> {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::os::unix::io::RawFd;
 
-use crate::io_driver::{IO_DRIVER, operations::IoDriverToken};
+use crate::io_driver::{IO_DRIVER, operations::OneshotToken};
 
 pub fn create_eventfd() -> RawFd {
     unsafe {
@@ -28,6 +28,6 @@ pub fn signal_eventfd(efd: RawFd, value: u64) {
     }
 }
 
-pub fn register_eventfd_read(efd: RawFd) -> IoDriverToken {
+pub fn register_eventfd_read(efd: RawFd) -> OneshotToken {
     IO_DRIVER.with(|driver| driver.push_signal_op(efd))
 }

@@ -4,10 +4,11 @@ use std::marker::PhantomData;
 use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::IO_DRIVER;
+use crate::io_driver::operations::OneshotToken;
 
 /// Async read from a pipe fd via io_uring.
 pub struct ReadPipe<'a> {
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     _phantom: PhantomData<&'a mut [u8]>,
 }
 
@@ -16,7 +17,7 @@ impl<'a> ReadPipe<'a> {
         let entry = opcode::Read::new(Fd(fd), buf.as_mut_ptr(), buf.len() as u32).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         Self {
-            id: Some(token as usize),
+            id: Some(token),
             _phantom: PhantomData,
         }
     }
@@ -30,8 +31,8 @@ impl<'a> Future for ReadPipe<'a> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let waker = cx.waker();
-        let id = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        let token = self.id.unwrap();
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(io_result) => {
                 self.id = None;
@@ -46,15 +47,15 @@ impl<'a> Future for ReadPipe<'a> {
 
 impl<'a> Drop for ReadPipe<'a> {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
         }
     }
 }
 
 /// Async write to a pipe fd via io_uring.
 pub struct WritePipe<'a> {
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     _phantom: PhantomData<&'a [u8]>,
 }
 
@@ -63,7 +64,7 @@ impl<'a> WritePipe<'a> {
         let entry = opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         Self {
-            id: Some(token as usize),
+            id: Some(token),
             _phantom: PhantomData,
         }
     }
@@ -77,8 +78,8 @@ impl<'a> Future for WritePipe<'a> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let waker = cx.waker();
-        let id = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        let token = self.id.unwrap();
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(io_result) => {
                 self.id = None;
@@ -93,8 +94,8 @@ impl<'a> Future for WritePipe<'a> {
 
 impl<'a> Drop for WritePipe<'a> {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
         }
     }
 }

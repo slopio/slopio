@@ -5,10 +5,10 @@ use std::{
 
 use io_uring::{opcode, types::Fd};
 
-use crate::io_driver::{BorrowedBuffer, BufGroup, IO_DRIVER, operations::sockets::SocketWrapper};
+use crate::io_driver::{BorrowedBuffer, BufGroup, IO_DRIVER, operations::{OneshotToken, sockets::SocketWrapper}};
 
 pub struct ManagedRecvBundle {
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     fd: i32,
     bgid: u16,
 }
@@ -29,7 +29,7 @@ impl ManagedRecvBundle {
     fn register_to_driver(&mut self) {
         let entry = opcode::RecvBundle::new(Fd(self.fd), self.bgid).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        self.id = Some(token as usize);
+        self.id = Some(token);
     }
 }
 
@@ -42,9 +42,9 @@ impl Future for ManagedRecvBundle {
         }
 
         let waker = cx.waker();
-        let id = self.id.unwrap();
+        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
@@ -65,8 +65,8 @@ impl Future for ManagedRecvBundle {
 
 impl Drop for ManagedRecvBundle {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, Some(self.bgid)))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, Some(self.bgid)))
         }
     }
 }

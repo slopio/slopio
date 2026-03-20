@@ -7,11 +7,11 @@ use std::{
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 
 use crate::io_driver::{
-    BorrowedBuffer, BufGroup, IO_DRIVER, OpMetadata, operations::sockets::SocketWrapper,
+    BorrowedBuffer, BufGroup, IO_DRIVER, OpMetadata, operations::{OneshotToken, sockets::SocketWrapper},
 };
 
 pub struct ManagedRecv {
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     fd: i32,
     bgid: u16,
 }
@@ -35,7 +35,7 @@ impl ManagedRecv {
             .build()
             .flags(io_uring::squeue::Flags::BUFFER_SELECT);
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        self.id = Some(token as usize);
+        self.id = Some(token);
     }
 
     fn parse_completion(&self, event: OpMetadata) -> std::io::Result<BorrowedBuffer> {
@@ -57,9 +57,9 @@ impl Future for ManagedRecv {
         }
 
         let waker = cx.waker();
-        let id = self.id.unwrap();
+        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
@@ -71,8 +71,8 @@ impl Future for ManagedRecv {
 
 impl Drop for ManagedRecv {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, Some(self.bgid)))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, Some(self.bgid)))
         }
     }
 }

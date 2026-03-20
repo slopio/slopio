@@ -13,11 +13,11 @@ use socket2::{Domain, Protocol, Socket as S, Type};
 use crate::io_driver::{
     IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     completion_events::MULTI_OP_FLAG,
-    operations::{IoOP, sockets::SocketWrapper},
+    operations::{IoOP, MultishotToken, sockets::SocketWrapper},
 };
 
 pub struct MultiAccept {
-    id: Option<usize>,
+    id: Option<MultishotToken>,
     fd: i32,
     sockets: MultiOpQueue,
     cancel_sent: bool,
@@ -108,8 +108,8 @@ impl Stream for MultiAccept {
         // On shutdown, ask io_uring to cancel the multishot accept (once).
         if shutting_down && !self.cancel_sent {
             self.cancel_sent = true;
-            let id = self.id.unwrap();
-            IO_DRIVER.with(|d| d.send_multiop_cancel_event((id as u64) | MULTI_OP_FLAG));
+            let token = self.id.unwrap();
+            IO_DRIVER.with(|d| d.send_multiop_cancel_event(token.raw() | MULTI_OP_FLAG));
         }
 
         if let Poll::Ready(result) = self.try_drain_one() {
@@ -117,9 +117,9 @@ impl Stream for MultiAccept {
         }
 
         let waker = cx.waker();
-        let id = self.id.unwrap();
+        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op_multishot(id, waker, &mut self.sockets)) {
+        match IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.sockets)) {
             MultiPollResult::Pending => Poll::Pending,
             MultiPollResult::Ready => {
                 let drained = self.try_drain_one();
@@ -139,7 +139,7 @@ impl Stream for MultiAccept {
                     return Poll::Ready(None);
                 }
                 let entry = self.to_entry();
-                IO_DRIVER.with(|d| d.resubmit_multishot(id, entry, waker));
+                IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
                 Poll::Pending
             }
         }
@@ -147,11 +147,10 @@ impl Stream for MultiAccept {
 }
 
 impl IoOP for MultiAccept {
-    fn register_to_driver(&mut self) -> crate::io_driver::operations::IoDriverToken {
+    fn register_to_driver(&mut self) {
         let entry = self.to_entry();
         let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd));
-        self.id = Some(token as usize);
-        token
+        self.id = Some(token);
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {

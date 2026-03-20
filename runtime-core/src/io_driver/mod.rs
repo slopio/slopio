@@ -7,14 +7,6 @@ use std::{
     time::Duration,
 };
 
-use io_uring::{
-    IoUring,
-    cqueue::Entry,
-    opcode, squeue,
-    types::{Fd, Timespec},
-};
-use slab::Slab;
-
 use crate::{
     define_buffer_rings,
     io_driver::{
@@ -22,10 +14,17 @@ use crate::{
             CompletionEvent, Event, IGNORED_FLAG, MULTI_OP_FLAG, MultiProcessResult,
             SingleProcessResult, process_multi, process_single,
         },
-        operations::IoDriverToken,
+        operations::{MultishotToken, OneshotToken},
     },
     scoped_thread_local,
 };
+use io_uring::{
+    IoUring,
+    cqueue::Entry,
+    opcode, squeue,
+    types::{Fd, Timespec},
+};
+use slab::Slab;
 mod completion_events;
 pub mod operations;
 mod sending_buffers;
@@ -39,8 +38,8 @@ const QUEUE_PAUSE_THRESHOLD: usize = 2;
 #[derive(Default)]
 pub struct IODriver {
     ring: UnsafeCell<Ring>,
-    slab: Rc<UnsafeCell<Slab<SingleOpState>>>,
-    multishot_slab: Rc<UnsafeCell<Slab<MultiOpState>>>,
+    slab: Rc<UnsafeCell<OneshotSlab>>,
+    multishot_slab: Rc<UnsafeCell<MultishotSlab>>,
     sending_buffers: SendingBufferPool,
     shutting_down: Cell<bool>,
 }
@@ -232,11 +231,12 @@ impl IODriver {
     }
 
     fn process_cqe(&self, completion_event: CompletionEvent) {
+        let raw_index = completion_event.slab_index;
         match completion_event.event {
             Event::MultiShot(cqe_data) => {
                 let clean_index = completion_event.clean_slab_index();
                 let slab = unsafe { &mut *self.multishot_slab.get() };
-                let slab_entry = unsafe { slab.get_unchecked_mut(clean_index) };
+                let slab_entry = unsafe { slab.get_unchecked_mut_raw(clean_index) };
 
                 match process_multi(
                     slab_entry,
@@ -253,7 +253,7 @@ impl IODriver {
                     }
                     MultiProcessResult::FullyPaused => {}
                     MultiProcessResult::CancelComplete => {
-                        slab.remove(clean_index);
+                        slab.remove_raw(clean_index);
                     }
                     MultiProcessResult::CancelledRecycling {
                         buffer_id,
@@ -270,7 +270,7 @@ impl IODriver {
                             && *ecancelled
                             && *last_cqe
                         {
-                            slab.remove(clean_index);
+                            slab.remove_raw(clean_index);
                         }
                     }
                     MultiProcessResult::InvalidState(_msg) => {}
@@ -278,7 +278,7 @@ impl IODriver {
             }
             Event::SingleShot(cqe_data) => {
                 let slab = unsafe { &mut *self.slab.get() };
-                let slab_entry = unsafe { slab.get_unchecked_mut(completion_event.slab_index) };
+                let slab_entry = unsafe { slab.get_unchecked_mut_raw(raw_index) };
 
                 match process_single(slab_entry, cqe_data) {
                     SingleProcessResult::Completed => {}
@@ -289,7 +289,7 @@ impl IODriver {
                     SingleProcessResult::CancelledRecycling { id, len, bgid } => {
                         let b = self.get_buffer(bgid, id, len as usize);
                         self.recycle_buffer(&b);
-                        slab.remove(completion_event.slab_index); //will never be polled
+                        slab.remove_raw(raw_index);
                     }
                 }
             }
@@ -300,7 +300,7 @@ impl IODriver {
                         std::io::Error::from_raw_os_error(-result)
                     );
                 }
-                self.sending_buffers.release(completion_event.slab_index);
+                self.sending_buffers.release(raw_index);
             }
         }
     }
@@ -319,13 +319,13 @@ impl IODriver {
         ring_inner.buffer_rings.recycle_buffer(buffer);
     }
 
-    pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> IoDriverToken {
-        let slab_multishot = unsafe { &mut *self.multishot_slab.get() };
+    pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> MultishotToken {
+        let slab = unsafe { &mut *self.multishot_slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let user_data = slab_multishot.insert(MultiOpState::Init { fd }) as IoDriverToken;
-        entry.set_user_data(user_data | MULTI_OP_FLAG);
+        let token = slab.insert(MultiOpState::Init { fd });
+        entry.set_user_data(token.raw() | MULTI_OP_FLAG);
         ring_inner.add(&entry);
-        user_data
+        token
     }
 
     pub fn push_anon_op(&self, entry: squeue::Entry) {
@@ -333,13 +333,13 @@ impl IODriver {
         ring_inner.add(&entry)
     }
 
-    pub fn push_op(&self, mut entry: squeue::Entry) -> IoDriverToken {
+    pub fn push_op(&self, mut entry: squeue::Entry) -> OneshotToken {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let user_data = slab.insert(SingleOpState::Init) as IoDriverToken;
-        entry.set_user_data(user_data);
+        let token = slab.insert(SingleOpState::Init);
+        entry.set_user_data(token.raw());
         ring_inner.add(&entry);
-        user_data
+        token
     }
 
     pub fn push_wakeup_timeout(&self, duration: Duration) {
@@ -352,26 +352,26 @@ impl IODriver {
         ring_inner.add(&entry);
     }
 
-    pub fn push_signal_op(&self, fd: RawFd) -> IoDriverToken {
+    pub fn push_signal_op(&self, fd: RawFd) -> OneshotToken {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
         let mut sig_data = Box::new([0u8; 8]);
         let ptr = sig_data.as_mut_ptr();
-        let user_data = slab.insert(SingleOpState::Signal(sig_data)) as IoDriverToken;
+        let token = slab.insert(SingleOpState::Signal(sig_data));
         let mut entry = opcode::Read::new(Fd(fd), ptr, 8).build();
-        entry.set_user_data(user_data);
+        entry.set_user_data(token.raw());
         ring_inner.add(&entry);
-        user_data
+        token
     }
 
     fn poll_op_multishot(
         &self,
-        id: usize,
+        token: MultishotToken,
         waker: &Waker,
         poller_queue: &mut MultiOpQueue,
     ) -> MultiPollResult {
-        let slab_multishot = unsafe { &mut *self.multishot_slab.get() };
-        let multishot_op = unsafe { slab_multishot.get_unchecked_mut(id) };
+        let slab = unsafe { &mut *self.multishot_slab.get() };
+        let multishot_op = unsafe { slab.get_unchecked_mut(token) };
         match multishot_op {
             MultiOpState::Init { .. } => {
                 multishot_op.transition_init_to_sent(waker);
@@ -403,10 +403,10 @@ impl IODriver {
         }
     }
 
-    pub fn poll_op(&self, id: usize, waker: &Waker) -> std::task::Poll<OpMetadata> {
+    pub fn poll_op(&self, token: OneshotToken, waker: &Waker) -> std::task::Poll<OpMetadata> {
         let slab = unsafe { &mut *self.slab.get() };
-        let entry = unsafe { slab.get_unchecked_mut(id) };
-        let mut id_to_delete = None;
+        let entry = unsafe { slab.get_unchecked_mut(token) };
+        let mut to_delete = None;
         let res = match entry {
             SingleOpState::Init => {
                 *entry = SingleOpState::Sent(waker.clone());
@@ -417,15 +417,15 @@ impl IODriver {
                 std::task::Poll::Pending
             }
             SingleOpState::Ended(e) => {
-                id_to_delete = Some(id);
+                to_delete = Some(token);
                 std::task::Poll::Ready(*e)
             }
             _ => {
                 unreachable!("this should never get polled")
             }
         };
-        if let Some(id) = id_to_delete {
-            slab.remove(id);
+        if let Some(token) = to_delete {
+            slab.remove(token);
         }
         res
     }
@@ -471,43 +471,48 @@ impl IODriver {
     /// Cancel a single-shot operation. `bgid` must be `Some` if the operation
     /// used provided buffers (so the buffer can be recycled on late completion),
     /// or `None` for operations that manage their own buffers.
-    pub fn cancel_single_op(&self, id: usize, bgid: Option<u16>) {
+    pub fn cancel_single_op(&self, token: OneshotToken, bgid: Option<u16>) {
         let slab = unsafe { &mut *self.slab.get() };
-        *slab.get_mut(id).unwrap() = SingleOpState::Cancelled { bgid };
-        self.send_singleop_cancel_event(id as u64);
+        *slab.get_mut(token).unwrap() = SingleOpState::Cancelled { bgid };
+        self.send_singleop_cancel_event(token.raw());
     }
 
-    fn send_singleop_cancel_event(&self, id: u64) {
+    fn send_singleop_cancel_event(&self, raw: u64) {
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let cancel_op = opcode::AsyncCancel::new(id)
+        let cancel_op = opcode::AsyncCancel::new(raw)
             .build()
-            .user_data(id | IGNORED_FLAG);
+            .user_data(raw | IGNORED_FLAG);
         ring_inner.add(&cancel_op);
     }
 
-    pub fn cancel_multishot_op(&self, id: usize, bgid: u16) {
+    pub fn cancel_multishot_op(&self, token: MultishotToken, bgid: u16) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
-        if let Some(entry) = slab.get_mut(id) {
+        if let Some(entry) = slab.get_mut(token) {
             *entry = MultiOpState::Cancelled {
                 bgid,
                 last_cqe: false,
                 ecancelled: false,
             };
-            self.send_multiop_cancel_event((id as u64) | MULTI_OP_FLAG);
+            self.send_multiop_cancel_event(token.raw() | MULTI_OP_FLAG);
         }
     }
 
-    pub fn send_multiop_cancel_event(&self, id: u64) {
+    pub fn send_multiop_cancel_event(&self, raw: u64) {
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let cancel_op = opcode::AsyncCancel::new(id)
+        let cancel_op = opcode::AsyncCancel::new(raw)
             .build()
-            .user_data(id | MULTI_OP_FLAG | IGNORED_FLAG);
+            .user_data(raw | MULTI_OP_FLAG | IGNORED_FLAG);
         ring_inner.add(&cancel_op);
     }
 
-    pub fn resubmit_multishot(&self, id: usize, mut entry: squeue::Entry, waker: &Waker) -> bool {
+    pub fn resubmit_multishot(
+        &self,
+        token: MultishotToken,
+        mut entry: squeue::Entry,
+        waker: &Waker,
+    ) -> bool {
         let slab = unsafe { &mut *self.multishot_slab.get() };
-        let op = match slab.get_mut(id) {
+        let op = match slab.get_mut(token) {
             Some(op) => op,
             None => return false,
         };
@@ -518,7 +523,7 @@ impl IODriver {
 
         op.transition_paused_to_sent(waker);
 
-        entry = entry.user_data((id as u64) | MULTI_OP_FLAG);
+        entry = entry.user_data(token.raw() | MULTI_OP_FLAG);
 
         let ring = unsafe { &mut *self.ring.get() };
         ring.add(&entry);
@@ -550,6 +555,82 @@ enum SingleOpState {
     Cancelled {
         bgid: Option<u16>,
     },
+}
+
+/// Type-safe slab for single-shot operations, keyed by `OneshotToken`.
+struct OneshotSlab(Slab<SingleOpState>);
+
+impl Default for OneshotSlab {
+    fn default() -> Self {
+        Self(Slab::new())
+    }
+}
+
+impl OneshotSlab {
+    fn insert(&mut self, val: SingleOpState) -> OneshotToken {
+        OneshotToken(self.0.insert(val) as u64)
+    }
+
+    fn get_mut(&mut self, token: OneshotToken) -> Option<&mut SingleOpState> {
+        self.0.get_mut(token.raw() as usize)
+    }
+
+    /// # Safety
+    /// The token must refer to an occupied slot.
+    unsafe fn get_unchecked_mut(&mut self, token: OneshotToken) -> &mut SingleOpState {
+        unsafe { self.0.get_unchecked_mut(token.raw() as usize) }
+    }
+
+    fn remove(&mut self, token: OneshotToken) -> SingleOpState {
+        self.0.remove(token.raw() as usize)
+    }
+
+    /// Access by raw index from a CQE user_data.
+    unsafe fn get_unchecked_mut_raw(&mut self, index: usize) -> &mut SingleOpState {
+        unsafe { self.0.get_unchecked_mut(index) }
+    }
+
+    fn remove_raw(&mut self, index: usize) -> SingleOpState {
+        self.0.remove(index)
+    }
+}
+
+/// Type-safe slab for multishot operations, keyed by `MultishotToken`.
+struct MultishotSlab(Slab<MultiOpState>);
+
+impl Default for MultishotSlab {
+    fn default() -> Self {
+        Self(Slab::new())
+    }
+}
+
+impl MultishotSlab {
+    fn insert(&mut self, val: MultiOpState) -> MultishotToken {
+        MultishotToken(self.0.insert(val) as u64)
+    }
+
+    fn get_mut(&mut self, token: MultishotToken) -> Option<&mut MultiOpState> {
+        self.0.get_mut(token.raw() as usize)
+    }
+
+    /// # Safety
+    /// The token must refer to an occupied slot.
+    unsafe fn get_unchecked_mut(&mut self, token: MultishotToken) -> &mut MultiOpState {
+        unsafe { self.0.get_unchecked_mut(token.raw() as usize) }
+    }
+
+    fn remove(&mut self, token: MultishotToken) -> MultiOpState {
+        self.0.remove(token.raw() as usize)
+    }
+
+    /// Access by raw index from a CQE user_data.
+    unsafe fn get_unchecked_mut_raw(&mut self, index: usize) -> &mut MultiOpState {
+        unsafe { self.0.get_unchecked_mut(index) }
+    }
+
+    fn remove_raw(&mut self, index: usize) -> MultiOpState {
+        self.0.remove(index)
+    }
 }
 
 struct Ring {

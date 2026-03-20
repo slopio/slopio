@@ -9,10 +9,11 @@ use std::{
 use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::IO_DRIVER;
+use crate::io_driver::operations::OneshotToken;
 
 pub struct UdpSendTo<'a> {
     fd: i32,
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     buffer: &'a [u8],
     msghdr: MaybeUninit<libc::msghdr>,
     iovec: MaybeUninit<libc::iovec>,
@@ -63,7 +64,7 @@ impl<'a> UdpSendTo<'a> {
 
         let entry = opcode::SendMsg::new(Fd(this.fd), this.msghdr.as_ptr()).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        this.id = Some(token as usize);
+        this.id = Some(token);
     }
 }
 
@@ -76,9 +77,9 @@ impl<'a> Future for UdpSendTo<'a> {
         }
 
         let waker = cx.waker();
-        let id = self.id.unwrap();
+        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
@@ -93,8 +94,8 @@ impl<'a> Future for UdpSendTo<'a> {
 
 impl Drop for UdpSendTo<'_> {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
         }
     }
 }

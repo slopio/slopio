@@ -5,7 +5,7 @@ use io_uring::{
 use std::future::Future;
 use std::io::IoSlice;
 
-use crate::io_driver::{IO_DRIVER, operations::sockets::SocketWrapper};
+use crate::io_driver::{IO_DRIVER, operations::{OneshotToken, sockets::SocketWrapper}};
 
 pub fn socket_send_vectored<'a>(
     socket: &SocketWrapper,
@@ -20,7 +20,7 @@ pub fn socket_send_vectored<'a>(
 
 pub struct WriteVectoredSocket<'a> {
     fd: i32,
-    id: Option<usize>,
+    id: Option<OneshotToken>,
     bufs: &'a [IoSlice<'a>],
 }
 
@@ -33,7 +33,7 @@ impl<'a> WriteVectoredSocket<'a> {
         )
         .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        self.id = Some(token as usize);
+        self.id = Some(token);
     }
 }
 
@@ -48,8 +48,8 @@ impl<'a> Future for WriteVectoredSocket<'a> {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let id = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(id, waker)) {
+        let token = self.id.unwrap();
+        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(io_result) => {
                 self.id = None;
@@ -64,8 +64,8 @@ impl<'a> Future for WriteVectoredSocket<'a> {
 
 impl<'a> Drop for WriteVectoredSocket<'a> {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(id, None))
+        if let Some(token) = self.id {
+            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
         }
     }
 }
