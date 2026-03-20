@@ -1,9 +1,8 @@
 use std::time::{Duration, Instant};
 
 use runtime::main_thread;
-use runtime::runtime::processes::pipe_io::{ReadPipe, WritePipe};
 use runtime::runtime::processes::spawn::Process;
-use runtime::runtime::processes::wait_id::ExitCode;
+use runtime::runtime::processes::wait_id::{ExitCode, IdType, WaitFlags, WaitProcess};
 use runtime::runtime::select::{SelectResult, select};
 use runtime::runtime::time::Sleep;
 
@@ -138,5 +137,46 @@ fn test_pipe_byte_by_byte() {
         let finished = proc.wait().await.unwrap();
         let code = unwrap_finished(finished).into_result().unwrap();
         assert_eq!(code, 0);
+    });
+}
+
+#[test]
+fn test_stop_notification() {
+    main_thread(async {
+        let proc = Process::new("sleep", &["60"]).unwrap();
+        let pid = proc.pid().unwrap();
+
+        // watch for STOPPED, not EXITED
+        let wait_stopped = WaitProcess::new(pid, IdType::Pid, WaitFlags::STOPPED);
+
+        // send SIGSTOP after 1s
+        let stop_handle = runtime::runtime::spawn(async move {
+            Sleep::during(Duration::from_secs(1)).await;
+            unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+        });
+
+        // race: stop notification vs 10s safety timeout
+        match select(wait_stopped, Sleep::during(Duration::from_secs(10))).await {
+            SelectResult::First(result) => {
+                let status = result.unwrap();
+                match status.code {
+                    ExitCode::Stopped(sig) => {
+                        assert_eq!(sig, libc::SIGSTOP, "expected SIGSTOP");
+                    }
+                    other => panic!("expected Stopped, got {:?}", other),
+                }
+            }
+            SelectResult::Second(_) => {
+                panic!("timeout fired — never got stop notification");
+            }
+        }
+
+        stop_handle.await;
+
+        // clean up: resume then kill
+        unsafe {
+            libc::kill(pid as i32, libc::SIGCONT);
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
     });
 }

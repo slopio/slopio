@@ -5,8 +5,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::runtime::select::{select, SelectResult};
 use crate::runtime::TIME_DRIVER;
+use crate::runtime::select::{SelectResult, select};
 
 /// Wraps a future with a timeout. Returns `Ok(output)` if the future completes
 /// before the deadline, or `Err(())` if the timeout fires first.
@@ -18,7 +18,7 @@ pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Outp
 }
 
 #[derive(Default)]
-pub(crate) struct TimeDriver {
+pub struct TimeDriver {
     inner: UnsafeCell<async_timers::TimeWheel>,
 }
 
