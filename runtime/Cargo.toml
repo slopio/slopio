@@ -21,7 +21,6 @@ rustls-pemfile = { version = "2", optional = true }
 mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 
 [dev-dependencies]
-runtime-http = { path = "../runtime-http" }
 runtime-streams = { path = "../runtime-streams" }
 bytes = "1"
 http = "1"

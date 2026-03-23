@@ -160,12 +160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "httparse"
-version = "1.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
-
-[[package]]
 name = "io-uring"
 version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -419,7 +413,6 @@ dependencies = [
  "popple-h2",
  "rand 0.8.5",
  "runtime-core 0.1.0",
- "runtime-http",
  "runtime-streams 0.1.0",
  "rustls",
  "rustls-pemfile",
@@ -488,16 +481,6 @@ dependencies = [
  "runtime-core 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
  "runtime-streams 0.1.0 (git+https://github.com/saucisoupe/runtime-streams)",
  "zerocopy",
-]
-
-[[package]]
-name = "runtime-http"
-version = "0.1.0"
-dependencies = [
- "bumpalo",
- "httparse",
- "memchr",
- "runtime-core 0.1.0",
 ]
 
 [[package]]
