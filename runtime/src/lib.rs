@@ -16,6 +16,8 @@ pub use runtime_core::tracing;
 #[cfg(feature = "otlp")]
 mod otlp_collector;
 
+pub mod http;
+
 #[cfg(feature = "tls")]
 pub mod tls;
 
