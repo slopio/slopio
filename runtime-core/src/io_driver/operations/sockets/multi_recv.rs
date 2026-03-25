@@ -78,7 +78,23 @@ impl MultiRecv {
 
 impl Drop for MultiRecv {
     fn drop(&mut self) {
+        // Recycle kernel buffers from any unprocessed completion events
+        // before cancelling the op, otherwise these buffer ring entries leak.
+        self.recycle_pending_buffers();
         self.driver_cleanup();
+    }
+}
+
+impl MultiRecv {
+    fn recycle_pending_buffers(&mut self) {
+        while let Some(event) = self.reads.pop() {
+            if event.result > 0 {
+                if let Some(buffer_id) = buffer_select(event.flags) {
+                    // get_buffer + drop recycles the buffer back to the ring
+                    drop(IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, event.result as usize)));
+                }
+            }
+        }
     }
 }
 
