@@ -73,7 +73,5 @@ impl std::str::FromStr for Method {
 }
 
 pub trait Handler<H, R, S, E> {
-    fn process_headers_only(&self, headers: &H) -> impl Future<Output = Result<Option<S>, E>>;
-
-    fn process_stream(&self, stream: &mut S) -> impl Future<Output = Result<Option<R>, E>>;
+    fn process_request(&self, stream: &mut S) -> impl Future<Output = Result<Option<R>, E>>;
 }
