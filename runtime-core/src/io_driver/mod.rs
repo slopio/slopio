@@ -249,7 +249,7 @@ impl IODriver {
                     MultiProcessResult::Queued => {}
                     MultiProcessResult::WakeConsumer => {}
                     MultiProcessResult::PauseRequired(user_data) => {
-                        self.send_multiop_cancel_event(user_data);
+                        self.send_multiop_cancel_event(user_data | MULTI_OP_FLAG);
                     }
                     MultiProcessResult::FullyPaused => {}
                     MultiProcessResult::CancelComplete => {
@@ -488,12 +488,33 @@ impl IODriver {
     pub fn cancel_multishot_op(&self, token: MultishotToken, bgid: u16) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
         if let Some(entry) = slab.get_mut(token) {
-            *entry = MultiOpState::Cancelled {
-                bgid,
-                last_cqe: false,
-                ecancelled: false,
-            };
+            // Recycle kernel buffers from the old state's queue before dropping it.
+            let old = std::mem::replace(
+                entry,
+                MultiOpState::Cancelled {
+                    bgid,
+                    last_cqe: false,
+                    ecancelled: false,
+                },
+            );
+            self.recycle_multiop_queue(old, bgid);
             self.send_multiop_cancel_event(token.raw() | MULTI_OP_FLAG);
+        }
+    }
+
+    fn recycle_multiop_queue(&self, state: MultiOpState, bgid: u16) {
+        let mut queue = match state {
+            MultiOpState::Sent { queue, .. }
+            | MultiOpState::TringToPause { queue, .. }
+            | MultiOpState::Paused { queue, .. } => queue,
+            _ => return,
+        };
+        while let Some(event) = queue.pop() {
+            if event.result > 0 {
+                if let Some(buffer_id) = io_uring::cqueue::buffer_select(event.flags) {
+                    drop(self.get_buffer(bgid, buffer_id, event.result as usize));
+                }
+            }
         }
     }
 
