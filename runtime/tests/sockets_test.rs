@@ -5,7 +5,7 @@ use runtime::main_thread;
 use runtime::runtime::spawn;
 use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -310,4 +310,79 @@ fn test_recv_timeout() {
         "timeout took too long: {:?}",
         elapsed
     );
+}
+
+#[test]
+fn test_vectored_write() {
+    let handle = std::thread::spawn(|| {
+        main_thread(async {
+            let mut ma = MultiAccept::new(8089).unwrap();
+
+            if let Some(socket) = ma.next().await {
+                let bufs = [
+                    IoSlice::new(b"Hello"),
+                    IoSlice::new(b", "),
+                    IoSlice::new(b"vectored"),
+                    IoSlice::new(b" world!"),
+                ];
+                socket.vectored_write(&bufs).await.unwrap()
+            } else {
+                0
+            }
+        })
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut client = TcpStream::connect("127.0.0.1:8089").unwrap();
+    let mut buffer = [0u8; 128];
+    let n = client.read(&mut buffer).unwrap();
+
+    let bytes_written = handle.join().unwrap();
+    assert_eq!(bytes_written, 22);
+    assert_eq!(&buffer[..n], b"Hello, vectored world!");
+}
+
+#[test]
+fn test_vectored_write_echo() {
+    let handle = std::thread::spawn(|| {
+        main_thread(async {
+            let mut ma = MultiAccept::new(8090).unwrap();
+
+            if let Some(socket) = ma.next().await {
+                // Receive data first
+                let mut buf1 = Box::new([0u8; 64]);
+                let n1 = socket_recv(&socket, buf1.as_mut(), 64).await.unwrap();
+
+                let mut buf2 = Box::new([0u8; 64]);
+                let n2 = socket_recv(&socket, buf2.as_mut(), 64).await.unwrap();
+
+                // Echo both chunks back in a single vectored write
+                let bufs = [
+                    IoSlice::new(&buf1[..n1]),
+                    IoSlice::new(&buf2[..n2]),
+                ];
+                socket.vectored_write(&bufs).await.unwrap()
+            } else {
+                0
+            }
+        })
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut client = TcpStream::connect("127.0.0.1:8090").unwrap();
+
+    // Send two separate messages
+    client.write_all(b"part one").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    client.write_all(b"part two").unwrap();
+
+    // Read the combined echo
+    let mut buffer = [0u8; 128];
+    let n = client.read(&mut buffer).unwrap();
+
+    let bytes_written = handle.join().unwrap();
+    assert_eq!(bytes_written, 16);
+    assert_eq!(&buffer[..n], b"part onepart two");
 }

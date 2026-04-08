@@ -1,5 +1,8 @@
 use libc::c_int;
+use std::io::IoSlice;
 use std::net::SocketAddr;
+
+use self::send_vectored::{socket_send_vectored, WriteVectoredSocket};
 
 pub mod managed_recv;
 pub mod managed_recv_bundle;
@@ -70,6 +73,10 @@ pub fn connect_tcp(addr: SocketAddr) -> std::io::Result<SocketWrapper> {
 impl SocketWrapper {
     pub fn fd(&self) -> i32 {
         self.fd
+    }
+
+    pub fn vectored_write<'a>(&self, bufs: &'a [IoSlice<'a>]) -> WriteVectoredSocket<'a> {
+        socket_send_vectored(self, bufs)
     }
 }
 
