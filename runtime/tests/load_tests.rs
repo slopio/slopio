@@ -467,10 +467,10 @@ fn load_tcp_profile() {
                         let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
                         for _ in 0..CYCLES {
                             match multi_recv.next().await {
-                                Some(data) => {
+                                Some(Ok(data)) => {
                                     socket_send(&socket, data.as_ref()).await.unwrap();
                                 }
-                                None => break,
+                                Some(Err(_)) | None => break,
                             }
                         }
                     }));

@@ -33,7 +33,7 @@ fn test_stream_stops_on_close() {
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
-                while let Some(_data) = multi_recv.next().await {
+                while let Some(Ok(_data)) = multi_recv.next().await {
                     recv_count += 1;
                 }
                 return Some(recv_count);
@@ -62,7 +62,7 @@ fn test_stream_stops_on_abrupt_close_rst() {
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
-                while let Some(_data) = multi_recv.next().await {
+                while let Some(Ok(_data)) = multi_recv.next().await {
                     recv_count += 1;
                 }
                 return Some(recv_count);
@@ -105,7 +105,7 @@ fn test_stream_stops_on_process_kill() {
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
-                while let Some(_data) = multi_recv.next().await {
+                while let Some(Ok(_data)) = multi_recv.next().await {
                     recv_count += 1;
                 }
                 return Some(recv_count);
@@ -148,7 +148,7 @@ fn byte_per_byte() {
             if let Some(socket) = multiaccept.next().await {
                 let mut received: Vec<u8> = Vec::new();
                 let mut multirecv = MultiRecv::new(socket.fd, BufGroup::Small);
-                while let Some(data) = multirecv.next().await {
+                while let Some(Ok(data)) = multirecv.next().await {
                     received.extend_from_slice(data.as_ref());
                 }
                 Some(received)
@@ -191,7 +191,7 @@ fn test_slow_consumer_triggers_pause() {
                 let mut multirecv = MultiRecv::new(socket.fd, BufGroup::Small);
                 let mut recv_count = 0;
 
-                while let Some(data) = multirecv.next().await {
+                while let Some(Ok(data)) = multirecv.next().await {
                     recv_count += 1;
                     received.extend_from_slice(data.as_ref());
                     if recv_count <= 70 {
@@ -269,7 +269,7 @@ fn test_fast_drain_triggers_resume() {
                 let mut recv_count = 0;
                 let mut slow_phase_count = 0;
 
-                while let Some(data) = multirecv.next().await {
+                while let Some(Ok(data)) = multirecv.next().await {
                     received.extend_from_slice(data.as_ref());
                     recv_count += 1;
 

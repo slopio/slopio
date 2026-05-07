@@ -101,16 +101,13 @@ impl MultiRecv {
 impl Unpin for MultiRecv {}
 
 impl MultiRecv {
-    fn try_drain_one(&mut self) -> Poll<Option<BorrowedBuffer>> {
+    fn try_drain_one(&mut self) -> Poll<Option<Result<BorrowedBuffer, CompletionError>>> {
         while let Some(completion_event) = self.reads.pop() {
             match self.try_parse(completion_event) {
-                Ok(buf) => return Poll::Ready(Some(buf)),
+                Ok(buf) => return Poll::Ready(Some(Ok(buf))),
+                Err(CompletionError::Eof { .. }) => return Poll::Ready(None),
                 Err(e) if e.can_continue() => continue,
-                Err(CompletionError::Other(r)) if r == -libc::ENOBUFS => {
-                    // buffer ring exhausted
-                    return Poll::Ready(None);
-                }
-                Err(_) => return Poll::Ready(None),
+                Err(e) => return Poll::Ready(Some(Err(e))),
             }
         }
         Poll::Pending
@@ -118,7 +115,7 @@ impl MultiRecv {
 }
 
 impl Stream for MultiRecv {
-    type Item = BorrowedBuffer;
+    type Item = Result<BorrowedBuffer, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Poll::Ready(result) = self.try_drain_one() {
