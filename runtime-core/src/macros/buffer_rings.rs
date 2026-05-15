@@ -78,7 +78,7 @@ macro_rules! define_buffer_rings {
         impl MultiRing {
             pub(crate) fn new(ring: &::io_uring::IoUring) -> Self {
                 Self {
-                    $($name: ::io_uring_rb::RingBuffer::new(ring, $bgid, 0).unwrap(),)*
+                    $($name: ::io_uring_rb::RingBuffer::new(ring, 0, $bgid).unwrap(),)*
                 }
             }
 
