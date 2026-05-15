@@ -16,5 +16,6 @@
 //   }
 
 define_buffer_rings! {
-    Small { bgid: 0, buffer_size: 4096, ring_size: 8192 }
+    Small  { bgid: 0, buffer_size: 4096,  ring_size: 8192 }
+    Medium { bgid: 1, buffer_size: 16384, ring_size: 2048 }
 }
