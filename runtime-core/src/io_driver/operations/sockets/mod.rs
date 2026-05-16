@@ -2,6 +2,7 @@ use libc::c_int;
 use std::io::IoSlice;
 use std::net::SocketAddr;
 
+use self::send_control_record::{socket_send_control_record, WriteControlRecord};
 use self::send_vectored::{socket_send_vectored, WriteVectoredSocket};
 
 pub mod managed_recv;
@@ -10,6 +11,7 @@ pub mod multi_accept;
 pub mod multi_recv;
 pub mod recv;
 pub mod send;
+pub mod send_control_record;
 pub mod send_vectored;
 pub mod udp;
 
@@ -77,6 +79,14 @@ impl SocketWrapper {
 
     pub fn vectored_write<'a>(&self, bufs: &'a [IoSlice<'a>]) -> WriteVectoredSocket<'a> {
         socket_send_vectored(self, bufs)
+    }
+
+    pub fn send_control_record<'a>(
+        &self,
+        record_type: u8,
+        payload: &'a [u8],
+    ) -> WriteControlRecord<'a> {
+        socket_send_control_record(self, record_type, payload)
     }
 }
 

@@ -20,3 +20,6 @@ socket2 = { version = "0.6.1", features = ["all"] }
 bumpalo = { version = "3.20.2", features = ["collections"] }
 rand = "0.8"
 smallvec = { version = "1", features = ["union"] }
+
+[dev-dependencies]
+libc = "0.2.178"

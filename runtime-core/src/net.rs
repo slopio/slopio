@@ -10,6 +10,9 @@ pub use crate::io_driver::operations::sockets::SocketWrapper;
 
 // send
 pub use crate::io_driver::operations::sockets::send::socket_send;
+pub use crate::io_driver::operations::sockets::send_control_record::{
+    socket_send_control_record, WriteControlRecord,
+};
 pub use crate::io_driver::operations::sockets::send_vectored::socket_send_vectored;
 
 // recv
