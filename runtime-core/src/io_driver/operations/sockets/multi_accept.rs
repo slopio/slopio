@@ -1,5 +1,4 @@
 use std::{
-    ffi::c_int,
     net::{Ipv4Addr, SocketAddr},
     os::fd::IntoRawFd,
     pin::Pin,
@@ -18,7 +17,7 @@ use crate::io_driver::{
 
 pub struct MultiAccept {
     id: Option<MultishotToken>,
-    fd: i32,
+    socket: SocketWrapper,
     sockets: MultiOpQueue,
     cancel_sent: bool,
 }
@@ -68,12 +67,25 @@ impl MultiAccept {
 
         let mut multi_accept = Self {
             id: None,
-            fd,
+            socket: SocketWrapper { fd },
             sockets: Default::default(),
             cancel_sent: false,
         };
         multi_accept.register_to_driver();
         Ok(multi_accept)
+    }
+
+    pub fn socket(&self) -> &SocketWrapper {
+        &self.socket
+    }
+
+    pub fn set_backlog(&self, backlog: i32) -> std::io::Result<()> {
+        let ret = unsafe { libc::listen(self.socket.fd, backlog) };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -149,19 +161,17 @@ impl Stream for MultiAccept {
 impl IoOP for MultiAccept {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd));
+        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket.fd));
         self.id = Some(token);
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::AcceptMulti::new(Fd(self.fd))
+        opcode::AcceptMulti::new(Fd(self.socket.fd))
             .flags(libc::SOCK_NONBLOCK)
             .build()
     }
 
     fn driver_cleanup(&mut self) {
-        unsafe {
-            libc::close(self.fd as c_int);
-        }
+        // fd is closed by SocketWrapper's Drop
     }
 }

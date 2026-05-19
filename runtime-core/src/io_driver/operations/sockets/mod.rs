@@ -1,6 +1,7 @@
 use libc::c_int;
-use std::io::IoSlice;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use self::send_control_record::{socket_send_control_record, WriteControlRecord};
 use self::send_vectored::{socket_send_vectored, WriteVectoredSocket};
@@ -87,6 +88,70 @@ impl SocketWrapper {
         payload: &'a [u8],
     ) -> WriteControlRecord<'a> {
         socket_send_control_record(self, record_type, payload)
+    }
+
+    pub fn set_nodelay(&self, on: bool) -> io::Result<()> {
+        self.set_opt(libc::IPPROTO_TCP, libc::TCP_NODELAY, &(on as c_int))
+    }
+
+    pub fn set_keepalive(&self, on: bool) -> io::Result<()> {
+        self.set_opt(libc::SOL_SOCKET, libc::SO_KEEPALIVE, &(on as c_int))
+    }
+
+    pub fn set_reuseaddr(&self, on: bool) -> io::Result<()> {
+        self.set_opt(libc::SOL_SOCKET, libc::SO_REUSEADDR, &(on as c_int))
+    }
+
+    pub fn set_reuseport(&self, on: bool) -> io::Result<()> {
+        self.set_opt(libc::SOL_SOCKET, libc::SO_REUSEPORT, &(on as c_int))
+    }
+
+    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+        self.set_opt(libc::SOL_SOCKET, libc::SO_RCVBUF, &(size as c_int))
+    }
+
+    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+        self.set_opt(libc::SOL_SOCKET, libc::SO_SNDBUF, &(size as c_int))
+    }
+
+    pub fn set_defer_accept(&self, secs: u32) -> io::Result<()> {
+        self.set_opt(libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, &(secs as c_int))
+    }
+
+    pub fn set_fastopen(&self, qlen: u32) -> io::Result<()> {
+        self.set_opt(libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &(qlen as c_int))
+    }
+
+    pub fn set_quickack(&self, on: bool) -> io::Result<()> {
+        self.set_opt(libc::IPPROTO_TCP, libc::TCP_QUICKACK, &(on as c_int))
+    }
+
+    pub fn set_linger(&self, dur: Option<Duration>) -> io::Result<()> {
+        let l = match dur {
+            Some(d) => libc::linger {
+                l_onoff: 1,
+                l_linger: d.as_secs().min(c_int::MAX as u64) as c_int,
+            },
+            None => libc::linger { l_onoff: 0, l_linger: 0 },
+        };
+        self.set_opt(libc::SOL_SOCKET, libc::SO_LINGER, &l)
+    }
+
+    fn set_opt<T>(&self, level: c_int, name: c_int, value: &T) -> io::Result<()> {
+        let ret = unsafe {
+            libc::setsockopt(
+                self.fd,
+                level,
+                name,
+                value as *const T as *const libc::c_void,
+                std::mem::size_of::<T>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 }
 
