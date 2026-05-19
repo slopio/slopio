@@ -76,16 +76,24 @@ impl SpanWrapper {
     }
 
     /// Add an event with a dynamic name, allocated in the arena. Zero heap allocation.
-    pub fn push_event_dyn(&mut self, message: &str) {
+    pub fn push_event_dyn(&mut self, message: &str, level: Level) {
         let s = self.alloc_str(message);
-        self.data.events.events.push(SpanEvent::new(s));
+        let mut event = SpanEvent::new(s);
+        event.attributes.push(KeyValue::new("level", level.as_str()));
+        self.data.events.events.push(event);
     }
 
     /// Add an event with a dynamic name and attributes. All strings (name + attribute values)
     /// are arena-allocated. Keys must be `&'static str`. Zero heap allocation.
-    pub fn push_event_attrs_dyn(&mut self, message: &str, attrs: &[(&'static str, &str)]) {
+    pub fn push_event_attrs_dyn(
+        &mut self,
+        message: &str,
+        attrs: &[(&'static str, &str)],
+        level: Level,
+    ) {
         let name = self.alloc_str(message);
         let mut event = SpanEvent::new(name);
+        event.attributes.push(KeyValue::new("level", level.as_str()));
         for &(k, v) in attrs {
             let v = self.alloc_str(v);
             event.attributes.push(KeyValue::new(k, v));
@@ -143,6 +151,11 @@ impl Drop for SpanGuard {
 pub struct Span(Option<SpanGuard>);
 
 impl Span {
+    /// A no-op span. Used by macros when the level is statically disabled.
+    pub const fn disabled() -> Self {
+        Self(None)
+    }
+
     /// Set the [`SpanKind`] for this span.
     pub fn kind(self, kind: SpanKind) -> Self {
         if self.0.is_some() {
@@ -243,20 +256,26 @@ pub fn new_trace_with_parent(name: &'static str, level: Level, parent: (TraceId,
 
 // ─── Span mutations ───────────────────────────────────────────────────────────
 
-pub fn event(message: &str) {
+pub fn event(level: Level, message: &str) {
+    if !level_enabled(level) {
+        return;
+    }
     with_current_task_tracing(|tracing| {
         if let Some(buf) = tracing.spans.back_mut() {
-            buf.push_event_dyn(message);
+            buf.push_event_dyn(message, level);
         }
     });
 }
 
 /// Add an event with attributes to the current span.
 /// All strings (name + attribute values) are arena-allocated. Keys must be `&'static str`.
-pub fn event_attrs(message: &str, attrs: &[(&'static str, &str)]) {
+pub fn event_attrs(level: Level, message: &str, attrs: &[(&'static str, &str)]) {
+    if !level_enabled(level) {
+        return;
+    }
     with_current_task_tracing(|tracing| {
         if let Some(buf) = tracing.spans.back_mut() {
-            buf.push_event_attrs_dyn(message, attrs);
+            buf.push_event_attrs_dyn(message, attrs, level);
         }
     });
 }

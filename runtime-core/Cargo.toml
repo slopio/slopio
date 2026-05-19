@@ -6,6 +6,22 @@ edition = "2024"
 [features]
 tracing = []
 
+# Compile-time max verbosity. Pick at most one in each group.
+up_to_off = []
+up_to_error = []
+up_to_warn = []
+up_to_info = []
+up_to_debug = []
+up_to_trace = []
+
+# Release-only variants — only effective under cfg(not(debug_assertions)).
+up_to_off_in_release = []
+up_to_error_in_release = []
+up_to_warn_in_release = []
+up_to_info_in_release = []
+up_to_debug_in_release = []
+up_to_trace_in_release = []
+
 [dependencies]
 io-uring = "0.7.11"
 libc = "0.2.178"

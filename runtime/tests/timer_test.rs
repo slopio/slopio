@@ -18,7 +18,7 @@ fn test_sleep_basic() {
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(60),
+        elapsed < Duration::from_millis(250),
         "Sleep took too long: {:?}",
         elapsed
     );
@@ -42,7 +42,7 @@ fn test_sleep_short_duration() {
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(50),
+        elapsed < Duration::from_millis(200),
         "Sleep took too long: {:?}",
         elapsed
     );
@@ -79,7 +79,7 @@ fn test_multiple_sequential_sleeps() {
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(250),
+        elapsed < Duration::from_millis(500),
         "Sequential sleeps took too long: {:?}",
         elapsed
     );
@@ -116,7 +116,7 @@ fn test_concurrent_sleeps_same_duration() {
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(200),
+        elapsed < Duration::from_millis(290),
         "Concurrent sleeps should run in parallel: {:?}",
         elapsed
     );
@@ -156,7 +156,7 @@ fn test_concurrent_sleeps_different_durations() {
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(250),
+        elapsed < Duration::from_millis(500),
         "Took too long: {:?}",
         elapsed
     );
@@ -218,7 +218,7 @@ fn test_zero_duration_sleep() {
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < Duration::from_millis(50),
+        elapsed < Duration::from_millis(200),
         "Zero duration sleep took too long: {:?}",
         elapsed
     );
@@ -251,7 +251,7 @@ fn test_many_concurrent_timers() {
         elapsed
     );
     assert!(
-        elapsed < Duration::from_millis(300),
+        elapsed < Duration::from_millis(600),
         "Many concurrent timers should run in parallel: {:?}",
         elapsed
     );

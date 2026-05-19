@@ -7,19 +7,22 @@ use crate::tracing::types::{KeyValue, SpanId, SpanKind, TraceId};
 
 // ─── Level ────────────────────────────────────────────────────────────────────
 
-/// Verbosity level for span filtering. Spans below the current max level are dropped.
+/// Verbosity level for span/event filtering. `Off` disables everything.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(u8)]
 pub enum Level {
-    Error = 0,
-    Warn = 1,
-    Info = 2,
-    Debug = 3,
-    Trace = 4,
+    Off = 0,
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
 }
 
 impl Level {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Level::Off => "OFF",
             Level::Error => "ERROR",
             Level::Warn => "WARN",
             Level::Info => "INFO",
@@ -29,22 +32,60 @@ impl Level {
     }
 }
 
+// ─── Compile-time max level ───────────────────────────────────────────────────
+
+/// Maximum verbosity emitted, chosen at compile time by Cargo features.
+///
+/// Resolution order:
+/// 1. `up_to_*` features (apply to both debug and release).
+/// 2. `up_to_*_in_release` features (apply only when `!debug_assertions`).
+/// 3. Default: `Trace` in debug, `Warn` in release.
+pub const STATIC_MAX_LEVEL: Level = {
+    if cfg!(feature = "up_to_off") {
+        Level::Off
+    } else if cfg!(feature = "up_to_error") {
+        Level::Error
+    } else if cfg!(feature = "up_to_warn") {
+        Level::Warn
+    } else if cfg!(feature = "up_to_info") {
+        Level::Info
+    } else if cfg!(feature = "up_to_debug") {
+        Level::Debug
+    } else if cfg!(feature = "up_to_trace") {
+        Level::Trace
+    } else if cfg!(all(not(debug_assertions), feature = "up_to_off_in_release")) {
+        Level::Off
+    } else if cfg!(all(not(debug_assertions), feature = "up_to_error_in_release")) {
+        Level::Error
+    } else if cfg!(all(not(debug_assertions), feature = "up_to_warn_in_release")) {
+        Level::Warn
+    } else if cfg!(all(not(debug_assertions), feature = "up_to_info_in_release")) {
+        Level::Info
+    } else if cfg!(all(not(debug_assertions), feature = "up_to_debug_in_release")) {
+        Level::Debug
+    } else if cfg!(all(not(debug_assertions), feature = "up_to_trace_in_release")) {
+        Level::Trace
+    } else if cfg!(not(debug_assertions)) {
+        Level::Warn
+    } else {
+        Level::Trace
+    }
+};
+
+/// `true` iff `level` is enabled at compile time. Const-foldable when `level`
+/// is a constant expression — call sites that fail this check are eliminated
+/// entirely by the optimiser.
+pub const fn level_enabled(level: Level) -> bool {
+    (level as u8) <= (STATIC_MAX_LEVEL as u8)
+}
+
 // ─── Thread-locals ────────────────────────────────────────────────────────────
 
 thread_local!(
     static CURRENT_TASK_TRACING: Cell<*mut TaskTelemetry> =
         const { Cell::new(std::ptr::null_mut()) };
-    static MAX_LEVEL: Cell<Level> = const { Cell::new(Level::Info) };
     static THREAD_ID: Cell<Option<usize>> = const { Cell::new(None) };
 );
-
-pub fn set_max_level(level: Level) {
-    MAX_LEVEL.with(|c| c.set(level));
-}
-
-pub(crate) fn level_enabled(level: Level) -> bool {
-    MAX_LEVEL.with(|c| level <= c.get())
-}
 
 pub fn set_thread_id(n: usize) {
     THREAD_ID.with(|c| c.set(Some(n)));

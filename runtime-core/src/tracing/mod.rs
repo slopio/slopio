@@ -2,6 +2,8 @@ use crate::scoped_thread_local;
 use crate::tracing::opentelemetry::TraceSink;
 
 pub mod collector;
+#[macro_use]
+mod macros;
 mod opentelemetry;
 mod propagation;
 mod resource;
@@ -20,8 +22,8 @@ pub use span::{
     new_trace_with_parent, span_set_attribute, span_set_error, span_set_kind, span_set_status,
 };
 pub use task::{
-    Level, TaskTelemetry, set_current_task_tracing, set_max_level, set_thread_id,
-    swap_current_task_tracing, with_current_task_tracing,
+    Level, STATIC_MAX_LEVEL, TaskTelemetry, level_enabled, set_current_task_tracing,
+    set_thread_id, swap_current_task_tracing, with_current_task_tracing,
 };
 pub use types::{KeyValue, SpanKind, SpanLink, Status};
 
