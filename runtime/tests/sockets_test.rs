@@ -1,3 +1,4 @@
+use runtime::io_driver::operations::sockets::connect::connect_tcp;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
 use runtime::io_driver::operations::sockets::recv::socket_recv_init as socket_recv;
 use runtime::io_driver::operations::sockets::send::socket_send;
@@ -6,7 +7,7 @@ use runtime::runtime::spawn;
 use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 use std::io::{IoSlice, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 #[test]
@@ -385,4 +386,40 @@ fn test_vectored_write_echo() {
     let bytes_written = handle.join().unwrap();
     assert_eq!(bytes_written, 16);
     assert_eq!(&buffer[..n], b"part onepart two");
+}
+
+#[test]
+fn test_local_and_peer_addr() {
+    let server = std::thread::spawn(|| {
+        main_thread(async {
+            let mut ma = MultiAccept::new(8091).unwrap();
+            let accepted = ma.next().await.unwrap();
+            // On the accepted socket, peer_addr is the client; local_addr is
+            // the listener's bound endpoint.
+            let local = accepted.local_addr().unwrap();
+            let peer = accepted.peer_addr().unwrap();
+            (local, peer)
+        })
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let client = std::thread::spawn(|| {
+        main_thread(async {
+            let addr: SocketAddr = "127.0.0.1:8091".parse().unwrap();
+            let socket = connect_tcp(addr).await.unwrap();
+            let local = socket.local_addr().unwrap();
+            let peer = socket.peer_addr().unwrap();
+            (local, peer)
+        })
+    });
+
+    let (server_local, server_peer) = server.join().unwrap();
+    let (client_local, client_peer) = client.join().unwrap();
+
+    assert_eq!(server_local.port(), 8091);
+    assert_eq!(client_peer.port(), 8091);
+    // The accepted socket's peer is the client; the client's local is itself.
+    assert_eq!(server_peer, client_local);
+    assert_eq!(client_peer, server_local);
 }

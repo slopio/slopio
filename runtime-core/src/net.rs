@@ -5,7 +5,7 @@
 
 // ── TCP ──
 
-pub use crate::io_driver::operations::sockets::connect_tcp;
+pub use crate::io_driver::operations::sockets::connect::{connect_tcp, ConnectTcp};
 pub use crate::io_driver::operations::sockets::SocketWrapper;
 
 // send

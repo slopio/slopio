@@ -68,7 +68,7 @@ fn control_record_emits_correct_content_type() {
     });
 
     main_thread(async move {
-        let socket = connect_tcp(addr).unwrap();
+        let socket = connect_tcp(addr).await.unwrap();
         if let Err(e) = enable_ktls_tx(socket.fd()) {
             panic!("kTLS setup failed ({e}); load the `tls` kernel module: `sudo modprobe tls`");
         }

@@ -71,6 +71,9 @@ impl CompletionEvent {
 #[derive(Debug)]
 pub(crate) enum SingleProcessResult {
     Completed,
+    /// CQE for an op whose future was dropped — slab entry (and any keepalive)
+    /// must be released.
+    CancelComplete,
     Shutdown,
     CancelledRecycling { id: u16, len: i32, bgid: u16 },
     InvalidState(&'static str),
@@ -106,9 +109,9 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
         }
         SingleOpState::Ended(_) => SingleProcessResult::InvalidState("received CQE for ended op"),
         SingleOpState::Signal(_) => SingleProcessResult::Shutdown,
-        SingleOpState::Cancelled { bgid } => {
+        SingleOpState::Cancelled { bgid, .. } => {
             if data.result == -ECANCELED {
-                SingleProcessResult::Completed
+                SingleProcessResult::CancelComplete
             } else {
                 if let Some(id) = buffer_select(data.flags)
                     && data.result > 0
@@ -121,7 +124,7 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
                     }
                 } else {
                     //no buffers were taken from the ring or there was an error
-                    SingleProcessResult::Completed
+                    SingleProcessResult::CancelComplete
                 }
             }
         }

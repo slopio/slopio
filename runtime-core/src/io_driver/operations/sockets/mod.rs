@@ -1,11 +1,13 @@
 use libc::c_int;
 use std::io::{self, IoSlice};
-use std::net::SocketAddr;
+use std::mem::MaybeUninit;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
 use self::send_control_record::{socket_send_control_record, WriteControlRecord};
 use self::send_vectored::{socket_send_vectored, WriteVectoredSocket};
 
+pub mod connect;
 pub mod managed_recv;
 pub mod managed_recv_bundle;
 pub mod multi_accept;
@@ -19,58 +21,6 @@ pub mod udp;
 #[derive(Debug)]
 pub struct SocketWrapper {
     pub fd: i32,
-}
-
-pub fn connect_tcp(addr: SocketAddr) -> std::io::Result<SocketWrapper> {
-    let fd = unsafe {
-        let af = match addr {
-            SocketAddr::V4(_) => libc::AF_INET,
-            SocketAddr::V6(_) => libc::AF_INET6,
-        };
-        let fd = libc::socket(af, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ret = match addr {
-            SocketAddr::V4(v4) => {
-                let sin = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as libc::sa_family_t,
-                    sin_port: v4.port().to_be(),
-                    sin_addr: libc::in_addr {
-                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                    },
-                    sin_zero: [0; 8],
-                };
-                libc::connect(
-                    fd,
-                    &sin as *const libc::sockaddr_in as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            }
-            SocketAddr::V6(v6) => {
-                let sin6 = libc::sockaddr_in6 {
-                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                    sin6_port: v6.port().to_be(),
-                    sin6_flowinfo: v6.flowinfo(),
-                    sin6_addr: libc::in6_addr {
-                        s6_addr: v6.ip().octets(),
-                    },
-                    sin6_scope_id: v6.scope_id(),
-                };
-                libc::connect(
-                    fd,
-                    &sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                )
-            }
-        };
-        if ret < 0 {
-            libc::close(fd);
-            return Err(std::io::Error::last_os_error());
-        }
-        fd
-    };
-    Ok(SocketWrapper { fd })
 }
 
 impl SocketWrapper {
@@ -137,6 +87,16 @@ impl SocketWrapper {
         self.set_opt(libc::SOL_SOCKET, libc::SO_LINGER, &l)
     }
 
+    /// Local end of the connection (`getsockname`). One syscall per call.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        getname(|sa, len| unsafe { libc::getsockname(self.fd, sa, len) })
+    }
+
+    /// Remote end of the connection (`getpeername`). One syscall per call.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        getname(|sa, len| unsafe { libc::getpeername(self.fd, sa, len) })
+    }
+
     fn set_opt<T>(&self, level: c_int, name: c_int, value: &T) -> io::Result<()> {
         let ret = unsafe {
             libc::setsockopt(
@@ -170,5 +130,46 @@ impl Drop for SocketWrapper {
             let fd = self.fd as c_int;
             libc::close(fd); //synchronous close to avoid fd conflicts
         }
+    }
+}
+
+fn getname(
+    syscall: impl FnOnce(*mut libc::sockaddr, *mut libc::socklen_t) -> c_int,
+) -> io::Result<SocketAddr> {
+    let mut storage: MaybeUninit<libc::sockaddr_storage> = MaybeUninit::uninit();
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let ret = syscall(
+        storage.as_mut_ptr() as *mut libc::sockaddr,
+        &mut len,
+    );
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let storage = unsafe { storage.assume_init() };
+    match storage.ss_family as c_int {
+        libc::AF_INET => {
+            let sin: libc::sockaddr_in =
+                unsafe { *(&storage as *const _ as *const libc::sockaddr_in) };
+            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+            Ok(SocketAddr::V4(SocketAddrV4::new(
+                ip,
+                u16::from_be(sin.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let sin6: libc::sockaddr_in6 =
+                unsafe { *(&storage as *const _ as *const libc::sockaddr_in6) };
+            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                ip,
+                u16::from_be(sin6.sin6_port),
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported address family",
+        )),
     }
 }

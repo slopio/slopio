@@ -282,6 +282,9 @@ impl IODriver {
 
                 match process_single(slab_entry, cqe_data) {
                     SingleProcessResult::Completed => {}
+                    SingleProcessResult::CancelComplete => {
+                        slab.remove_raw(raw_index);
+                    }
                     SingleProcessResult::Shutdown => {
                         self.shutting_down.replace(true);
                     }
@@ -472,8 +475,24 @@ impl IODriver {
     /// used provided buffers (so the buffer can be recycled on late completion),
     /// or `None` for operations that manage their own buffers.
     pub fn cancel_single_op(&self, token: OneshotToken, bgid: Option<u16>) {
+        self.cancel_single_op_keep(token, bgid, None);
+    }
+
+    /// Cancel a single-shot operation, transferring ownership of `keepalive`
+    /// to the driver. The kernel may still be reading from memory referenced
+    /// by the in-flight SQE; `keepalive` is dropped only when the cancelled
+    /// op's CQE arrives.
+    pub fn cancel_single_op_keep(
+        &self,
+        token: OneshotToken,
+        bgid: Option<u16>,
+        keepalive: Option<Box<dyn std::any::Any>>,
+    ) {
         let slab = unsafe { &mut *self.slab.get() };
-        *slab.get_mut(token).unwrap() = SingleOpState::Cancelled { bgid };
+        *slab.get_mut(token).unwrap() = SingleOpState::Cancelled {
+            bgid,
+            keepalive: keepalive.map(CancelKeepalive),
+        };
         self.send_singleop_cancel_event(token.raw());
     }
 
@@ -565,6 +584,14 @@ pub struct OpMetadata {
     pub flags: u32,
 }
 
+struct CancelKeepalive(#[allow(dead_code)] Box<dyn std::any::Any>);
+
+impl std::fmt::Debug for CancelKeepalive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CancelKeepalive(..)")
+    }
+}
+
 #[derive(Debug)]
 enum SingleOpState {
     Init,
@@ -573,8 +600,12 @@ enum SingleOpState {
     Signal(Box<[u8; 8]>),
     /// The operation was cancelled. `bgid` is set when the op used provided
     /// buffers so a late-arriving completion can recycle the buffer.
+    /// `keepalive` owns memory the kernel may still be reading; it is dropped
+    /// when the cancelled op's CQE arrives.
     Cancelled {
         bgid: Option<u16>,
+        #[allow(dead_code)]
+        keepalive: Option<CancelKeepalive>,
     },
 }
 
