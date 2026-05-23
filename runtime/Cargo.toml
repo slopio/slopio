@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-tracing         = ["runtime-core/tracing"]
-otlp            = ["tracing", "dep:runtime-h2"]
+tracing               = ["runtime-core/tracing"]
+otlp                  = ["tracing", "dep:runtime-h2"]
+local_debug_collector = ["runtime-core/local_debug_collector"]
 
 [dependencies]
 runtime-core = { path = "../runtime-core" }

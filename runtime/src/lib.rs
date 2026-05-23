@@ -19,6 +19,37 @@ mod otlp_collector;
 #[cfg(feature = "otlp")]
 pub use otlp_collector::{OtlpConfig, set_otlp_config};
 
+/// Selects which collector to use for telemetry. Picked at runtime by the
+/// caller and passed to the runtime entry point.
+///
+/// Each variant is gated behind its collector's feature flag: enabling the
+/// feature exposes the variant, disabling it compiles the variant (and the
+/// collector itself) away. So `--features otlp` is the only way to get
+/// `CollectorChoice::Otlp`, etc.
+///
+/// Each variant reads its own configuration from a dedicated setter
+/// (`set_otlp_config`, `set_local_debug_config`, ...) — the enum only picks
+/// *which* collector runs, not *how* it's configured.
+///
+/// There is intentionally no `None` variant: if you want no telemetry, build
+/// without the `tracing` feature and the entire span machinery compiles away.
+/// Enabling `tracing` means you've committed to picking a collector.
+#[cfg(feature = "tracing")]
+#[derive(Debug, Clone, Copy)]
+pub enum CollectorChoice {
+    /// `ConsoleCollector` — one line per span to stderr. Available whenever
+    /// `tracing` is enabled.
+    Console,
+    /// `LocalDebugCollector` — per-worker JSONL files for local inspection.
+    /// Configured via `runtime_core::tracing::set_local_debug_config`.
+    #[cfg(feature = "local_debug_collector")]
+    LocalDebug,
+    /// `OtlpCollector` — gRPC export to an OTLP backend (e.g. Tempo).
+    /// Configured via [`set_otlp_config`].
+    #[cfg(feature = "otlp")]
+    Otlp,
+}
+
 pub mod http;
 
 #[global_allocator]
