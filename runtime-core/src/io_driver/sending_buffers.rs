@@ -3,7 +3,7 @@ use std::{cell::UnsafeCell, mem::MaybeUninit, net::SocketAddr};
 use io_uring::{opcode, types::Fd};
 use slab::Slab;
 
-use super::completion_events::SEND_BUFFER_FLAG;
+use super::user_data::UserData;
 
 /// Maximum size for UDP packets (typical MTU minus headers)
 pub const SEND_BUFFER_SIZE: usize = 1500;
@@ -187,7 +187,7 @@ impl SendingBufferPool {
         buffer.prepare_msghdr();
         opcode::SendMsg::new(Fd(fd), buffer.msghdr.as_ptr())
             .build()
-            .user_data((index as u64) | SEND_BUFFER_FLAG)
+            .user_data(UserData::send_buffer_op(index as u64).into_bits())
     }
 
     /// Releases a buffer by its slab index.

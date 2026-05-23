@@ -1,11 +1,7 @@
 use io_uring::cqueue::{self, Entry, buffer_select};
 use libc::ECANCELED;
 
-use super::{MultiOpState, MultishotCompletionEvent, OpMetadata, SingleOpState};
-
-pub(crate) const MULTI_OP_FLAG: u64 = 1u64 << 63;
-pub(crate) const IGNORED_FLAG: u64 = 1u64 << 62;
-pub(crate) const SEND_BUFFER_FLAG: u64 = 1u64 << 61;
+use super::{MultiOpState, MultishotCompletionEvent, OpMetadata, SingleOpState, UserData};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CQEData {
@@ -37,34 +33,24 @@ pub(crate) struct CompletionEvent {
 
 impl CompletionEvent {
     pub fn from_entry(entry: Entry) -> Option<Self> {
-        let user_data = entry.user_data();
+        let ud = UserData::from_bits(entry.user_data());
 
-        if user_data & IGNORED_FLAG != 0 {
+        if ud.ignored() {
             return None;
         }
 
         let data = CQEData::from(entry);
+        let slab_index = ud.index() as usize;
 
-        if user_data & SEND_BUFFER_FLAG != 0 {
-            Some(CompletionEvent {
-                slab_index: (user_data & !(SEND_BUFFER_FLAG)) as usize,
-                event: Event::SendBuffer(data.result),
-            })
-        } else if user_data & MULTI_OP_FLAG != 0 {
-            Some(CompletionEvent {
-                slab_index: user_data as usize,
-                event: Event::MultiShot(data),
-            })
+        let event = if ud.send_buffer() {
+            Event::SendBuffer(data.result)
+        } else if ud.multi_op() {
+            Event::MultiShot(data)
         } else {
-            Some(CompletionEvent {
-                slab_index: user_data as usize,
-                event: Event::SingleShot(data),
-            })
-        }
-    }
+            Event::SingleShot(data)
+        };
 
-    pub fn clean_slab_index(&self) -> usize {
-        (self.slab_index as u64 & !MULTI_OP_FLAG) as usize
+        Some(CompletionEvent { slab_index, event })
     }
 }
 
@@ -227,20 +213,3 @@ pub(crate) fn process_multi(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_flag_constants() {
-        assert_eq!(MULTI_OP_FLAG & IGNORED_FLAG, 0);
-
-        let combined = MULTI_OP_FLAG | IGNORED_FLAG;
-        assert!(combined & MULTI_OP_FLAG != 0);
-        assert!(combined & IGNORED_FLAG != 0);
-
-        let slab_index: u64 = 42;
-        let user_data = slab_index | MULTI_OP_FLAG;
-        assert_eq!((user_data & !MULTI_OP_FLAG) as usize, 42);
-    }
-}

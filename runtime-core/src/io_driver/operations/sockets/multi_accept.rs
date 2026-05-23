@@ -10,8 +10,7 @@ use runtime_streams::Stream;
 use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
-    IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
-    completion_events::MULTI_OP_FLAG,
+    IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent, UserData,
     operations::{IoOP, MultishotToken, sockets::SocketWrapper},
 };
 
@@ -121,7 +120,8 @@ impl Stream for MultiAccept {
         if shutting_down && !self.cancel_sent {
             self.cancel_sent = true;
             let token = self.id.unwrap();
-            IO_DRIVER.with(|d| d.send_multiop_cancel_event(token.raw() | MULTI_OP_FLAG));
+            IO_DRIVER
+                .with(|d| d.send_multiop_cancel_event(UserData::multi(token.raw()).into_bits()));
         }
 
         if let Poll::Ready(result) = self.try_drain_one() {

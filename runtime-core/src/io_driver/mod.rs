@@ -11,8 +11,8 @@ use crate::{
     define_buffer_rings,
     io_driver::{
         completion_events::{
-            CompletionEvent, Event, IGNORED_FLAG, MULTI_OP_FLAG, MultiProcessResult,
-            SingleProcessResult, process_multi, process_single,
+            CompletionEvent, Event, MultiProcessResult, SingleProcessResult, process_multi,
+            process_single,
         },
         operations::{MultishotToken, OneshotToken},
     },
@@ -28,6 +28,9 @@ use slab::Slab;
 mod completion_events;
 pub mod operations;
 mod sending_buffers;
+mod user_data;
+
+pub(crate) use user_data::UserData;
 
 pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
@@ -231,12 +234,11 @@ impl IODriver {
     }
 
     fn process_cqe(&self, completion_event: CompletionEvent) {
-        let raw_index = completion_event.slab_index;
+        let index = completion_event.slab_index;
         match completion_event.event {
             Event::MultiShot(cqe_data) => {
-                let clean_index = completion_event.clean_slab_index();
                 let slab = unsafe { &mut *self.multishot_slab.get() };
-                let slab_entry = unsafe { slab.get_unchecked_mut_raw(clean_index) };
+                let slab_entry = unsafe { slab.get_unchecked_mut_raw(index) };
 
                 match process_multi(
                     slab_entry,
@@ -244,16 +246,18 @@ impl IODriver {
                         result: cqe_data.result,
                         flags: cqe_data.flags,
                     },
-                    clean_index as u64,
+                    index as u64,
                 ) {
                     MultiProcessResult::Queued => {}
                     MultiProcessResult::WakeConsumer => {}
-                    MultiProcessResult::PauseRequired(user_data) => {
-                        self.send_multiop_cancel_event(user_data | MULTI_OP_FLAG);
+                    MultiProcessResult::PauseRequired(clean_index) => {
+                        self.send_multiop_cancel_event(
+                            UserData::multi(clean_index).into_bits(),
+                        );
                     }
                     MultiProcessResult::FullyPaused => {}
                     MultiProcessResult::CancelComplete => {
-                        slab.remove_raw(clean_index);
+                        slab.remove_raw(index);
                     }
                     MultiProcessResult::CancelledRecycling {
                         buffer_id,
@@ -270,7 +274,7 @@ impl IODriver {
                             && *ecancelled
                             && *last_cqe
                         {
-                            slab.remove_raw(clean_index);
+                            slab.remove_raw(index);
                         }
                     }
                     MultiProcessResult::InvalidState(_msg) => {}
@@ -278,12 +282,12 @@ impl IODriver {
             }
             Event::SingleShot(cqe_data) => {
                 let slab = unsafe { &mut *self.slab.get() };
-                let slab_entry = unsafe { slab.get_unchecked_mut_raw(raw_index) };
+                let slab_entry = unsafe { slab.get_unchecked_mut_raw(index) };
 
                 match process_single(slab_entry, cqe_data) {
                     SingleProcessResult::Completed => {}
                     SingleProcessResult::CancelComplete => {
-                        slab.remove_raw(raw_index);
+                        slab.remove_raw(index);
                     }
                     SingleProcessResult::Shutdown => {
                         self.shutting_down.replace(true);
@@ -292,7 +296,7 @@ impl IODriver {
                     SingleProcessResult::CancelledRecycling { id, len, bgid } => {
                         let b = self.get_buffer(bgid, id, len as usize);
                         self.recycle_buffer(&b);
-                        slab.remove_raw(raw_index);
+                        slab.remove_raw(index);
                     }
                 }
             }
@@ -303,7 +307,7 @@ impl IODriver {
                         std::io::Error::from_raw_os_error(-result)
                     );
                 }
-                self.sending_buffers.release(raw_index);
+                self.sending_buffers.release(index);
             }
         }
     }
@@ -326,7 +330,7 @@ impl IODriver {
         let slab = unsafe { &mut *self.multishot_slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
         let token = slab.insert(MultiOpState::Init { fd });
-        entry.set_user_data(token.raw() | MULTI_OP_FLAG);
+        entry.set_user_data(UserData::multi(token.raw()).into_bits());
         ring_inner.add(&entry);
         token
     }
@@ -340,7 +344,7 @@ impl IODriver {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
         let token = slab.insert(SingleOpState::Init);
-        entry.set_user_data(token.raw());
+        entry.set_user_data(UserData::single(token.raw()).into_bits());
         ring_inner.add(&entry);
         token
     }
@@ -351,7 +355,7 @@ impl IODriver {
         let entry = io_uring::opcode::Timeout::new(&ring_inner.wakeup_timeout)
             .count(1)
             .build()
-            .user_data(IGNORED_FLAG);
+            .user_data(UserData::ignored_only().into_bits());
         ring_inner.add(&entry);
     }
 
@@ -362,7 +366,7 @@ impl IODriver {
         let ptr = sig_data.as_mut_ptr();
         let token = slab.insert(SingleOpState::Signal(sig_data));
         let mut entry = opcode::Read::new(Fd(fd), ptr, 8).build();
-        entry.set_user_data(token.raw());
+        entry.set_user_data(UserData::single(token.raw()).into_bits());
         ring_inner.add(&entry);
         token
     }
@@ -500,7 +504,7 @@ impl IODriver {
         let ring_inner = unsafe { &mut *self.ring.get() };
         let cancel_op = opcode::AsyncCancel::new(raw)
             .build()
-            .user_data(raw | IGNORED_FLAG);
+            .user_data(UserData::cancel_echo(raw).into_bits());
         ring_inner.add(&cancel_op);
     }
 
@@ -517,7 +521,7 @@ impl IODriver {
                 },
             );
             self.recycle_multiop_queue(old, bgid);
-            self.send_multiop_cancel_event(token.raw() | MULTI_OP_FLAG);
+            self.send_multiop_cancel_event(UserData::multi(token.raw()).into_bits());
         }
     }
 
@@ -541,7 +545,7 @@ impl IODriver {
         let ring_inner = unsafe { &mut *self.ring.get() };
         let cancel_op = opcode::AsyncCancel::new(raw)
             .build()
-            .user_data(raw | MULTI_OP_FLAG | IGNORED_FLAG);
+            .user_data(UserData::cancel_echo(raw).into_bits());
         ring_inner.add(&cancel_op);
     }
 
@@ -563,7 +567,7 @@ impl IODriver {
 
         op.transition_paused_to_sent(waker);
 
-        entry = entry.user_data(token.raw() | MULTI_OP_FLAG);
+        entry = entry.user_data(UserData::multi(token.raw()).into_bits());
 
         let ring = unsafe { &mut *self.ring.get() };
         ring.add(&entry);
