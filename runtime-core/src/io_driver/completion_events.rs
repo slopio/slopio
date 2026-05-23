@@ -60,6 +60,8 @@ pub(crate) enum SingleProcessResult {
     /// CQE for an op whose future was dropped — slab entry (and any keepalive)
     /// must be released.
     CancelComplete,
+    /// CQE for a non-terminal link in a chain — slab entry should be reaped.
+    LinkCompleted,
     Shutdown,
     CancelledRecycling { id: u16, len: i32, bgid: u16 },
     InvalidState(&'static str),
@@ -95,6 +97,7 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
         }
         SingleOpState::Ended(_) => SingleProcessResult::InvalidState("received CQE for ended op"),
         SingleOpState::Signal(_) => SingleProcessResult::Shutdown,
+        SingleOpState::LinkedSent(_next) => SingleProcessResult::LinkCompleted,
         SingleOpState::Cancelled { bgid, .. } => {
             if data.result == -ECANCELED {
                 SingleProcessResult::CancelComplete

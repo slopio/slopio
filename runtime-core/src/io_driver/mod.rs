@@ -289,6 +289,9 @@ impl IODriver {
                     SingleProcessResult::CancelComplete => {
                         slab.remove_raw(index);
                     }
+                    SingleProcessResult::LinkCompleted => {
+                        slab.remove_raw(index);
+                    }
                     SingleProcessResult::Shutdown => {
                         self.shutting_down.replace(true);
                     }
@@ -602,6 +605,10 @@ enum SingleOpState {
     Sent(Waker),
     Ended(OpMetadata),
     Signal(Box<[u8; 8]>),
+    /// Slot for a non-terminal op in a link chain. The `u64` is the slab
+    /// id of the next link, so a cancel walker can traverse the chain and
+    /// reap slab entries. No waker — the result is dropped on completion.
+    LinkedSent(u64),
     /// The operation was cancelled. `bgid` is set when the op used provided
     /// buffers so a late-arriving completion can recycle the buffer.
     /// `keepalive` owns memory the kernel may still be reading; it is dropped

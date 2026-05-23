@@ -69,3 +69,34 @@ impl<'a> Drop for WriteVectoredSocket<'a> {
         }
     }
 }
+
+/// Send every byte across all iovecs, looping over short writes. The
+/// fast path (kernel writes the whole list in one go) does no allocation;
+/// only partial completions pay a single `Vec` copy to walk the remaining
+/// iovecs. Returns `WriteZero` if the kernel ever accepts zero bytes.
+pub async fn send_vectored_all<'a>(
+    socket: &SocketWrapper,
+    bufs: &'a [IoSlice<'a>],
+) -> std::io::Result<()> {
+    let total: usize = bufs.iter().map(|s| s.len()).sum();
+    let n = socket_send_vectored(socket, bufs).await?;
+    if n == total {
+        return Ok(());
+    }
+    if n == 0 {
+        return Err(std::io::ErrorKind::WriteZero.into());
+    }
+
+    // Slow path: copy + advance + retry until drained.
+    let mut owned: Vec<IoSlice<'a>> = bufs.to_vec();
+    let mut slice: &mut [IoSlice<'a>] = &mut owned[..];
+    IoSlice::advance_slices(&mut slice, n);
+    while !slice.is_empty() {
+        let m = socket_send_vectored(socket, slice).await?;
+        if m == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut slice, m);
+    }
+    Ok(())
+}

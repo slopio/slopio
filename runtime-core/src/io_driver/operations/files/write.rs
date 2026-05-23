@@ -54,3 +54,18 @@ impl<'a> Future for WriteFile<'a> {
 impl<'a> Drop for WriteFile<'a> {
     fn drop(&mut self) {}
 }
+
+/// Write the entire buffer, looping over short writes until every byte is
+/// flushed to the file or an error occurs. Returns `WriteZero` if the
+/// kernel ever accepts zero bytes (which would otherwise spin forever).
+pub async fn write_all(file: &OpenedFile, data: &[u8]) -> std::io::Result<()> {
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let n = file.write(remaining).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        remaining = &remaining[n..];
+    }
+    Ok(())
+}

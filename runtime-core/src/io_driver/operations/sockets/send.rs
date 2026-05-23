@@ -10,6 +10,21 @@ pub fn socket_send<'a>(socket: &SocketWrapper, data: &'a [u8]) -> WriteSocket<'a
     WriteSocket::from_socket(socket, data)
 }
 
+/// Send the entire buffer, looping over short writes until every byte is
+/// queued or an error occurs. Returns `WriteZero` if the kernel ever
+/// accepts zero bytes (which would otherwise spin forever).
+pub async fn send_all(socket: &SocketWrapper, data: &[u8]) -> std::io::Result<()> {
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let n = socket_send(socket, remaining).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        remaining = &remaining[n..];
+    }
+    Ok(())
+}
+
 impl<'a> WriteSocket<'a> {
     fn from_socket(socket: &SocketWrapper, data: &'a [u8]) -> Self {
         WriteSocket {
