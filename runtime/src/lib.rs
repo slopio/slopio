@@ -16,10 +16,10 @@ pub use runtime_core::tracing;
 #[cfg(feature = "otlp")]
 mod otlp_collector;
 
-pub mod http;
+#[cfg(feature = "otlp")]
+pub use otlp_collector::{OtlpConfig, set_otlp_config};
 
-#[cfg(feature = "tls")]
-pub mod tls;
+pub mod http;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
