@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 tracing = []
+local_debug_collector = ["tracing"]
 
 # Compile-time max verbosity. Pick at most one in each group.
 up_to_off = []

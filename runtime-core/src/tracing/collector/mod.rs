@@ -1,4 +1,6 @@
 pub mod console;
+#[cfg(feature = "local_debug_collector")]
+pub mod local_debug_collector;
 pub mod otlp;
 
 use crate::tracing::span::SpanWrapper;

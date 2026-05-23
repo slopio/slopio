@@ -13,6 +13,10 @@ pub mod types;
 
 pub use collector::Collector;
 pub use collector::console::ConsoleCollector;
+#[cfg(feature = "local_debug_collector")]
+pub use collector::local_debug_collector::{
+    LocalDebugCollector, LocalDebugConfig, set_local_debug_config,
+};
 pub use opentelemetry::init_trace_sink;
 pub use propagation::{extract, inject};
 pub(crate) use resource::resource_config;
