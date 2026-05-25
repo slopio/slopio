@@ -10,9 +10,7 @@ pub use crate::io_driver::operations::sockets::SocketWrapper;
 
 // send
 pub use crate::io_driver::operations::{IoBuf, Slice};
-pub use crate::io_driver::operations::sockets::send::{
-    WriteSocketOwned, socket_send, socket_send_owned,
-};
+pub use crate::io_driver::operations::sockets::send::{WriteSocket, send_all, socket_send};
 pub use crate::io_driver::operations::sockets::send_control_record::{
     socket_send_control_record, WriteControlRecord,
 };

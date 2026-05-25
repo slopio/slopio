@@ -91,7 +91,7 @@ fn test_tiny_send_chunks() {
 
                 // Send 1 byte at a time
                 for &byte in data.iter() {
-                    let n = socket_send(&socket, &[byte]).await.unwrap();
+                    let n = socket_send(&socket, vec![byte]).await.0.unwrap();
                     total_sent += n;
                 }
 
@@ -139,7 +139,7 @@ fn test_concurrent_connections() {
                     let handler = spawn(async move {
                         let mut buffer = Box::new([0u8; 64]);
                         let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
-                        socket_send(&socket, &buffer[..n]).await.unwrap();
+                        socket_send(&socket, buffer[..n].to_vec()).await.0.unwrap();
                         n
                     });
                     handlers.push(handler);
@@ -220,7 +220,7 @@ fn test_multiple_cycles() {
                 for _ in 0..10 {
                     let mut buffer = Box::new([0u8; 64]);
                     let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
-                    socket_send(&socket, &buffer[..n]).await.unwrap();
+                    socket_send(&socket, buffer[..n].to_vec()).await.0.unwrap();
                     total += n;
                 }
 
@@ -295,7 +295,7 @@ fn test_nested_socket_spawns() {
                     let inner_task = spawn(async move {
                         let mut buffer = Box::new([0u8; 64]);
                         let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
-                        socket_send(&socket, b"PONG").await.unwrap();
+                        socket_send(&socket, b"PONG").await.0.unwrap();
                         n
                     });
                     inner_task.await
@@ -332,7 +332,7 @@ fn test_sequential_accept_handle() {
                 if let Some(socket) = ma.next().await {
                     let mut buffer = Box::new([0u8; 32]);
                     socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
-                    socket_send(&socket, b"OK").await.unwrap();
+                    socket_send(&socket, b"OK").await.0.unwrap();
                     count += 1;
                 }
             }
@@ -376,7 +376,7 @@ fn test_interleaved_socket_operations() {
                         let n = socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
 
                         // Echo it back
-                        socket_send(&socket, &buffer[..n]).await.unwrap();
+                        socket_send(&socket, buffer[..n].to_vec()).await.0.unwrap();
                         (i, n)
                     });
                     handlers.push(handler);
@@ -467,7 +467,7 @@ fn test_empty_send() {
             let mut ma = MultiAccept::new(9011).unwrap();
 
             if let Some(socket) = ma.next().await {
-                socket_send(&socket, &[]).await.unwrap()
+                socket_send(&socket, b"").await.0.unwrap()
             } else {
                 999
             }

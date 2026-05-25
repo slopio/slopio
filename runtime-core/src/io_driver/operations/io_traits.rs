@@ -26,6 +26,18 @@ use std::ops::{Bound, RangeBounds};
 /// - `'static` is required so the buffer can be type-erased into
 ///   `Box<dyn Any>` for the cancellation keepalive path.
 pub unsafe trait IoBuf: Unpin + Sized + 'static {
+    /// Whether this buffer's memory needs to be kept alive past the user's
+    /// future when an op is cancelled mid-flight.
+    ///
+    /// Set to `false` for buffers whose backing memory lives forever
+    /// regardless of the value being dropped — e.g. `&'static [u8]`, whose
+    /// bytes live in the binary's `.rodata`. The runtime then skips the
+    /// type-erasure `Box<dyn Any>` allocation on cancel for these types.
+    ///
+    /// Defaults to `true` (the safe assumption): the runtime keeps the
+    /// buffer alive until the cancelled CQE arrives.
+    const NEEDS_KEEPALIVE: bool = true;
+
     /// Pointer to the first byte the kernel may read.
     fn stable_ptr(&self) -> *const u8;
     /// Number of initialized bytes the kernel may read from `stable_ptr`.
@@ -91,6 +103,7 @@ unsafe impl IoBuf for Box<[u8]> {
 // SAFETY: `&'static [u8]` points at memory with the `'static` lifetime —
 // never freed. Pointer is trivially stable.
 unsafe impl IoBuf for &'static [u8] {
+    const NEEDS_KEEPALIVE: bool = false;
     fn stable_ptr(&self) -> *const u8 {
         (*self).as_ptr()
     }
@@ -102,6 +115,7 @@ unsafe impl IoBuf for &'static [u8] {
 // SAFETY: same as `&'static [u8]`. Lets byte-string literals (`b"foo"`,
 // of type `&'static [u8; N]`) be passed without an explicit `.as_slice()`.
 unsafe impl<const N: usize> IoBuf for &'static [u8; N] {
+    const NEEDS_KEEPALIVE: bool = false;
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
@@ -147,6 +161,10 @@ impl<B: IoBuf> Slice<B> {
 // fixed at construction. `end - begin` (the new `bytes_init`) is checked
 // at construction to fit within `buf.bytes_init()`.
 unsafe impl<B: IoBuf> IoBuf for Slice<B> {
+    // Propagate from the inner buffer: slicing static memory still gives
+    // static memory; slicing owned heap still gives owned heap.
+    const NEEDS_KEEPALIVE: bool = B::NEEDS_KEEPALIVE;
+
     fn stable_ptr(&self) -> *const u8 {
         unsafe { self.buf.stable_ptr().add(self.begin) }
     }

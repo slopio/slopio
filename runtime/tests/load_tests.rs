@@ -268,7 +268,7 @@ fn load_200_concurrent_connections() {
                     handlers.push(spawn(async move {
                         let mut buf = Box::new([0u8; 8]);
                         socket_recv(&socket, buf.as_mut(), 8).await.unwrap();
-                        socket_send(&socket, b"ok").await.unwrap();
+                        socket_send(&socket, b"ok").await.0.unwrap();
                     }));
                 }
             }
@@ -360,7 +360,7 @@ fn load_ping_pong_10k_rounds() {
                     if n == 0 {
                         break;
                     }
-                    socket_send(&socket, &buf[..n]).await.unwrap();
+                    socket_send(&socket, buf[..n].to_vec()).await.0.unwrap();
                 }
             }
         })
@@ -409,7 +409,7 @@ fn load_100_connections_100_cycles_each() {
                             if n == 0 {
                                 break;
                             }
-                            socket_send(&socket, &buf[..n]).await.unwrap();
+                            socket_send(&socket, buf[..n].to_vec()).await.0.unwrap();
                         }
                     }));
                 }
@@ -468,7 +468,7 @@ fn load_tcp_profile() {
                         for _ in 0..CYCLES {
                             match multi_recv.next().await {
                                 Some(Ok(data)) => {
-                                    socket_send(&socket, data.as_ref()).await.unwrap();
+                                    socket_send(&socket, data.as_ref().to_vec()).await.0.unwrap();
                                 }
                                 Some(Err(_)) | None => break,
                             }

@@ -72,7 +72,7 @@ fn test_socket_send_data() {
 
             if let Some(socket) = ma.next().await {
                 let data = b"Response from server";
-                socket_send(&socket, data).await.unwrap()
+                socket_send(&socket, data).await.0.unwrap()
             } else {
                 0
             }
@@ -103,7 +103,7 @@ fn test_echo_server() {
                 let n_bytes = socket_recv(&socket, buffer.as_mut(), 128).await.unwrap();
 
                 // Echo back the data
-                socket_send(&socket, &buffer[..n_bytes]).await.unwrap()
+                socket_send(&socket, buffer[..n_bytes].to_vec()).await.0.unwrap()
             } else {
                 0
             }
@@ -140,7 +140,7 @@ fn test_multiple_recv_send() {
                 total_bytes += n1;
 
                 // Send response
-                socket_send(&socket, b"ACK1").await.unwrap();
+                socket_send(&socket, b"ACK1").await.0.unwrap();
 
                 // Receive second message
                 let mut buffer2 = Box::new([0u8; 64]);
@@ -148,7 +148,7 @@ fn test_multiple_recv_send() {
                 total_bytes += n2;
 
                 // Send final response
-                socket_send(&socket, b"ACK2").await.unwrap();
+                socket_send(&socket, b"ACK2").await.0.unwrap();
 
                 total_bytes
             } else {
@@ -192,7 +192,7 @@ fn test_spawned_socket_handler() {
                 let task_handle = spawn(async move {
                     let mut buffer = Box::new([0u8; 128]);
                     let n_bytes = socket_recv(&socket, buffer.as_mut(), 128).await.unwrap();
-                    socket_send(&socket, &buffer[..n_bytes]).await.unwrap();
+                    socket_send(&socket, buffer[..n_bytes].to_vec()).await.0.unwrap();
                     n_bytes
                 });
 
@@ -268,7 +268,7 @@ fn test_recv_timeout() {
                 assert_eq!(&buf[..n], b"hello");
 
                 // Signal client that we're about to start the timed recv
-                socket_send(&socket, b"ok").await.unwrap();
+                socket_send(&socket, b"ok").await.0.unwrap();
 
                 // Second recv: client doesn't send anything, should time out
                 let second: Result<std::io::Result<usize>, ()> = timeout(
