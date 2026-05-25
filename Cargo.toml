@@ -10,7 +10,17 @@ members = [
 resolver = "2"
 
 [profile.release]
-debug = true  # ou dans [profile.bench]
+debug = true
+# Panics in spawned tasks unwind through the runtime's internal data
+# structures (slab, waker queue) leaving them in an inconsistent state.
+# With `abort`, the process exits immediately instead — no corruption.
+# This is what production servers want anyway; debugging-build users get
+# the same guarantee via [profile.dev].
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
 
 [profile.bench]
 debug = true
+# `panic` is ignored for bench profile by cargo, no point setting it here.

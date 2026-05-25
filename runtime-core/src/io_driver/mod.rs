@@ -514,20 +514,36 @@ impl IODriver {
         bgid: Option<u16>,
         keepalive: Option<Box<dyn std::any::Any>>,
     ) {
-        let slab = unsafe { &mut *self.slab.get() };
-        *slab.get_mut(token).unwrap() = SingleOpState::Cancelled {
-            bgid,
-            keepalive: keepalive.map(CancelKeepalive),
-        };
-        self.send_singleop_cancel_event(token.raw());
+        // Only transition to Cancelled (and stash the keepalive) if the cancel
+        // SQE was actually submitted. For ops already in `Ended` state,
+        // `send_singleop_cancel_event` reaps the slab entry directly and
+        // returns false — the keepalive then drops at end-of-scope.
+        if self.send_singleop_cancel_event(token) {
+            let slab = unsafe { &mut *self.slab.get() };
+            *slab.get_mut(token).unwrap() = SingleOpState::Cancelled {
+                bgid,
+                keepalive: keepalive.map(CancelKeepalive),
+            };
+        }
     }
 
-    fn send_singleop_cancel_event(&self, raw: u64) {
+    /// Submit an async cancel SQE for `token`, returning `true` if a cancel
+    /// was actually needed. If the op is already in `Ended` state (CQE arrived
+    /// before this cancel call), the slab entry is reaped directly and `false`
+    /// is returned — no cancel SQE is sent.
+    fn send_singleop_cancel_event(&self, token: OneshotToken) -> bool {
+        let slab = unsafe { &mut *self.slab.get() };
+        if matches!(slab.get_mut(token), Some(SingleOpState::Ended(_))) {
+            slab.remove(token);
+            return false;
+        }
+        let raw = token.raw();
         let ring_inner = unsafe { &mut *self.ring.get() };
         let cancel_op = opcode::AsyncCancel::new(raw)
             .build()
             .user_data(UserData::cancel_echo(raw).into_bits());
         ring_inner.add(&cancel_op);
+        true
     }
 
     pub fn cancel_multishot_op(&self, token: MultishotToken, bgid: u16) {

@@ -7,7 +7,7 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, Slice, files::OpenedFile},
+    operations::{IoBuf, OneshotToken, files::OpenedFile},
 };
 
 impl OpenedFile {
