@@ -1,16 +1,18 @@
-use std::mem::MaybeUninit;
-
 use runtime::{io_driver::operations::sockets::udp::UdpSocket, main_thread};
 
 fn main() {
     main_thread(async {
         let udp = UdpSocket::bind(9091).unwrap();
-        let mut buffer = [MaybeUninit::uninit(); 1500];
+        // Pre-allocated 1500-byte recv buffer, reused across iterations.
+        let mut buffer: Vec<u8> = Vec::with_capacity(1500);
         loop {
-            let packet = udp.recv_from(&mut buffer).await.unwrap();
-            let data =
-                unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), packet.len()) };
-            udp.send_to(data, packet.addr()).await.unwrap();
+            let (recv_result, buf) = udp.recv_from(buffer).await;
+            let packet = recv_result.unwrap();
+            // `buf.len()` is now `packet.len()` (set via `set_init`); the
+            // capacity (1500) is preserved for the next recv.
+            let payload = buf[..packet.len()].to_vec();
+            buffer = buf;
+            udp.send_to(payload, packet.addr()).await.0.unwrap();
         }
     });
 }

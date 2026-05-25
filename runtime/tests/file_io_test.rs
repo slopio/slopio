@@ -1,5 +1,5 @@
 use runtime::io_driver::operations::files::open::{flags, mode};
-use runtime::io_driver::operations::files::{AsyncFileRead, AsyncFileWrite, open_file};
+use runtime::io_driver::operations::files::open_file;
 use runtime::main_thread;
 use std::fs;
 
@@ -20,7 +20,7 @@ fn test_file_write_and_read() {
         .unwrap();
 
         let data = b"Hello from async runtime!";
-        let bytes_written = file.write(data).await.unwrap();
+        let bytes_written = file.write(data).await.0.unwrap();
         assert_eq!(bytes_written, data.len());
 
         drop(file);
@@ -28,11 +28,12 @@ fn test_file_write_and_read() {
         // Read from file
         let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
 
-        let mut buffer = vec![0u8; 128];
-        let bytes_read = file.read(&mut buffer, 128).await.unwrap();
+        let buffer: Vec<u8> = Vec::with_capacity(128);
+        let (result, buffer) = file.read(buffer).await;
+        let bytes_read = result.unwrap();
 
         assert_eq!(bytes_read, data.len());
-        assert_eq!(&buffer[..bytes_read], data);
+        assert_eq!(&buffer[..], data);
     });
 
     // Clean up
@@ -50,7 +51,7 @@ fn test_file_create_write() {
             .unwrap();
 
         let data = b"Test content";
-        let n = file.write(data).await.unwrap();
+        let n = file.write(data).await.0.unwrap();
 
         assert_eq!(n, data.len());
     });
@@ -72,10 +73,11 @@ fn test_file_read_existing() {
     main_thread(async {
         let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
 
-        let mut buffer = vec![0u8; 64];
-        let n = file.read(&mut buffer, 64).await.unwrap();
+        let buffer: Vec<u8> = Vec::with_capacity(64);
+        let (result, buffer) = file.read(buffer).await;
+        let _n = result.unwrap();
 
-        assert_eq!(&buffer[..n], b"Existing content");
+        assert_eq!(&buffer[..], b"Existing content");
     });
 
     let _ = fs::remove_file(test_file);
@@ -94,7 +96,7 @@ fn test_file_append() {
             .unwrap();
 
         let data = b"Second line\n";
-        file.write(data).await.unwrap();
+        file.write(data).await.0.unwrap();
     });
 
     // Verify content
@@ -117,7 +119,7 @@ fn test_file_truncate() {
             .unwrap();
 
         let data = b"New";
-        file.write(data).await.unwrap();
+        file.write(data).await.0.unwrap();
     });
 
     // Verify file was truncated
@@ -140,17 +142,18 @@ fn test_file_read_write() {
 
         // Write
         let data = b"Read and write test";
-        file.write(data).await.unwrap();
+        file.write(data).await.0.unwrap();
 
         drop(file);
 
         // Read back (need to reopen for now since we don't have seek)
         let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
 
-        let mut buffer = vec![0u8; 64];
-        let n = file.read(&mut buffer, 64).await.unwrap();
+        let buffer: Vec<u8> = Vec::with_capacity(64);
+        let (result, buffer) = file.read(buffer).await;
+        let _n = result.unwrap();
 
-        assert_eq!(&buffer[..n], data);
+        assert_eq!(&buffer[..], data);
     });
 
     let _ = fs::remove_file(test_file);
@@ -168,9 +171,9 @@ fn test_file_multiple_writes() {
             .unwrap();
 
         // Multiple writes
-        file.write(b"First ").await.unwrap();
-        file.write(b"Second ").await.unwrap();
-        file.write(b"Third").await.unwrap();
+        file.write(b"First ").await.0.unwrap();
+        file.write(b"Second ").await.0.unwrap();
+        file.write(b"Third").await.0.unwrap();
     });
 
     let content = fs::read_to_string(test_file).unwrap();
@@ -189,7 +192,7 @@ fn test_file_empty_write() {
             .await
             .unwrap();
 
-        let n = file.write(b"").await.unwrap();
+        let n = file.write(b"").await.0.unwrap();
         assert_eq!(n, 0);
     });
 
@@ -211,9 +214,10 @@ fn test_file_large_write() {
 
         // Write 1MB
         let data = vec![b'X'; 1024 * 1024];
-        let n = file.write(&data).await.unwrap();
+        let expected_len = data.len();
+        let n = file.write(data).await.0.unwrap();
 
-        assert_eq!(n, data.len());
+        assert_eq!(n, expected_len);
     });
 
     let metadata = fs::metadata(test_file).unwrap();
@@ -234,16 +238,18 @@ fn test_file_read_chunks() {
         let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
 
         // Read in small chunks
-        let mut buffer1 = vec![0u8; 5];
-        let n1 = file.read(&mut buffer1, 5).await.unwrap();
+        let buffer1: Vec<u8> = Vec::with_capacity(5);
+        let (result1, buffer1) = file.read(buffer1).await;
+        let n1 = result1.unwrap();
         assert_eq!(n1, 5);
-        assert_eq!(&buffer1[..n1], b"01234");
+        assert_eq!(&buffer1[..], b"01234");
 
         // Note: without seek, subsequent reads continue from current position
-        let mut buffer2 = vec![0u8; 5];
-        let n2 = file.read(&mut buffer2, 5).await.unwrap();
+        let buffer2: Vec<u8> = Vec::with_capacity(5);
+        let (result2, buffer2) = file.read(buffer2).await;
+        let n2 = result2.unwrap();
         assert_eq!(n2, 5);
-        assert_eq!(&buffer2[..n2], b"56789");
+        assert_eq!(&buffer2[..], b"56789");
     });
 
     let _ = fs::remove_file(test_file);

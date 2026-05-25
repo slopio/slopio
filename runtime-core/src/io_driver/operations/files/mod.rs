@@ -8,21 +8,11 @@ pub mod write;
 
 pub use open::{OpenFileError, open_file};
 pub use read::ReadFile;
-pub use write::WriteFile;
+pub use write::{WriteFile, write_all};
 
 #[derive(Debug)]
 pub struct OpenedFile {
-    fd: i32,
-}
-
-pub trait AsyncFileRead {
-    type Reader<'a>;
-    fn read<'a>(&self, buffer: &'a mut [u8], len: u32) -> Self::Reader<'a>;
-}
-
-pub trait AsyncFileWrite {
-    type Writer<'a>;
-    fn write<'a>(&self, data: &'a [u8]) -> Self::Writer<'a>;
+    pub(crate) fd: i32,
 }
 
 impl Drop for OpenedFile {

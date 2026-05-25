@@ -184,3 +184,80 @@ unsafe impl<B: IoBuf> IoBuf for Slice<B> {
         self.end - self.begin
     }
 }
+
+/// A buffer the kernel may write into during a recv-direction io_uring op.
+///
+/// Independent of [`IoBuf`] so it can be implemented for
+/// `Box<[std::mem::MaybeUninit<u8>]>` — reading uninitialized memory is UB,
+/// so such buffers can't be `IoBuf`, but they're perfectly valid recv
+/// destinations.
+///
+/// # Safety
+/// - `stable_mut_ptr` must return the same pointer for the lifetime of
+///   `self`, regardless of moves of `self`.
+/// - The first `bytes_total` bytes starting at `stable_mut_ptr` must be
+///   valid to write while `self` is held.
+/// - `'static` is required so the buffer can be type-erased into
+///   `Box<dyn Any>` for the cancellation keepalive path.
+pub unsafe trait IoBufMut: 'static + Sized + Unpin {
+    /// Mutable pointer to the first byte the kernel may write to.
+    fn stable_mut_ptr(&mut self) -> *mut u8;
+
+    /// Total writable capacity in bytes — the kernel may write up to this
+    /// many bytes starting at `stable_mut_ptr`.
+    fn bytes_total(&self) -> usize;
+
+    /// Called by IO operations after the kernel has written `n` bytes into
+    /// `[stable_mut_ptr(), stable_mut_ptr() + n)`. Buffer types that track
+    /// their own "initialized length" (e.g. `Vec<u8>::set_len`) update it
+    /// here; fixed-size types no-op and the caller uses the returned count.
+    ///
+    /// # Safety
+    /// `n <= bytes_total()` and the first `n` bytes starting at
+    /// `stable_mut_ptr()` must actually have been initialized.
+    unsafe fn set_init(&mut self, n: usize);
+}
+
+// SAFETY: `Vec`'s heap pointer is stable; `capacity()` bytes are available
+// for writing; `set_len(n)` correctly tracks initialization for the caller.
+unsafe impl IoBufMut for Vec<u8> {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+    fn bytes_total(&self) -> usize {
+        self.capacity()
+    }
+    unsafe fn set_init(&mut self, n: usize) {
+        unsafe {
+            self.set_len(n);
+        }
+    }
+}
+
+// SAFETY: `Box<[u8]>` has fixed-size heap storage with a stable pointer.
+unsafe impl IoBufMut for Box<[u8]> {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+    fn bytes_total(&self) -> usize {
+        self.len()
+    }
+    unsafe fn set_init(&mut self, _n: usize) {
+        // Length is fixed; caller uses the returned byte count.
+    }
+}
+
+// SAFETY: same as `Box<[u8]>`. Lets callers do zero-init-free recv into
+// uninit heap memory.
+unsafe impl IoBufMut for Box<[std::mem::MaybeUninit<u8>]> {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr().cast()
+    }
+    fn bytes_total(&self) -> usize {
+        self.len()
+    }
+    unsafe fn set_init(&mut self, _n: usize) {
+        // Length is fixed; caller uses the returned byte count and casts
+        // the appropriate prefix to `&[u8]` themselves.
+    }
+}

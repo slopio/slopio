@@ -1,6 +1,6 @@
 use std::{
+    any::Any,
     future::Future,
-    mem::MaybeUninit,
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
@@ -9,30 +9,40 @@ use std::{
 use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::IO_DRIVER;
-use crate::io_driver::operations::OneshotToken;
+use crate::io_driver::operations::{IoBuf, OneshotToken};
 
-pub struct UdpSendTo<'a> {
-    fd: i32,
-    id: Option<OneshotToken>,
-    buffer: &'a [u8],
-    msghdr: MaybeUninit<libc::msghdr>,
-    iovec: MaybeUninit<libc::iovec>,
+/// Heap-stable kernel-visible state for an in-flight `SendMsg` op.
+/// `msghdr.msg_name` and `msghdr.msg_iov` point into this struct's `addr`
+/// and `iovec` fields, so the whole thing must live at a stable address —
+/// hence `Box<UdpSendState>` rather than inline-in-future fields.
+#[allow(dead_code)]
+struct UdpSendState {
+    msghdr: libc::msghdr,
+    iovec: libc::iovec,
     addr: libc::sockaddr_in,
 }
 
-impl<'a> UdpSendTo<'a> {
-    pub(super) fn new(fd: i32, buffer: &'a [u8], dest: SocketAddr) -> Self {
+/// Cancellation-safe UDP send: takes ownership of the buffer, returns it on
+/// completion. If dropped mid-flight, the buffer **and** the boxed kernel
+/// state are both kept alive via the driver's keepalive slot until the
+/// cancelled CQE arrives.
+pub struct UdpSendTo<B: IoBuf> {
+    fd: i32,
+    id: Option<OneshotToken>,
+    buf: Option<B>,
+    state: Option<Box<UdpSendState>>,
+}
+
+impl<B: IoBuf> UdpSendTo<B> {
+    pub(super) fn new(fd: i32, buf: B, dest: SocketAddr) -> Self {
         let (ip, port) = match dest {
             SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
             SocketAddr::V6(_) => panic!("IPv6 not supported"),
         };
 
-        Self {
-            fd,
-            id: None,
-            buffer,
-            msghdr: MaybeUninit::uninit(),
-            iovec: MaybeUninit::uninit(),
+        let state = Box::new(UdpSendState {
+            msghdr: unsafe { std::mem::zeroed() },
+            iovec: unsafe { std::mem::zeroed() },
             addr: libc::sockaddr_in {
                 sin_family: libc::AF_INET as u16,
                 sin_port: port.to_be(),
@@ -41,39 +51,43 @@ impl<'a> UdpSendTo<'a> {
                 },
                 sin_zero: [0; 8],
             },
+        });
+
+        Self {
+            fd,
+            id: None,
+            buf: Some(buf),
+            state: Some(state),
         }
     }
 
-    fn register_to_driver(self: Pin<&mut Self>) {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn register_to_driver(&mut self) {
+        let state = self.state.as_mut().expect("state present");
+        let buf = self.buf.as_ref().expect("buf present");
 
-        this.iovec.write(libc::iovec {
-            iov_base: this.buffer.as_ptr() as *mut _,
-            iov_len: this.buffer.len(),
-        });
+        state.iovec.iov_base = buf.stable_ptr() as *mut _;
+        state.iovec.iov_len = buf.bytes_init();
 
-        this.msghdr.write(libc::msghdr {
-            msg_name: &mut this.addr as *mut _ as *mut _,
-            msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as u32,
-            msg_iov: this.iovec.as_mut_ptr(),
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        });
+        let addr_ptr = &mut state.addr as *mut _ as *mut libc::c_void;
+        let iovec_ptr = &mut state.iovec as *mut libc::iovec;
 
-        let entry = opcode::SendMsg::new(Fd(this.fd), this.msghdr.as_ptr()).build();
+        state.msghdr.msg_name = addr_ptr;
+        state.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        state.msghdr.msg_iov = iovec_ptr;
+        state.msghdr.msg_iovlen = 1;
+
+        let entry = opcode::SendMsg::new(Fd(self.fd), &state.msghdr).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        this.id = Some(token);
+        self.id = Some(token);
     }
 }
 
-impl<'a> Future for UdpSendTo<'a> {
-    type Output = std::io::Result<usize>;
+impl<B: IoBuf> Future for UdpSendTo<B> {
+    type Output = (std::io::Result<usize>, B);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.id.is_none() {
-            self.as_mut().register_to_driver();
+            self.register_to_driver();
         }
 
         let waker = cx.waker();
@@ -83,19 +97,32 @@ impl<'a> Future for UdpSendTo<'a> {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
-                match io_result.result {
-                    len @ 0.. => Poll::Ready(Ok(len as usize)),
-                    err => Poll::Ready(Err(std::io::Error::from_raw_os_error(-err))),
-                }
+                let buf = self.buf.take().expect("buf already taken");
+                let result = match io_result.result {
+                    len @ 0.. => Ok(len as usize),
+                    err => Err(std::io::Error::from_raw_os_error(-err)),
+                };
+                Poll::Ready((result, buf))
             }
         }
     }
 }
 
-impl Drop for UdpSendTo<'_> {
+impl<B: IoBuf> Drop for UdpSendTo<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
+            let state = self.state.take().expect("state present");
+            // The kernel state always needs keeping (msghdr/addr/iovec read
+            // until cancel completes). The buffer only needs keeping if
+            // `B::NEEDS_KEEPALIVE` says so — `&'static` data lives forever
+            // and the const branch is elided at monomorphization.
+            let keep: Box<dyn Any> = if B::NEEDS_KEEPALIVE {
+                let buf = self.buf.take().expect("buf present");
+                Box::new((buf, state))
+            } else {
+                Box::new(state)
+            };
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep)));
         }
     }
 }

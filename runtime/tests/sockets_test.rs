@@ -1,6 +1,6 @@
 use runtime::io_driver::operations::sockets::connect::connect_tcp;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime::io_driver::operations::sockets::recv::socket_recv_init as socket_recv;
+use runtime::io_driver::operations::sockets::recv::socket_recv;
 use runtime::io_driver::operations::sockets::send::socket_send;
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::main_thread;
@@ -43,8 +43,9 @@ fn test_socket_recv_data() {
             let mut ma = MultiAccept::new(8082).unwrap();
 
             if let Some(socket) = ma.next().await {
-                let mut buffer = Box::new([0u8; 128]);
-                let n_bytes = socket_recv(&socket, buffer.as_mut(), 128).await.unwrap();
+                let buffer = Vec::<u8>::with_capacity(128);
+                let (result, buffer) = socket_recv(&socket, buffer).await;
+                let n_bytes = result.unwrap();
 
                 // Return the received data
                 String::from_utf8_lossy(&buffer[..n_bytes]).to_string()
@@ -100,8 +101,9 @@ fn test_echo_server() {
             let mut ma = MultiAccept::new(8084).unwrap();
 
             if let Some(socket) = ma.next().await {
-                let mut buffer = Box::new([0u8; 128]);
-                let n_bytes = socket_recv(&socket, buffer.as_mut(), 128).await.unwrap();
+                let buffer = Vec::<u8>::with_capacity(128);
+                let (result, buffer) = socket_recv(&socket, buffer).await;
+                let n_bytes = result.unwrap();
 
                 // Echo back the data
                 socket_send(&socket, buffer[..n_bytes].to_vec()).await.0.unwrap()
@@ -136,16 +138,18 @@ fn test_multiple_recv_send() {
                 let mut total_bytes = 0;
 
                 // Receive first message
-                let mut buffer1 = Box::new([0u8; 64]);
-                let n1 = socket_recv(&socket, buffer1.as_mut(), 64).await.unwrap();
+                let buffer1 = Vec::<u8>::with_capacity(64);
+                let (result, _buffer1) = socket_recv(&socket, buffer1).await;
+                let n1 = result.unwrap();
                 total_bytes += n1;
 
                 // Send response
                 socket_send(&socket, b"ACK1").await.0.unwrap();
 
                 // Receive second message
-                let mut buffer2 = Box::new([0u8; 64]);
-                let n2 = socket_recv(&socket, buffer2.as_mut(), 64).await.unwrap();
+                let buffer2 = Vec::<u8>::with_capacity(64);
+                let (result, _buffer2) = socket_recv(&socket, buffer2).await;
+                let n2 = result.unwrap();
                 total_bytes += n2;
 
                 // Send final response
@@ -191,8 +195,9 @@ fn test_spawned_socket_handler() {
             if let Some(socket) = ma.next().await {
                 // Spawn a task to handle the socket
                 let task_handle = spawn(async move {
-                    let mut buffer = Box::new([0u8; 128]);
-                    let n_bytes = socket_recv(&socket, buffer.as_mut(), 128).await.unwrap();
+                    let buffer = Vec::<u8>::with_capacity(128);
+                    let (result, buffer) = socket_recv(&socket, buffer).await;
+                    let n_bytes = result.unwrap();
                     socket_send(&socket, buffer[..n_bytes].to_vec()).await.0.unwrap();
                     n_bytes
                 });
@@ -225,13 +230,16 @@ fn test_zero_length_recv() {
             let mut ma = MultiAccept::new(8087).unwrap();
 
             if let Some(socket) = ma.next().await {
-                let mut buffer = Box::new([0u8; 64]);
+                let buffer = Vec::<u8>::with_capacity(64);
 
                 // Receive some data first
-                let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                let (result, mut buffer) = socket_recv(&socket, buffer).await;
+                let n = result.unwrap();
 
                 // Client closes connection, should get 0 bytes
-                let n_zero = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                buffer.clear();
+                let (result, _buffer) = socket_recv(&socket, buffer).await;
+                let n_zero = result.unwrap();
 
                 (n, n_zero)
             } else {
@@ -259,22 +267,24 @@ fn test_recv_timeout() {
             let mut ma = MultiAccept::new(8088).unwrap();
 
             if let Some(socket) = ma.next().await {
-                let mut buf = [0u8; 128];
+                let buf: Vec<u8> = Vec::with_capacity(128);
 
                 // First recv: client sends data quickly, should succeed
-                let first: Result<std::io::Result<usize>, ()> =
-                    timeout(Duration::from_secs(1), socket_recv(&socket, &mut buf, 128)).await;
+                let first: Result<(std::io::Result<usize>, Vec<u8>), ()> =
+                    timeout(Duration::from_secs(1), socket_recv(&socket, buf)).await;
                 assert!(first.is_ok(), "first recv should not time out");
-                let n = first.unwrap().unwrap();
+                let (result, buf) = first.unwrap();
+                let n = result.unwrap();
                 assert_eq!(&buf[..n], b"hello");
 
                 // Signal client that we're about to start the timed recv
                 socket_send(&socket, b"ok").await.0.unwrap();
 
                 // Second recv: client doesn't send anything, should time out
-                let second: Result<std::io::Result<usize>, ()> = timeout(
+                let buf2: Vec<u8> = Vec::with_capacity(128);
+                let second: Result<(std::io::Result<usize>, Vec<u8>), ()> = timeout(
                     Duration::from_millis(150),
-                    socket_recv(&socket, &mut buf, 128),
+                    socket_recv(&socket, buf2),
                 )
                 .await;
                 assert!(second.is_err(), "second recv should time out");
@@ -353,11 +363,13 @@ fn test_vectored_write_echo() {
 
             if let Some(socket) = ma.next().await {
                 // Receive data first
-                let mut buf1 = Box::new([0u8; 64]);
-                let n1 = socket_recv(&socket, buf1.as_mut(), 64).await.unwrap();
+                let buf1 = Vec::<u8>::with_capacity(64);
+                let (result, buf1) = socket_recv(&socket, buf1).await;
+                let n1 = result.unwrap();
 
-                let mut buf2 = Box::new([0u8; 64]);
-                let n2 = socket_recv(&socket, buf2.as_mut(), 64).await.unwrap();
+                let buf2 = Vec::<u8>::with_capacity(64);
+                let (result, buf2) = socket_recv(&socket, buf2).await;
+                let n2 = result.unwrap();
 
                 // Echo both chunks back in a single vectored write
                 let bufs: Vec<Vec<u8>> = vec![buf1[..n1].to_vec(), buf2[..n2].to_vec()];

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::ffi::CString;
 use std::ffi::NulError;
 use std::future::Future;
@@ -39,23 +40,35 @@ impl Future for OpenFile {
     type Output = std::io::Result<OpenedFile>;
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let waker = cx.waker();
         let token = self.id.unwrap();
         match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(io_result) => std::task::Poll::Ready(match io_result.result {
-                fd @ 0.. => Ok(OpenedFile { fd }),
-                err => Err(std::io::Error::from_raw_os_error(-err)),
-            }),
+            std::task::Poll::Ready(io_result) => {
+                self.id = None;
+                std::task::Poll::Ready(match io_result.result {
+                    fd @ 0.. => Ok(OpenedFile { fd }),
+                    err => Err(std::io::Error::from_raw_os_error(-err)),
+                })
+            }
         }
     }
 }
 
 impl Drop for OpenFile {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(token) = self.id.take() {
+            // The kernel reads the filename from the `CString` during
+            // `openat`. Move it into the driver's keepalive so it outlives
+            // any in-flight kernel access after cancel.
+            let filename = std::mem::take(&mut self.filename);
+            let keep: Box<dyn Any> = Box::new(filename);
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep)));
+        }
+    }
 }
 
 impl IoOP for OpenFile {

@@ -1,6 +1,6 @@
 use std::{
+    any::Any,
     future::Future,
-    mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
     task::{Context, Poll},
@@ -9,53 +9,62 @@ use std::{
 use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::IO_DRIVER;
-use crate::io_driver::operations::OneshotToken;
+use crate::io_driver::operations::{IoBufMut, OneshotToken};
 
-pub struct UdpRecvFrom<'a> {
-    fd: i32,
-    id: Option<OneshotToken>,
-    buffer: &'a mut [MaybeUninit<u8>],
-    // These must stay pinned for the duration of the operation
-    msghdr: MaybeUninit<libc::msghdr>,
-    iovec: MaybeUninit<libc::iovec>,
-    addr: MaybeUninit<libc::sockaddr_in>,
+/// Heap-stable kernel-visible state for an in-flight `RecvMsg` op.
+/// `msghdr.msg_name` points into this struct's `addr` (kernel writes the
+/// sender address there); `msghdr.msg_iov` points into `iovec`. Boxed so
+/// the whole thing has a stable heap address regardless of future moves,
+/// and can be handed to the cancel keepalive on drop.
+#[allow(dead_code)]
+struct UdpRecvState {
+    msghdr: libc::msghdr,
+    iovec: libc::iovec,
+    addr: libc::sockaddr_in,
 }
 
-impl<'a> UdpRecvFrom<'a> {
-    pub(super) fn new(fd: i32, buffer: &'a mut [MaybeUninit<u8>]) -> Self {
+/// Cancellation-safe UDP recv: takes ownership of the buffer, returns it on
+/// completion with the kernel-written byte count reflected in
+/// `IoBufMut::set_init`. If dropped mid-flight, both buffer and boxed kernel
+/// state are kept alive via the driver's keepalive slot.
+pub struct UdpRecvFrom<B: IoBufMut> {
+    fd: i32,
+    id: Option<OneshotToken>,
+    buf: Option<B>,
+    state: Option<Box<UdpRecvState>>,
+}
+
+impl<B: IoBufMut> UdpRecvFrom<B> {
+    pub(super) fn new(fd: i32, buf: B) -> Self {
+        // All-zero state is fine: addr will be overwritten by the kernel,
+        // msghdr/iovec are populated in `register_to_driver`.
+        let state = Box::new(unsafe { std::mem::zeroed::<UdpRecvState>() });
         Self {
             fd,
             id: None,
-            buffer,
-            msghdr: MaybeUninit::uninit(),
-            iovec: MaybeUninit::uninit(),
-            addr: MaybeUninit::uninit(),
+            buf: Some(buf),
+            state: Some(state),
         }
     }
 
-    fn register_to_driver(self: Pin<&mut Self>) {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn register_to_driver(&mut self) {
+        let state = self.state.as_mut().expect("state present");
+        let buf = self.buf.as_mut().expect("buf present");
 
-        // Initialize iovec
-        this.iovec.write(libc::iovec {
-            iov_base: this.buffer.as_mut_ptr().cast(),
-            iov_len: this.buffer.len(),
-        });
+        state.iovec.iov_base = buf.stable_mut_ptr().cast();
+        state.iovec.iov_len = buf.bytes_total();
 
-        // Initialize msghdr
-        this.msghdr.write(libc::msghdr {
-            msg_name: this.addr.as_mut_ptr().cast(),
-            msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as u32,
-            msg_iov: this.iovec.as_mut_ptr(),
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        });
+        let addr_ptr = &mut state.addr as *mut _ as *mut libc::c_void;
+        let iovec_ptr = &mut state.iovec as *mut libc::iovec;
 
-        let entry = opcode::RecvMsg::new(Fd(this.fd), this.msghdr.as_mut_ptr()).build();
+        state.msghdr.msg_name = addr_ptr;
+        state.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        state.msghdr.msg_iov = iovec_ptr;
+        state.msghdr.msg_iovlen = 1;
+
+        let entry = opcode::RecvMsg::new(Fd(self.fd), &mut state.msghdr).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        this.id = Some(token);
+        self.id = Some(token);
     }
 }
 
@@ -78,42 +87,54 @@ impl UdpPacket {
     }
 }
 
-impl<'a> Future for UdpRecvFrom<'a> {
-    type Output = std::io::Result<UdpPacket>;
+impl<B: IoBufMut> Future for UdpRecvFrom<B> {
+    type Output = (std::io::Result<UdpPacket>, B);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.id.is_none() {
-            self.as_mut().register_to_driver();
+            self.register_to_driver();
         }
-
         let waker = cx.waker();
         let token = self.id.unwrap();
-
         match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
-                match io_result.result {
+                let mut buf = self.buf.take().expect("buf already taken");
+                let result = match io_result.result {
                     len @ 0.. => {
-                        let addr = unsafe { self.addr.assume_init_ref() };
+                        let n = len as usize;
+                        // SAFETY: the kernel wrote `n` bytes into the buffer
+                        // we handed it via `stable_mut_ptr` / `bytes_total`.
+                        unsafe {
+                            buf.set_init(n);
+                        }
+                        let state = self.state.as_ref().expect("state present");
+                        let addr = &state.addr;
                         let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
                         let port = u16::from_be(addr.sin_port);
-                        Poll::Ready(Ok(UdpPacket {
-                            len: len as usize,
+                        Ok(UdpPacket {
+                            len: n,
                             addr: SocketAddr::V4(SocketAddrV4::new(ip, port)),
-                        }))
+                        })
                     }
-                    err => Poll::Ready(Err(std::io::Error::from_raw_os_error(-err))),
-                }
+                    err => Err(std::io::Error::from_raw_os_error(-err)),
+                };
+                Poll::Ready((result, buf))
             }
         }
     }
 }
 
-impl Drop for UdpRecvFrom<'_> {
+impl<B: IoBufMut> Drop for UdpRecvFrom<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
+            // Both must be kept alive: kernel writes into buf and msghdr→addr
+            // until the cancel CQE arrives.
+            let state = self.state.take().expect("state present");
+            let buf = self.buf.take().expect("buf present");
+            let keep: Box<dyn Any> = Box::new((buf, state));
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep)));
         }
     }
 }

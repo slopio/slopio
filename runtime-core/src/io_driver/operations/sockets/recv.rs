@@ -1,37 +1,40 @@
 use io_uring::opcode::{self};
 use io_uring::types::Fd;
+use std::any::Any;
 use std::future::Future;
-use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::io_driver::IO_DRIVER;
+use crate::io_driver::operations::{IoBufMut, OneshotToken};
 
 use super::SocketWrapper;
-use crate::io_driver::operations::OneshotToken;
 
-pub struct ClassicRecv<'a> {
+/// Cancellation-safe socket recv: takes ownership of the buffer, returns it
+/// on completion with the kernel-written byte count reflected in
+/// `IoBufMut::set_init`. If dropped mid-flight, the buffer is moved into the
+/// driver's keepalive slot so the kernel never writes into freed memory.
+pub struct ClassicRecv<B: IoBufMut> {
     fd: i32,
     id: Option<OneshotToken>,
-    buffer: &'a mut [MaybeUninit<u8>],
-    len: usize,
+    buf: Option<B>,
 }
 
-impl<'a> ClassicRecv<'a> {
-    fn from_socket(socket: &SocketWrapper, buffer: &'a mut [MaybeUninit<u8>], len: usize) -> Self {
+impl<B: IoBufMut> ClassicRecv<B> {
+    fn from_socket(socket: &SocketWrapper, buf: B) -> Self {
         Self {
             fd: socket.fd(),
             id: None,
-            len,
-            buffer,
+            buf: Some(buf),
         }
     }
 
     fn register_to_driver(&mut self) {
+        let buf = self.buf.as_mut().expect("buf taken before submit");
         let entry = opcode::Recv::new(
             Fd(self.fd),
-            self.buffer.as_mut_ptr().cast::<u8>(),
-            self.len as u32,
+            buf.stable_mut_ptr(),
+            buf.bytes_total() as u32,
         )
         .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
@@ -39,27 +42,12 @@ impl<'a> ClassicRecv<'a> {
     }
 }
 
-pub fn socket_recv<'a>(
-    socket: &SocketWrapper,
-    buffer: &'a mut [MaybeUninit<u8>],
-    len: usize,
-) -> ClassicRecv<'a> {
-    ClassicRecv::<'a>::from_socket(socket, buffer, len)
+pub fn socket_recv<B: IoBufMut>(socket: &SocketWrapper, buf: B) -> ClassicRecv<B> {
+    ClassicRecv::from_socket(socket, buf)
 }
 
-pub fn socket_recv_init<'a>(
-    socket: &SocketWrapper,
-    buffer: &'a mut [u8],
-    len: usize,
-) -> ClassicRecv<'a> {
-    // SAFETY: MaybeUninit<u8> has the same layout as u8, and the buffer is already initialized
-    let uninit_buffer: &'a mut [MaybeUninit<u8>] =
-        unsafe { &mut *(buffer as *mut [u8] as *mut [MaybeUninit<u8>]) };
-    ClassicRecv::<'a>::from_socket(socket, uninit_buffer, len)
-}
-
-impl<'a> Future for ClassicRecv<'a> {
-    type Output = std::io::Result<usize>;
+impl<B: IoBufMut> Future for ClassicRecv<B> {
+    type Output = (std::io::Result<usize>, B);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.id.is_none() {
@@ -73,19 +61,30 @@ impl<'a> Future for ClassicRecv<'a> {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
                 self.id = None;
-                Poll::Ready(match io_result.result {
-                    bytes_read @ 0.. => Ok(bytes_read as usize),
+                let mut buf = self.buf.take().expect("buf already taken");
+                let result = match io_result.result {
+                    n @ 0.. => {
+                        let n = n as usize;
+                        // SAFETY: the kernel wrote `n` bytes into the buffer
+                        // we handed it via `stable_mut_ptr` / `bytes_total`.
+                        unsafe {
+                            buf.set_init(n);
+                        }
+                        Ok(n)
+                    }
                     err => Err(std::io::Error::from_raw_os_error(-err)),
-                })
+                };
+                Poll::Ready((result, buf))
             }
         }
     }
 }
 
-impl Drop for ClassicRecv<'_> {
+impl<B: IoBufMut> Drop for ClassicRecv<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
+            let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
         }
     }
 }

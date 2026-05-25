@@ -1,6 +1,5 @@
 use runtime::{
     io_driver::operations::files::{
-        AsyncFileWrite,
         open::{flags, mode},
         open_file,
     },
@@ -39,9 +38,9 @@ fn join_io_test() {
 
         let w1 = f1.write(b"salut");
         let w2 = f2.write(b"salut");
-        let (Ok(r1_res), Ok(r2_res)) = join(w1, w2).await else {
-            panic!("afdsf");
-        };
+        let ((r1_res, _), (r2_res, _)) = join(w1, w2).await;
+        let r1_res = r1_res.unwrap();
+        let r2_res = r2_res.unwrap();
         assert_eq!(r1_res, r2_res);
     });
 }

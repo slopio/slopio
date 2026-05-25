@@ -8,7 +8,7 @@ use runtime::channels::{bounded_channel, unbounded_channel};
 use runtime::io_driver::BufGroup;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
 use runtime::io_driver::operations::sockets::multi_recv::MultiRecv;
-use runtime::io_driver::operations::sockets::recv::socket_recv_init as socket_recv;
+use runtime::io_driver::operations::sockets::recv::socket_recv;
 use runtime::io_driver::operations::sockets::send::socket_send;
 use runtime::main_thread;
 use runtime::runtime::time::Sleep;
@@ -266,8 +266,8 @@ fn load_200_concurrent_connections() {
             for _ in 0..N {
                 if let Some(socket) = ma.next().await {
                     handlers.push(spawn(async move {
-                        let mut buf = Box::new([0u8; 8]);
-                        socket_recv(&socket, buf.as_mut(), 8).await.unwrap();
+                        let buf = Vec::<u8>::with_capacity(8);
+                        socket_recv(&socket, buf).await.0.unwrap();
                         socket_send(&socket, b"ok").await.0.unwrap();
                     }));
                 }
@@ -312,8 +312,9 @@ fn load_tcp_1mb_recv() {
             if let Some(socket) = ma.next().await {
                 let mut total = 0usize;
                 loop {
-                    let mut buf = Box::new([0u8; 4096]);
-                    let n = socket_recv(&socket, buf.as_mut(), 4096).await.unwrap();
+                    let buf = Vec::<u8>::with_capacity(4096);
+                    let (result, _buf) = socket_recv(&socket, buf).await;
+                    let n = result.unwrap();
                     if n == 0 {
                         break;
                     }
@@ -354,9 +355,11 @@ fn load_ping_pong_10k_rounds() {
         main_thread(async {
             let mut ma = MultiAccept::new(9202).unwrap();
             if let Some(socket) = ma.next().await {
-                let mut buf = Box::new([0u8; 4]);
+                let mut buf = Vec::<u8>::with_capacity(4);
                 for _ in 0..ROUNDS {
-                    let n = socket_recv(&socket, buf.as_mut(), 4).await.unwrap();
+                    let (result, returned) = socket_recv(&socket, buf).await;
+                    buf = returned;
+                    let n = result.unwrap();
                     if n == 0 {
                         break;
                     }
@@ -403,9 +406,11 @@ fn load_100_connections_100_cycles_each() {
             for _ in 0..CONNS {
                 if let Some(socket) = ma.next().await {
                     handlers.push(spawn(async move {
-                        let mut buf = Box::new([0u8; 8]);
+                        let mut buf = Vec::<u8>::with_capacity(8);
                         for _ in 0..CYCLES {
-                            let n = socket_recv(&socket, buf.as_mut(), 8).await.unwrap();
+                            let (result, returned) = socket_recv(&socket, buf).await;
+                            buf = returned;
+                            let n = result.unwrap();
                             if n == 0 {
                                 break;
                             }

@@ -1,5 +1,5 @@
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime::io_driver::operations::sockets::recv::socket_recv_init as socket_recv;
+use runtime::io_driver::operations::sockets::recv::socket_recv;
 use runtime::io_driver::operations::sockets::send::socket_send;
 use runtime::main_thread;
 use runtime::runtime::spawn;
@@ -55,8 +55,9 @@ fn test_tiny_recv_chunks() {
 
                 // Read 1 byte at a time, 20 times
                 for _ in 0..20 {
-                    let mut buffer = Box::new([0u8; 1]);
-                    let n = socket_recv(&socket, buffer.as_mut(), 1).await.unwrap();
+                    let buffer = Vec::<u8>::with_capacity(1);
+                    let (result, buffer) = socket_recv(&socket, buffer).await;
+                    let n = result.unwrap();
                     if n > 0 {
                         total_received.push(buffer[0]);
                     }
@@ -137,8 +138,9 @@ fn test_concurrent_connections() {
             for _ in 0..10 {
                 if let Some(socket) = ma.next().await {
                     let handler = spawn(async move {
-                        let mut buffer = Box::new([0u8; 64]);
-                        let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                        let buffer = Vec::<u8>::with_capacity(64);
+                        let (result, buffer) = socket_recv(&socket, buffer).await;
+                        let n = result.unwrap();
                         socket_send(&socket, buffer[..n].to_vec()).await.0.unwrap();
                         n
                     });
@@ -190,8 +192,8 @@ fn test_large_buffer_small_data() {
             let mut ma = MultiAccept::new(9004).unwrap();
 
             if let Some(socket) = ma.next().await {
-                let mut buffer = Box::new([0u8; 4096]);
-                socket_recv(&socket, buffer.as_mut(), 4096).await.unwrap()
+                let buffer = Vec::<u8>::with_capacity(4096);
+                socket_recv(&socket, buffer).await.0.unwrap()
             } else {
                 0
             }
@@ -218,8 +220,9 @@ fn test_multiple_cycles() {
                 let mut total = 0;
 
                 for _ in 0..10 {
-                    let mut buffer = Box::new([0u8; 64]);
-                    let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                    let buffer = Vec::<u8>::with_capacity(64);
+                    let (result, buffer) = socket_recv(&socket, buffer).await;
+                    let n = result.unwrap();
                     socket_send(&socket, buffer[..n].to_vec()).await.0.unwrap();
                     total += n;
                 }
@@ -257,13 +260,16 @@ fn test_client_disconnect_during_recv() {
             let mut ma = MultiAccept::new(9006).unwrap();
 
             if let Some(socket) = ma.next().await {
-                let mut buffer = Box::new([0u8; 64]);
+                let buffer = Vec::<u8>::with_capacity(64);
 
                 // First recv should succeed
-                let n1 = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                let (result, mut buffer) = socket_recv(&socket, buffer).await;
+                let n1 = result.unwrap();
 
                 // Second recv should get 0 (connection closed)
-                let n2 = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                buffer.clear();
+                let (result, _buffer) = socket_recv(&socket, buffer).await;
+                let n2 = result.unwrap();
 
                 (n1, n2)
             } else {
@@ -293,8 +299,9 @@ fn test_nested_socket_spawns() {
             if let Some(socket) = ma.next().await {
                 let outer_task = spawn(async move {
                     let inner_task = spawn(async move {
-                        let mut buffer = Box::new([0u8; 64]);
-                        let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                        let buffer = Vec::<u8>::with_capacity(64);
+                        let (result, _buffer) = socket_recv(&socket, buffer).await;
+                        let n = result.unwrap();
                         socket_send(&socket, b"PONG").await.0.unwrap();
                         n
                     });
@@ -330,8 +337,8 @@ fn test_sequential_accept_handle() {
 
             for _ in 0..20 {
                 if let Some(socket) = ma.next().await {
-                    let mut buffer = Box::new([0u8; 32]);
-                    socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
+                    let buffer = Vec::<u8>::with_capacity(32);
+                    socket_recv(&socket, buffer).await.0.unwrap();
                     socket_send(&socket, b"OK").await.0.unwrap();
                     count += 1;
                 }
@@ -372,8 +379,9 @@ fn test_interleaved_socket_operations() {
                 if let Some(socket) = ma.next().await {
                     let handler = spawn(async move {
                         // Receive data
-                        let mut buffer = Box::new([0u8; 32]);
-                        let n = socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
+                        let buffer = Vec::<u8>::with_capacity(32);
+                        let (result, buffer) = socket_recv(&socket, buffer).await;
+                        let n = result.unwrap();
 
                         // Echo it back
                         socket_send(&socket, buffer[..n].to_vec()).await.0.unwrap();
@@ -440,8 +448,9 @@ fn test_immediate_recv_after_accept() {
 
             if let Some(socket) = ma.next().await {
                 // Immediately try to recv - client may have already sent data
-                let mut buffer = Box::new([0u8; 64]);
-                let n = socket_recv(&socket, buffer.as_mut(), 64).await.unwrap();
+                let buffer = Vec::<u8>::with_capacity(64);
+                let (result, buffer) = socket_recv(&socket, buffer).await;
+                let n = result.unwrap();
                 String::from_utf8_lossy(&buffer[..n]).to_string()
             } else {
                 String::new()
@@ -492,8 +501,8 @@ fn test_mixed_socket_handling() {
 
             // First socket - handle directly
             if let Some(socket) = ma.next().await {
-                let mut buffer = Box::new([0u8; 32]);
-                socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
+                let buffer = Vec::<u8>::with_capacity(32);
+                socket_recv(&socket, buffer).await.0.unwrap();
                 results.lock().unwrap().push(1);
             }
 
@@ -501,8 +510,8 @@ fn test_mixed_socket_handling() {
             if let Some(socket) = ma.next().await {
                 let r = results.clone();
                 let task = spawn(async move {
-                    let mut buffer = Box::new([0u8; 32]);
-                    socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
+                    let buffer = Vec::<u8>::with_capacity(32);
+                    socket_recv(&socket, buffer).await.0.unwrap();
                     r.lock().unwrap().push(2);
                 });
                 task.await;
@@ -510,8 +519,8 @@ fn test_mixed_socket_handling() {
 
             // Third socket - handle directly again
             if let Some(socket) = ma.next().await {
-                let mut buffer = Box::new([0u8; 32]);
-                socket_recv(&socket, buffer.as_mut(), 32).await.unwrap();
+                let buffer = Vec::<u8>::with_capacity(32);
+                socket_recv(&socket, buffer).await.0.unwrap();
                 results.lock().unwrap().push(3);
             }
 

@@ -7,13 +7,13 @@ pub use recv::{UdpPacket, UdpRecvFrom};
 pub use send::UdpSendTo;
 
 use std::{
-    mem::MaybeUninit,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::IntoRawFd,
 };
 
 use socket2::{Domain, Protocol, Socket as S, Type};
 
+use crate::io_driver::operations::{IoBuf, IoBufMut};
 use crate::io_driver::operations::sockets::SocketWrapper;
 
 pub struct UdpSocket {
@@ -49,11 +49,11 @@ impl UdpSocket {
         self.socket.fd()
     }
 
-    pub fn recv_from<'a>(&self, buffer: &'a mut [MaybeUninit<u8>]) -> UdpRecvFrom<'a> {
-        UdpRecvFrom::new(self.socket.fd(), buffer)
+    pub fn recv_from<B: IoBufMut>(&self, buf: B) -> UdpRecvFrom<B> {
+        UdpRecvFrom::new(self.socket.fd(), buf)
     }
 
-    pub fn send_to<'a>(&self, buffer: &'a [u8], dest: SocketAddr) -> UdpSendTo<'a> {
-        UdpSendTo::new(self.socket.fd(), buffer, dest)
+    pub fn send_to<B: IoBuf>(&self, buf: B, dest: SocketAddr) -> UdpSendTo<B> {
+        UdpSendTo::new(self.socket.fd(), buf, dest)
     }
 }
