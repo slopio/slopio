@@ -44,7 +44,9 @@ pub struct UdpMultiRecv {
     fd: i32,
     bgid: u16,
     reads: MultiOpQueue,
-    hdr: Box<MsgHdrBox>,
+    /// `Some` until `driver_cleanup` runs in `Drop`, at which point the Box
+    /// is moved into the driver's keepalive slot.
+    hdr: Option<Box<MsgHdrBox>>,
 }
 
 pub struct UdpDatagram {
@@ -80,7 +82,7 @@ impl UdpMultiRecv {
             fd,
             bgid: group.bgid(),
             reads: Default::default(),
-            hdr: MsgHdrBox::new(),
+            hdr: Some(MsgHdrBox::new()),
         }
     }
 
@@ -99,7 +101,11 @@ impl UdpMultiRecv {
         let bid = buffer_select(event.flags).ok_or(())?;
         let buffer = IO_DRIVER.with(|d| d.get_buffer(self.bgid, bid, len));
 
-        let parsed = RecvMsgOut::parse(buffer.as_ref(), &self.hdr.msghdr).map_err(|_| ())?;
+        let parsed = RecvMsgOut::parse(
+            buffer.as_ref(),
+            &self.hdr.as_ref().expect("hdr present").msghdr,
+        )
+        .map_err(|_| ())?;
 
         let name = parsed.name_data();
         if name.len() < std::mem::size_of::<libc::sockaddr_in>() {
@@ -135,7 +141,24 @@ impl UdpMultiRecv {
 
 impl Drop for UdpMultiRecv {
     fn drop(&mut self) {
+        // Recycle kernel buffers from any unprocessed completion events
+        // before cancelling, otherwise buffer-ring entries leak.
+        self.recycle_pending_buffers();
         self.driver_cleanup();
+    }
+}
+
+impl UdpMultiRecv {
+    fn recycle_pending_buffers(&mut self) {
+        while let Some(event) = self.reads.pop() {
+            if event.result > 0 {
+                if let Some(buffer_id) = buffer_select(event.flags) {
+                    drop(IO_DRIVER.with(|d| {
+                        d.get_buffer(self.bgid, buffer_id, event.result as usize)
+                    }));
+                }
+            }
+        }
     }
 }
 
@@ -185,8 +208,24 @@ impl IoOP for UdpMultiRecv {
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMsgMulti::new(Fd(self.fd), self.hdr.msghdr_ptr(), self.bgid).build()
+        opcode::RecvMsgMulti::new(
+            Fd(self.fd),
+            self.hdr.as_ref().expect("hdr present").msghdr_ptr(),
+            self.bgid,
+        )
+        .build()
     }
 
-    fn driver_cleanup(&mut self) {}
+    fn driver_cleanup(&mut self) {
+        if let Some(token) = self.id.take() {
+            // The kernel may still write into msghdr.msg_name → addr for any
+            // in-flight datagram before the cancel completes. Hand the Box
+            // to the driver as keepalive so it outlives those accesses.
+            let keep = self
+                .hdr
+                .take()
+                .map(|h| h as Box<dyn std::any::Any>);
+            IO_DRIVER.with(|d| d.cancel_multishot_op_keep(token, self.bgid, keep));
+        }
+    }
 }

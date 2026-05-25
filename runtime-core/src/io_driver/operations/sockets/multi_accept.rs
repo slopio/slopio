@@ -90,7 +90,23 @@ impl MultiAccept {
 
 impl Drop for MultiAccept {
     fn drop(&mut self) {
+        // Close fds queued locally that the user never picked up. Driver-side
+        // queue + future-arriving accept CQEs are handled by the cancel call
+        // in driver_cleanup via the `AcceptCancelled` state machine.
+        self.close_pending_fds();
         self.driver_cleanup();
+    }
+}
+
+impl MultiAccept {
+    fn close_pending_fds(&mut self) {
+        while let Some(event) = self.sockets.pop() {
+            if event.result > 0 {
+                unsafe {
+                    libc::close(event.result);
+                }
+            }
+        }
     }
 }
 
@@ -172,6 +188,11 @@ impl IoOP for MultiAccept {
     }
 
     fn driver_cleanup(&mut self) {
-        // fd is closed by SocketWrapper's Drop
+        // Cancel the multishot accept via the accept-aware path so any
+        // already-queued or in-flight accept fds get closed instead of
+        // leaked. Listener fd is closed separately by `SocketWrapper`'s Drop.
+        if let Some(token) = self.id.take() {
+            IO_DRIVER.with(|d| d.cancel_multishot_op_accept(token));
+        }
     }
 }

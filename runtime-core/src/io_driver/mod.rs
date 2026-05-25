@@ -135,6 +135,19 @@ enum MultiOpState {
         bgid: u16,
         last_cqe: bool,
         ecancelled: bool,
+        /// Memory the kernel may still touch (e.g. a UDP `msghdr` Box) for
+        /// in-flight CQEs after cancel is submitted. Dropped when the slab
+        /// entry is reaped on `CancelComplete`.
+        #[allow(dead_code)]
+        keepalive: Option<CancelKeepalive>,
+    },
+    /// Cancelled multishot accept. Separate from `Cancelled` because for
+    /// accept-style ops `event.result > 0` means "a freshly-accepted fd",
+    /// not a buffer index. The driver closes these fds as they arrive
+    /// instead of trying to recycle them as buffers.
+    AcceptCancelled {
+        last_cqe: bool,
+        ecancelled: bool,
     },
 }
 
@@ -186,6 +199,7 @@ impl MultiOpState {
             MultiOpState::TringToPause { .. } => unreachable!("already"),
             MultiOpState::Paused { .. } => todo!(),
             MultiOpState::Cancelled { .. } => {}
+            MultiOpState::AcceptCancelled { .. } => {}
         }
     }
 
@@ -202,6 +216,7 @@ impl MultiOpState {
                 waker.wake_by_ref();
             }
             MultiOpState::Cancelled { .. } => {}
+            MultiOpState::AcceptCancelled { .. } => {}
         }
     }
 }
@@ -257,6 +272,9 @@ impl IODriver {
                     }
                     MultiProcessResult::FullyPaused => {}
                     MultiProcessResult::CancelComplete => {
+                        slab.remove_raw(index);
+                    }
+                    MultiProcessResult::AcceptCancelComplete => {
                         slab.remove_raw(index);
                     }
                     MultiProcessResult::CancelledRecycling {
@@ -410,6 +428,7 @@ impl IODriver {
                 MultiPollResult::NeedsResubmit
             }
             MultiOpState::Cancelled { .. } => MultiPollResult::Pending,
+            MultiOpState::AcceptCancelled { .. } => MultiPollResult::Pending,
         }
     }
 
@@ -512,6 +531,19 @@ impl IODriver {
     }
 
     pub fn cancel_multishot_op(&self, token: MultishotToken, bgid: u16) {
+        self.cancel_multishot_op_keep(token, bgid, None);
+    }
+
+    /// Cancel a multishot op, transferring ownership of `keepalive` to the
+    /// driver. The kernel may still write to memory referenced by the op
+    /// (e.g. a UDP recvmsg's msghdr) until the cancelled CQE arrives;
+    /// `keepalive` is dropped only at that point.
+    pub fn cancel_multishot_op_keep(
+        &self,
+        token: MultishotToken,
+        bgid: u16,
+        keepalive: Option<Box<dyn std::any::Any>>,
+    ) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
         if let Some(entry) = slab.get_mut(token) {
             // Recycle kernel buffers from the old state's queue before dropping it.
@@ -521,9 +553,45 @@ impl IODriver {
                     bgid,
                     last_cqe: false,
                     ecancelled: false,
+                    keepalive: keepalive.map(CancelKeepalive),
                 },
             );
             self.recycle_multiop_queue(old, bgid);
+            self.send_multiop_cancel_event(UserData::multi(token.raw()).into_bits());
+        }
+    }
+
+    /// Cancel a multishot accept. The driver transitions the slab entry to
+    /// `AcceptCancelled`, closes any already-accepted fds still queued from
+    /// before cancel, and submits the cancel SQE. Subsequent accept CQEs
+    /// arriving during the cancel window have their fds closed in
+    /// `process_multi`'s `AcceptCancelled` arm.
+    pub(crate) fn cancel_multishot_op_accept(&self, token: MultishotToken) {
+        let slab = unsafe { &mut *self.multishot_slab.get() };
+        if let Some(entry) = slab.get_mut(token) {
+            let old = std::mem::replace(
+                entry,
+                MultiOpState::AcceptCancelled {
+                    last_cqe: false,
+                    ecancelled: false,
+                },
+            );
+            // Close any fds the kernel queued before we cancelled.
+            let queue = match old {
+                MultiOpState::Sent { queue, .. }
+                | MultiOpState::TringToPause { queue, .. }
+                | MultiOpState::Paused { queue, .. } => Some(queue),
+                _ => None,
+            };
+            if let Some(mut queue) = queue {
+                while let Some(event) = queue.pop() {
+                    if event.result > 0 {
+                        unsafe {
+                            libc::close(event.result);
+                        }
+                    }
+                }
+            }
             self.send_multiop_cancel_event(UserData::multi(token.raw()).into_bits());
         }
     }

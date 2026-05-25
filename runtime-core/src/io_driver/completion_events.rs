@@ -74,6 +74,9 @@ pub(crate) enum MultiProcessResult {
     PauseRequired(u64),
     FullyPaused,
     CancelComplete,
+    /// All CQEs accounted for after an accept cancel — incoming fds (if any)
+    /// were already closed by `process_multi`. Slab entry can be reaped.
+    AcceptCancelComplete,
     CancelledRecycling {
         buffer_id: u16,
         len: usize,
@@ -173,10 +176,35 @@ pub(crate) fn process_multi(
             MultiProcessResult::InvalidState("received CQE while paused")
         }
 
+        MultiOpState::AcceptCancelled {
+            ecancelled,
+            last_cqe,
+        } => {
+            if event.result == -ECANCELED {
+                *ecancelled = true;
+            }
+            if !cqueue::more(event.flags) {
+                *last_cqe = true;
+            }
+            // Any positive result is a freshly-accepted fd we'll never hand
+            // to the user — close it.
+            if event.result > 0 {
+                unsafe {
+                    libc::close(event.result);
+                }
+            }
+            if *ecancelled && *last_cqe {
+                MultiProcessResult::AcceptCancelComplete
+            } else {
+                MultiProcessResult::Queued
+            }
+        }
+
         MultiOpState::Cancelled {
             bgid,
             ecancelled,
             last_cqe,
+            ..
         } => {
             if event.result == -ECANCELED {
                 *ecancelled = true;
