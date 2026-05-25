@@ -1,11 +1,12 @@
 use libc::c_int;
-use std::io::{self, IoSlice};
+use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
 use self::send_control_record::{socket_send_control_record, WriteControlRecord};
 use self::send_vectored::{socket_send_vectored, WriteVectoredSocket};
+use crate::io_driver::operations::IoBuf;
 
 pub mod connect;
 pub mod managed_recv;
@@ -28,7 +29,7 @@ impl SocketWrapper {
         self.fd
     }
 
-    pub fn vectored_write<'a>(&self, bufs: &'a [IoSlice<'a>]) -> WriteVectoredSocket<'a> {
+    pub fn vectored_write<B: IoBuf>(&self, bufs: Vec<B>) -> WriteVectoredSocket<B> {
         socket_send_vectored(self, bufs)
     }
 

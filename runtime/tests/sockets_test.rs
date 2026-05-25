@@ -2,11 +2,12 @@ use runtime::io_driver::operations::sockets::connect::connect_tcp;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
 use runtime::io_driver::operations::sockets::recv::socket_recv_init as socket_recv;
 use runtime::io_driver::operations::sockets::send::socket_send;
+use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::main_thread;
 use runtime::runtime::spawn;
 use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
-use std::io::{IoSlice, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
@@ -320,13 +321,13 @@ fn test_vectored_write() {
             let mut ma = MultiAccept::new(8089).unwrap();
 
             if let Some(socket) = ma.next().await {
-                let bufs = [
-                    IoSlice::new(b"Hello"),
-                    IoSlice::new(b", "),
-                    IoSlice::new(b"vectored"),
-                    IoSlice::new(b" world!"),
+                let bufs: Vec<&'static [u8]> = vec![
+                    b"Hello".as_slice(),
+                    b", ".as_slice(),
+                    b"vectored".as_slice(),
+                    b" world!".as_slice(),
                 ];
-                socket.vectored_write(&bufs).await.unwrap()
+                socket.vectored_write(bufs).await.0.unwrap()
             } else {
                 0
             }
@@ -359,11 +360,8 @@ fn test_vectored_write_echo() {
                 let n2 = socket_recv(&socket, buf2.as_mut(), 64).await.unwrap();
 
                 // Echo both chunks back in a single vectored write
-                let bufs = [
-                    IoSlice::new(&buf1[..n1]),
-                    IoSlice::new(&buf2[..n2]),
-                ];
-                socket.vectored_write(&bufs).await.unwrap()
+                let bufs: Vec<Vec<u8>> = vec![buf1[..n1].to_vec(), buf2[..n2].to_vec()];
+                socket.vectored_write(bufs).await.0.unwrap()
             } else {
                 0
             }
@@ -386,6 +384,79 @@ fn test_vectored_write_echo() {
     let bytes_written = handle.join().unwrap();
     assert_eq!(bytes_written, 16);
     assert_eq!(&buffer[..n], b"part onepart two");
+}
+
+// Force `send_vectored_all` through its partial-write loop by shrinking both
+// the server send buffer and the client receive buffer, and having the client
+// read slowly so the kernel-side TCP buffers stay near-full. The byte pattern
+// check catches any off-by-one in chunk advancement.
+#[test]
+fn test_vectored_write_partial() {
+    use socket2::SockRef;
+
+    const CHUNK_COUNT: usize = 32;
+    const CHUNK_SIZE: usize = 4 * 1024;
+    const TOTAL: usize = CHUNK_COUNT * CHUNK_SIZE;
+
+    let server = std::thread::spawn(|| {
+        main_thread(async {
+            let mut ma = MultiAccept::new(8094).unwrap();
+            let socket = ma.next().await.unwrap();
+            // Shrink the send buffer to force partial writes. Linux doubles
+            // the requested value internally, so the effective size will be
+            // around 8 KB — far smaller than the 1 MB payload.
+            socket.set_send_buffer_size(4096).ok();
+
+            // Chunk i is all `(i % 256) as u8`. If chunk-advance is wrong,
+            // bytes will shift and the per-chunk pattern assertion will fail.
+            let bufs: Vec<Vec<u8>> = (0..CHUNK_COUNT)
+                .map(|i| vec![(i % 256) as u8; CHUNK_SIZE])
+                .collect();
+
+            let (result, _bufs) = send_vectored_all(&socket, bufs).await;
+            result.unwrap();
+            // Socket dropped here → close → client gets EOF.
+        })
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut client = TcpStream::connect("127.0.0.1:8094").unwrap();
+    // Shrink the client's recv buffer too so the kernel can't absorb the
+    // whole payload at once.
+    SockRef::from(&client).set_recv_buffer_size(4096).ok();
+
+    let mut received = Vec::with_capacity(TOTAL);
+    let mut buf = [0u8; 4096];
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                received.extend_from_slice(&buf[..n]);
+                // Read slowly so the server-side send buffer fills and the
+                // kernel forces partial writes on each writev op.
+                std::thread::sleep(Duration::from_micros(500));
+            }
+            Err(_) => break,
+        }
+    }
+
+    server.join().unwrap();
+
+    assert_eq!(received.len(), TOTAL, "total byte count mismatch");
+
+    // Verify byte pattern per chunk — catches off-by-one in chunk advance.
+    for i in 0..CHUNK_COUNT {
+        let chunk_start = i * CHUNK_SIZE;
+        let expected = (i % 256) as u8;
+        for j in 0..CHUNK_SIZE {
+            assert_eq!(
+                received[chunk_start + j], expected,
+                "byte mismatch at chunk {}, offset {}",
+                i, j
+            );
+        }
+    }
 }
 
 #[test]

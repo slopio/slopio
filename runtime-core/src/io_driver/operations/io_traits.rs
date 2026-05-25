@@ -154,6 +154,18 @@ impl<B: IoBuf> Slice<B> {
     pub fn into_inner(self) -> B {
         self.buf
     }
+    /// Advance `begin` by `n` bytes within this slice. Used by partial-write
+    /// loops (e.g. `send_vectored_all`) to consume a prefix without copying.
+    /// Panics if `n` exceeds the current length.
+    pub fn advance(&mut self, n: usize) {
+        let new_begin = self.begin + n;
+        assert!(
+            new_begin <= self.end,
+            "Slice::advance({n}) past end (len = {})",
+            self.len()
+        );
+        self.begin = new_begin;
+    }
 }
 
 // SAFETY: `stable_ptr` is `self.buf.stable_ptr().add(self.begin)`. The
