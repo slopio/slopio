@@ -4,6 +4,8 @@ pub mod files;
 pub mod io_traits;
 pub mod sockets;
 
+pub use io_traits::{IoBuf, Slice};
+
 /// A token for a single-shot io_uring operation.
 #[derive(Debug, Clone, Copy)]
 pub struct OneshotToken(pub(crate) u64);
