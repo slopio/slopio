@@ -106,7 +106,10 @@ fn test_echo_server() {
                 let n_bytes = result.unwrap();
 
                 // Echo back the data
-                socket_send(&socket, buffer[..n_bytes].to_vec()).await.0.unwrap()
+                socket_send(&socket, buffer[..n_bytes].to_vec())
+                    .await
+                    .0
+                    .unwrap()
             } else {
                 0
             }
@@ -198,7 +201,10 @@ fn test_spawned_socket_handler() {
                     let buffer = Vec::<u8>::with_capacity(128);
                     let (result, buffer) = socket_recv(&socket, buffer).await;
                     let n_bytes = result.unwrap();
-                    socket_send(&socket, buffer[..n_bytes].to_vec()).await.0.unwrap();
+                    socket_send(&socket, buffer[..n_bytes].to_vec())
+                        .await
+                        .0
+                        .unwrap();
                     n_bytes
                 });
 
@@ -282,11 +288,8 @@ fn test_recv_timeout() {
 
                 // Second recv: client doesn't send anything, should time out
                 let buf2: Vec<u8> = Vec::with_capacity(128);
-                let second: Result<(std::io::Result<usize>, Vec<u8>), ()> = timeout(
-                    Duration::from_millis(150),
-                    socket_recv(&socket, buf2),
-                )
-                .await;
+                let second: Result<(std::io::Result<usize>, Vec<u8>), ()> =
+                    timeout(Duration::from_millis(150), socket_recv(&socket, buf2)).await;
                 assert!(second.is_err(), "second recv should time out");
 
                 true
@@ -463,9 +466,11 @@ fn test_vectored_write_partial() {
         let expected = (i % 256) as u8;
         for j in 0..CHUNK_SIZE {
             assert_eq!(
-                received[chunk_start + j], expected,
+                received[chunk_start + j],
+                expected,
                 "byte mismatch at chunk {}, offset {}",
-                i, j
+                i,
+                j
             );
         }
     }

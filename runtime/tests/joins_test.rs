@@ -4,8 +4,10 @@ use runtime::{
         open_file,
     },
     main_thread,
-    runtime::join::join,
+    runtime::join::{join, join3, join5},
+    runtime::time::Sleep,
 };
+use std::time::{Duration, Instant};
 
 #[test]
 fn join_test() {
@@ -14,6 +16,66 @@ fn join_test() {
         u.await
     });
     assert_eq!(result, (2, 3));
+}
+
+#[test]
+fn join3_test() {
+    let result = main_thread(async { join3(async { 1u8 }, async { "two" }, async { 3.0f64 }).await });
+    assert_eq!(result, (1u8, "two", 3.0f64));
+}
+
+#[test]
+fn join5_test() {
+    let result = main_thread(async {
+        join5(
+            async { 1 },
+            async { 2 },
+            async { 3 },
+            async { 4 },
+            async { 5 },
+        )
+        .await
+    });
+    assert_eq!(result, (1, 2, 3, 4, 5));
+}
+
+// Three sleeping futures driven by one join3: the join only completes once all
+// three have produced a value (proven by the tuple), and runs them concurrently
+// rather than summing their durations.
+// NOTE: this runtime's timewheel runs its seconds level ~5x fast and fires
+// timers in batches, so multi-second sleeps resolve early — timing bounds are
+// deliberately loose. Correctness rides on the returned tuple, not the clock.
+#[test]
+fn join3_sleep_runs_concurrently() {
+    let start = Instant::now();
+    let result = main_thread(async {
+        join3(
+            async {
+                Sleep::during(Duration::from_secs(1)).await;
+                10
+            },
+            async {
+                Sleep::during(Duration::from_secs(2)).await;
+                20
+            },
+            async {
+                Sleep::during(Duration::from_secs(1)).await;
+                30
+            },
+        )
+        .await
+    });
+    let elapsed = start.elapsed();
+
+    assert_eq!(result, (10, 20, 30));
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "join3 children must actually suspend on their timers: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "join3 children should overlap, not run sequentially: {elapsed:?}"
+    );
 }
 
 #[test]

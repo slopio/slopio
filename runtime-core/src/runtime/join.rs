@@ -93,3 +93,47 @@ where
         }
     }
 }
+
+/// Generates `joinN`: drives N heterogeneous futures concurrently, completing
+/// with a tuple of all outputs once every one is ready. Reuses [`WrappedFut`]
+/// for per-future state, so it allocates nothing. Completion is decided by
+/// re-reading each future's readiness every poll (never an accumulating
+/// counter), which stays correct under coalesced wakeups.
+macro_rules! impl_join_n {
+    ($join_ty:ident, $join_fn:ident, $($F:ident => $f:ident),+) => {
+        #[pin_project]
+        pub struct $join_ty<$($F: Future),+> {
+            $(#[pin] $f: WrappedFut<$F>,)+
+        }
+
+        pub fn $join_fn<$($F: Future),+>($($f: $F),+) -> $join_ty<$($F),+> {
+            $join_ty {
+                $($f: $f.into(),)+
+            }
+        }
+
+        impl<$($F: Future),+> Future for $join_ty<$($F),+> {
+            type Output = ($($F::Output,)+);
+
+            fn poll(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                let mut this = self.project();
+                $(let _ = this.$f.as_mut().poll(cx);)+
+                if true $(&& this.$f.output_ready())+ {
+                    std::task::Poll::Ready(($(this.$f.as_mut().take_output(),)+))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        }
+    };
+}
+
+impl_join_n!(Join3, join3, F1 => f1, F2 => f2, F3 => f3);
+impl_join_n!(Join4, join4, F1 => f1, F2 => f2, F3 => f3, F4 => f4);
+impl_join_n!(Join5, join5, F1 => f1, F2 => f2, F3 => f3, F4 => f4, F5 => f5);
+impl_join_n!(Join6, join6, F1 => f1, F2 => f2, F3 => f3, F4 => f4, F5 => f5, F6 => f6);
+impl_join_n!(Join7, join7, F1 => f1, F2 => f2, F3 => f3, F4 => f4, F5 => f5, F6 => f6, F7 => f7);
+impl_join_n!(Join8, join8, F1 => f1, F2 => f2, F3 => f3, F4 => f4, F5 => f5, F6 => f6, F7 => f7, F8 => f8);
