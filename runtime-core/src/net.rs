@@ -31,5 +31,4 @@ pub use crate::io_driver::operations::sockets::udp::UdpMultiRecv;
 
 // ── Buffers ──
 
-pub use crate::io_driver::BufGroup;
-pub use crate::io_driver::BorrowedBuffer;
+pub use crate::io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec};

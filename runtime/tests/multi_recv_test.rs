@@ -12,9 +12,8 @@ use std::{
 };
 
 use runtime::{
-    io_driver::BufGroup,
     io_driver::operations::sockets::{multi_accept::MultiAccept, multi_recv::MultiRecv},
-    main_thread,
+    main_thread_with,
 };
 use runtime_streams::StreamExt;
 
@@ -22,17 +21,19 @@ use crate::common::Cv;
 
 mod common;
 
+runtime::define_buf_ring!(pub Small, bgid = 0, buffer_size = 4096, ring_size = 8192);
+
 #[test]
 fn test_stream_stops_on_close() {
     let (cv1, cv2) = Cv::new();
 
     let reading_thread = std::thread::spawn(move || {
-        main_thread(async {
+        main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9091).unwrap();
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
-                let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
+                let mut multi_recv = MultiRecv::<Small>::new(socket.fd);
                 while let Some(Ok(_data)) = multi_recv.next().await {
                     recv_count += 1;
                 }
@@ -56,12 +57,12 @@ fn test_stream_stops_on_abrupt_close_rst() {
     let (cv1, cv2) = Cv::new();
 
     let reading_thread = std::thread::spawn(move || {
-        main_thread(async {
+        main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9092).unwrap();
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
-                let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
+                let mut multi_recv = MultiRecv::<Small>::new(socket.fd);
                 while let Some(Ok(_data)) = multi_recv.next().await {
                     recv_count += 1;
                 }
@@ -99,12 +100,12 @@ fn test_stream_stops_on_process_kill() {
     let (cv1, cv2) = Cv::new();
 
     let reading_thread = std::thread::spawn(move || {
-        main_thread(async {
+        main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9093).unwrap();
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut recv_count = 0;
-                let mut multi_recv = MultiRecv::new(socket.fd, BufGroup::Small);
+                let mut multi_recv = MultiRecv::<Small>::new(socket.fd);
                 while let Some(Ok(_data)) = multi_recv.next().await {
                     recv_count += 1;
                 }
@@ -141,13 +142,13 @@ fn byte_per_byte() {
     let (cv1, cv2) = Cv::new();
 
     let reading_thread = std::thread::spawn(move || {
-        main_thread(async {
+        main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9090).unwrap();
             cv1.notify();
 
             if let Some(socket) = multiaccept.next().await {
                 let mut received: Vec<u8> = Vec::new();
-                let mut multirecv = MultiRecv::new(socket.fd, BufGroup::Small);
+                let mut multirecv = MultiRecv::<Small>::new(socket.fd);
                 while let Some(Ok(data)) = multirecv.next().await {
                     received.extend_from_slice(data.as_ref());
                 }
@@ -183,12 +184,12 @@ fn test_slow_consumer_triggers_pause() {
     let (cv1, cv2) = Cv::new();
 
     let reading_thread = std::thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<Small, _>(async move {
             let mut multiaccept = MultiAccept::new(9095).unwrap();
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut received: Vec<u8> = Vec::new();
-                let mut multirecv = MultiRecv::new(socket.fd, BufGroup::Small);
+                let mut multirecv = MultiRecv::<Small>::new(socket.fd);
                 let mut recv_count = 0;
 
                 while let Some(Ok(data)) = multirecv.next().await {
@@ -260,12 +261,12 @@ fn test_fast_drain_triggers_resume() {
     let switch_clone = switch_to_fast.clone();
 
     let reading_thread = std::thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<Small, _>(async move {
             let mut multiaccept = MultiAccept::new(9096).unwrap();
             cv1.notify();
             if let Some(socket) = multiaccept.next().await {
                 let mut received = Vec::new();
-                let mut multirecv = MultiRecv::new(socket.fd, BufGroup::Small);
+                let mut multirecv = MultiRecv::<Small>::new(socket.fd);
                 let mut recv_count = 0;
                 let mut slow_phase_count = 0;
 

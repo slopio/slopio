@@ -101,6 +101,14 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
             _not_send_sync: PhantomData,
         })
     }
+
+    /// Resolve a buffer id to its raw pointer. Returns `None` if `bid` is
+    /// out of range for this ring.
+    pub fn ptr_for_bid(&self, bid: BufferId) -> Option<std::ptr::NonNull<u8>> {
+        let inner = unsafe { &*self.buffer_pool.get() };
+        inner.get(bid)
+    }
+
     ///recycles a buffer in the ring, use this only once on a buffer when you are done
     pub fn recycle_buffer(&self, buffer: &Buffer<BUFFER_SIZE>) {
         let ring = unsafe { &*self.mapped_ring.get() };
@@ -113,6 +121,27 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
                 tail,
                 buffer.ptr.as_ptr() as u64,
                 buffer.bid,
+            );
+            set_tail(ring_ptr, tail.wrapping_add(1));
+        }
+    }
+
+    /// Recycle by buffer id, without holding a `Buffer` handle. Used by the
+    /// runtime's cancel paths and by typed `BorrowedBuffer<S>`'s drop, which
+    /// only retain the raw bid.
+    pub fn recycle_bid(&self, bid: BufferId) {
+        let inner = unsafe { &*self.buffer_pool.get() };
+        let ptr = inner.get(bid).expect("invalid bid");
+        let ring = unsafe { &*self.mapped_ring.get() };
+
+        unsafe {
+            let ring_ptr = ring.inner().as_ptr();
+            let tail = get_tail(ring_ptr);
+            setup_ring_entry::<BUFFER_SIZE, RING_SIZE>(
+                ring_ptr,
+                tail,
+                ptr.as_ptr() as u64,
+                bid,
             );
             set_tail(ring_ptr, tail.wrapping_add(1));
         }

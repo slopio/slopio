@@ -63,7 +63,7 @@ pub(crate) enum SingleProcessResult {
     /// CQE for a non-terminal link in a chain — slab entry should be reaped.
     LinkCompleted,
     Shutdown,
-    CancelledRecycling { id: u16, len: i32, bgid: u16 },
+    CancelledRecycling { id: u16, bgid: u16 },
     InvalidState(&'static str),
 }
 
@@ -79,7 +79,6 @@ pub(crate) enum MultiProcessResult {
     AcceptCancelComplete,
     CancelledRecycling {
         buffer_id: u16,
-        len: usize,
         bgid: u16,
     },
     InvalidState(&'static str),
@@ -111,7 +110,6 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
                 {
                     SingleProcessResult::CancelledRecycling {
                         id,
-                        len: data.result,
                         bgid: *bgid,
                     }
                 } else {
@@ -215,28 +213,19 @@ pub(crate) fn process_multi(
 
             // Recycle buffer if the kernel consumed one
             let recycle = if event.result > 0 {
-                buffer_select(event.flags)
-                    .map(|buffer_id| (buffer_id, event.result as usize, *bgid))
+                buffer_select(event.flags).map(|buffer_id| (buffer_id, *bgid))
             } else {
                 None
             };
 
             if *ecancelled && *last_cqe {
-                if let Some((buffer_id, len, bgid)) = recycle {
+                if let Some((buffer_id, bgid)) = recycle {
                     // This last CQE also had a buffer — recycle it, then signal complete
-                    return MultiProcessResult::CancelledRecycling {
-                        buffer_id,
-                        len,
-                        bgid,
-                    };
+                    return MultiProcessResult::CancelledRecycling { buffer_id, bgid };
                 }
                 MultiProcessResult::CancelComplete
-            } else if let Some((buffer_id, len, bgid)) = recycle {
-                MultiProcessResult::CancelledRecycling {
-                    buffer_id,
-                    len,
-                    bgid,
-                }
+            } else if let Some((buffer_id, bgid)) = recycle {
+                MultiProcessResult::CancelledRecycling { buffer_id, bgid }
             } else {
                 MultiProcessResult::Queued
             }

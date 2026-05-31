@@ -8,7 +8,6 @@ use std::{
 };
 
 use crate::{
-    define_buffer_rings,
     io_driver::{
         completion_events::{
             CompletionEvent, Event, MultiProcessResult, SingleProcessResult, process_multi,
@@ -25,6 +24,7 @@ use io_uring::{
     types::{Fd, Timespec},
 };
 use slab::Slab;
+mod buf_ring;
 mod completion_events;
 pub mod operations;
 mod sending_buffers;
@@ -32,9 +32,8 @@ mod user_data;
 
 pub(crate) use user_data::UserData;
 
+pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec};
 pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
-
-include!(concat!(env!("OUT_DIR"), "/ring_config.rs"));
 
 const QUEUE_PAUSE_THRESHOLD: usize = 2;
 
@@ -45,6 +44,11 @@ pub struct IODriver {
     multishot_slab: Rc<UnsafeCell<MultishotSlab>>,
     sending_buffers: SendingBufferPool,
     shutting_down: Cell<bool>,
+    /// Cancel-path recycler fallbacks, keyed by bgid. The hot path uses
+    /// the typed `S::recycle_bid` instead; this table is only consulted
+    /// when a cancelled completion delivers a buffer at a point where the
+    /// originating spec type has already been erased.
+    recyclers: UnsafeCell<smallvec::SmallVec<[(u16, fn(u16)); 4]>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -230,10 +234,8 @@ impl Default for Ring {
             .setup_defer_taskrun()
             .build(4096)
             .unwrap();
-        let buffer_rings = MultiRing::new(&ring);
 
         Self {
-            buffer_rings,
             inner: ring,
             pending: 0,
             wakeup_timeout: Timespec::new(),
@@ -277,12 +279,8 @@ impl IODriver {
                     MultiProcessResult::AcceptCancelComplete => {
                         slab.remove_raw(index);
                     }
-                    MultiProcessResult::CancelledRecycling {
-                        buffer_id,
-                        len,
-                        bgid,
-                    } => {
-                        drop(self.get_buffer(bgid, buffer_id, len));
+                    MultiProcessResult::CancelledRecycling { buffer_id, bgid } => {
+                        self.recycle_by_bgid(bgid, buffer_id);
                         // Check if cancel is now complete
                         if let MultiOpState::Cancelled {
                             ecancelled,
@@ -314,9 +312,8 @@ impl IODriver {
                         self.shutting_down.replace(true);
                     }
                     SingleProcessResult::InvalidState(_msg) => {}
-                    SingleProcessResult::CancelledRecycling { id, len, bgid } => {
-                        let b = self.get_buffer(bgid, id, len as usize);
-                        self.recycle_buffer(&b);
+                    SingleProcessResult::CancelledRecycling { id, bgid } => {
+                        self.recycle_by_bgid(bgid, id);
                         slab.remove_raw(index);
                     }
                 }
@@ -337,14 +334,32 @@ impl IODriver {
         IO_DRIVER.set(self, f)
     }
 
-    pub(crate) fn get_buffer(&self, bgid: u16, id: u16, len: usize) -> BorrowedBuffer {
+    /// Install every ring in `R` against this driver's io_uring instance,
+    /// registering each spec's recycler into the cancel-fallback table.
+    /// Must be called exactly once per worker thread, before any IO op that
+    /// uses provided buffers is submitted.
+    pub fn init_buf_rings<R: BufRingSet>(&self) {
         let ring_inner = unsafe { &*self.ring.get() };
-        ring_inner.buffer_rings.get_buffer(bgid, id, len)
+        R::init_all(&ring_inner.inner);
+        R::register_fallbacks(self);
     }
 
-    pub(crate) fn recycle_buffer(&self, buffer: &BorrowedBuffer) {
-        let ring_inner = unsafe { &*self.ring.get() };
-        ring_inner.buffer_rings.recycle_buffer(buffer);
+    pub(crate) fn register_recycler(&self, bgid: u16, f: fn(u16)) {
+        let recyclers = unsafe { &mut *self.recyclers.get() };
+        recyclers.push((bgid, f));
+    }
+
+    /// Recycle buffer `bid` back to the ring identified by `bgid`. Used by
+    /// cancel cleanup, which doesn't carry the spec type through the slab.
+    pub(crate) fn recycle_by_bgid(&self, bgid: u16, bid: u16) {
+        let recyclers = unsafe { &*self.recyclers.get() };
+        for &(g, f) in recyclers.iter() {
+            if g == bgid {
+                f(bid);
+                return;
+            }
+        }
+        panic!("no recycler registered for bgid {bgid}");
     }
 
     pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> MultishotToken {
@@ -622,7 +637,7 @@ impl IODriver {
         while let Some(event) = queue.pop() {
             if event.result > 0 {
                 if let Some(buffer_id) = io_uring::cqueue::buffer_select(event.flags) {
-                    drop(self.get_buffer(bgid, buffer_id, event.result as usize));
+                    self.recycle_by_bgid(bgid, buffer_id);
                 }
             }
         }
@@ -782,7 +797,6 @@ impl MultishotSlab {
 
 struct Ring {
     inner: IoUring,
-    buffer_rings: MultiRing,
     pending: u32,
     wakeup_timeout: Timespec,
 }

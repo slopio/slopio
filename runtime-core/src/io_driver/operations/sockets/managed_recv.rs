@@ -1,4 +1,5 @@
 use std::{
+    marker::PhantomData,
     pin::Pin,
     ptr::null,
     task::{Context, Poll},
@@ -7,49 +8,52 @@ use std::{
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 
 use crate::io_driver::{
-    BorrowedBuffer, BufGroup, IO_DRIVER, OpMetadata, operations::{OneshotToken, sockets::SocketWrapper},
+    BorrowedBuffer, BufRingSpec, IO_DRIVER, OpMetadata,
+    operations::{OneshotToken, sockets::SocketWrapper},
 };
 
-pub struct ManagedRecv {
+pub struct ManagedRecv<S: BufRingSpec> {
     id: Option<OneshotToken>,
     fd: i32,
-    bgid: u16,
+    _spec: PhantomData<S>,
 }
 
-pub fn socket_managed_recv(socket: &SocketWrapper, group: BufGroup) -> ManagedRecv {
-    ManagedRecv::from_socket(socket, group)
+pub fn socket_managed_recv<S: BufRingSpec>(socket: &SocketWrapper) -> ManagedRecv<S> {
+    ManagedRecv::from_socket(socket)
 }
 
-impl ManagedRecv {
-    fn from_socket(socket: &SocketWrapper, group: BufGroup) -> Self {
+impl<S: BufRingSpec> ManagedRecv<S> {
+    fn from_socket(socket: &SocketWrapper) -> Self {
         Self {
             id: None,
             fd: socket.fd(),
-            bgid: group.bgid(),
+            _spec: PhantomData,
         }
     }
 
     fn register_to_driver(&mut self) {
         let entry = opcode::Recv::new(Fd(self.fd), null::<u8>() as _, 0)
-            .buf_group(self.bgid)
+            .buf_group(S::BGID)
             .build()
             .flags(io_uring::squeue::Flags::BUFFER_SELECT);
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
 
-    fn parse_completion(&self, event: OpMetadata) -> std::io::Result<BorrowedBuffer> {
+    fn parse_completion(&self, event: OpMetadata) -> std::io::Result<BorrowedBuffer<S>> {
         if event.result <= 0 {
             return Err(std::io::Error::from_raw_os_error(-event.result));
         }
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
-        Ok(IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, len)))
+        Ok(S::make_buffer(buffer_id, len))
     }
 }
 
-impl Future for ManagedRecv {
-    type Output = std::io::Result<BorrowedBuffer>;
+impl<S: BufRingSpec> Unpin for ManagedRecv<S> {}
+
+impl<S: BufRingSpec> Future for ManagedRecv<S> {
+    type Output = std::io::Result<BorrowedBuffer<S>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.id.is_none() {
@@ -69,10 +73,10 @@ impl Future for ManagedRecv {
     }
 }
 
-impl Drop for ManagedRecv {
+impl<S: BufRingSpec> Drop for ManagedRecv<S> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, Some(self.bgid)))
+            IO_DRIVER.with(|d| d.cancel_single_op(token, Some(S::BGID)))
         }
     }
 }

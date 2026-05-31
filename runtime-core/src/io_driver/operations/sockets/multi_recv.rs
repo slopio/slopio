@@ -1,20 +1,21 @@
 use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 use runtime_streams::Stream;
 use std::{
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use crate::io_driver::{
-    BorrowedBuffer, BufGroup, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
+    BorrowedBuffer, BufRingSpec, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     operations::{IoOP, MultishotToken},
 };
 
-pub struct MultiRecv {
+pub struct MultiRecv<S: BufRingSpec> {
     id: Option<MultishotToken>,
     fd: i32,
-    bgid: u16,
     reads: MultiOpQueue,
+    _spec: PhantomData<S>,
 }
 
 #[derive(Debug)]
@@ -49,14 +50,13 @@ impl CompletionError {
     }
 }
 
-impl MultiRecv {
-    pub fn new(fd: i32, group: BufGroup) -> Self {
-        let bgid = group.bgid();
+impl<S: BufRingSpec> MultiRecv<S> {
+    pub fn new(fd: i32) -> Self {
         let mut multi_recv = Self {
             id: None,
             fd,
-            bgid,
             reads: Default::default(),
+            _spec: PhantomData,
         };
         multi_recv.register_to_driver();
         multi_recv
@@ -65,18 +65,17 @@ impl MultiRecv {
     fn try_parse(
         &self,
         event: MultishotCompletionEvent,
-    ) -> Result<BorrowedBuffer, CompletionError> {
+    ) -> Result<BorrowedBuffer<S>, CompletionError> {
         if event.result <= 0 {
             return Err(CompletionError::from_code(event.result, event.flags));
         }
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
-        let buf = IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, len));
-        Ok(buf)
+        Ok(S::make_buffer(buffer_id, len))
     }
 }
 
-impl Drop for MultiRecv {
+impl<S: BufRingSpec> Drop for MultiRecv<S> {
     fn drop(&mut self) {
         // Recycle kernel buffers from any unprocessed completion events
         // before cancelling the op, otherwise these buffer ring entries leak.
@@ -85,23 +84,22 @@ impl Drop for MultiRecv {
     }
 }
 
-impl MultiRecv {
+impl<S: BufRingSpec> MultiRecv<S> {
     fn recycle_pending_buffers(&mut self) {
         while let Some(event) = self.reads.pop() {
             if event.result > 0 {
                 if let Some(buffer_id) = buffer_select(event.flags) {
-                    // get_buffer + drop recycles the buffer back to the ring
-                    drop(IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, event.result as usize)));
+                    S::recycle_bid(buffer_id);
                 }
             }
         }
     }
 }
 
-impl Unpin for MultiRecv {}
+impl<S: BufRingSpec> Unpin for MultiRecv<S> {}
 
-impl MultiRecv {
-    fn try_drain_one(&mut self) -> Poll<Option<Result<BorrowedBuffer, CompletionError>>> {
+impl<S: BufRingSpec> MultiRecv<S> {
+    fn try_drain_one(&mut self) -> Poll<Option<Result<BorrowedBuffer<S>, CompletionError>>> {
         while let Some(completion_event) = self.reads.pop() {
             match self.try_parse(completion_event) {
                 Ok(buf) => return Poll::Ready(Some(Ok(buf))),
@@ -114,8 +112,8 @@ impl MultiRecv {
     }
 }
 
-impl Stream for MultiRecv {
-    type Item = Result<BorrowedBuffer, CompletionError>;
+impl<S: BufRingSpec> Stream for MultiRecv<S> {
+    type Item = Result<BorrowedBuffer<S>, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Poll::Ready(result) = self.try_drain_one() {
@@ -153,7 +151,7 @@ impl Stream for MultiRecv {
     }
 }
 
-impl IoOP for MultiRecv {
+impl<S: BufRingSpec> IoOP for MultiRecv<S> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
         let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd));
@@ -161,12 +159,12 @@ impl IoOP for MultiRecv {
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMulti::new(Fd(self.fd), self.bgid).build()
+        opcode::RecvMulti::new(Fd(self.fd), S::BGID).build()
     }
 
     fn driver_cleanup(&mut self) {
         if let Some(token) = self.id.take() {
-            IO_DRIVER.with(|d| d.cancel_multishot_op(token, self.bgid));
+            IO_DRIVER.with(|d| d.cancel_multishot_op(token, S::BGID));
         }
     }
 }

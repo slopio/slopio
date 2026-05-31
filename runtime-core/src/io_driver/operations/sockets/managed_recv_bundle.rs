@@ -1,40 +1,48 @@
 use std::{
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use io_uring::{opcode, types::Fd};
 
-use crate::io_driver::{BorrowedBuffer, BufGroup, IO_DRIVER, operations::{OneshotToken, sockets::SocketWrapper}};
+use crate::io_driver::{
+    BorrowedBuffer, BufRingSpec, IO_DRIVER,
+    operations::{OneshotToken, sockets::SocketWrapper},
+};
 
-pub struct ManagedRecvBundle {
+pub struct ManagedRecvBundle<S: BufRingSpec> {
     id: Option<OneshotToken>,
     fd: i32,
-    bgid: u16,
+    _spec: PhantomData<S>,
 }
 
-pub fn socket_managed_recv_bundle(socket: &SocketWrapper, group: BufGroup) -> ManagedRecvBundle {
-    ManagedRecvBundle::from_socket(socket, group)
+pub fn socket_managed_recv_bundle<S: BufRingSpec>(
+    socket: &SocketWrapper,
+) -> ManagedRecvBundle<S> {
+    ManagedRecvBundle::from_socket(socket)
 }
 
-impl ManagedRecvBundle {
-    fn from_socket(socket: &SocketWrapper, group: BufGroup) -> Self {
+impl<S: BufRingSpec> ManagedRecvBundle<S> {
+    fn from_socket(socket: &SocketWrapper) -> Self {
         Self {
             id: None,
             fd: socket.fd(),
-            bgid: group.bgid(),
+            _spec: PhantomData,
         }
     }
 
     fn register_to_driver(&mut self) {
-        let entry = opcode::RecvBundle::new(Fd(self.fd), self.bgid).build();
+        let entry = opcode::RecvBundle::new(Fd(self.fd), S::BGID).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
 }
 
-impl Future for ManagedRecvBundle {
-    type Output = std::io::Result<BorrowedBuffer>;
+impl<S: BufRingSpec> Unpin for ManagedRecvBundle<S> {}
+
+impl<S: BufRingSpec> Future for ManagedRecvBundle<S> {
+    type Output = std::io::Result<BorrowedBuffer<S>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.id.is_none() {
@@ -54,19 +62,17 @@ impl Future for ManagedRecvBundle {
                     use io_uring::cqueue::buffer_select;
                     let len = io_result.result as usize;
                     let buffer_id = buffer_select(io_result.flags).unwrap();
-                    Poll::Ready(Ok(
-                        IO_DRIVER.with(|d| d.get_buffer(self.bgid, buffer_id, len))
-                    ))
+                    Poll::Ready(Ok(S::make_buffer(buffer_id, len)))
                 }
             }
         }
     }
 }
 
-impl Drop for ManagedRecvBundle {
+impl<S: BufRingSpec> Drop for ManagedRecvBundle<S> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, Some(self.bgid)))
+            IO_DRIVER.with(|d| d.cancel_single_op(token, Some(S::BGID)))
         }
     }
 }

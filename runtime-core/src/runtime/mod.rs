@@ -5,7 +5,7 @@ use std::pin::pin;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use crate::io_driver::IODriver;
+use crate::io_driver::{BufRingSet, IODriver};
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
 use crate::{runtime, scoped_thread_local};
@@ -73,7 +73,7 @@ impl RuntimeInner {
         }
     }
 
-    pub fn block_on<F: Future>(
+    pub fn block_on<R: BufRingSet, F: Future>(
         self,
         f: F,
         event_fd: Option<RawFd>,
@@ -83,6 +83,7 @@ impl RuntimeInner {
         let mut context = Context::from_waker(waker);
         set_thread_id(self.thread_id);
         self.io_driver.with(|| {
+            self.io_driver.init_buf_rings::<R>();
             TASK_LIST.set(&self.tasks, || {
                 TIME_DRIVER.set(&self.time_driver, || {
                     let run: Box<dyn FnOnce() -> F::Output + '_> = Box::new(|| {
@@ -150,7 +151,7 @@ pub fn thread_id() -> usize {
 }
 
 pub fn main_thread<F: Future>(f: F) -> F::Output {
-    RuntimeInner::default().block_on(f, None, |run| run())
+    RuntimeInner::default().block_on::<(), F>(f, None, |run| run())
 }
 
 pub fn now() -> std::time::SystemTime {

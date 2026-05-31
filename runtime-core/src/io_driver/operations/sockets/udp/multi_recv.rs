@@ -1,4 +1,5 @@
 use std::{
+    marker::PhantomData,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
     task::{Context, Poll},
@@ -12,7 +13,7 @@ use io_uring::{
 use runtime_streams::Stream;
 
 use crate::io_driver::{
-    BorrowedBuffer, BufGroup, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
+    BorrowedBuffer, BufRingSpec, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     operations::{IoOP, MultishotToken},
 };
 
@@ -39,24 +40,24 @@ impl MsgHdrBox {
     }
 }
 
-pub struct UdpMultiRecv {
+pub struct UdpMultiRecv<S: BufRingSpec> {
     id: Option<MultishotToken>,
     fd: i32,
-    bgid: u16,
     reads: MultiOpQueue,
     /// `Some` until `driver_cleanup` runs in `Drop`, at which point the Box
     /// is moved into the driver's keepalive slot.
     hdr: Option<Box<MsgHdrBox>>,
+    _spec: PhantomData<S>,
 }
 
-pub struct UdpDatagram {
-    buffer: BorrowedBuffer,
+pub struct UdpDatagram<S: BufRingSpec> {
+    buffer: BorrowedBuffer<S>,
     payload_offset: usize,
     payload_len: usize,
     addr: SocketAddr,
 }
 
-impl UdpDatagram {
+impl<S: BufRingSpec> UdpDatagram<S> {
     pub fn payload(&self) -> &[u8] {
         let data = self.buffer.as_ref();
         &data[self.payload_offset..self.payload_offset + self.payload_len]
@@ -75,14 +76,14 @@ impl UdpDatagram {
     }
 }
 
-impl UdpMultiRecv {
-    pub fn new(fd: i32, group: BufGroup) -> Self {
+impl<S: BufRingSpec> UdpMultiRecv<S> {
+    pub fn new(fd: i32) -> Self {
         Self {
             id: None,
             fd,
-            bgid: group.bgid(),
             reads: Default::default(),
             hdr: Some(MsgHdrBox::new()),
+            _spec: PhantomData,
         }
     }
 
@@ -92,14 +93,14 @@ impl UdpMultiRecv {
         }
     }
 
-    fn try_parse(&self, event: MultishotCompletionEvent) -> Result<UdpDatagram, ()> {
+    fn try_parse(&self, event: MultishotCompletionEvent) -> Result<UdpDatagram<S>, ()> {
         if event.result <= 0 {
             return Err(());
         }
 
         let len = event.result as usize;
         let bid = buffer_select(event.flags).ok_or(())?;
-        let buffer = IO_DRIVER.with(|d| d.get_buffer(self.bgid, bid, len));
+        let buffer = S::make_buffer(bid, len);
 
         let parsed = RecvMsgOut::parse(
             buffer.as_ref(),
@@ -129,7 +130,7 @@ impl UdpMultiRecv {
         })
     }
 
-    fn try_drain_one(&mut self) -> Poll<Option<UdpDatagram>> {
+    fn try_drain_one(&mut self) -> Poll<Option<UdpDatagram<S>>> {
         while let Some(event) = self.reads.pop() {
             if let Ok(datagram) = self.try_parse(event) {
                 return Poll::Ready(Some(datagram));
@@ -139,7 +140,7 @@ impl UdpMultiRecv {
     }
 }
 
-impl Drop for UdpMultiRecv {
+impl<S: BufRingSpec> Drop for UdpMultiRecv<S> {
     fn drop(&mut self) {
         // Recycle kernel buffers from any unprocessed completion events
         // before cancelling, otherwise buffer-ring entries leak.
@@ -148,24 +149,22 @@ impl Drop for UdpMultiRecv {
     }
 }
 
-impl UdpMultiRecv {
+impl<S: BufRingSpec> UdpMultiRecv<S> {
     fn recycle_pending_buffers(&mut self) {
         while let Some(event) = self.reads.pop() {
             if event.result > 0 {
                 if let Some(buffer_id) = buffer_select(event.flags) {
-                    drop(IO_DRIVER.with(|d| {
-                        d.get_buffer(self.bgid, buffer_id, event.result as usize)
-                    }));
+                    S::recycle_bid(buffer_id);
                 }
             }
         }
     }
 }
 
-impl Unpin for UdpMultiRecv {}
+impl<S: BufRingSpec> Unpin for UdpMultiRecv<S> {}
 
-impl Stream for UdpMultiRecv {
-    type Item = UdpDatagram;
+impl<S: BufRingSpec> Stream for UdpMultiRecv<S> {
+    type Item = UdpDatagram<S>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.ensure_registered();
@@ -200,7 +199,7 @@ impl Stream for UdpMultiRecv {
     }
 }
 
-impl IoOP for UdpMultiRecv {
+impl<S: BufRingSpec> IoOP for UdpMultiRecv<S> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
         let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd));
@@ -211,7 +210,7 @@ impl IoOP for UdpMultiRecv {
         opcode::RecvMsgMulti::new(
             Fd(self.fd),
             self.hdr.as_ref().expect("hdr present").msghdr_ptr(),
-            self.bgid,
+            S::BGID,
         )
         .build()
     }
@@ -225,7 +224,7 @@ impl IoOP for UdpMultiRecv {
                 .hdr
                 .take()
                 .map(|h| h as Box<dyn std::any::Any>);
-            IO_DRIVER.with(|d| d.cancel_multishot_op_keep(token, self.bgid, keep));
+            IO_DRIVER.with(|d| d.cancel_multishot_op_keep(token, S::BGID, keep));
         }
     }
 }
