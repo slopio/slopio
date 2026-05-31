@@ -7,6 +7,7 @@ edition = "2024"
 tracing               = ["runtime-core/tracing"]
 otlp                  = ["tracing", "dep:runtime-h2"]
 local_debug_collector = ["runtime-core/local_debug_collector"]
+ebpf_balancer         = ["runtime-core/ebpf_balancer"]
 
 [dependencies]
 runtime-core = { path = "../runtime-core" }

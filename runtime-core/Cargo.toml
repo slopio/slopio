@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 tracing = []
 local_debug_collector = ["tracing"]
+ebpf_balancer = ["dep:runtime_ebpf_balancer"]
 
 # Compile-time max verbosity. Pick at most one in each group.
 up_to_off = []
@@ -27,7 +28,7 @@ up_to_trace_in_release = []
 io-uring = "0.7.11"
 libc = "0.2.178"
 io_uring_rb = { path = "../io_uring_rb" }
-runtime_ebpf_balancer = { path = "../runtime_ebpf_balancer" }
+runtime_ebpf_balancer = { path = "../runtime_ebpf_balancer", optional = true }
 async_timers = { path = "../async_timers" }
 runtime-streams = { path = "../runtime-streams" }
 mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
