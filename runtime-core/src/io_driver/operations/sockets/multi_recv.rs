@@ -7,11 +7,12 @@ use std::{
 };
 
 use crate::io_driver::{
-    BorrowedBuffer, BufRingSpec, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
+    BorrowedBuffer, BufRingSpec, DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult,
+    MultishotCompletionEvent,
     operations::{IoOP, MultishotToken},
 };
 
-pub struct MultiRecv<S: BufRingSpec> {
+pub struct MultiRecv<S: BufRingSpec, const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
     id: Option<MultishotToken>,
     fd: i32,
     reads: MultiOpQueue,
@@ -50,12 +51,18 @@ impl CompletionError {
     }
 }
 
-impl<S: BufRingSpec> MultiRecv<S> {
+impl<S: BufRingSpec> MultiRecv<S, DEFAULT_QUEUE_SIZE> {
     pub fn new(fd: i32) -> Self {
+        Self::with_queue_size(fd)
+    }
+}
+
+impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
+    pub fn with_queue_size(fd: i32) -> Self {
         let mut multi_recv = Self {
             id: None,
             fd,
-            reads: Default::default(),
+            reads: MultiOpQueue::new(QUEUE_SIZE),
             _spec: PhantomData,
         };
         multi_recv.register_to_driver();
@@ -75,7 +82,7 @@ impl<S: BufRingSpec> MultiRecv<S> {
     }
 }
 
-impl<S: BufRingSpec> Drop for MultiRecv<S> {
+impl<S: BufRingSpec, const QUEUE_SIZE: usize> Drop for MultiRecv<S, QUEUE_SIZE> {
     fn drop(&mut self) {
         // Recycle kernel buffers from any unprocessed completion events
         // before cancelling the op, otherwise these buffer ring entries leak.
@@ -84,7 +91,7 @@ impl<S: BufRingSpec> Drop for MultiRecv<S> {
     }
 }
 
-impl<S: BufRingSpec> MultiRecv<S> {
+impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
     fn recycle_pending_buffers(&mut self) {
         while let Some(event) = self.reads.pop() {
             if event.result > 0 {
@@ -96,9 +103,9 @@ impl<S: BufRingSpec> MultiRecv<S> {
     }
 }
 
-impl<S: BufRingSpec> Unpin for MultiRecv<S> {}
+impl<S: BufRingSpec, const QUEUE_SIZE: usize> Unpin for MultiRecv<S, QUEUE_SIZE> {}
 
-impl<S: BufRingSpec> MultiRecv<S> {
+impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
     fn try_drain_one(&mut self) -> Poll<Option<Result<BorrowedBuffer<S>, CompletionError>>> {
         while let Some(completion_event) = self.reads.pop() {
             match self.try_parse(completion_event) {
@@ -112,7 +119,7 @@ impl<S: BufRingSpec> MultiRecv<S> {
     }
 }
 
-impl<S: BufRingSpec> Stream for MultiRecv<S> {
+impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for MultiRecv<S, QUEUE_SIZE> {
     type Item = Result<BorrowedBuffer<S>, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -151,10 +158,10 @@ impl<S: BufRingSpec> Stream for MultiRecv<S> {
     }
 }
 
-impl<S: BufRingSpec> IoOP for MultiRecv<S> {
+impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for MultiRecv<S, QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd));
+        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd, QUEUE_SIZE));
         self.id = Some(token);
     }
 

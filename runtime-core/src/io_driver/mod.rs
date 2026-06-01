@@ -35,7 +35,7 @@ pub(crate) use user_data::UserData;
 pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec};
 pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
-const QUEUE_PAUSE_THRESHOLD: usize = 2;
+pub const DEFAULT_QUEUE_SIZE: usize = 32;
 
 #[derive(Default)]
 pub struct IODriver {
@@ -69,6 +69,7 @@ impl From<Entry> for MultishotCompletionEvent {
 #[derive(Debug)]
 struct MultiOpQueue {
     inner: VecDeque<MultishotCompletionEvent>,
+    pause_threshold: usize,
 }
 
 enum QueueInsertEvent {
@@ -85,6 +86,13 @@ pub(crate) enum MultiPollResult {
 }
 
 impl MultiOpQueue {
+    fn new(pause_threshold: usize) -> Self {
+        Self {
+            inner: VecDeque::with_capacity(pause_threshold + 10),
+            pause_threshold,
+        }
+    }
+
     fn has_content(&self) -> bool {
         !self.inner.is_empty()
     }
@@ -93,7 +101,7 @@ impl MultiOpQueue {
         self.inner.push_back(element);
         match self.inner.len() {
             1 => QueueInsertEvent::WasEmpty,
-            k if k > QUEUE_PAUSE_THRESHOLD => QueueInsertEvent::TooFull,
+            k if k > self.pause_threshold => QueueInsertEvent::TooFull,
             _ => QueueInsertEvent::Ok,
         }
     }
@@ -105,17 +113,14 @@ impl MultiOpQueue {
 
 impl Default for MultiOpQueue {
     fn default() -> Self {
-        Self {
-            inner: VecDeque::with_capacity(QUEUE_PAUSE_THRESHOLD + 10),
-        }
+        Self::new(DEFAULT_QUEUE_SIZE)
     }
 }
-
-impl MultiOpQueue {}
 
 enum MultiOpState {
     Init {
         fd: i32,
+        queue_size: usize,
     },
     Sent {
         waker: Waker,
@@ -157,11 +162,11 @@ enum MultiOpState {
 
 impl MultiOpState {
     fn transition_init_to_sent(&mut self, waker: &Waker) {
-        if let MultiOpState::Init { fd } = self {
+        if let MultiOpState::Init { fd, queue_size } = self {
             *self = MultiOpState::Sent {
                 waker: waker.clone(),
                 fd: *fd,
-                queue: Default::default(),
+                queue: MultiOpQueue::new(*queue_size),
             };
         }
     }
@@ -362,10 +367,15 @@ impl IODriver {
         panic!("no recycler registered for bgid {bgid}");
     }
 
-    pub fn push_multishot_op(&self, mut entry: squeue::Entry, fd: i32) -> MultishotToken {
+    pub fn push_multishot_op(
+        &self,
+        mut entry: squeue::Entry,
+        fd: i32,
+        queue_size: usize,
+    ) -> MultishotToken {
         let slab = unsafe { &mut *self.multishot_slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let token = slab.insert(MultiOpState::Init { fd });
+        let token = slab.insert(MultiOpState::Init { fd, queue_size });
         entry.set_user_data(UserData::multi(token.raw()).into_bits());
         ring_inner.add(&entry);
         token

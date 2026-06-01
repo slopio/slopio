@@ -10,11 +10,12 @@ use runtime_streams::Stream;
 use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
-    IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent, UserData,
+    DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
+    UserData,
     operations::{IoOP, MultishotToken, sockets::SocketWrapper},
 };
 
-pub struct MultiAccept {
+pub struct MultiAccept<const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
     id: Option<MultishotToken>,
     socket: SocketWrapper,
     sockets: MultiOpQueue,
@@ -49,13 +50,21 @@ impl TryFrom<MultishotCompletionEvent> for SocketWrapper {
         if value.result < 0 {
             Err(AcceptError::from_result(value.result))
         } else {
-            Ok(SocketWrapper { fd: value.result })
+            let socket = SocketWrapper { fd: value.result };
+            let _ = socket.set_nodelay(true);
+            Ok(socket)
         }
     }
 }
 
-impl MultiAccept {
+impl MultiAccept<DEFAULT_QUEUE_SIZE> {
     pub fn new(port: u16) -> std::io::Result<Self> {
+        Self::with_queue_size(port)
+    }
+}
+
+impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
+    pub fn with_queue_size(port: u16) -> std::io::Result<Self> {
         let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
         let socket = S::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_reuse_port(true)?;
@@ -67,7 +76,7 @@ impl MultiAccept {
         let mut multi_accept = Self {
             id: None,
             socket: SocketWrapper { fd },
-            sockets: Default::default(),
+            sockets: MultiOpQueue::new(QUEUE_SIZE),
             cancel_sent: false,
         };
         multi_accept.register_to_driver();
@@ -88,7 +97,7 @@ impl MultiAccept {
     }
 }
 
-impl Drop for MultiAccept {
+impl<const QUEUE_SIZE: usize> Drop for MultiAccept<QUEUE_SIZE> {
     fn drop(&mut self) {
         // Close fds queued locally that the user never picked up. Driver-side
         // queue + future-arriving accept CQEs are handled by the cancel call
@@ -98,7 +107,7 @@ impl Drop for MultiAccept {
     }
 }
 
-impl MultiAccept {
+impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
     fn close_pending_fds(&mut self) {
         while let Some(event) = self.sockets.pop() {
             if event.result > 0 {
@@ -110,9 +119,9 @@ impl MultiAccept {
     }
 }
 
-impl Unpin for MultiAccept {}
+impl<const QUEUE_SIZE: usize> Unpin for MultiAccept<QUEUE_SIZE> {}
 
-impl MultiAccept {
+impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
     /// Try to drain one valid socket from the queue, skipping errors.
     fn try_drain_one(&mut self) -> Poll<Option<SocketWrapper>> {
         while let Some(event) = self.sockets.pop() {
@@ -126,7 +135,7 @@ impl MultiAccept {
     }
 }
 
-impl Stream for MultiAccept {
+impl<const QUEUE_SIZE: usize> Stream for MultiAccept<QUEUE_SIZE> {
     type Item = SocketWrapper;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -174,10 +183,10 @@ impl Stream for MultiAccept {
     }
 }
 
-impl IoOP for MultiAccept {
+impl<const QUEUE_SIZE: usize> IoOP for MultiAccept<QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket.fd));
+        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket.fd, QUEUE_SIZE));
         self.id = Some(token);
     }
 
