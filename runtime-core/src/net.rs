@@ -9,10 +9,13 @@ pub use crate::io_driver::operations::sockets::connect::{connect_tcp, ConnectTcp
 pub use crate::io_driver::operations::sockets::SocketWrapper;
 
 // send
-pub use crate::io_driver::operations::{IoBuf, IoBufMut, Slice};
+pub use crate::io_driver::operations::{FixedBufIndex, IoBuf, IoBufMut, Slice};
 pub use crate::io_driver::operations::sockets::send::{WriteSocket, send_all, socket_send};
 pub use crate::io_driver::operations::sockets::send_control_record::{
     socket_send_control_record, WriteControlRecord,
+};
+pub use crate::io_driver::operations::sockets::send_fixed::{
+    WriteFixedSocket, socket_write_fixed,
 };
 pub use crate::io_driver::operations::sockets::send_vectored::socket_send_vectored;
 
@@ -31,4 +34,6 @@ pub use crate::io_driver::operations::sockets::udp::UdpMultiRecv;
 
 // ── Buffers ──
 
-pub use crate::io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec};
+pub use crate::io_driver::{
+    BorrowedBuffer, BufRingSet, BufRingSpec, FixedBufAcquire, FixedSendBufPool, PooledBuf,
+};

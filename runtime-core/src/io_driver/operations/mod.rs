@@ -1,9 +1,11 @@
 use io_uring::squeue::Entry;
 
 pub mod files;
+pub mod fixed_buf;
 pub mod io_traits;
 pub mod sockets;
 
+pub use fixed_buf::FixedBufIndex;
 pub use io_traits::{IoBuf, IoBufMut, Slice};
 
 /// A token for a single-shot io_uring operation.

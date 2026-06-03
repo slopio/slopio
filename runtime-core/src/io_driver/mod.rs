@@ -26,6 +26,7 @@ use io_uring::{
 use slab::Slab;
 mod buf_ring;
 mod completion_events;
+mod fixed_buf_pool;
 pub mod operations;
 mod sending_buffers;
 mod user_data;
@@ -33,6 +34,7 @@ mod user_data;
 pub(crate) use user_data::UserData;
 
 pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec};
+pub use fixed_buf_pool::{Acquire as FixedBufAcquire, FixedSendBufPool, PooledBuf};
 pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
 pub const DEFAULT_QUEUE_SIZE: usize = 32;
@@ -347,6 +349,26 @@ impl IODriver {
         let ring_inner = unsafe { &*self.ring.get() };
         R::init_all(&ring_inner.inner);
         R::register_fallbacks(self);
+    }
+
+    /// Register a set of pre-allocated buffers with the kernel for use with
+    /// `*Fixed` opcodes. The caller is responsible for keeping the memory
+    /// referenced by `iovecs` valid until the ring is dropped or
+    /// [`unregister_fixed_buffers`](Self::unregister_fixed_buffers) is called.
+    ///
+    /// # Safety
+    /// Each `iov_base`/`iov_len` must point to memory that stays valid for
+    /// the registration's lifetime.
+    pub unsafe fn register_fixed_buffers(&self, iovecs: &[libc::iovec]) -> std::io::Result<()> {
+        let ring_inner = unsafe { &*self.ring.get() };
+        unsafe { ring_inner.inner.submitter().register_buffers(iovecs) }
+    }
+
+    /// Tell the kernel to drop its references to the previously-registered
+    /// fixed buffer set. Safe to call without a prior registration.
+    pub fn unregister_fixed_buffers(&self) -> std::io::Result<()> {
+        let ring_inner = unsafe { &*self.ring.get() };
+        ring_inner.inner.submitter().unregister_buffers()
     }
 
     pub(crate) fn register_recycler(&self, bgid: u16, f: fn(u16)) {

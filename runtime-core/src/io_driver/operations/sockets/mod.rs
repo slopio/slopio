@@ -16,6 +16,7 @@ pub mod multi_recv;
 pub mod recv;
 pub mod send;
 pub mod send_control_record;
+pub mod send_fixed;
 pub mod send_vectored;
 pub mod udp;
 
