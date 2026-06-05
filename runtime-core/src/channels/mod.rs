@@ -1,5 +1,6 @@
 mod bounded;
 mod unbounded;
+mod vec_channel;
 
 pub use bounded::{
     Receiver as BoundedReceiver, RecvAllFuture as BoundedRecvAllFuture,
@@ -7,3 +8,6 @@ pub use bounded::{
     bounded_channel,
 };
 pub use unbounded::{Receiver, RecvAllFuture, RecvFuture, Sender, unbounded_channel};
+pub use vec_channel::{
+    Receiver as VecReceiver, RecvFuture as VecRecvFuture, Sender as VecSender, vec_channel,
+};
