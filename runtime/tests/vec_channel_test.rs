@@ -54,14 +54,14 @@ fn recv_drains_before_none() {
     });
 }
 
-// extend with an iterator appends in order.
+// extend with a slice appends in order.
 #[test]
 fn extend_appends_in_order() {
     main_thread(async {
         let (tx, rx) = vec_channel::<i32>();
         tx.push(1);
-        tx.extend([2, 3, 4]);
-        tx.extend(5..=7);
+        tx.extend(&[2, 3, 4]);
+        tx.extend(&[5, 6, 7]);
 
         let batch = rx.recv().await.unwrap();
         assert_eq!(batch, vec![1, 2, 3, 4, 5, 6, 7]);
@@ -77,17 +77,17 @@ fn extend_wakes_receiver() {
         let consumer = spawn(async move { rx.recv().await });
         spawn(async {}).await;
 
-        tx.extend([10, 20, 30]);
+        tx.extend(&[10, 20, 30]);
         assert_eq!(consumer.await.unwrap(), vec![10, 20, 30]);
     });
 }
 
-// extend with an empty iterator must not wake the receiver.
+// extend with an empty slice must not wake the receiver.
 #[test]
 fn extend_empty_does_not_wake() {
     main_thread(async {
         let (tx, rx) = vec_channel::<i32>();
-        tx.extend(std::iter::empty::<i32>());
+        tx.extend(&[]);
         assert!(rx.peek().is_empty());
 
         // recv would still block here; verify by dropping sender after.
@@ -176,7 +176,7 @@ fn drop_receiver_sender_continues() {
         tx.push(1);
         drop(rx);
         tx.push(2);
-        tx.extend([3, 4, 5]);
+        tx.extend(&[3, 4, 5]);
     });
 }
 
@@ -248,7 +248,8 @@ fn fifo_ordering() {
         for i in 0..100 {
             tx.push(i);
         }
-        tx.extend(100..200);
+        let tail: Vec<i32> = (100..200).collect();
+        tx.extend(&tail);
 
         let batch = rx.recv().await.unwrap();
         assert_eq!(batch.len(), 200);

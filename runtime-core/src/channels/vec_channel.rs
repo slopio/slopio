@@ -61,14 +61,20 @@ impl<T> Sender<T> {
         }
     }
 
-    pub fn extend<I: IntoIterator<Item = T>>(&self, iter: I) {
+    pub fn extend(&self, slice: &[T])
+    where
+        T: Copy,
+    {
+        if slice.is_empty() {
+            return;
+        }
         let state = unsafe { &mut *(*self.shared.0).get() };
         if state.receiver_dropped {
             return;
         }
         let was_empty = state.data.is_empty();
-        state.data.extend(iter);
-        if was_empty && !state.data.is_empty() {
+        state.data.extend_from_slice(slice);
+        if was_empty {
             state.wake();
         }
     }
