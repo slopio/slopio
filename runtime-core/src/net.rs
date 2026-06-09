@@ -17,7 +17,13 @@ pub use crate::io_driver::operations::sockets::send_control_record::{
 pub use crate::io_driver::operations::sockets::send_fixed::{
     WriteFixedSocket, socket_write_fixed,
 };
+pub use crate::io_driver::operations::sockets::send_fixed_zc::{
+    WriteFixedSocketZc, socket_write_fixed_zc,
+};
 pub use crate::io_driver::operations::sockets::send_vectored::socket_send_vectored;
+pub use crate::io_driver::operations::sockets::send_zc::{
+    WriteSocketZc, send_all_zc, socket_send_zc,
+};
 
 // recv
 pub use crate::io_driver::operations::sockets::recv::{ClassicRecv, socket_recv};

@@ -492,6 +492,12 @@ impl IODriver {
                 existing.clone_from(waker);
                 std::task::Poll::Pending
             }
+            SingleOpState::Notif {
+                waker: existing, ..
+            } => {
+                existing.clone_from(waker);
+                std::task::Poll::Pending
+            }
             SingleOpState::Ended(e) => {
                 to_delete = Some(token);
                 std::task::Poll::Ready(*e)
@@ -734,6 +740,11 @@ impl std::fmt::Debug for CancelKeepalive {
 enum SingleOpState {
     Init,
     Sent(Waker),
+    /// Zero-copy send: the completion CQE arrived with `IORING_CQE_F_MORE`
+    /// set, so the byte count is known but the kernel may still be reading
+    /// the buffer. We stash the result and wait for the `IORING_CQE_F_NOTIF`
+    /// notification before waking — only then is the buffer safe to release.
+    Notif { result: i32, waker: Waker },
     Ended(OpMetadata),
     Signal(Box<[u8; 8]>),
     /// Slot for a non-terminal op in a link chain. The `u64` is the slab

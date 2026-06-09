@@ -90,9 +90,32 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
             SingleProcessResult::InvalidState("submitted entry shouldn't be in init")
         }
         SingleOpState::Sent(waker) => {
+            if cqueue::more(data.flags) {
+                // Zero-copy completion: a notification still follows, and the
+                // kernel may keep reading the buffer until it lands. Stash the
+                // byte count and wait — do NOT wake, the future can't make
+                // progress while its buffer is pinned.
+                *op_state = SingleOpState::Notif {
+                    result: data.result,
+                    waker: waker.clone(),
+                };
+            } else {
+                // Normal send, or a zero-copy error / copy-fallback success:
+                // no notification is coming, so this CQE is terminal.
+                waker.wake_by_ref();
+                *op_state = SingleOpState::Ended(OpMetadata {
+                    result: data.result,
+                    flags: data.flags,
+                });
+            }
+            SingleProcessResult::Completed
+        }
+        SingleOpState::Notif { result, waker } => {
+            // The zero-copy notification (`F_NOTIF`): the buffer is now free.
+            // Deliver the byte count stashed from the completion CQE.
             waker.wake_by_ref();
             *op_state = SingleOpState::Ended(OpMetadata {
-                result: data.result,
+                result: *result,
                 flags: data.flags,
             });
             SingleProcessResult::Completed
@@ -101,6 +124,12 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
         SingleOpState::Signal(_) => SingleProcessResult::Shutdown,
         SingleOpState::LinkedSent(_next) => SingleProcessResult::LinkCompleted,
         SingleOpState::Cancelled { bgid, .. } => {
+            if cqueue::more(data.flags) {
+                // Zero-copy completion landed mid-cancel; the notification (and
+                // the buffer release) is still pending. Keep the keepalive and
+                // the slab entry alive until the final no-`F_MORE` CQE.
+                return SingleProcessResult::Completed;
+            }
             if data.result == -ECANCELED {
                 SingleProcessResult::CancelComplete
             } else {
