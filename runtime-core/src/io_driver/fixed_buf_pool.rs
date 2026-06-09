@@ -6,27 +6,41 @@
 //! `[i * size, (i + 1) * size)` and corresponds to [`FixedBufIndex::new(i)`].
 //!
 //! The pool is `!Send + !Sync` — registration belongs to one ring on one
-//! thread. Acquire with [`FixedSendBufPool::acquire`] (async, waits when
-//! the pool is empty); release with [`FixedSendBufPool::release`] or
-//! [`FixedSendBufPool::release_index`] (manual — there is no auto-release
-//! on `PooledBuf` drop).
+//! thread. Acquire with [`FixedSendBufPool::acquire`] (async, waits when the
+//! pool is empty); the slot is returned **automatically** when the
+//! [`PooledBuf`] is dropped, so it cannot be leaked by forgetting to release.
+//!
+//! # Ownership / lifetime contract
+//!
+//! A [`PooledBuf`] references its pool through a raw pointer rather than an
+//! owning handle, so acquiring and releasing a slot costs nothing beyond a
+//! pointer copy. The caller upholds one invariant in exchange:
+//!
+//! > The pool must outlive every `PooledBuf` it hands out — including any
+//! > buffer parked inside a send future's cancel keepalive — and, once the
+//! > first slot has been acquired, the pool value must not move.
+//!
+//! Both are satisfied by keeping the pool behind an `Rc`/`Box` that lives for
+//! the worker's duration (as the examples and tests do): the heap address is
+//! stable, and the pool outlives all in-flight sends. Dropping the pool while
+//! a send is still in flight is a use-after-free.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
-use std::marker::PhantomData;
 use std::pin::Pin;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use crate::io_driver::{IO_DRIVER, operations::FixedBufIndex};
 
 pub struct FixedSendBufPool {
-    inner: RefCell<PoolInner>,
-    /// Owns the backing memory. `Box<[u8]>` is fixed-size by construction,
-    /// so the heap allocation never moves — the iovecs the kernel registered
-    /// stay valid until `Drop` calls unregister.
+    state: RefCell<PoolState>,
+    /// Owns the backing memory. `Box<[u8]>` is fixed-size by construction, so
+    /// the heap allocation never moves — the iovecs the kernel registered stay
+    /// valid until `Drop` calls unregister.
     #[allow(dead_code)]
     storage: Box<[u8]>,
     /// Cached `storage.as_mut_ptr()`. Stable for the pool's lifetime.
@@ -35,13 +49,13 @@ pub struct FixedSendBufPool {
     size: u32,
 }
 
-struct PoolInner {
-    /// Free-list, used as a stack: `release` pushes to the back, `acquire`
-    /// pops from the back. LIFO keeps the just-released slot hot in cache.
+struct PoolState {
+    /// Free-list, used as a stack: release pushes to the back, acquire pops
+    /// from the back. LIFO keeps the just-released slot hot in cache.
     free: Vec<u16>,
     /// Cells let `Acquire::drop` mark a queued waiter as cancelled without
-    /// scanning the deque: release pops slots and skips cells whose waker
-    /// has been cleared.
+    /// scanning the deque: release pops slots and skips cells whose waker has
+    /// been cleared.
     waiters: VecDeque<Rc<Cell<Option<Waker>>>>,
 }
 
@@ -64,13 +78,13 @@ impl FixedSendBufPool {
             .collect();
 
         // SAFETY: `storage` is owned by `Self` as a `Box<[u8]>`; the heap
-        // allocation cannot move and iovecs stay valid until `Drop` calls
+        // allocation cannot move and the iovecs stay valid until `Drop` calls
         // unregister.
         IO_DRIVER.with(|d| unsafe { d.register_fixed_buffers(&iovecs) })?;
 
         let free: Vec<u16> = (0..count).rev().collect();
         Ok(Self {
-            inner: RefCell::new(PoolInner {
+            state: RefCell::new(PoolState {
                 free,
                 waiters: VecDeque::new(),
             }),
@@ -81,29 +95,36 @@ impl FixedSendBufPool {
         })
     }
 
-    /// Wait for a free buffer slot. Resolves immediately if one is
-    /// available; otherwise parks the task until `release` frees one.
-    pub fn acquire(&self) -> Acquire<'_> {
+    /// Wait for a free buffer slot. Resolves immediately if one is available;
+    /// otherwise parks the task until a `PooledBuf` is dropped.
+    pub fn acquire(&self) -> Acquire {
         Acquire {
-            pool: self,
+            pool: NonNull::from(self),
             waker_slot: None,
         }
     }
 
-    /// Hand `buf` back to the free-list and wake the next waiter (if any).
-    pub fn release(&self, buf: PooledBuf<'_>) {
-        self.release_index(buf.index);
+    /// Number of buffers in the pool.
+    pub fn capacity(&self) -> usize {
+        self.count as usize
     }
 
-    /// Hand `index` back to the free-list directly. Used by the cancel
-    /// keepalive path, where the original `PooledBuf` no longer exists but
-    /// its slot still needs to be reclaimed.
-    pub fn release_index(&self, index: FixedBufIndex) {
+    /// Size of each buffer in bytes.
+    pub fn buffer_size(&self) -> usize {
+        self.size as usize
+    }
+
+    fn slot_ptr(&self, index: u16) -> *mut u8 {
+        unsafe { self.base_ptr.add(index as usize * self.size as usize) }
+    }
+
+    /// Hand `index` back to the free-list and wake the next live waiter.
+    fn release(&self, index: FixedBufIndex) {
         let waker_to_wake = {
-            let mut inner = self.inner.borrow_mut();
-            inner.free.push(index.get());
+            let mut state = self.state.borrow_mut();
+            state.free.push(index.get());
             loop {
-                match inner.waiters.pop_front() {
+                match state.waiters.pop_front() {
                     Some(slot) => {
                         if let Some(w) = slot.take() {
                             break Some(w);
@@ -118,52 +139,43 @@ impl FixedSendBufPool {
             w.wake();
         }
     }
-
-    /// Number of buffers in the pool.
-    pub fn capacity(&self) -> usize {
-        self.count as usize
-    }
-
-    /// Size of each buffer in bytes.
-    pub fn buffer_size(&self) -> usize {
-        self.size as usize
-    }
-
-    /// Base pointer for slot `index`. Stable for the pool's lifetime.
-    fn slot_ptr(&self, index: u16) -> *mut u8 {
-        unsafe { self.base_ptr.add(index as usize * self.size as usize) }
-    }
 }
 
 impl Drop for FixedSendBufPool {
     fn drop(&mut self) {
         // Tell the kernel to drop its references before `storage` is freed.
-        // Best-effort: if unregister fails (e.g. ring already gone) we have
-        // nothing useful to do with the error here.
+        // Per the lifetime contract no `PooledBuf` (hence no in-flight op) is
+        // referencing the registration at this point. Best-effort: if
+        // unregister fails (e.g. ring already gone) there is nothing useful to
+        // do here.
         let _ = IO_DRIVER.with(|d| d.unregister_fixed_buffers());
     }
 }
 
 /// A buffer slot borrowed from a [`FixedSendBufPool`].
 ///
-/// Acts as a writable cursor: `Write` advances `len()` and refuses bytes
-/// past the slot's `capacity`. `as_slice` exposes the written prefix to
-/// hand to the kernel via the slot's `buf_index`.
+/// Acts as a writable cursor: `Write` advances `len()` and refuses bytes past
+/// the slot's `capacity`. `as_slice` exposes the written prefix to hand to the
+/// kernel via the slot's `buf_index`.
 ///
-/// Released by calling [`FixedSendBufPool::release`] — there is no
-/// automatic release on drop.
-pub struct PooledBuf<'p> {
-    /// Cached `pool.base_ptr + index * size`. Avoids re-deriving the slot
-    /// pointer (and re-entering the pool) on every `Write` call. Tied to the
-    /// pool's lifetime via `_pool`.
+/// The slot is returned to its pool automatically when the `PooledBuf` is
+/// dropped. A send future (`socket_write_fixed`/`_zc`) takes ownership of the
+/// `PooledBuf` and hands it back on completion; if such a future is dropped
+/// mid-flight it stashes the `PooledBuf` until the kernel signals it is done,
+/// so the slot is never reused while still being read.
+///
+/// Holds a raw pointer to its pool; see the module-level lifetime contract.
+pub struct PooledBuf {
+    pool: NonNull<FixedSendBufPool>,
+    /// Cached `base_ptr + index * size`. Avoids re-deriving the slot pointer
+    /// on every `Write` call.
     slot_base: *mut u8,
     cap: u32,
     index: FixedBufIndex,
     write_pos: u32,
-    _pool: PhantomData<&'p FixedSendBufPool>,
 }
 
-impl<'p> PooledBuf<'p> {
+impl PooledBuf {
     pub fn buf_index(&self) -> FixedBufIndex {
         self.index
     }
@@ -209,7 +221,7 @@ impl<'p> PooledBuf<'p> {
     }
 }
 
-impl io::Write for PooledBuf<'_> {
+impl io::Write for PooledBuf {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let dst = self.remaining_mut();
         let n = dst.len().min(buf.len());
@@ -223,40 +235,48 @@ impl io::Write for PooledBuf<'_> {
     }
 }
 
+impl Drop for PooledBuf {
+    fn drop(&mut self) {
+        // SAFETY: the pool outlives every PooledBuf it issued (module contract).
+        unsafe { self.pool.as_ref().release(self.index) };
+    }
+}
+
 /// Future returned by [`FixedSendBufPool::acquire`].
-pub struct Acquire<'p> {
-    pool: &'p FixedSendBufPool,
+pub struct Acquire {
+    pool: NonNull<FixedSendBufPool>,
     waker_slot: Option<Rc<Cell<Option<Waker>>>>,
 }
 
-impl<'p> Future for Acquire<'p> {
-    type Output = PooledBuf<'p>;
+impl Future for Acquire {
+    type Output = PooledBuf;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.pool.inner.borrow_mut();
-        if let Some(idx) = inner.free.pop() {
-            drop(inner);
-            // Drop our queued waker slot (if any) so release won't try to
-            // wake a future that's already completed.
+        // SAFETY: the pool outlives this future (module contract).
+        let pool = unsafe { self.pool.as_ref() };
+        let mut state = pool.state.borrow_mut();
+        if let Some(idx) = state.free.pop() {
+            drop(state);
+            // Drop our queued waker slot (if any) so release won't try to wake
+            // a future that's already completed.
             if let Some(slot) = self.waker_slot.take() {
                 slot.set(None);
             }
             return Poll::Ready(PooledBuf {
-                slot_base: self.pool.slot_ptr(idx),
-                cap: self.pool.size,
+                pool: self.pool,
+                slot_base: pool.slot_ptr(idx),
+                cap: pool.size,
                 index: FixedBufIndex::new(idx),
                 write_pos: 0,
-                _pool: PhantomData,
             });
         }
         match &self.waker_slot {
             Some(slot) => {
                 // If a release already took our waker (cell is None) but a
-                // racing acquirer grabbed the freed slot before us, our cell
-                // is no longer in `waiters` — re-enqueue, otherwise this task
-                // would never be woken again. If the stored waker already
-                // matches `cx.waker()`, reuse it and skip the atomic-refcount
-                // clone.
+                // racing acquirer grabbed the freed slot before us, our cell is
+                // no longer in `waiters` — re-enqueue, otherwise this task would
+                // never be woken again. If the stored waker already matches
+                // `cx.waker()`, reuse it and skip the atomic-refcount clone.
                 let old = slot.take();
                 let needs_enqueue = old.is_none();
                 let to_store = match old {
@@ -265,13 +285,13 @@ impl<'p> Future for Acquire<'p> {
                 };
                 slot.set(Some(to_store));
                 if needs_enqueue {
-                    inner.waiters.push_back(slot.clone());
+                    state.waiters.push_back(slot.clone());
                 }
             }
             None => {
                 let slot = Rc::new(Cell::new(Some(cx.waker().clone())));
-                inner.waiters.push_back(slot.clone());
-                drop(inner);
+                state.waiters.push_back(slot.clone());
+                drop(state);
                 self.waker_slot = Some(slot);
             }
         }
@@ -279,7 +299,7 @@ impl<'p> Future for Acquire<'p> {
     }
 }
 
-impl<'p> Drop for Acquire<'p> {
+impl Drop for Acquire {
     fn drop(&mut self) {
         if let Some(slot) = self.waker_slot.take() {
             // Mark this waiter cancelled; release will skip it.

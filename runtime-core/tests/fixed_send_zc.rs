@@ -7,8 +7,8 @@ use runtime_core::runtime::main_thread;
 
 // Zero-copy send from a registered ("fixed") buffer. Drives several buffers
 // through the pool so the `Sent -> Notif -> Ended` path runs for each, then
-// recycles the slots. Verifies the server receives every byte in order and
-// that the slots round-trip back to the pool.
+// lets each release on drop. Verifies the server receives every byte in order
+// and that the slots round-trip back to the pool.
 #[test]
 fn fixed_send_zc_end_to_end() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -26,25 +26,16 @@ fn fixed_send_zc_end_to_end() {
         let socket = connect_tcp(addr).await.unwrap();
 
         // Send 6 messages, cycling through the 3-slot pool twice — each send
-        // resolves only on its zero-copy notification, after which the slot is
-        // released and reused.
+        // resolves only on its zero-copy notification, after which the buffer
+        // is dropped and its slot reused.
         for i in 0..6u32 {
             let mut b = pool.acquire().await;
             write!(b, "zc-{:02} ", i).unwrap();
             let expect_len = b.len();
 
-            let idx = b.buf_index();
-            let on_cancel = {
-                let pool = pool.clone();
-                move || pool.release_index(idx)
-            };
-
-            let n = socket_write_fixed_zc(&socket, &b, on_cancel)
-                .await
-                .unwrap();
-            assert_eq!(n, expect_len);
-
-            pool.release(b);
+            let (result, b) = socket_write_fixed_zc(&socket, b).await;
+            assert_eq!(result.unwrap(), expect_len);
+            drop(b); // slot returns to the pool
         }
 
         // All slots came back to the pool.

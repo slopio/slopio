@@ -42,10 +42,11 @@ fn fixed_send_pool_end_to_end() {
         let set_two: HashSet<u16> = round_two.iter().copied().collect();
         assert_eq!(set_one, set_two, "round 2 didn't recycle the same slots");
 
-        // --- 3. Cancel-safety: a dropped Acquire future must not strand
-        //        the next live waiter. We hold all 3 slots, start a waiter
-        //        that times out (dropping its Acquire while parked), then
-        //        release one slot and confirm a fresh acquire still works.
+        // --- 3. Cancel-safety: a dropped Acquire future must not strand the
+        //        next live waiter. We hold all 3 slots, start a waiter that
+        //        times out (dropping its Acquire while parked), then drop one
+        //        held buffer and confirm a fresh acquire still works. The held
+        //        buffers auto-release on drop. ---
         let held = [
             pool.acquire().await,
             pool.acquire().await,
@@ -57,14 +58,14 @@ fn fixed_send_pool_end_to_end() {
 
         let [a, b, c] = held;
         let a_idx = a.buf_index().get();
-        pool.release(a);
+        drop(a); // returns the slot to the pool
 
         // Slot just freed should be the one a fresh acquire receives.
         let revived = pool.acquire().await;
         assert_eq!(revived.buf_index().get(), a_idx);
-        pool.release(revived);
-        pool.release(b);
-        pool.release(c);
+        drop(revived);
+        drop(b);
+        drop(c);
 
         // --- 4. Waiting acquire wakes when a slot is released ---
         let h0 = pool.acquire().await;
@@ -77,10 +78,9 @@ fn fixed_send_pool_end_to_end() {
         use runtime_core::runtime::time::Sleep;
 
         let releaser = {
-            let pool = pool.clone();
             async move {
                 Sleep::during(Duration::from_millis(20)).await;
-                pool.release(h2);
+                drop(h2); // releasing the slot wakes the parked acquire
             }
         };
         let acquirer = pool.acquire();
@@ -92,9 +92,9 @@ fn fixed_send_pool_end_to_end() {
         // when select picked Second), but the slot is now free.
         let woken = pool.acquire().await;
         assert_eq!(woken.buf_index().get(), h2_idx);
-        pool.release(woken);
-        pool.release(h0);
-        pool.release(h1);
+        drop(woken);
+        drop(h0);
+        drop(h1);
 
         // Drop the socket → server-side read_to_end returns.
         drop(socket);
@@ -106,32 +106,103 @@ fn fixed_send_pool_end_to_end() {
     assert_eq!(s, expected);
 }
 
-/// Acquire 3 slots concurrently, send each, release each. Returns the
-/// indices used (in send order).
+// Dropping a fixed send mid-flight must return its slot to the pool exactly
+// once — not early (kernel may still be reading) and not twice (no double
+// free). With a single-slot pool the only way a later acquire can succeed is
+// if the cancelled send's buffer was correctly released after its CQE; a
+// double free would instead hand the same slot out twice.
+#[test]
+fn fixed_send_cancel_returns_slot_once() {
+    use runtime_core::runtime::select::{SelectResult, select};
+    use runtime_core::runtime::time::Sleep;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        buf
+    });
+
+    main_thread(async move {
+        let pool = Rc::new(FixedSendBufPool::new(1, 64).unwrap());
+        let socket = connect_tcp(addr).await.unwrap();
+
+        // Acquire the only slot and start a send, then race it against an
+        // immediate timer so the send future is dropped (cancelled) — whether
+        // or not it managed to complete first, the slot must round-trip back.
+        let mut b = pool.acquire().await;
+        write!(b, "cancelled").unwrap();
+        let send = socket_write_fixed(&socket, b);
+        match select(send, Sleep::during(Duration::from_nanos(1))).await {
+            SelectResult::First((res, buf)) => {
+                res.unwrap();
+                drop(buf);
+            }
+            SelectResult::Second(()) => { /* send dropped mid-flight */ }
+        }
+
+        // The slot must come back (immediately if completed, after the cancel
+        // CQE if it was in flight). A long timeout tolerates the cancel round
+        // trip; failure here means the slot was lost.
+        let h = timeout(Duration::from_secs(2), pool.acquire())
+            .await
+            .expect("slot should return to the pool after cancel")
+            .buf_index()
+            .get();
+        assert_eq!(h, 0);
+
+        // Re-acquire and hold it, then a second acquire must time out: the pool
+        // has exactly one slot. If the cancel path had double-released, the
+        // free-list would contain the slot twice and this would succeed.
+        let held = pool.acquire().await;
+        let dup = timeout(Duration::from_millis(80), pool.acquire()).await;
+        assert!(
+            dup.is_err(),
+            "pool handed out the single slot twice — double free on cancel"
+        );
+        drop(held);
+
+        // Registration is still intact: a normal send goes through.
+        let mut fb = pool.acquire().await;
+        write!(fb, "final").unwrap();
+        let (res, fb) = socket_write_fixed(&socket, fb).await;
+        assert_eq!(res.unwrap(), 5);
+        drop(fb);
+
+        drop(socket);
+    });
+
+    let received = server.join().unwrap();
+    assert!(
+        received.ends_with(b"final"),
+        "final message missing; got {received:?}"
+    );
+}
+
+/// Acquire 3 slots concurrently, send each, let each release on drop. Returns
+/// the indices used (in send order).
 async fn send_round(
     pool: &Rc<FixedSendBufPool>,
     socket: &SocketWrapper,
     base: u32,
 ) -> Vec<u16> {
-    let mut bufs: Vec<PooledBuf<'_>> = Vec::new();
+    let mut bufs: Vec<PooledBuf> = Vec::new();
     for i in 0..3u32 {
         let mut b = pool.acquire().await;
         write!(b, "msg-{:02} ", base + i).unwrap();
         bufs.push(b);
     }
     let mut indices = Vec::new();
-    for buf in bufs.iter() {
-        let idx = buf.buf_index();
-        indices.push(idx.get());
-        let on_cancel = {
-            let pool = pool.clone();
-            move || pool.release_index(idx)
-        };
-        let n = socket_write_fixed(socket, buf, on_cancel).await.unwrap();
-        assert_eq!(n, buf.len());
-    }
     for buf in bufs {
-        pool.release(buf);
+        let idx = buf.buf_index().get();
+        let expect_len = buf.len();
+        indices.push(idx);
+        let (result, buf) = socket_write_fixed(socket, buf).await;
+        assert_eq!(result.unwrap(), expect_len);
+        drop(buf); // slot returns to the pool
     }
     indices
 }
