@@ -256,3 +256,39 @@ fn test_many_concurrent_timers() {
         elapsed
     );
 }
+
+#[test]
+fn test_sleep_completes_while_scheduler_is_busy() {
+    use runtime::yield_now;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let start = Instant::now();
+    main_thread(async {
+        let stop = Rc::new(Cell::new(false));
+        let spinner_stop = stop.clone();
+        // Keep the scheduler loop hot: with tasks always runnable, the
+        // runtime never parks and ticks the timewheel far more often than
+        // its 10ms resolution. The sleep must still fire on time.
+        spawn(async move {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !spinner_stop.get() && Instant::now() < deadline {
+                yield_now().await;
+            }
+        });
+        Sleep::during(Duration::from_millis(100)).await;
+        stop.set(true);
+    });
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "Sleep finished too early: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Sleep stalled while the scheduler was busy: {:?}",
+        elapsed
+    );
+}

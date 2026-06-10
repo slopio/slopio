@@ -10,8 +10,9 @@ fn test_task_execution_order() {
     main_thread(async move {
         order_clone.lock().unwrap().push(1);
 
-        let handle = spawn(async {
-            order_clone.lock().unwrap().push(2);
+        let order_task = order_clone.clone();
+        let handle = spawn(async move {
+            order_task.lock().unwrap().push(2);
         });
 
         order_clone.lock().unwrap().push(3);

@@ -44,7 +44,10 @@ impl<T: Future> State<T> {
     }
 }
 
-pub fn new_task<F: Future>(f: F) -> (TypeAgnosticTask, Handle<F::Output>) {
+// `'static` is load-bearing: the task may outlive the caller's stack frame
+// (it is freed by the runtime, not the spawner), so the future must not
+// borrow anything shorter-lived.
+pub fn new_task<F: Future + 'static>(f: F) -> (TypeAgnosticTask, Handle<F::Output>) {
     let task = TypedTask::new(f);
     let erased_type_task = task.erase_type();
     let handle = Handle::from(erased_type_task);

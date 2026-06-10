@@ -772,3 +772,53 @@ fn test_next_deadline_cancelled_timer_still_in_bucket() {
         "Bucket occupied bit should still be set after cancel"
     );
 }
+
+#[test]
+fn test_timer_fires_when_ticked_faster_than_resolution() {
+    use std::time::Instant;
+
+    let mut wheel = TimeWheel::new();
+    let (counter, waker) = make_waker();
+
+    wheel
+        .init_timer(Duration::from_millis(100), &waker)
+        .unwrap();
+
+    // Tick every ~2ms, much faster than the 10ms resolution. Sub-tick
+    // elapsed time must accumulate across calls instead of being discarded,
+    // otherwise the wheel never advances (the "busy event loop" regression).
+    let start = Instant::now();
+    while counter.count() == 0 && start.elapsed() < Duration::from_secs(2) {
+        sleep(Duration::from_millis(2));
+        wheel.tick();
+    }
+
+    assert_eq!(
+        counter.count(),
+        1,
+        "timer never fired while ticking faster than the wheel resolution"
+    );
+    // Generous upper bound (known wheel slack), well under the 2s bail-out.
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "timer fired too late: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn test_fired_timer_releases_slab_slot_on_poll() {
+    let mut wheel = TimeWheel::new();
+    let (_, waker) = make_waker();
+
+    let id = wheel.init_timer(Duration::from_millis(20), &waker).unwrap();
+    assert_eq!(wheel.active_timers(), 1);
+
+    sleep(Duration::from_millis(30));
+    wheel.tick();
+
+    // Observing Ready is the timer's last poll; the slot must be released
+    // or every completed Sleep leaks a slab entry for the process lifetime.
+    assert_eq!(wheel.poll(id, &waker), Poll::Ready(()));
+    assert_eq!(wheel.active_timers(), 0);
+}

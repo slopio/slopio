@@ -160,36 +160,50 @@ pub(crate) fn process_multi(
             MultiProcessResult::InvalidState("received CQE for operation still in Init state")
         }
 
-        MultiOpState::Sent { queue, .. } => match queue.push(event) {
-            super::QueueInsertEvent::Ok => MultiProcessResult::Queued,
-            super::QueueInsertEvent::WasEmpty => {
-                multi_op.wake();
-                MultiProcessResult::WakeConsumer
+        MultiOpState::Sent {
+            queue, last_cqe, ..
+        } => {
+            if !cqueue::more(event.flags) {
+                // Terminal CQE (EOF, error): the kernel posts nothing further
+                // for this token. Recorded so a later cancel can reap the
+                // slab entry directly instead of waiting for a CQE that will
+                // never come.
+                *last_cqe = true;
             }
-            super::QueueInsertEvent::TooFull => {
-                multi_op.transition_to_trying_to_pause();
-                MultiProcessResult::PauseRequired(user_data)
+            let terminated = *last_cqe;
+            match queue.push(event) {
+                super::QueueInsertEvent::Ok => MultiProcessResult::Queued,
+                super::QueueInsertEvent::WasEmpty => {
+                    multi_op.wake();
+                    MultiProcessResult::WakeConsumer
+                }
+                super::QueueInsertEvent::TooFull => {
+                    if terminated {
+                        // The op already stopped on its own — there is
+                        // nothing left to pause, and a cancel SQE would
+                        // strand the entry in `TringToPause`.
+                        MultiProcessResult::Queued
+                    } else {
+                        multi_op.transition_to_trying_to_pause();
+                        MultiProcessResult::PauseRequired(user_data)
+                    }
+                }
             }
-        },
+        }
 
         MultiOpState::TringToPause {
-            queue,
-            ecancelled,
-            last_cqe,
-            ..
+            queue, last_cqe, ..
         } => {
             if !cqueue::more(event.flags) {
                 *last_cqe = true;
             }
-
-            if event.result == -ECANCELED {
-                *ecancelled = true;
-            }
-
+            let paused = *last_cqe;
             queue.push(event);
 
-            // Check if we've fully paused
-            if *ecancelled && *last_cqe {
+            // Whether the final CQE is our pause-cancel's -ECANCELED or the
+            // op terminating on its own (EOF/error), no further CQE is
+            // coming — the pause is complete either way.
+            if paused {
                 multi_op.transition_to_paused();
                 multi_op.wake();
                 MultiProcessResult::FullyPaused
@@ -203,13 +217,7 @@ pub(crate) fn process_multi(
             MultiProcessResult::InvalidState("received CQE while paused")
         }
 
-        MultiOpState::AcceptCancelled {
-            ecancelled,
-            last_cqe,
-        } => {
-            if event.result == -ECANCELED {
-                *ecancelled = true;
-            }
+        MultiOpState::AcceptCancelled { last_cqe } => {
             if !cqueue::more(event.flags) {
                 *last_cqe = true;
             }
@@ -220,7 +228,7 @@ pub(crate) fn process_multi(
                     libc::close(event.result);
                 }
             }
-            if *ecancelled && *last_cqe {
+            if *last_cqe {
                 MultiProcessResult::AcceptCancelComplete
             } else {
                 MultiProcessResult::Queued
@@ -228,14 +236,8 @@ pub(crate) fn process_multi(
         }
 
         MultiOpState::Cancelled {
-            bgid,
-            ecancelled,
-            last_cqe,
-            ..
+            bgid, last_cqe, ..
         } => {
-            if event.result == -ECANCELED {
-                *ecancelled = true;
-            }
             if !cqueue::more(event.flags) {
                 *last_cqe = true;
             }
@@ -247,7 +249,7 @@ pub(crate) fn process_multi(
                 None
             };
 
-            if *ecancelled && *last_cqe {
+            if *last_cqe {
                 if let Some((buffer_id, bgid)) = recycle {
                     // This last CQE also had a buffer — recycle it, then signal complete
                     return MultiProcessResult::CancelledRecycling { buffer_id, bgid };

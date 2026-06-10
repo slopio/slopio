@@ -16,6 +16,10 @@ impl TimerStorage {
         self.inner.insert(Timer::Waiting(waker.clone()))
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+
     pub(crate) fn drop(&mut self, id: usize) {
         let timer = self.inner.get_mut(id).unwrap();
         match timer {
@@ -30,14 +34,26 @@ impl TimerStorage {
     }
 
     pub(crate) fn poll(&mut self, id: usize, waker: &Waker) -> std::task::Poll<()> {
-        let timers = self.inner.get_mut(id).unwrap();
-        if let Timer::Waiting(r_waker) = timers {
-            if !r_waker.will_wake(waker) {
-                *r_waker = waker.clone();
+        let timer = self.inner.get_mut(id).unwrap();
+        match timer {
+            Timer::Waiting(r_waker) => {
+                if !r_waker.will_wake(waker) {
+                    *r_waker = waker.clone();
+                }
+                std::task::Poll::Pending
             }
-            return std::task::Poll::Pending;
+            // Fired: the id was already drained from its bucket by `wake`,
+            // so the slot can be released here. Callers forget their id once
+            // they observe `Ready`.
+            Timer::Done => {
+                self.inner.remove(id);
+                std::task::Poll::Ready(())
+            }
+            // Cancelled ids are still parked in a bucket; the slot is freed
+            // when the bucket fires (`wake`). Removing it here would let the
+            // slab reuse the id while the bucket still references it.
+            Timer::Cancelled => std::task::Poll::Ready(()),
         }
-        std::task::Poll::Ready(())
     }
 
     pub(crate) fn wake(&mut self, id: usize) {

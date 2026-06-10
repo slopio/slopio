@@ -129,8 +129,19 @@ impl TimeWheel {
             self.process_single_tick();
         }
 
-        self.last_tick = now;
+        // Advance by whole ticks only, keeping the sub-tick remainder.
+        // Resetting to `now` unconditionally would discard up to MS_TICK of
+        // elapsed time per call — called faster than once per MS_TICK (a busy
+        // event loop), the wheel would never accumulate a full tick and never
+        // advance.
+        self.last_tick += Duration::from_millis(ticks_to_process as u64 * MS_TICK);
         self.last_tick_wall = now_wall;
+    }
+
+    /// Number of timers currently occupying slab slots: waiting, fired but
+    /// not yet polled, or cancelled but not yet swept by their bucket.
+    pub fn active_timers(&self) -> usize {
+        self.storage.len()
     }
 
     fn process_single_tick(&mut self) {

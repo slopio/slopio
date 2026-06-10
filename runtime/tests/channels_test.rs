@@ -21,7 +21,7 @@ fn unbounded_drop_parts() {
     main_thread(async {
         let (send, recv) = unbounded_channel::<usize>();
         let k = spawn(async move { drop(send) });
-        let k2 = spawn(recv.recv());
+        let k2 = spawn(async move { recv.recv().await });
         let _ = k.await;
         let k2 = k2.await;
         assert_eq!(k2, None);

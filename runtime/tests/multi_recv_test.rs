@@ -364,3 +364,46 @@ fn test_fast_drain_triggers_resume() {
         );
     }
 }
+
+#[test]
+fn test_multishot_slab_entry_reaped_after_eof() {
+    let (cv1, cv2) = Cv::new();
+
+    let reading_thread = std::thread::spawn(move || {
+        main_thread_with::<Small, _>(async {
+            let mut multiaccept = MultiAccept::new(9097).unwrap();
+            cv1.notify();
+            let socket = multiaccept.next().await.unwrap();
+
+            // Baseline includes the still-live MultiAccept entry.
+            let baseline =
+                runtime::io_driver::IO_DRIVER.with(|d| d.multishot_ops_in_flight());
+
+            let mut multi_recv = MultiRecv::<Small>::new(socket.fd);
+            let mut received = 0usize;
+            while let Some(Ok(data)) = multi_recv.next().await {
+                received += data.as_ref().len();
+            }
+            drop(multi_recv);
+
+            // The recv op terminated at EOF, so no further CQE exists for it.
+            // Dropping the stream must reap its slab entry immediately —
+            // before this fix, every peer-closed connection leaked one.
+            let after = runtime::io_driver::IO_DRIVER.with(|d| d.multishot_ops_in_flight());
+            (baseline, after, received)
+        })
+    });
+
+    cv2.wait();
+
+    let mut client = TcpStream::connect("localhost:9097").unwrap();
+    client.write_all(b"hello multishot").unwrap();
+    drop(client);
+
+    let (baseline, after, received) = reading_thread.join().unwrap();
+    assert_eq!(received, b"hello multishot".len());
+    assert_eq!(
+        after, baseline,
+        "dropping a MultiRecv after EOF leaked a multishot slab entry"
+    );
+}

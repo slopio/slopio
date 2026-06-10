@@ -129,13 +129,17 @@ enum MultiOpState {
         // woken_up: bool,
         fd: i32,
         queue: MultiOpQueue,
+        /// Set when a CQE without `IORING_CQE_F_MORE` was queued: the kernel
+        /// op terminated on its own (EOF, error) and no further CQE will
+        /// arrive for this token. Cancellation must then reap the slab entry
+        /// directly instead of waiting for a CQE that will never come.
+        last_cqe: bool,
     },
     TringToPause {
         waker: Waker,
         fd: i32,
         queue: MultiOpQueue,
         last_cqe: bool,
-        ecancelled: bool,
     },
     Paused {
         waker: Waker,
@@ -145,7 +149,6 @@ enum MultiOpState {
     Cancelled {
         bgid: u16,
         last_cqe: bool,
-        ecancelled: bool,
         /// Memory the kernel may still touch (e.g. a UDP `msghdr` Box) for
         /// in-flight CQEs after cancel is submitted. Dropped when the slab
         /// entry is reaped on `CancelComplete`.
@@ -158,7 +161,6 @@ enum MultiOpState {
     /// instead of trying to recycle them as buffers.
     AcceptCancelled {
         last_cqe: bool,
-        ecancelled: bool,
     },
 }
 
@@ -169,6 +171,7 @@ impl MultiOpState {
                 waker: waker.clone(),
                 fd: *fd,
                 queue: MultiOpQueue::new(*queue_size),
+                last_cqe: false,
             };
         }
     }
@@ -191,6 +194,8 @@ impl MultiOpState {
                 waker: new_waker.clone(),
                 fd: *fd,
                 queue: std::mem::take(queue),
+                // A fresh SQE is about to be submitted for this token.
+                last_cqe: false,
             };
         }
     }
@@ -198,13 +203,17 @@ impl MultiOpState {
     fn transition_to_trying_to_pause(&mut self) {
         match self {
             MultiOpState::Init { .. } => unreachable!("pause a non init ?"),
-            MultiOpState::Sent { waker, fd, queue } => {
+            MultiOpState::Sent {
+                waker,
+                fd,
+                queue,
+                last_cqe,
+            } => {
                 *self = Self::TringToPause {
                     waker: waker.clone(),
                     fd: *fd,
                     queue: std::mem::take(queue),
-                    last_cqe: false,
-                    ecancelled: false,
+                    last_cqe: *last_cqe,
                 };
             }
             MultiOpState::TringToPause { .. } => unreachable!("already"),
@@ -289,12 +298,7 @@ impl IODriver {
                     MultiProcessResult::CancelledRecycling { buffer_id, bgid } => {
                         self.recycle_by_bgid(bgid, buffer_id);
                         // Check if cancel is now complete
-                        if let MultiOpState::Cancelled {
-                            ecancelled,
-                            last_cqe,
-                            ..
-                        } = slab_entry
-                            && *ecancelled
+                        if let MultiOpState::Cancelled { last_cqe, .. } = slab_entry
                             && *last_cqe
                         {
                             slab.remove_raw(index);
@@ -387,6 +391,13 @@ impl IODriver {
             }
         }
         panic!("no recycler registered for bgid {bgid}");
+    }
+
+    /// Number of multishot slab entries currently held by the driver.
+    /// Diagnostic accessor, used by leak regression tests.
+    pub fn multishot_ops_in_flight(&self) -> usize {
+        let slab = unsafe { &*self.multishot_slab.get() };
+        slab.len()
     }
 
     pub fn push_multishot_op(
@@ -614,18 +625,50 @@ impl IODriver {
         keepalive: Option<Box<dyn std::any::Any>>,
     ) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
-        if let Some(entry) = slab.get_mut(token) {
-            // Recycle kernel buffers from the old state's queue before dropping it.
-            let old = std::mem::replace(
-                entry,
-                MultiOpState::Cancelled {
-                    bgid,
-                    last_cqe: false,
-                    ecancelled: false,
-                    keepalive: keepalive.map(CancelKeepalive),
-                },
-            );
+        let Some(entry) = slab.get_mut(token) else {
+            return;
+        };
+
+        // If the kernel op already terminated, no CQE will ever arrive for
+        // this token again: an `AsyncCancel` would complete with -ENOENT on
+        // its own (suppressed) user_data, and a `Cancelled` entry would wait
+        // forever — leaking the slab slot and the keepalive on every
+        // peer-closed connection. Reap directly instead, mirroring the
+        // oneshot `Ended` fast path. This covers `Sent` after a terminal CQE
+        // (EOF/error) and `Paused` (pausing works by cancelling, so a paused
+        // op is already fully stopped in the kernel).
+        if matches!(
+            entry,
+            MultiOpState::Sent { last_cqe: true, .. } | MultiOpState::Paused { .. }
+        ) {
+            let old = slab.remove(token);
             self.recycle_multiop_queue(old, bgid);
+            return;
+        }
+
+        // Already cancelled: replacing the entry would reset its completion
+        // flags and orphan it.
+        if matches!(
+            entry,
+            MultiOpState::Cancelled { .. } | MultiOpState::AcceptCancelled { .. }
+        ) {
+            return;
+        }
+
+        // A pause already has a cancel SQE in flight; don't submit a second.
+        let pause_cancel_in_flight = matches!(entry, MultiOpState::TringToPause { .. });
+
+        // Recycle kernel buffers from the old state's queue before dropping it.
+        let old = std::mem::replace(
+            entry,
+            MultiOpState::Cancelled {
+                bgid,
+                last_cqe: false,
+                keepalive: keepalive.map(CancelKeepalive),
+            },
+        );
+        self.recycle_multiop_queue(old, bgid);
+        if !pause_cancel_in_flight {
             self.send_multiop_cancel_event(UserData::multi(token.raw()).into_bits());
         }
     }
@@ -637,31 +680,51 @@ impl IODriver {
     /// `process_multi`'s `AcceptCancelled` arm.
     pub(crate) fn cancel_multishot_op_accept(&self, token: MultishotToken) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
-        if let Some(entry) = slab.get_mut(token) {
-            let old = std::mem::replace(
-                entry,
-                MultiOpState::AcceptCancelled {
-                    last_cqe: false,
-                    ecancelled: false,
-                },
-            );
-            // Close any fds the kernel queued before we cancelled.
-            let queue = match old {
-                MultiOpState::Sent { queue, .. }
-                | MultiOpState::TringToPause { queue, .. }
-                | MultiOpState::Paused { queue, .. } => Some(queue),
-                _ => None,
-            };
-            if let Some(mut queue) = queue {
-                while let Some(event) = queue.pop() {
-                    if event.result > 0 {
-                        unsafe {
-                            libc::close(event.result);
-                        }
-                    }
+        let Some(entry) = slab.get_mut(token) else {
+            return;
+        };
+
+        // Same terminal-op fast path as `cancel_multishot_op_keep`: no CQE
+        // will arrive for an already-terminated op, so reap directly.
+        if matches!(
+            entry,
+            MultiOpState::Sent { last_cqe: true, .. } | MultiOpState::Paused { .. }
+        ) {
+            let old = slab.remove(token);
+            Self::close_queued_fds(old);
+            return;
+        }
+
+        if matches!(
+            entry,
+            MultiOpState::Cancelled { .. } | MultiOpState::AcceptCancelled { .. }
+        ) {
+            return;
+        }
+
+        let pause_cancel_in_flight = matches!(entry, MultiOpState::TringToPause { .. });
+
+        let old = std::mem::replace(entry, MultiOpState::AcceptCancelled { last_cqe: false });
+        // Close any fds the kernel queued before we cancelled.
+        Self::close_queued_fds(old);
+        if !pause_cancel_in_flight {
+            self.send_multiop_cancel_event(UserData::multi(token.raw()).into_bits());
+        }
+    }
+
+    fn close_queued_fds(state: MultiOpState) {
+        let mut queue = match state {
+            MultiOpState::Sent { queue, .. }
+            | MultiOpState::TringToPause { queue, .. }
+            | MultiOpState::Paused { queue, .. } => queue,
+            _ => return,
+        };
+        while let Some(event) = queue.pop() {
+            if event.result > 0 {
+                unsafe {
+                    libc::close(event.result);
                 }
             }
-            self.send_multiop_cancel_event(UserData::multi(token.raw()).into_bits());
         }
     }
 
@@ -812,6 +875,10 @@ impl Default for MultishotSlab {
 impl MultishotSlab {
     fn insert(&mut self, val: MultiOpState) -> MultishotToken {
         MultishotToken(self.0.insert(val) as u64)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
     }
 
     fn get_mut(&mut self, token: MultishotToken) -> Option<&mut MultiOpState> {

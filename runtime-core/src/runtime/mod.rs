@@ -94,8 +94,21 @@ impl RuntimeInner {
                         loop {
                             loop {
                                 self.time_driver.tick();
-                                while let Some(item) = self.tasks.pop() {
+                                // Drain one generation: only tasks queued
+                                // before this pass. Tasks that re-queue
+                                // themselves while polling (yield_now,
+                                // self-wakes) run on the next pass, after
+                                // timers tick and IO flushes — otherwise a
+                                // single always-ready task starves the
+                                // timewheel, the IO driver and the root
+                                // future for as long as it stays ready.
+                                let mut budget = self.tasks.len();
+                                while budget > 0 {
+                                    let Some(item) = self.tasks.pop() else {
+                                        break;
+                                    };
                                     item.poll();
+                                    budget -= 1;
                                 }
 
                                 // Only flush if tasks actually submitted IO operations.
@@ -158,7 +171,7 @@ pub fn now() -> std::time::SystemTime {
     TIME_DRIVER.with(|d| d.now())
 }
 
-pub fn spawn<F: Future>(f: F) -> Handle<F::Output> {
+pub fn spawn<F: Future + 'static>(f: F) -> Handle<F::Output> {
     let (task, handle) = new_task(f);
     TASK_LIST.with(|ctx| {
         ctx.push(task);
@@ -180,6 +193,11 @@ impl TaskList {
     pub(crate) fn is_empty(&self) -> bool {
         let tasks_list = unsafe { &*self.tasks.get() };
         tasks_list.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        let tasks_list = unsafe { &*self.tasks.get() };
+        tasks_list.len()
     }
 
     pub(crate) fn pop(&self) -> Option<TypeAgnosticTask> {
