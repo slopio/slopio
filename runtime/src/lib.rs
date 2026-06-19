@@ -67,6 +67,7 @@ pub fn main_thread<F: Future>(f: F) -> F::Output {
 /// worker thread before running `f`. `R` may be `()`, a single
 /// `BufRingSpec`, or a tuple of `BufRingSpec`s.
 pub fn main_thread_with<R: BufRingSet, F: Future>(f: F) -> F::Output {
+    ignore_sigpipe();
     let rt = RuntimeInner::default();
     #[cfg(feature = "otlp")]
     return rt.block_on::<R, F>(f, None, |run| {
@@ -83,6 +84,36 @@ pub fn main_thread_with<R: BufRingSet, F: Future>(f: F) -> F::Output {
     });
     #[cfg(not(feature = "tracing"))]
     rt.block_on::<R, F>(f, None, |run| run())
+}
+
+/// Set `SIGPIPE`'s disposition to `SIG_IGN` for the whole process.
+///
+/// io_uring send/write ops never raise `SIGPIPE` (a dead peer is reported as
+/// `-EPIPE` in the CQE), so the runtime's own I/O path is already immune. But
+/// libraries layered on top may do *synchronous* `write`/`send` off the ring
+/// (e.g. logging to a closed stdout pipe, or a blocking client socket), and we
+/// don't control whether they pass `MSG_NOSIGNAL`. Without this, such a write
+/// to a closed peer would kill the process with `SIGPIPE`.
+///
+/// Signal *disposition* is process-wide (it is not part of the per-thread
+/// signal mask), so installing it once — before any worker starts — protects
+/// every thread. With `SIG_IGN` in place, those synchronous writes fail with
+/// `EPIPE` instead, which the calling code can observe and handle.
+///
+/// Rust's std normally installs this same `SIG_IGN` during runtime init, but
+/// we set it explicitly so the guarantee does not depend on that implicit
+/// behavior (which can be opted out of, e.g. via `#[unix_sigpipe]` or a
+/// `no_main` entry, or reset by a C dependency calling `signal(SIGPIPE, …)`).
+fn ignore_sigpipe() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        if libc::signal(libc::SIGPIPE, libc::SIG_IGN) == libc::SIG_ERR {
+            panic!(
+                "failed to set SIGPIPE to SIG_IGN: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    });
 }
 
 fn block_signals_for_thread() {
@@ -135,6 +166,7 @@ where
     R: BufRingSet + 'static,
     F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
+    ignore_sigpipe();
     block_signals_for_thread();
     let num_threads: usize = std::thread::available_parallelism().unwrap().into();
     let fds = (0..num_threads)
