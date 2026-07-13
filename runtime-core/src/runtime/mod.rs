@@ -121,6 +121,13 @@ impl RuntimeInner {
                                 let pinned = pinned_f.as_mut();
                                 match pinned.poll(&mut context) {
                                     std::task::Poll::Ready(output) => {
+                                        // Flush any ops submitted during this
+                                        // final poll (e.g. a MSG_RING to a peer)
+                                        // before returning — otherwise they sit
+                                        // unsubmitted in the SQ and are lost.
+                                        if self.io_driver.has_pending_sqes() {
+                                            self.io_driver.submit();
+                                        }
                                         return output;
                                     }
                                     std::task::Poll::Pending => {}
