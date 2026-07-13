@@ -195,10 +195,10 @@ pub fn now() -> std::time::SystemTime {
 }
 
 /// Send a message to peer `thread_id` from the current worker via MSG_RING.
-/// The peer receives a [`PeerMessage`] carrying `tag` and `data`. Only valid
-/// inside a multi-threaded runtime.
-pub fn send_to_peer(thread_id: usize, data: i32, tag: u64) {
-    crate::io_driver::IO_DRIVER.with(|d| d.send_to_peer(thread_id, data, tag));
+/// The peer receives a [`PeerMessage`] carrying `payload` (62 bits) and `data`.
+/// Only valid inside a multi-threaded runtime.
+pub fn send_to_peer(thread_id: usize, data: i32, payload: u64) {
+    crate::io_driver::IO_DRIVER.with(|d| d.send_to_peer(thread_id, data, payload));
 }
 
 /// Await the next message sent to this worker by a peer.

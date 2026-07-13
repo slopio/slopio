@@ -38,12 +38,12 @@ fn ping_pong_between_two_workers() {
                 0 => {
                     send_to_peer(1, 42, thread_id as u64);
                     let reply = recv_or_timeout("worker 0").await;
-                    assert_eq!(reply.tag, 1, "reply should come from worker 1");
+                    assert_eq!(reply.payload, 1, "reply should come from worker 1");
                     assert_eq!(reply.data, 43, "worker 1 should have echoed data + 1");
                 }
                 1 => {
                     let msg = recv_or_timeout("worker 1").await;
-                    assert_eq!(msg.tag, 0, "ping should come from worker 0");
+                    assert_eq!(msg.payload, 0, "ping should come from worker 0");
                     assert_eq!(msg.data, 42);
                     send_to_peer(0, msg.data + 1, thread_id as u64);
                 }

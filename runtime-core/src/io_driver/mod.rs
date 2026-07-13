@@ -34,7 +34,9 @@ pub mod operations;
 mod sending_buffers;
 mod user_data;
 
-pub(crate) use user_data::UserData;
+pub(crate) use user_data::{
+    IO_MULTI, IO_SEND_BUFFER, PeerUserData, TAG_IGNORED, TAG_IO, TAG_MESSAGE, UserData,
+};
 
 pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec};
 pub use fixed_buf_pool::{Acquire as FixedBufAcquire, FixedSendBufPool, PooledBuf};
@@ -64,9 +66,9 @@ pub struct IODriver {
 /// A message received from another worker via MSG_RING.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerMessage {
-    /// Sender-defined tag (from the SQE `user_data`), e.g. the sender's id.
-    pub tag: u64,
-    /// Payload (from the CQE `res`).
+    /// Caller-defined 62-bit payload (from the SQE `user_data`).
+    pub payload: u64,
+    /// Secondary payload (from the CQE `res`).
     pub data: i32,
 }
 
@@ -361,9 +363,9 @@ impl IODriver {
                 }
                 self.sending_buffers.release(index);
             }
-            Event::PeerMessage(cqe_data) => {
-                // `index` is the sender's tag, not a slab index.
-                self.deliver_peer_message(index as u64, cqe_data.result);
+            Event::PeerMessage { payload, data } => {
+                // No slab entry — `index` is unused for peer messages.
+                self.deliver_peer_message(payload, data);
             }
         }
     }
@@ -469,8 +471,8 @@ impl IODriver {
 
     /// Post a MSG_RING to peer `thread_id`: looks up its ring fd in the shared
     /// table and pushes the op onto our own ring. The peer receives a
-    /// [`PeerMessage`] carrying `tag` and `data` in its inbox.
-    pub fn send_to_peer(&self, thread_id: usize, data: i32, tag: u64) {
+    /// [`PeerMessage`] carrying `payload` and `data` in its inbox.
+    pub fn send_to_peer(&self, thread_id: usize, data: i32, payload: u64) {
         let peers = self
             .peers
             .as_ref()
@@ -479,7 +481,7 @@ impl IODriver {
             .slot(thread_id)
             .ring_fd()
             .expect("peer ring fd unpublished; the startup barrier guarantees it");
-        self.push_msg_ring(fd, data, UserData::peer_message(tag).into_bits());
+        self.push_msg_ring(fd, data, PeerUserData::message(payload).into_bits());
     }
 
     /// Low-level MSG_RING: deliver a CQE on `target_ring_fd` carrying `data`
@@ -492,9 +494,9 @@ impl IODriver {
     }
 
     /// Push an inbound peer message and wake any pending `recv_from_peer`.
-    fn deliver_peer_message(&self, tag: u64, data: i32) {
+    fn deliver_peer_message(&self, payload: u64, data: i32) {
         let inbox = unsafe { &mut *self.peer_inbox.get() };
-        inbox.queue.push_back(PeerMessage { tag, data });
+        inbox.queue.push_back(PeerMessage { payload, data });
         if let Some(waker) = inbox.waker.take() {
             waker.wake();
         }

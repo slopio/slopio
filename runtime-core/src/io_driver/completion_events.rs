@@ -1,7 +1,10 @@
 use io_uring::cqueue::{self, Entry, buffer_select};
 use libc::ECANCELED;
 
-use super::{MultiOpState, MultishotCompletionEvent, OpMetadata, SingleOpState, UserData};
+use super::{
+    IO_MULTI, IO_SEND_BUFFER, MultiOpState, MultishotCompletionEvent, OpMetadata, PeerUserData,
+    SingleOpState, TAG_IGNORED, TAG_IO, TAG_MESSAGE, UserData,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CQEData {
@@ -23,9 +26,9 @@ pub(crate) enum Event {
     SingleShot(CQEData),
     MultiShot(CQEData),
     SendBuffer(i32),
-    /// MSG_RING delivered by another worker. Carries no slab entry — the
-    /// `slab_index` field holds the sender's tag and `result` the payload.
-    PeerMessage(CQEData),
+    /// MSG_RING delivered by another worker. Carries no slab entry: `payload`
+    /// is the 62-bit `user_data` field and `data` the CQE `res`.
+    PeerMessage { payload: u64, data: i32 },
 }
 
 #[derive(Debug)]
@@ -36,33 +39,38 @@ pub(crate) struct CompletionEvent {
 
 impl CompletionEvent {
     pub fn from_entry(entry: Entry) -> Option<Self> {
-        let ud = UserData::from_bits(entry.user_data());
-
-        if ud.ignored() {
-            return None;
+        let raw = entry.user_data();
+        match UserData::from_bits(raw).tag() {
+            TAG_IGNORED => None,
+            TAG_MESSAGE => {
+                // No slab entry: the low 62 bits are a caller-defined payload.
+                let payload = PeerUserData::from_bits(raw).payload();
+                Some(CompletionEvent {
+                    slab_index: 0,
+                    event: Event::PeerMessage {
+                        payload,
+                        data: entry.result(),
+                    },
+                })
+            }
+            TAG_IO => {
+                let ud = UserData::from_bits(raw);
+                let data = CQEData::from(entry);
+                let event = match ud.io_kind() {
+                    IO_SEND_BUFFER => Event::SendBuffer(data.result),
+                    IO_MULTI => Event::MultiShot(data),
+                    _ /* IO_SINGLE */ => Event::SingleShot(data),
+                };
+                Some(CompletionEvent {
+                    slab_index: ud.index() as usize,
+                    event,
+                })
+            }
+            _ /* reserved */ => {
+                debug_assert!(false, "unknown user_data tag");
+                None
+            }
         }
-
-        let data = CQEData::from(entry);
-        let slab_index = ud.index() as usize;
-
-        // Peer messages carry no slab entry: `slab_index` is the sender's
-        // tag, not an index. Route them out before slab classification.
-        if ud.peer_msg() {
-            return Some(CompletionEvent {
-                slab_index,
-                event: Event::PeerMessage(data),
-            });
-        }
-
-        let event = if ud.send_buffer() {
-            Event::SendBuffer(data.result)
-        } else if ud.multi_op() {
-            Event::MultiShot(data)
-        } else {
-            Event::SingleShot(data)
-        };
-
-        Some(CompletionEvent { slab_index, event })
     }
 }
 
