@@ -5,13 +5,14 @@ use std::pin::pin;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use crate::io_driver::{BufRingSet, IODriver};
+use crate::io_driver::{BufRingSet, IODriver, PeerMessage};
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
 use crate::{runtime, scoped_thread_local};
 
 pub mod eventfd;
 pub mod join;
+pub mod peers;
 pub mod processes;
 pub mod repeat;
 pub mod retry;
@@ -73,6 +74,17 @@ impl RuntimeInner {
         }
     }
 
+    /// Like [`with_thread_id`](Self::with_thread_id), but attaches the shared
+    /// peer table to this worker's io_driver so it can MSG_RING its peers.
+    pub fn with_peers(thread_id: usize, peers: std::sync::Arc<peers::PeerTable>) -> Self {
+        let mut rt = Self {
+            thread_id,
+            ..Default::default()
+        };
+        rt.io_driver.attach_peers(peers);
+        rt
+    }
+
     pub fn block_on<R: BufRingSet, F: Future>(
         self,
         f: F,
@@ -87,6 +99,10 @@ impl RuntimeInner {
             TASK_LIST.set(&self.tasks, || {
                 TIME_DRIVER.set(&self.time_driver, || {
                     let run: Box<dyn FnOnce() -> F::Output + '_> = Box::new(|| {
+                        // Publish our ring fd into the shared peer table and
+                        // rendezvous, so every worker's fd is visible before
+                        // any task runs. No-op under `main_thread` (no peers).
+                        self.io_driver.publish_self(self.thread_id);
                         if let Some(fd) = event_fd {
                             runtime::eventfd::register_eventfd_read(fd);
                         }
@@ -176,6 +192,35 @@ pub fn main_thread<F: Future>(f: F) -> F::Output {
 
 pub fn now() -> std::time::SystemTime {
     TIME_DRIVER.with(|d| d.now())
+}
+
+/// Send a message to peer `thread_id` from the current worker via MSG_RING.
+/// The peer receives a [`PeerMessage`] carrying `tag` and `data`. Only valid
+/// inside a multi-threaded runtime.
+pub fn send_to_peer(thread_id: usize, data: i32, tag: u64) {
+    crate::io_driver::IO_DRIVER.with(|d| d.send_to_peer(thread_id, data, tag));
+}
+
+/// Await the next message sent to this worker by a peer.
+pub fn recv_from_peer() -> RecvFromPeer {
+    RecvFromPeer { _priv: () }
+}
+
+/// Future returned by [`recv_from_peer`]. Resolves to the next inbound
+/// [`PeerMessage`], parking on the worker's inbox until one arrives.
+pub struct RecvFromPeer {
+    _priv: (),
+}
+
+impl std::future::Future for RecvFromPeer {
+    type Output = PeerMessage;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<PeerMessage> {
+        crate::io_driver::IO_DRIVER.with(|d| d.poll_peer_inbox(cx.waker()))
+    }
 }
 
 pub fn spawn<F: Future + 'static>(f: F) -> Handle<F::Output> {

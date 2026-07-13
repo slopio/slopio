@@ -1,11 +1,14 @@
 use std::{
     cell::{Cell, UnsafeCell},
     collections::VecDeque,
-    os::fd::RawFd,
+    os::fd::{AsRawFd, RawFd},
     rc::Rc,
+    sync::Arc,
     task::Waker,
     time::Duration,
 };
+
+use crate::runtime::peers::PeerTable;
 
 use crate::{
     io_driver::{
@@ -51,6 +54,26 @@ pub struct IODriver {
     /// when a cancelled completion delivers a buffer at a point where the
     /// originating spec type has already been erased.
     recyclers: UnsafeCell<smallvec::SmallVec<[(u16, fn(u16)); 4]>>,
+    /// Shared, process-wide registry of every worker's ring/event fds. Used
+    /// to target MSG_RING at peer rings. `None` under `main_thread`.
+    peers: Option<Arc<PeerTable>>,
+    /// Messages delivered by peers via MSG_RING, drained by `recv_from_peer`.
+    peer_inbox: UnsafeCell<PeerInbox>,
+}
+
+/// A message received from another worker via MSG_RING.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerMessage {
+    /// Sender-defined tag (from the SQE `user_data`), e.g. the sender's id.
+    pub tag: u64,
+    /// Payload (from the CQE `res`).
+    pub data: i32,
+}
+
+#[derive(Default)]
+struct PeerInbox {
+    queue: VecDeque<PeerMessage>,
+    waker: Option<Waker>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -338,6 +361,10 @@ impl IODriver {
                 }
                 self.sending_buffers.release(index);
             }
+            Event::PeerMessage(cqe_data) => {
+                // `index` is the sender's tag, not a slab index.
+                self.deliver_peer_message(index as u64, cqe_data.result);
+            }
         }
     }
 
@@ -417,6 +444,73 @@ impl IODriver {
     pub fn push_anon_op(&self, entry: squeue::Entry) {
         let ring_inner = unsafe { &mut *self.ring.get() };
         ring_inner.add(&entry)
+    }
+
+    /// Attach the shared peer table to this driver. Called once at
+    /// construction by [`RuntimeInner::with_peers`](crate::runtime::RuntimeInner::with_peers).
+    pub fn attach_peers(&mut self, peers: Arc<PeerTable>) {
+        self.peers = Some(peers);
+    }
+
+    /// Raw fd of the underlying io_uring, usable as a MSG_RING target from
+    /// other threads (the fd table is shared process-wide).
+    pub fn ring_fd(&self) -> RawFd {
+        let ring = unsafe { &*self.ring.get() };
+        ring.inner.as_raw_fd()
+    }
+
+    /// Publish our ring fd into the shared table, then rendezvous on the
+    /// startup barrier. No-op when no peer table is attached (`main_thread`).
+    pub fn publish_self(&self, thread_id: usize) {
+        if let Some(peers) = &self.peers {
+            peers.publish(thread_id, self.ring_fd());
+        }
+    }
+
+    /// Post a MSG_RING to peer `thread_id`: looks up its ring fd in the shared
+    /// table and pushes the op onto our own ring. The peer receives a
+    /// [`PeerMessage`] carrying `tag` and `data` in its inbox.
+    pub fn send_to_peer(&self, thread_id: usize, data: i32, tag: u64) {
+        let peers = self
+            .peers
+            .as_ref()
+            .expect("send_to_peer called outside a multi-threaded runtime");
+        let fd = peers
+            .slot(thread_id)
+            .ring_fd()
+            .expect("peer ring fd unpublished; the startup barrier guarantees it");
+        self.push_msg_ring(fd, data, UserData::peer_message(tag).into_bits());
+    }
+
+    /// Low-level MSG_RING: deliver a CQE on `target_ring_fd` carrying `data`
+    /// and `peer_user_data`. Our own send completion is marked ignored.
+    fn push_msg_ring(&self, target_ring_fd: RawFd, data: i32, peer_user_data: u64) {
+        let entry = opcode::MsgRingData::new(Fd(target_ring_fd), data, peer_user_data, None)
+            .build()
+            .user_data(UserData::ignored_only().into_bits());
+        self.push_anon_op(entry);
+    }
+
+    /// Push an inbound peer message and wake any pending `recv_from_peer`.
+    fn deliver_peer_message(&self, tag: u64, data: i32) {
+        let inbox = unsafe { &mut *self.peer_inbox.get() };
+        inbox.queue.push_back(PeerMessage { tag, data });
+        if let Some(waker) = inbox.waker.take() {
+            waker.wake();
+        }
+    }
+
+    /// Poll for the next peer message. Returns `Ready` immediately if the
+    /// inbox is non-empty; otherwise registers `waker` and returns `Pending`.
+    pub fn poll_peer_inbox(&self, waker: &Waker) -> std::task::Poll<PeerMessage> {
+        let inbox = unsafe { &mut *self.peer_inbox.get() };
+        match inbox.queue.pop_front() {
+            Some(msg) => std::task::Poll::Ready(msg),
+            None => {
+                inbox.waker = Some(waker.clone());
+                std::task::Poll::Pending
+            }
+        }
     }
 
     pub fn push_op(&self, mut entry: squeue::Entry) -> OneshotToken {

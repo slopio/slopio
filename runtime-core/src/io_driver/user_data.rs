@@ -5,18 +5,20 @@ use bitfield_struct::bitfield;
 /// each CQE back to its slab entry and op kind.
 ///
 /// Layout (LSB → MSB):
-///   bits  0..=60 : slab index
-///   bit       61 : `send_buffer`
-///   bit       62 : `ignored`   (drop this CQE on arrival)
-///   bit       63 : `multi_op`
+///   bits  0..=59 : slab index (or, for `peer_msg`, a sender-chosen tag)
+///   bit       60 : `send_buffer`
+///   bit       61 : `ignored`   (drop this CQE on arrival)
+///   bit       62 : `multi_op`
+///   bit       63 : `peer_msg`  (MSG_RING from another worker — route to inbox)
 #[bitfield(u64)]
 #[derive(PartialEq, Eq)]
 pub(crate) struct UserData {
-    #[bits(61)]
+    #[bits(60)]
     pub index: u64,
     pub send_buffer: bool,
     pub ignored: bool,
     pub multi_op: bool,
+    pub peer_msg: bool,
 }
 
 impl UserData {
@@ -27,6 +29,7 @@ impl UserData {
         .with_send_buffer(true)
         .with_ignored(true)
         .with_multi_op(true)
+        .with_peer_msg(true)
         .into_bits();
 
     #[inline]
@@ -61,6 +64,15 @@ impl UserData {
     #[inline]
     pub const fn ignored_only() -> Self {
         Self::new().with_ignored(true)
+    }
+
+    /// A MSG_RING sent to a peer worker. `tag` is sender-defined (e.g. the
+    /// sender's own thread id, or a logical channel) and is delivered
+    /// verbatim in the peer's inbox — it is *not* a slab index.
+    #[inline]
+    pub const fn peer_message(tag: u64) -> Self {
+        Self::check(tag);
+        Self::new().with_peer_msg(true).with_index(tag)
     }
 
     /// Echo of an existing `user_data` with IGNORED set. Used as the

@@ -175,13 +175,19 @@ where
 
     setup_sig_handling(fds.clone());
 
+    // Shared registry: eventfds filled now, ring fds published by each worker
+    // once it has created its ring (barrier sized to num_threads).
+    let peers = std::sync::Arc::new(
+        runtime_core::runtime::peers::PeerTable::new(&fds),
+    );
+
     let f = std::sync::Arc::new(f);
     let handles = fds
         .iter()
         .zip(0..num_threads)
         .map(|(sig_handler_fd, n)| {
             let f = f.clone();
-            spawn_worker_on::<R, F>(n, num_threads, f, *sig_handler_fd)
+            spawn_worker_on::<R, F>(n, num_threads, f, *sig_handler_fd, peers.clone())
         })
         .collect::<Vec<_>>();
 
@@ -220,6 +226,7 @@ fn spawn_worker_on<R, F>(
     num_threads: usize,
     f: std::sync::Arc<F>,
     event_fd: i32,
+    peers: std::sync::Arc<runtime_core::runtime::peers::PeerTable>,
 ) -> JoinHandle<()>
 where
     R: BufRingSet + 'static,
@@ -232,7 +239,7 @@ where
             num_threads,
         };
         let fut = f(ctx);
-        let rt = RuntimeInner::with_thread_id(n);
+        let rt = RuntimeInner::with_peers(n, peers);
         #[cfg(feature = "otlp")]
         return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
             use crate::otlp_collector::OtlpCollector;

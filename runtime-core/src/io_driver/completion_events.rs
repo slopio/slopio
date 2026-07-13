@@ -23,6 +23,9 @@ pub(crate) enum Event {
     SingleShot(CQEData),
     MultiShot(CQEData),
     SendBuffer(i32),
+    /// MSG_RING delivered by another worker. Carries no slab entry — the
+    /// `slab_index` field holds the sender's tag and `result` the payload.
+    PeerMessage(CQEData),
 }
 
 #[derive(Debug)]
@@ -41,6 +44,15 @@ impl CompletionEvent {
 
         let data = CQEData::from(entry);
         let slab_index = ud.index() as usize;
+
+        // Peer messages carry no slab entry: `slab_index` is the sender's
+        // tag, not an index. Route them out before slab classification.
+        if ud.peer_msg() {
+            return Some(CompletionEvent {
+                slab_index,
+                event: Event::PeerMessage(data),
+            });
+        }
 
         let event = if ud.send_buffer() {
             Event::SendBuffer(data.result)
