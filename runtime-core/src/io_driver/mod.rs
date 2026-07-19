@@ -30,13 +30,17 @@ use slab::Slab;
 mod buf_ring;
 mod completion_events;
 mod fixed_buf_pool;
+mod message;
 pub mod operations;
 mod sending_buffers;
 mod user_data;
 
 pub(crate) use user_data::{
-    IO_MULTI, IO_SEND_BUFFER, PeerUserData, TAG_IGNORED, TAG_IO, TAG_MESSAGE, UserData,
+    BoxedUserData, IO_MULTI, IO_SEND_BUFFER, PeerUserData, TAG_BOXED, TAG_IGNORED, TAG_IO,
+    TAG_MESSAGE, UserData,
 };
+
+pub use message::{ErasedMessage, Header, Message};
 
 pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec};
 pub use fixed_buf_pool::{Acquire as FixedBufAcquire, FixedSendBufPool, PooledBuf};
@@ -61,6 +65,9 @@ pub struct IODriver {
     peers: Option<Arc<PeerTable>>,
     /// Messages delivered by peers via MSG_RING, drained by `recv_from_peer`.
     peer_inbox: UnsafeCell<PeerInbox>,
+    /// Heap-allocated, type-erased messages delivered by peers via MSG_RING,
+    /// drained by `recv_boxed_from_peer`.
+    boxed_inbox: UnsafeCell<BoxedInbox>,
 }
 
 /// A message received from another worker via MSG_RING.
@@ -75,6 +82,12 @@ pub struct PeerMessage {
 #[derive(Default)]
 struct PeerInbox {
     queue: VecDeque<PeerMessage>,
+    waker: Option<Waker>,
+}
+
+#[derive(Default)]
+struct BoxedInbox {
+    queue: VecDeque<ErasedMessage>,
     waker: Option<Waker>,
 }
 
@@ -367,6 +380,10 @@ impl IODriver {
                 // No slab entry — `index` is unused for peer messages.
                 self.deliver_peer_message(payload, data);
             }
+            Event::BoxedMessage(msg) => {
+                // No slab entry — we own the erased allocation and hand it off.
+                self.deliver_boxed_message(msg);
+            }
         }
     }
 
@@ -484,6 +501,21 @@ impl IODriver {
         self.push_msg_ring(fd, data, PeerUserData::message(payload).into_bits());
     }
 
+    /// Post a heap-allocated, type-erased message to peer `thread_id`. Ownership
+    /// of `msg` passes to the wire: the pointer travels in the receiver's
+    /// `user_data`, and the peer reclaims the allocation in its boxed inbox.
+    pub fn send_boxed_to_peer(&self, thread_id: usize, msg: ErasedMessage) {
+        let peers = self
+            .peers
+            .as_ref()
+            .expect("send_boxed_to_peer called outside a multi-threaded runtime");
+        let fd = peers
+            .slot(thread_id)
+            .ring_fd()
+            .expect("peer ring fd unpublished; the startup barrier guarantees it");
+        self.push_msg_ring(fd, 0, BoxedUserData::boxed(msg.into_raw()).into_bits());
+    }
+
     /// Low-level MSG_RING: deliver a CQE on `target_ring_fd` carrying `data`
     /// and `peer_user_data`. Our own send completion is marked ignored.
     fn push_msg_ring(&self, target_ring_fd: RawFd, data: i32, peer_user_data: u64) {
@@ -506,6 +538,28 @@ impl IODriver {
     /// inbox is non-empty; otherwise registers `waker` and returns `Pending`.
     pub fn poll_peer_inbox(&self, waker: &Waker) -> std::task::Poll<PeerMessage> {
         let inbox = unsafe { &mut *self.peer_inbox.get() };
+        match inbox.queue.pop_front() {
+            Some(msg) => std::task::Poll::Ready(msg),
+            None => {
+                inbox.waker = Some(waker.clone());
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// Push an inbound boxed message and wake any pending `recv_boxed_from_peer`.
+    fn deliver_boxed_message(&self, msg: ErasedMessage) {
+        let inbox = unsafe { &mut *self.boxed_inbox.get() };
+        inbox.queue.push_back(msg);
+        if let Some(waker) = inbox.waker.take() {
+            waker.wake();
+        }
+    }
+
+    /// Poll for the next boxed message. Returns `Ready` immediately if the
+    /// inbox is non-empty; otherwise registers `waker` and returns `Pending`.
+    pub fn poll_boxed_inbox(&self, waker: &Waker) -> std::task::Poll<ErasedMessage> {
+        let inbox = unsafe { &mut *self.boxed_inbox.get() };
         match inbox.queue.pop_front() {
             Some(msg) => std::task::Poll::Ready(msg),
             None => {

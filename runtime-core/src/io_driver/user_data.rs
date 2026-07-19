@@ -5,7 +5,10 @@ use bitfield_struct::bitfield;
 pub(crate) const TAG_IO: u8 = 0b00;
 pub(crate) const TAG_MESSAGE: u8 = 0b01;
 pub(crate) const TAG_IGNORED: u8 = 0b10;
-// 0b11 reserved for future use.
+/// The 62-bit payload is a thin pointer to a heap `Message<T>` (see
+/// [`BoxedUserData`]). A user-space pointer fits in 62 bits, leaving the tag
+/// bits free.
+pub(crate) const TAG_BOXED: u8 = 0b11;
 
 /// Kind of an IO op, in bits 60..=61 — only meaningful when the tag is
 /// [`TAG_IO`]. `Single` MUST stay 0 (see the invariant on [`UserData`]).
@@ -128,5 +131,28 @@ impl PeerUserData {
             "peer message payload exceeds the 62-bit field",
         );
         Self::new().with_payload(payload).with_tag(TAG_MESSAGE)
+    }
+}
+
+/// The boxed-message view, selected when the tag is [`TAG_BOXED`]. The low 62
+/// bits are a thin pointer to a heap `Message<T>`; the top 2 bits hold the tag.
+#[bitfield(u64)]
+#[derive(PartialEq, Eq)]
+pub(crate) struct BoxedUserData {
+    #[bits(62)]
+    pub ptr: u64,
+    #[bits(2)]
+    pub tag: u8,
+}
+
+impl BoxedUserData {
+    #[inline]
+    #[track_caller]
+    pub const fn boxed(ptr: u64) -> Self {
+        assert!(
+            ptr <= PeerUserData::MAX_PAYLOAD,
+            "message pointer does not fit in the 62-bit field",
+        );
+        Self::new().with_ptr(ptr).with_tag(TAG_BOXED)
     }
 }

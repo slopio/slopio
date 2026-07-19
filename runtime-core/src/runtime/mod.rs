@@ -5,7 +5,7 @@ use std::pin::pin;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use crate::io_driver::{BufRingSet, IODriver, PeerMessage};
+use crate::io_driver::{BufRingSet, IODriver, Message, PeerMessage};
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
 use crate::{runtime, scoped_thread_local};
@@ -204,6 +204,50 @@ pub fn send_to_peer(thread_id: usize, data: i32, payload: u64) {
 /// Await the next message sent to this worker by a peer.
 pub fn recv_from_peer() -> RecvFromPeer {
     RecvFromPeer { _priv: () }
+}
+
+/// Send a heap-allocated, typed message to peer `thread_id`. The payload is
+/// boxed, its type erased for the crossing, and recovered by the receiver via
+/// [`ErasedMessage::downcast`]. Only valid inside a multi-threaded runtime.
+pub fn send_boxed_to_peer<T: Send + 'static>(thread_id: usize, payload: T) {
+    let erased = Message::new(payload).erase();
+    crate::io_driver::IO_DRIVER.with(|d| d.send_boxed_to_peer(thread_id, erased));
+}
+
+/// Await the next boxed message sent to this worker by a peer, recovering it as
+/// `Box<Message<T>>`.
+///
+/// # Safety
+/// The next message in this worker's inbox must actually be a `Message<T>`.
+/// The receiver is responsible for knowing which type it is sent — there is no
+/// runtime tag to check against. Reinterpreting a different payload as `T` is
+/// undefined behaviour.
+pub unsafe fn recv_boxed_from_peer<T: 'static>() -> RecvBoxedFromPeer<T> {
+    RecvBoxedFromPeer {
+        _marker: std::marker::PhantomData,
+    }
+}
+
+/// Future returned by [`recv_boxed_from_peer`]. Resolves to the next inbound
+/// message cast to `Box<Message<T>>`, parking on the worker's boxed inbox until
+/// one arrives.
+pub struct RecvBoxedFromPeer<T> {
+    _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: 'static> std::future::Future for RecvBoxedFromPeer<T> {
+    type Output = Box<Message<T>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<Box<Message<T>>> {
+        crate::io_driver::IO_DRIVER
+            .with(|d| d.poll_boxed_inbox(cx.waker()))
+            // SAFETY: forwarded from `recv_boxed_from_peer`'s contract — the
+            // caller guarantees the next message is a `Message<T>`.
+            .map(|erased| unsafe { erased.into_typed::<T>() })
+    }
 }
 
 /// Future returned by [`recv_from_peer`]. Resolves to the next inbound

@@ -2,8 +2,8 @@ use io_uring::cqueue::{self, Entry, buffer_select};
 use libc::ECANCELED;
 
 use super::{
-    IO_MULTI, IO_SEND_BUFFER, MultiOpState, MultishotCompletionEvent, OpMetadata, PeerUserData,
-    SingleOpState, TAG_IGNORED, TAG_IO, TAG_MESSAGE, UserData,
+    BoxedUserData, ErasedMessage, IO_MULTI, IO_SEND_BUFFER, MultiOpState, MultishotCompletionEvent,
+    OpMetadata, PeerUserData, SingleOpState, TAG_BOXED, TAG_IGNORED, TAG_IO, TAG_MESSAGE, UserData,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +29,9 @@ pub(crate) enum Event {
     /// MSG_RING delivered by another worker. Carries no slab entry: `payload`
     /// is the 62-bit `user_data` field and `data` the CQE `res`.
     PeerMessage { payload: u64, data: i32 },
+    /// A heap-allocated, type-erased message delivered by another worker. The
+    /// 62-bit `user_data` was a thin pointer; we own the allocation now.
+    BoxedMessage(ErasedMessage),
 }
 
 #[derive(Debug)]
@@ -51,6 +54,16 @@ impl CompletionEvent {
                         payload,
                         data: entry.result(),
                     },
+                })
+            }
+            TAG_BOXED => {
+                // The 62-bit field is a thin pointer to a heap `Message<T>`;
+                // reclaiming it here transfers ownership to the driver.
+                let ptr = BoxedUserData::from_bits(raw).ptr();
+                let erased = unsafe { ErasedMessage::from_raw(ptr) };
+                Some(CompletionEvent {
+                    slab_index: 0,
+                    event: Event::BoxedMessage(erased),
                 })
             }
             TAG_IO => {
