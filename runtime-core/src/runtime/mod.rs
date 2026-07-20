@@ -5,7 +5,7 @@ use std::pin::pin;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use crate::io_driver::{BufRingSet, IODriver, Message, PeerMessage};
+use crate::io_driver::{BufRingSet, Endpoint, Header, IODriver, Message, PeerMessage};
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
 use crate::{runtime, scoped_thread_local};
@@ -247,6 +247,83 @@ impl<T: 'static> std::future::Future for RecvBoxedFromPeer<T> {
             // SAFETY: forwarded from `recv_boxed_from_peer`'s contract — the
             // caller guarantees the next message is a `Message<T>`.
             .map(|erased| unsafe { erased.into_typed::<T>() })
+    }
+}
+
+/// Send a typed request to `peer` and await its reply.
+///
+/// Reserves a reply slot on this worker, stamps it into the request's
+/// `sender.slab`, and returns a future that resolves when the peer replies (via
+/// [`reply_boxed_to_peer`], which routes the reply straight back into that
+/// slot). Only valid inside a multi-threaded runtime.
+pub fn request_boxed_from_peer<Req: Send + 'static, Rep>(
+    peer: usize,
+    payload: Req,
+) -> RecvBoxedReply<Rep> {
+    let slot = crate::io_driver::IO_DRIVER.with(|d| {
+        let slot = d.reserve_reply_slot();
+        let header = Header::new(
+            Endpoint::with_slab(thread_id() as u16, slot),
+            Endpoint::new(peer as u16),
+        );
+        d.send_boxed_to_peer(peer, Message::with_header(header, payload).erase());
+        slot
+    });
+    RecvBoxedReply {
+        slot,
+        _marker: std::marker::PhantomData,
+    }
+}
+
+/// Reply to a request received via [`recv_boxed_from_peer`], routing `payload`
+/// back to the requester's reply slot.
+///
+/// `request_header` is the header of the received request (`msg.header`); its
+/// two ends are swapped so the reply lands in the slot the requester reserved.
+pub fn reply_boxed_to_peer<Rep: Send + 'static>(request_header: &Header, payload: Rep) {
+    let header = request_header.swapped();
+    let peer = header.receiver.thread as usize;
+    crate::io_driver::IO_DRIVER
+        .with(|d| d.send_boxed_to_peer(peer, Message::with_header(header, payload).erase()));
+}
+
+/// Future returned by [`request_boxed_from_peer`]. Resolves to the peer's reply
+/// as `Box<Message<Rep>>` once it lands in the reserved slot.
+///
+/// # Safety
+/// The peer must reply with a `Message<Rep>`. As with [`recv_boxed_from_peer`],
+/// there is no runtime type tag; reinterpreting a different payload as `Rep` is
+/// undefined behaviour. Dropping the future before the reply arrives releases
+/// the slot; a reply already delivered but not yet taken is freed on drop.
+pub struct RecvBoxedReply<Rep: 'static> {
+    slot: u32,
+    _marker: std::marker::PhantomData<fn() -> Rep>,
+}
+
+impl<Rep: 'static> std::future::Future for RecvBoxedReply<Rep> {
+    type Output = Box<Message<Rep>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<Box<Message<Rep>>> {
+        crate::io_driver::IO_DRIVER
+            .with(|d| d.poll_reply_slot(self.slot, cx.waker()))
+            // SAFETY: forwarded from `request_boxed_from_peer`'s contract — the
+            // peer replies with a `Message<Rep>`.
+            .map(|erased| unsafe { erased.into_typed::<Rep>() })
+    }
+}
+
+impl<Rep: 'static> Drop for RecvBoxedReply<Rep> {
+    fn drop(&mut self) {
+        // Release the slot. If a reply was delivered but never polled out, we
+        // now know its concrete type, so reclaim the allocation instead of
+        // leaking it.
+        if let Some(erased) = crate::io_driver::IO_DRIVER.with(|d| d.abandon_reply_slot(self.slot))
+        {
+            drop(unsafe { erased.into_typed::<Rep>() });
+        }
     }
 }
 

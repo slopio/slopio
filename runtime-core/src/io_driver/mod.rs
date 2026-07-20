@@ -40,7 +40,7 @@ pub(crate) use user_data::{
     TAG_MESSAGE, UserData,
 };
 
-pub use message::{ErasedMessage, Header, Message};
+pub use message::{Endpoint, ErasedMessage, Header, Message};
 
 pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec};
 pub use fixed_buf_pool::{Acquire as FixedBufAcquire, FixedSendBufPool, PooledBuf};
@@ -68,6 +68,20 @@ pub struct IODriver {
     /// Heap-allocated, type-erased messages delivered by peers via MSG_RING,
     /// drained by `recv_boxed_from_peer`.
     boxed_inbox: UnsafeCell<BoxedInbox>,
+    /// Slots this worker reserved for replies to requests it sent. A peer's
+    /// reply names its slot in `receiver.slab`; delivery routes it here and
+    /// wakes the awaiting future instead of the generic `boxed_inbox`.
+    reply_slab: UnsafeCell<Slab<ReplySlot>>,
+}
+
+/// A reserved slot awaiting the reply to a request this worker sent out. Its
+/// index rides in the request's `sender.slab` and comes back in the reply's
+/// `receiver.slab`.
+enum ReplySlot {
+    /// No reply yet; wake this waker (if any) when it lands.
+    Waiting(Option<Waker>),
+    /// The reply arrived and is parked here until the awaiting future takes it.
+    Delivered(ErasedMessage),
 }
 
 /// A message received from another worker via MSG_RING.
@@ -547,12 +561,80 @@ impl IODriver {
         }
     }
 
-    /// Push an inbound boxed message and wake any pending `recv_boxed_from_peer`.
+    /// Route an inbound boxed message. If it names an existing reply slot
+    /// (`receiver.slab`), hand it to that slot and wake the awaiting future;
+    /// otherwise fall back to the generic inbox drained by
+    /// `recv_boxed_from_peer`. A named-but-missing slot (the awaiter was
+    /// dropped) also falls back rather than leaking silently.
     fn deliver_boxed_message(&self, msg: ErasedMessage) {
+        if let Some(slab_index) = msg.header().receiver.slab {
+            let slab = unsafe { &mut *self.reply_slab.get() };
+            if let Some(slot) = slab.get_mut(slab_index as usize) {
+                match slot {
+                    ReplySlot::Waiting(waker) => {
+                        let waker = waker.take();
+                        *slot = ReplySlot::Delivered(msg);
+                        if let Some(waker) = waker {
+                            waker.wake();
+                        }
+                    }
+                    ReplySlot::Delivered(_) => {
+                        debug_assert!(false, "second reply delivered to one slot");
+                        self.push_boxed_inbox(msg);
+                    }
+                }
+                return;
+            }
+        }
+        self.push_boxed_inbox(msg);
+    }
+
+    /// Append a boxed message to the generic inbox and wake any pending
+    /// `recv_boxed_from_peer`.
+    fn push_boxed_inbox(&self, msg: ErasedMessage) {
         let inbox = unsafe { &mut *self.boxed_inbox.get() };
         inbox.queue.push_back(msg);
         if let Some(waker) = inbox.waker.take() {
             waker.wake();
+        }
+    }
+
+    /// Reserve a reply slot for a request about to go out. The returned index
+    /// is what the request carries in `sender.slab`; the peer echoes it back in
+    /// the reply's `receiver.slab`.
+    pub fn reserve_reply_slot(&self) -> u32 {
+        let slab = unsafe { &mut *self.reply_slab.get() };
+        let index = slab.insert(ReplySlot::Waiting(None));
+        index.try_into().expect("reply slab index exceeds u32")
+    }
+
+    /// Poll a reserved reply slot: `Ready` once the peer's reply has landed
+    /// (removing the slot), otherwise parks `waker` and returns `Pending`.
+    pub fn poll_reply_slot(&self, index: u32, waker: &Waker) -> std::task::Poll<ErasedMessage> {
+        let slab = unsafe { &mut *self.reply_slab.get() };
+        match slab.get_mut(index as usize) {
+            Some(ReplySlot::Delivered(_)) => {
+                let ReplySlot::Delivered(msg) = slab.remove(index as usize) else {
+                    unreachable!("slot was Delivered")
+                };
+                std::task::Poll::Ready(msg)
+            }
+            Some(slot @ ReplySlot::Waiting(_)) => {
+                *slot = ReplySlot::Waiting(Some(waker.clone()));
+                std::task::Poll::Pending
+            }
+            None => panic!("polled a reply slot that no longer exists"),
+        }
+    }
+
+    /// Release a reply slot whose awaiting future was dropped. Returns any
+    /// reply that had already been delivered but not yet taken, so the caller —
+    /// which knows the concrete type — can free it.
+    pub fn abandon_reply_slot(&self, index: u32) -> Option<ErasedMessage> {
+        let slab = unsafe { &mut *self.reply_slab.get() };
+        match slab.try_remove(index as usize) {
+            Some(ReplySlot::Delivered(msg)) => Some(msg),
+            _ => None,
         }
     }
 
