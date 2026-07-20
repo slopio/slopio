@@ -5,7 +5,9 @@ use std::pin::pin;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use crate::io_driver::{BufRingSet, Endpoint, Header, IODriver, Message, PeerMessage};
+use crate::io_driver::{
+    BufRingSet, Endpoint, ErasedMessage, Header, IODriver, Message, PeerMessage,
+};
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
 use crate::{runtime, scoped_thread_local};
@@ -317,14 +319,21 @@ impl<Rep: 'static> std::future::Future for RecvBoxedReply<Rep> {
 
 impl<Rep: 'static> Drop for RecvBoxedReply<Rep> {
     fn drop(&mut self) {
-        // Release the slot. If a reply was delivered but never polled out, we
-        // now know its concrete type, so reclaim the allocation instead of
-        // leaking it.
-        if let Some(erased) = crate::io_driver::IO_DRIVER.with(|d| d.abandon_reply_slot(self.slot))
-        {
-            drop(unsafe { erased.into_typed::<Rep>() });
-        }
+        // Don't free the slot outright — a reply may still be racing toward it.
+        // Hand `abandon_reply_slot` the type-recovering glue for `Rep`: if a
+        // reply was already delivered but never polled, it is freed now; if none
+        // has arrived, the slot is kept as `Cancelled` (glue stashed) so the
+        // late reply is freed when it lands, rather than leaking or mis-routing
+        // into a reused slot.
+        crate::io_driver::IO_DRIVER.with(|d| d.abandon_reply_slot(self.slot, drop_erased_as::<Rep>));
     }
+}
+
+/// Type-recovering drop glue for a reply that outlived its awaiter. Stashed in
+/// the `Cancelled` slot at drop time — the one place that still statically knows
+/// `Rep` — so the driver can free a reply it only holds as an [`ErasedMessage`].
+fn drop_erased_as<Rep: 'static>(erased: ErasedMessage) {
+    drop(unsafe { erased.into_typed::<Rep>() });
 }
 
 /// Future returned by [`recv_from_peer`]. Resolves to the next inbound

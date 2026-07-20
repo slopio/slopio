@@ -82,6 +82,12 @@ enum ReplySlot {
     Waiting(Option<Waker>),
     /// The reply arrived and is parked here until the awaiting future takes it.
     Delivered(ErasedMessage),
+    /// The awaiting future was dropped, but a reply may still be racing toward
+    /// this slot. The slot stays reserved — so its index is not handed to a new
+    /// request — until that late reply lands; the stored glue then frees the
+    /// reply. It is the only carrier of the concrete payload type, which the
+    /// driver otherwise cannot recover to drop the `Box`.
+    Cancelled(fn(ErasedMessage)),
 }
 
 /// A message received from another worker via MSG_RING.
@@ -578,6 +584,14 @@ impl IODriver {
                             waker.wake();
                         }
                     }
+                    ReplySlot::Cancelled(drop_glue) => {
+                        // The awaiter walked away and left this glue behind: free
+                        // the late reply in its concrete type and release the
+                        // slot, now safe to reuse.
+                        let drop_glue = *drop_glue;
+                        slab.remove(slab_index as usize);
+                        drop_glue(msg);
+                    }
                     ReplySlot::Delivered(_) => {
                         debug_assert!(false, "second reply delivered to one slot");
                         self.push_boxed_inbox(msg);
@@ -623,18 +637,38 @@ impl IODriver {
                 *slot = ReplySlot::Waiting(Some(waker.clone()));
                 std::task::Poll::Pending
             }
+            Some(ReplySlot::Cancelled(_)) => {
+                unreachable!("polled a reply slot after its future was cancelled")
+            }
             None => panic!("polled a reply slot that no longer exists"),
         }
     }
 
-    /// Release a reply slot whose awaiting future was dropped. Returns any
-    /// reply that had already been delivered but not yet taken, so the caller —
-    /// which knows the concrete type — can free it.
-    pub fn abandon_reply_slot(&self, index: u32) -> Option<ErasedMessage> {
+    /// Release a reply slot whose awaiting future was dropped.
+    ///
+    /// If a reply had already been delivered but never taken, free it now via
+    /// `drop_glue` (which knows the concrete type) and remove the slot. If no
+    /// reply has arrived yet, keep the slot reserved as `Cancelled`, stashing
+    /// `drop_glue` so the eventual late reply is freed — and the slot released —
+    /// in [`deliver_boxed_message`](Self::deliver_boxed_message). Holding the
+    /// slot occupied until then stops its index from being reused while a reply
+    /// is still in flight toward it.
+    pub fn abandon_reply_slot(&self, index: u32, drop_glue: fn(ErasedMessage)) {
         let slab = unsafe { &mut *self.reply_slab.get() };
-        match slab.try_remove(index as usize) {
-            Some(ReplySlot::Delivered(msg)) => Some(msg),
-            _ => None,
+        match slab.get_mut(index as usize) {
+            Some(ReplySlot::Delivered(_)) => {
+                let ReplySlot::Delivered(msg) = slab.remove(index as usize) else {
+                    unreachable!("slot was Delivered")
+                };
+                drop_glue(msg);
+            }
+            Some(slot @ ReplySlot::Waiting(_)) => {
+                *slot = ReplySlot::Cancelled(drop_glue);
+            }
+            Some(ReplySlot::Cancelled(_)) => {
+                debug_assert!(false, "reply slot abandoned twice");
+            }
+            None => {}
         }
     }
 
