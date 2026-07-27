@@ -1,6 +1,6 @@
 //! Sharing a single message allocation across the MSG_RING boundary.
 //!
-//! `send_arc_to_peer` transfers one strong reference rather than the whole
+//! `send_shared_to_peer` transfers one strong reference rather than the whole
 //! allocation, so the sender can keep reading the payload after it has crossed —
 //! and can fan the *same* allocation out to several peers without re-allocating
 //! per peer. Two properties are exercised here:
@@ -22,7 +22,7 @@ use std::time::Duration;
 use runtime::io_driver::Message;
 use runtime::runtime::select::{SelectResult, select};
 use runtime::runtime::time::Sleep;
-use runtime::runtime::{recv_boxed_from_peer, send_arc_to_peer, send_boxed_to_peer};
+use runtime::runtime::{recv_msg_from_peer, send_shared_to_peer, send_msg_to_peer};
 use runtime::thread_per_core;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,7 +45,7 @@ struct Ack {
 /// The next inbound message must be a `Message<T>` — guaranteed here by the
 /// fixed protocol between the workers.
 async unsafe fn recv_or_timeout<T: 'static>(who: &str) -> Arc<Message<T>> {
-    match select(unsafe { recv_boxed_from_peer::<T>() }, Sleep::during(TIMEOUT)).await {
+    match select(unsafe { recv_msg_from_peer::<T>() }, Sleep::during(TIMEOUT)).await {
         SelectResult::First(msg) => msg,
         SelectResult::Second(()) => panic!("{who}: timed out waiting for a message"),
     }
@@ -64,7 +64,7 @@ fn sender_keeps_access_to_a_shared_message() {
             match thread_id {
                 0 => {
                     let msg = Message::new(Shared { n: 42 });
-                    send_arc_to_peer(1, Arc::clone(&msg));
+                    send_shared_to_peer(1, Arc::clone(&msg));
 
                     // Held across the await, so worker 1's count includes it.
                     let ack = unsafe { recv_or_timeout::<Ack>("worker 0") }.await;
@@ -84,7 +84,7 @@ fn sender_keeps_access_to_a_shared_message() {
 
                     let strong = Arc::strong_count(&msg);
                     let unique = Arc::into_inner(msg).is_some();
-                    send_boxed_to_peer(0, Ack { strong, unique });
+                    send_msg_to_peer(0, Ack { strong, unique });
                 }
                 _ => {}
             }
@@ -106,7 +106,7 @@ fn fan_out_shares_one_allocation_across_peers() {
                 0 => {
                     let msg = Message::new(Shared { n: 7 });
                     for peer in 1..=2 {
-                        send_arc_to_peer(peer, Arc::clone(&msg));
+                        send_shared_to_peer(peer, Arc::clone(&msg));
                     }
                     for _ in 0..2 {
                         let ack = unsafe { recv_or_timeout::<Ack>("worker 0") }.await;
@@ -120,7 +120,7 @@ fn fan_out_shares_one_allocation_across_peers() {
 
                     let strong = Arc::strong_count(&msg);
                     let unique = Arc::into_inner(msg).is_some();
-                    send_boxed_to_peer(0, Ack { strong, unique });
+                    send_msg_to_peer(0, Ack { strong, unique });
                 }
                 _ => {}
             }
@@ -142,7 +142,7 @@ fn unshared_message_arrives_unique_and_is_takeable() {
                 0 => {
                     // No clone retained, so the crossing is a plain move: the
                     // receiver's `Arc` is unique and gives up its payload.
-                    send_boxed_to_peer(1, Shared { n: 1 });
+                    send_msg_to_peer(1, Shared { n: 1 });
                     let ack = unsafe { recv_or_timeout::<Ack>("worker 0") }.await;
                     assert_eq!(ack.payload.strong, 1);
                     assert!(ack.payload.unique, "unshared message should be takeable");
@@ -153,7 +153,7 @@ fn unshared_message_arrives_unique_and_is_takeable() {
                     let taken = Arc::into_inner(msg);
                     let unique = taken.is_some();
                     assert_eq!(taken.map(|m| m.payload), Some(Shared { n: 1 }));
-                    send_boxed_to_peer(0, Ack { strong, unique });
+                    send_msg_to_peer(0, Ack { strong, unique });
                 }
                 _ => {}
             }

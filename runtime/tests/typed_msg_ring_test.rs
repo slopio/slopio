@@ -1,7 +1,7 @@
 //! Ping-pong of heap-allocated messages between two workers.
 //!
-//! Worker 0 sends a boxed `Ping` to worker 1; worker 1 receives it *as* a
-//! `Ping` (it knows the protocol), replies with a boxed `Pong`, and worker 0
+//! Worker 0 sends a heap-allocated `Ping` to worker 1; worker 1 receives it *as* a
+//! `Ping` (it knows the protocol), replies with a `Pong`, and worker 0
 //! receives it *as* a `Pong`. This exercises the full round-trip: allocate on
 //! one worker, erase to a thin pointer, cross MSG_RING, and cast straight back
 //! on the other side — no runtime type tag, the receiver knows its type.
@@ -16,7 +16,7 @@ use std::time::Duration;
 use runtime::io_driver::Message;
 use runtime::runtime::select::{SelectResult, select};
 use runtime::runtime::time::Sleep;
-use runtime::runtime::{recv_boxed_from_peer, send_boxed_to_peer};
+use runtime::runtime::{recv_msg_from_peer, send_msg_to_peer};
 use runtime::thread_per_core;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,14 +37,14 @@ struct Pong {
 /// The next inbound message must be a `Message<T>` — guaranteed here by the
 /// fixed ping/pong protocol between the two workers.
 async unsafe fn recv_or_timeout<T: 'static>(who: &str) -> Arc<Message<T>> {
-    match select(unsafe { recv_boxed_from_peer::<T>() }, Sleep::during(TIMEOUT)).await {
+    match select(unsafe { recv_msg_from_peer::<T>() }, Sleep::during(TIMEOUT)).await {
         SelectResult::First(msg) => msg,
-        SelectResult::Second(()) => panic!("{who}: timed out waiting for a boxed message"),
+        SelectResult::Second(()) => panic!("{who}: timed out waiting for a message"),
     }
 }
 
 #[test]
-fn boxed_ping_pong_between_two_workers() {
+fn typed_ping_pong_between_two_workers() {
     thread_per_core(move |ctx| {
         let thread_id = ctx.thread_id;
         let num_threads = ctx.num_threads;
@@ -55,14 +55,14 @@ fn boxed_ping_pong_between_two_workers() {
             }
             match thread_id {
                 0 => {
-                    send_boxed_to_peer(1, Ping { n: 7 });
+                    send_msg_to_peer(1, Ping { n: 7 });
                     let reply = unsafe { recv_or_timeout::<Pong>("worker 0") }.await;
                     assert_eq!(reply.payload, Pong { n: 8 });
                 }
                 1 => {
                     let ping = unsafe { recv_or_timeout::<Ping>("worker 1") }.await;
                     assert_eq!(ping.payload, Ping { n: 7 });
-                    send_boxed_to_peer(0, Pong { n: ping.payload.n + 1 });
+                    send_msg_to_peer(0, Pong { n: ping.payload.n + 1 });
                 }
                 _ => {}
             }

@@ -36,8 +36,8 @@ mod sending_buffers;
 mod user_data;
 
 pub(crate) use user_data::{
-    BoxedUserData, IO_MULTI, IO_SEND_BUFFER, PeerUserData, TAG_BOXED, TAG_IGNORED, TAG_IO,
-    TAG_MESSAGE, UserData,
+    IO_MULTI, IO_SEND_BUFFER, MsgPtrUserData, PeerUserData, TAG_IGNORED, TAG_IO, TAG_MESSAGE,
+    TAG_MSG_PTR, UserData,
 };
 
 pub use message::{Endpoint, ErasedMessage, Header, Message};
@@ -66,11 +66,11 @@ pub struct IODriver {
     /// Messages delivered by peers via MSG_RING, drained by `recv_from_peer`.
     peer_inbox: UnsafeCell<PeerInbox>,
     /// Heap-allocated, type-erased messages delivered by peers via MSG_RING,
-    /// drained by `recv_boxed_from_peer`.
-    boxed_inbox: UnsafeCell<BoxedInbox>,
+    /// drained by `recv_msg_from_peer`.
+    msg_inbox: UnsafeCell<MsgInbox>,
     /// Slots this worker reserved for replies to requests it sent. A peer's
     /// reply names its slot in `receiver.slab`; delivery routes it here and
-    /// wakes the awaiting future instead of the generic `boxed_inbox`.
+    /// wakes the awaiting future instead of the generic `msg_inbox`.
     reply_slab: UnsafeCell<Slab<ReplySlot>>,
 }
 
@@ -106,7 +106,7 @@ struct PeerInbox {
 }
 
 #[derive(Default)]
-struct BoxedInbox {
+struct MsgInbox {
     queue: VecDeque<ErasedMessage>,
     waker: Option<Waker>,
 }
@@ -400,9 +400,9 @@ impl IODriver {
                 // No slab entry — `index` is unused for peer messages.
                 self.deliver_peer_message(payload, data);
             }
-            Event::BoxedMessage(msg) => {
+            Event::TypedMessage(msg) => {
                 // No slab entry — we own the erased allocation and hand it off.
-                self.deliver_boxed_message(msg);
+                self.route_msg(msg);
             }
         }
     }
@@ -524,18 +524,18 @@ impl IODriver {
     /// Post a heap-allocated, type-erased message to peer `thread_id`. The
     /// strong reference held by `msg` passes to the wire: the pointer travels in
     /// the receiver's `user_data`, and the peer reclaims that reference in its
-    /// boxed inbox. Whether it is the *last* reference depends on what the
+    /// message inbox. Whether it is the *last* reference depends on what the
     /// sender kept — see [`Message::erase`].
-    pub fn send_boxed_to_peer(&self, thread_id: usize, msg: ErasedMessage) {
+    pub fn send_erased_to_peer(&self, thread_id: usize, msg: ErasedMessage) {
         let peers = self
             .peers
             .as_ref()
-            .expect("send_boxed_to_peer called outside a multi-threaded runtime");
+            .expect("send_msg_to_peer called outside a multi-threaded runtime");
         let fd = peers
             .slot(thread_id)
             .ring_fd()
             .expect("peer ring fd unpublished; the startup barrier guarantees it");
-        self.push_msg_ring(fd, 0, BoxedUserData::boxed(msg.into_raw()).into_bits());
+        self.push_msg_ring(fd, 0, MsgPtrUserData::for_msg(msg.into_raw()).into_bits());
     }
 
     /// Low-level MSG_RING: deliver a CQE on `target_ring_fd` carrying `data`
@@ -569,12 +569,12 @@ impl IODriver {
         }
     }
 
-    /// Route an inbound boxed message. If it names an existing reply slot
+    /// Route an inbound typed message. If it names an existing reply slot
     /// (`receiver.slab`), hand it to that slot and wake the awaiting future;
     /// otherwise fall back to the generic inbox drained by
-    /// `recv_boxed_from_peer`. A named-but-missing slot (the awaiter was
+    /// `recv_msg_from_peer`. A named-but-missing slot (the awaiter was
     /// dropped) also falls back rather than leaking silently.
-    fn deliver_boxed_message(&self, msg: ErasedMessage) {
+    fn route_msg(&self, msg: ErasedMessage) {
         if let Some(slab_index) = msg.header().receiver.slab {
             let slab = unsafe { &mut *self.reply_slab.get() };
             if let Some(slot) = slab.get_mut(slab_index as usize) {
@@ -596,19 +596,19 @@ impl IODriver {
                     }
                     ReplySlot::Delivered(_) => {
                         debug_assert!(false, "second reply delivered to one slot");
-                        self.push_boxed_inbox(msg);
+                        self.push_msg_inbox(msg);
                     }
                 }
                 return;
             }
         }
-        self.push_boxed_inbox(msg);
+        self.push_msg_inbox(msg);
     }
 
-    /// Append a boxed message to the generic inbox and wake any pending
-    /// `recv_boxed_from_peer`.
-    fn push_boxed_inbox(&self, msg: ErasedMessage) {
-        let inbox = unsafe { &mut *self.boxed_inbox.get() };
+    /// Append a typed message to the generic inbox and wake any pending
+    /// `recv_msg_from_peer`.
+    fn push_msg_inbox(&self, msg: ErasedMessage) {
+        let inbox = unsafe { &mut *self.msg_inbox.get() };
         inbox.queue.push_back(msg);
         if let Some(waker) = inbox.waker.take() {
             waker.wake();
@@ -652,7 +652,7 @@ impl IODriver {
     /// `drop_glue` (which knows the concrete type) and remove the slot. If no
     /// reply has arrived yet, keep the slot reserved as `Cancelled`, stashing
     /// `drop_glue` so the eventual late reply is freed — and the slot released —
-    /// in [`deliver_boxed_message`](Self::deliver_boxed_message). Holding the
+    /// in [`route_msg`](Self::route_msg). Holding the
     /// slot occupied until then stops its index from being reused while a reply
     /// is still in flight toward it.
     pub fn abandon_reply_slot(&self, index: u32, drop_glue: fn(ErasedMessage)) {
@@ -674,10 +674,10 @@ impl IODriver {
         }
     }
 
-    /// Poll for the next boxed message. Returns `Ready` immediately if the
+    /// Poll for the next typed message. Returns `Ready` immediately if the
     /// inbox is non-empty; otherwise registers `waker` and returns `Pending`.
-    pub fn poll_boxed_inbox(&self, waker: &Waker) -> std::task::Poll<ErasedMessage> {
-        let inbox = unsafe { &mut *self.boxed_inbox.get() };
+    pub fn poll_msg_inbox(&self, waker: &Waker) -> std::task::Poll<ErasedMessage> {
+        let inbox = unsafe { &mut *self.msg_inbox.get() };
         match inbox.queue.pop_front() {
             Some(msg) => std::task::Poll::Ready(msg),
             None => {
