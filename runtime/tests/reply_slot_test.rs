@@ -65,7 +65,8 @@ fn request_reply_between_two_workers() {
             }
             match thread_id {
                 0 => {
-                    let pending = request_msg_from_peer::<Req, Rep>(1, Req { n: 7 });
+                    // SAFETY: worker 1 below answers this `Req` with a `Rep`.
+                    let pending = unsafe { request_msg_from_peer::<Req, Rep>(1, Req { n: 7 }) };
                     let reply = reply_or_timeout(pending, "worker 0").await;
                     assert_eq!(reply.payload, Rep { n: 8 });
                 }
@@ -132,12 +133,14 @@ fn cancelled_reply_future_frees_the_late_reply() {
                 0 => {
                     // R1: reserve a slot, send it, then drop the future →
                     // slot becomes `Cancelled` while the request is in flight.
-                    let f1 = request_msg_from_peer::<Req, DropRep>(1, Req { n: 1 });
+                    // SAFETY: worker 1 answers every `Req` with a `DropRep`.
+                    let f1 = unsafe { request_msg_from_peer::<Req, DropRep>(1, Req { n: 1 }) };
                     drop(f1);
 
                     // R2: its slot must differ from R1's (still occupied), and
                     // its reply must come back intact.
-                    let f2 = request_msg_from_peer::<Req, DropRep>(1, Req { n: 2 });
+                    // SAFETY: as above.
+                    let f2 = unsafe { request_msg_from_peer::<Req, DropRep>(1, Req { n: 2 }) };
                     let reply2 = reply_or_timeout(f2, "worker 0").await;
                     assert_eq!(
                         reply2.payload.n, 3,

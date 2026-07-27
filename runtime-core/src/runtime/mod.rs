@@ -286,9 +286,30 @@ impl<T: 'static> std::future::Future for RecvMsgFromPeer<T> {
 ///
 /// Reserves a reply slot on this worker, stamps it into the request's
 /// `sender.slab`, and returns a future that resolves when the peer replies (via
-/// [`reply_msg_to_peer`], which routes the reply straight back into that
-/// slot). Only valid inside a multi-threaded runtime.
-pub fn request_msg_from_peer<Req: Send + Sync + 'static, Rep>(
+/// [`reply_msg_to_peer`], which routes the reply straight back into that slot,
+/// bypassing the generic inbox). The request goes out immediately, not on first
+/// poll. Only valid inside a multi-threaded runtime.
+///
+/// There is no timeout and no error channel: if the peer never replies, the
+/// future stays `Pending` forever. Wrap it in [`select`](select::select) against
+/// a [`Sleep`](time::Sleep) if you need a deadline. Dropping the future early is
+/// safe — the slot stays reserved until any in-flight reply lands and is freed.
+///
+/// # Safety
+/// The peer must answer this request with a `Message<Rep>`. There is no runtime
+/// type tag: the returned future casts whatever lands in the reply slot straight
+/// to `Rep`, so a reply of any other type is undefined behaviour. Calling this
+/// asserts both halves of the protocol — that `peer` runs a handler for `Req`,
+/// and that the handler replies with exactly `Rep`.
+///
+/// Note the asymmetry this leaves: that assertion can be broken from *safe*
+/// code. The senders ([`send_msg_to_peer`], [`send_shared_to_peer`],
+/// [`reply_msg_to_peer`]) are all safe, and [`Header`] is publicly
+/// constructible, so nothing stops another worker from aiming a
+/// differently-typed message at this slot. Keeping that from happening is a
+/// whole-program invariant that this signature cannot enforce; the `unsafe`
+/// here marks where the cast is asserted, not where it can be violated.
+pub unsafe fn request_msg_from_peer<Req: Send + Sync + 'static, Rep>(
     peer: usize,
     payload: Req,
 ) -> RecvMsgReply<Rep> {
@@ -312,6 +333,23 @@ pub fn request_msg_from_peer<Req: Send + Sync + 'static, Rep>(
 ///
 /// `request_header` is the header of the received request (`msg.header`); its
 /// two ends are swapped so the reply lands in the slot the requester reserved.
+/// The destination worker is taken from the swapped header, which is why there
+/// is no `peer` argument.
+///
+/// This is the same wire operation as [`send_msg_to_peer`] — only the header
+/// differs. That matters in both directions:
+///
+/// - Answering with [`send_msg_to_peer`] instead zeroes the header, so the reply
+///   lands in the requester's *generic* inbox and its future never resolves. No
+///   error is reported; the `await` simply hangs.
+/// - Pass the header you received, never one you built. A forged
+///   `receiver.slab` aims the reply at an arbitrary slot on the target worker,
+///   whose awaiter will then cast it to *its* `Rep`. Likewise, `Rep` must be the
+///   type that requester declared — see the safety contract on
+///   [`request_msg_from_peer`], which this call is trusted to uphold.
+///
+/// Replying to a fire-and-forget message (one whose `sender.slab` is `None`) is
+/// harmless: the reply just falls through to the sender's generic inbox.
 pub fn reply_msg_to_peer<Rep: Send + Sync + 'static>(request_header: &Header, payload: Rep) {
     let header = request_header.swapped();
     let peer = header.receiver.thread as usize;
@@ -322,11 +360,14 @@ pub fn reply_msg_to_peer<Rep: Send + Sync + 'static>(request_header: &Header, pa
 /// Future returned by [`request_msg_from_peer`]. Resolves to the peer's reply
 /// as `Arc<Message<Rep>>` once it lands in the reserved slot.
 ///
-/// # Safety
-/// The peer must reply with a `Message<Rep>`. As with [`recv_msg_from_peer`],
-/// there is no runtime type tag; reinterpreting a different payload as `Rep` is
-/// undefined behaviour. Dropping the future before the reply arrives releases
-/// the slot; a reply already delivered but not yet taken is freed on drop.
+/// The cast to `Rep` rides on the contract asserted at [`request_msg_from_peer`];
+/// this type carries no check of its own.
+///
+/// Dropping it before the reply arrives does not release the slot outright — a
+/// reply may still be racing toward it. The slot is kept as `Cancelled` with
+/// type-recovering drop glue, so a late reply is freed when it lands rather than
+/// leaking or mis-routing into a reused slot. A reply already delivered but
+/// never taken is freed immediately on drop.
 pub struct RecvMsgReply<Rep: 'static> {
     slot: u32,
     _marker: std::marker::PhantomData<fn() -> Rep>,
