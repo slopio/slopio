@@ -9,6 +9,7 @@
 //! reply straight into that slot and wakes the awaiting future — the reply
 //! never touches worker 0's generic inbox.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -33,7 +34,7 @@ struct Rep {
 }
 
 /// Await a reply or fail loudly on timeout.
-async fn reply_or_timeout<T: 'static>(fut: RecvBoxedReply<T>, who: &str) -> Box<Message<T>> {
+async fn reply_or_timeout<T: 'static>(fut: RecvBoxedReply<T>, who: &str) -> Arc<Message<T>> {
     match select(fut, Sleep::during(TIMEOUT)).await {
         SelectResult::First(msg) => msg,
         SelectResult::Second(()) => panic!("{who}: timed out waiting for a reply"),
@@ -45,7 +46,7 @@ async fn reply_or_timeout<T: 'static>(fut: RecvBoxedReply<T>, who: &str) -> Box<
 /// # Safety
 /// The next inbound message must be a `Message<T>` — guaranteed here by the
 /// fixed request/reply protocol between the two workers.
-async unsafe fn recv_or_timeout<T: 'static>(who: &str) -> Box<Message<T>> {
+async unsafe fn recv_or_timeout<T: 'static>(who: &str) -> Arc<Message<T>> {
     match select(unsafe { recv_boxed_from_peer::<T>() }, Sleep::during(TIMEOUT)).await {
         SelectResult::First(msg) => msg,
         SelectResult::Second(()) => panic!("{who}: timed out waiting for a request"),

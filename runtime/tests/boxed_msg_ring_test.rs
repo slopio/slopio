@@ -10,6 +10,7 @@
 //! id >= 2 return. Each `recv` is guarded with a generous timeout so a missing
 //! wakeup fails loudly instead of hanging.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use runtime::io_driver::Message;
@@ -35,7 +36,7 @@ struct Pong {
 /// # Safety
 /// The next inbound message must be a `Message<T>` — guaranteed here by the
 /// fixed ping/pong protocol between the two workers.
-async unsafe fn recv_or_timeout<T: 'static>(who: &str) -> Box<Message<T>> {
+async unsafe fn recv_or_timeout<T: 'static>(who: &str) -> Arc<Message<T>> {
     match select(unsafe { recv_boxed_from_peer::<T>() }, Sleep::during(TIMEOUT)).await {
         SelectResult::First(msg) => msg,
         SelectResult::Second(()) => panic!("{who}: timed out waiting for a boxed message"),

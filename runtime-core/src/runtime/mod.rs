@@ -2,6 +2,7 @@ use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::pin::pin;
+use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
@@ -209,15 +210,44 @@ pub fn recv_from_peer() -> RecvFromPeer {
 }
 
 /// Send a heap-allocated, typed message to peer `thread_id`. The payload is
-/// boxed, its type erased for the crossing, and recovered by the receiver via
-/// [`ErasedMessage::downcast`]. Only valid inside a multi-threaded runtime.
-pub fn send_boxed_to_peer<T: Send + 'static>(thread_id: usize, payload: T) {
-    let erased = Message::new(payload).erase();
+/// allocated, its type erased for the crossing, and recovered by the receiver
+/// via [`recv_boxed_from_peer`]. Only valid inside a multi-threaded runtime.
+///
+/// This hands the whole allocation over: the sender keeps nothing, so the
+/// receiver's `Arc` is unique and `Arc::into_inner` gives it the payload
+/// outright. Use [`send_arc_to_peer`] to keep a handle on it instead.
+pub fn send_boxed_to_peer<T: Send + Sync + 'static>(thread_id: usize, payload: T) {
+    send_arc_to_peer(thread_id, Message::new(payload));
+}
+
+/// Send an already-allocated message to peer `thread_id`, consuming one strong
+/// reference.
+///
+/// This is the sharing form of [`send_boxed_to_peer`]: clone `msg` beforehand to
+/// keep reading the payload after it has crossed, or to fan the *same*
+/// allocation out to several peers without re-allocating per peer:
+///
+/// ```ignore
+/// let msg = Message::new(Config { .. });
+/// for peer in 1..n {
+///     send_arc_to_peer(peer, Arc::clone(&msg));
+/// }
+/// // `msg` is still readable here.
+/// ```
+///
+/// Every surviving clone means the receiver sees a non-unique `Arc` and can only
+/// read the payload, never take it.
+pub fn send_arc_to_peer<T: Send + Sync + 'static>(thread_id: usize, msg: Arc<Message<T>>) {
+    let erased = msg.erase();
     crate::io_driver::IO_DRIVER.with(|d| d.send_boxed_to_peer(thread_id, erased));
 }
 
 /// Await the next boxed message sent to this worker by a peer, recovering it as
-/// `Box<Message<T>>`.
+/// `Arc<Message<T>>`.
+///
+/// The `Arc` is unique — so `Arc::into_inner` yields the payload — only if the
+/// sender kept no clone (i.e. it used [`send_boxed_to_peer`] rather than
+/// [`send_arc_to_peer`] with a retained handle).
 ///
 /// # Safety
 /// The next message in this worker's inbox must actually be a `Message<T>`.
@@ -231,19 +261,19 @@ pub unsafe fn recv_boxed_from_peer<T: 'static>() -> RecvBoxedFromPeer<T> {
 }
 
 /// Future returned by [`recv_boxed_from_peer`]. Resolves to the next inbound
-/// message cast to `Box<Message<T>>`, parking on the worker's boxed inbox until
+/// message cast to `Arc<Message<T>>`, parking on the worker's boxed inbox until
 /// one arrives.
 pub struct RecvBoxedFromPeer<T> {
     _marker: std::marker::PhantomData<fn() -> T>,
 }
 
 impl<T: 'static> std::future::Future for RecvBoxedFromPeer<T> {
-    type Output = Box<Message<T>>;
+    type Output = Arc<Message<T>>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> std::task::Poll<Box<Message<T>>> {
+    ) -> std::task::Poll<Arc<Message<T>>> {
         crate::io_driver::IO_DRIVER
             .with(|d| d.poll_boxed_inbox(cx.waker()))
             // SAFETY: forwarded from `recv_boxed_from_peer`'s contract — the
@@ -258,7 +288,7 @@ impl<T: 'static> std::future::Future for RecvBoxedFromPeer<T> {
 /// `sender.slab`, and returns a future that resolves when the peer replies (via
 /// [`reply_boxed_to_peer`], which routes the reply straight back into that
 /// slot). Only valid inside a multi-threaded runtime.
-pub fn request_boxed_from_peer<Req: Send + 'static, Rep>(
+pub fn request_boxed_from_peer<Req: Send + Sync + 'static, Rep>(
     peer: usize,
     payload: Req,
 ) -> RecvBoxedReply<Rep> {
@@ -282,7 +312,7 @@ pub fn request_boxed_from_peer<Req: Send + 'static, Rep>(
 ///
 /// `request_header` is the header of the received request (`msg.header`); its
 /// two ends are swapped so the reply lands in the slot the requester reserved.
-pub fn reply_boxed_to_peer<Rep: Send + 'static>(request_header: &Header, payload: Rep) {
+pub fn reply_boxed_to_peer<Rep: Send + Sync + 'static>(request_header: &Header, payload: Rep) {
     let header = request_header.swapped();
     let peer = header.receiver.thread as usize;
     crate::io_driver::IO_DRIVER
@@ -290,7 +320,7 @@ pub fn reply_boxed_to_peer<Rep: Send + 'static>(request_header: &Header, payload
 }
 
 /// Future returned by [`request_boxed_from_peer`]. Resolves to the peer's reply
-/// as `Box<Message<Rep>>` once it lands in the reserved slot.
+/// as `Arc<Message<Rep>>` once it lands in the reserved slot.
 ///
 /// # Safety
 /// The peer must reply with a `Message<Rep>`. As with [`recv_boxed_from_peer`],
@@ -303,12 +333,12 @@ pub struct RecvBoxedReply<Rep: 'static> {
 }
 
 impl<Rep: 'static> std::future::Future for RecvBoxedReply<Rep> {
-    type Output = Box<Message<Rep>>;
+    type Output = Arc<Message<Rep>>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> std::task::Poll<Box<Message<Rep>>> {
+    ) -> std::task::Poll<Arc<Message<Rep>>> {
         crate::io_driver::IO_DRIVER
             .with(|d| d.poll_reply_slot(self.slot, cx.waker()))
             // SAFETY: forwarded from `request_boxed_from_peer`'s contract — the
@@ -331,7 +361,10 @@ impl<Rep: 'static> Drop for RecvBoxedReply<Rep> {
 
 /// Type-recovering drop glue for a reply that outlived its awaiter. Stashed in
 /// the `Cancelled` slot at drop time — the one place that still statically knows
-/// `Rep` — so the driver can free a reply it only holds as an [`ErasedMessage`].
+/// `Rep` — so the driver can release a reply it only holds as an
+/// [`ErasedMessage`]. Dropping the recovered `Arc` releases the strong reference
+/// the wire was carrying; the allocation itself only goes away if the sender
+/// kept no clone.
 fn drop_erased_as<Rep: 'static>(erased: ErasedMessage) {
     drop(unsafe { erased.into_typed::<Rep>() });
 }

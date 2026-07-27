@@ -84,9 +84,9 @@ enum ReplySlot {
     Delivered(ErasedMessage),
     /// The awaiting future was dropped, but a reply may still be racing toward
     /// this slot. The slot stays reserved — so its index is not handed to a new
-    /// request — until that late reply lands; the stored glue then frees the
+    /// request — until that late reply lands; the stored glue then releases the
     /// reply. It is the only carrier of the concrete payload type, which the
-    /// driver otherwise cannot recover to drop the `Box`.
+    /// driver otherwise cannot recover to drop the `Arc`.
     Cancelled(fn(ErasedMessage)),
 }
 
@@ -521,9 +521,11 @@ impl IODriver {
         self.push_msg_ring(fd, data, PeerUserData::message(payload).into_bits());
     }
 
-    /// Post a heap-allocated, type-erased message to peer `thread_id`. Ownership
-    /// of `msg` passes to the wire: the pointer travels in the receiver's
-    /// `user_data`, and the peer reclaims the allocation in its boxed inbox.
+    /// Post a heap-allocated, type-erased message to peer `thread_id`. The
+    /// strong reference held by `msg` passes to the wire: the pointer travels in
+    /// the receiver's `user_data`, and the peer reclaims that reference in its
+    /// boxed inbox. Whether it is the *last* reference depends on what the
+    /// sender kept — see [`Message::erase`].
     pub fn send_boxed_to_peer(&self, thread_id: usize, msg: ErasedMessage) {
         let peers = self
             .peers
