@@ -64,7 +64,10 @@ fn sender_keeps_access_to_a_shared_message() {
             match thread_id {
                 0 => {
                     let msg = Message::new(Shared { n: 42 });
-                    send_shared_to_peer(1, Arc::clone(&msg));
+                    // SAFETY: the retained clone means both workers hold a
+                    // `&Shared`; `Shared` is a plain `Sync` struct, so that is
+                    // sound, and neither side mutates it.
+                    unsafe { send_shared_to_peer(1, Arc::clone(&msg)) };
 
                     // Held across the await, so worker 1's count includes it.
                     let ack = unsafe { recv_or_timeout::<Ack>("worker 0") }.await;
@@ -106,7 +109,9 @@ fn fan_out_shares_one_allocation_across_peers() {
                 0 => {
                     let msg = Message::new(Shared { n: 7 });
                     for peer in 1..=2 {
-                        send_shared_to_peer(peer, Arc::clone(&msg));
+                        // SAFETY: as above — `Shared` is `Sync` and read-only
+                        // on every side, so fanning clones out is sound.
+                        unsafe { send_shared_to_peer(peer, Arc::clone(&msg)) };
                     }
                     for _ in 0..2 {
                         let ack = unsafe { recv_or_timeout::<Ack>("worker 0") }.await;

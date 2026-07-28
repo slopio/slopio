@@ -216,8 +216,15 @@ pub fn recv_from_peer() -> RecvFromPeer {
 /// This hands the whole allocation over: the sender keeps nothing, so the
 /// receiver's `Arc` is unique and `Arc::into_inner` gives it the payload
 /// outright. Use [`send_shared_to_peer`] to keep a handle on it instead.
-pub fn send_msg_to_peer<T: Send + Sync + 'static>(thread_id: usize, payload: T) {
-    send_shared_to_peer(thread_id, Message::new(payload));
+///
+/// Safe despite delegating to an `unsafe` sender: the `Arc` is allocated here
+/// and never escapes, so no clone can survive the crossing and the payload is
+/// owned by exactly one thread throughout.
+pub fn send_msg_to_peer<T: Send + 'static>(thread_id: usize, payload: T) {
+    // SAFETY: `Message::new` is the only holder of this `Arc` and it is moved
+    // straight into the send, so the receiver's reference is unique. No `&T`
+    // can exist on two threads at once, which is the whole contract below.
+    unsafe { send_shared_to_peer(thread_id, Message::new(payload)) };
 }
 
 /// Send an already-allocated message to peer `thread_id`, consuming one strong
@@ -228,16 +235,29 @@ pub fn send_msg_to_peer<T: Send + Sync + 'static>(thread_id: usize, payload: T) 
 /// allocation out to several peers without re-allocating per peer:
 ///
 /// ```ignore
-/// let msg = Message::new(Config { .. });
+/// let msg = Message::new(Config { .. });  // `Config: Sync`, so sharing is sound
 /// for peer in 1..n {
-///     send_shared_to_peer(peer, Arc::clone(&msg));
+///     unsafe { send_shared_to_peer(peer, Arc::clone(&msg)) };
 /// }
 /// // `msg` is still readable here.
 /// ```
 ///
 /// Every surviving clone means the receiver sees a non-unique `Arc` and can only
 /// read the payload, never take it.
-pub fn send_shared_to_peer<T: Send + Sync + 'static>(thread_id: usize, msg: Arc<Message<T>>) {
+///
+/// # Safety
+/// If any clone of `msg` outlives this call, the payload is genuinely shared:
+/// this thread and `thread_id` can hold a `&T` at the same time. The caller must
+/// ensure that is sound for `T` — which for a `T: Sync` payload it always is,
+/// and for a `!Sync` one means arranging the discipline by hand (no interior
+/// mutability touched while shared, a handoff protocol, or the caller's own
+/// locking).
+///
+/// The bound is `Send` alone precisely so that choice stays with the caller.
+/// Dropping every clone before calling — the plain move — discharges the
+/// contract outright: the receiver's `Arc` is unique and no `&T` ever exists on
+/// two threads at once. That case is what safe [`send_msg_to_peer`] wraps.
+pub unsafe fn send_shared_to_peer<T: Send + 'static>(thread_id: usize, msg: Arc<Message<T>>) {
     let erased = msg.erase();
     crate::io_driver::IO_DRIVER.with(|d| d.send_erased_to_peer(thread_id, erased));
 }
@@ -303,13 +323,14 @@ impl<T: 'static> std::future::Future for RecvMsgFromPeer<T> {
 /// and that the handler replies with exactly `Rep`.
 ///
 /// Note the asymmetry this leaves: that assertion can be broken from *safe*
-/// code. The senders ([`send_msg_to_peer`], [`send_shared_to_peer`],
-/// [`reply_msg_to_peer`]) are all safe, and [`Header`] is publicly
-/// constructible, so nothing stops another worker from aiming a
-/// differently-typed message at this slot. Keeping that from happening is a
+/// code. [`send_msg_to_peer`] and [`reply_msg_to_peer`] are safe, and [`Header`]
+/// is publicly constructible, so nothing stops another worker from aiming a
+/// differently-typed message at this slot. ([`send_shared_to_peer`] is `unsafe`,
+/// but for an unrelated reason — sharing a payload across threads, not routing.)
+/// Keeping that from happening is a
 /// whole-program invariant that this signature cannot enforce; the `unsafe`
 /// here marks where the cast is asserted, not where it can be violated.
-pub unsafe fn request_msg_from_peer<Req: Send + Sync + 'static, Rep>(
+pub unsafe fn request_msg_from_peer<Req: Send + 'static, Rep>(
     peer: usize,
     payload: Req,
 ) -> RecvMsgReply<Rep> {
@@ -350,7 +371,7 @@ pub unsafe fn request_msg_from_peer<Req: Send + Sync + 'static, Rep>(
 ///
 /// Replying to a fire-and-forget message (one whose `sender.slab` is `None`) is
 /// harmless: the reply just falls through to the sender's generic inbox.
-pub fn reply_msg_to_peer<Rep: Send + Sync + 'static>(request_header: &Header, payload: Rep) {
+pub fn reply_msg_to_peer<Rep: Send + 'static>(request_header: &Header, payload: Rep) {
     let header = request_header.swapped();
     let peer = header.receiver.thread as usize;
     crate::io_driver::IO_DRIVER

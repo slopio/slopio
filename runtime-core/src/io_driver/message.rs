@@ -88,7 +88,7 @@ impl<T> Message<T> {
     }
 }
 
-impl<T: Send + Sync + 'static> Message<T> {
+impl<T: Send + 'static> Message<T> {
     /// Consume one strong reference and hand it to the wire as a thin pointer.
     ///
     /// The reference is *transferred*, not duplicated: the caller keeps whatever
@@ -96,8 +96,12 @@ impl<T: Send + Sync + 'static> Message<T> {
     /// the one given up here. Clone before erasing to keep a handle on the
     /// payload, or to fan the same allocation out to several peers.
     ///
-    /// `Sync` is required because a surviving clone means both threads can hold
-    /// a `&T` at once — unlike the move-only path, the payload really is shared.
+    /// Only `Send` is required. Erasing with a clone still alive is what makes
+    /// two threads able to hold a `&T` at once, and that — not the crossing
+    /// itself — is what `T: Sync` would cover. The bound is deliberately not
+    /// imposed here: the move-only path never needs it, and a caller that does
+    /// share a `!Sync` payload is expected to arrange its own discipline around
+    /// it (interior-mutability-free data, a handoff protocol, its own locking).
     ///
     /// [`into_typed`]: ErasedMessage::into_typed
     pub fn erase(self: Arc<Self>) -> ErasedMessage {
