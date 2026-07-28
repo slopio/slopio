@@ -36,8 +36,8 @@ mod sending_buffers;
 mod user_data;
 
 pub(crate) use user_data::{
-    IO_MULTI, IO_SEND_BUFFER, MsgPtrUserData, PeerUserData, TAG_IGNORED, TAG_IO, TAG_MESSAGE,
-    TAG_MSG_PTR, UserData,
+    IO_MULTI, IO_REPLY_SIGNAL, IO_SEND_BUFFER, MsgPtrUserData, PeerUserData, TAG_IGNORED, TAG_IO,
+    TAG_MESSAGE, TAG_MSG_PTR, UserData,
 };
 
 pub use message::{Endpoint, ErasedMessage, Header, Message};
@@ -82,12 +82,18 @@ enum ReplySlot {
     Waiting(Option<Waker>),
     /// The reply arrived and is parked here until the awaiting future takes it.
     Delivered(ErasedMessage),
+    /// A pointer-free wakeup landed: the peer answered by naming this slot
+    /// instead of sending it a payload. Carries the CQE `res` as a status.
+    Signalled(i32),
     /// The awaiting future was dropped, but a reply may still be racing toward
     /// this slot. The slot stays reserved — so its index is not handed to a new
-    /// request — until that late reply lands; the stored glue then releases the
-    /// reply. It is the only carrier of the concrete payload type, which the
-    /// driver otherwise cannot recover to drop the `Arc`.
-    Cancelled(fn(ErasedMessage)),
+    /// request — until that late reply lands.
+    ///
+    /// `Some(glue)` for a message-kind request: it is the only carrier of the
+    /// concrete payload type, which the driver otherwise cannot recover to drop
+    /// the `Arc`. `None` for a signal-kind one — a wakeup owns nothing, so
+    /// absorbing it is just releasing the slot.
+    Cancelled(Option<fn(ErasedMessage)>),
 }
 
 /// A message received from another worker via MSG_RING.
@@ -404,6 +410,10 @@ impl IODriver {
                 // No slab entry — we own the erased allocation and hand it off.
                 self.route_msg(msg);
             }
+            Event::ReplySignal { status } => {
+                // `index` is the reply slot the peer named; nothing is owned.
+                self.route_signal(index as u32, status);
+            }
         }
     }
 
@@ -521,6 +531,25 @@ impl IODriver {
         self.push_msg_ring(fd, data, PeerUserData::message(payload).into_bits());
     }
 
+    /// Wake reply slot `slot` on peer `thread_id` without allocating anything:
+    /// the slot index travels in the `user_data` and `status` in the CQE `res`.
+    ///
+    /// The counterpart of [`send_erased_to_peer`](Self::send_erased_to_peer)
+    /// for a reply that carries no payload — because the requester already
+    /// holds it. Nothing is owned by the wire, so a wakeup aimed at a slot that
+    /// no longer exists is simply dropped.
+    pub fn send_signal_to_peer(&self, thread_id: usize, slot: u32, status: i32) {
+        let peers = self
+            .peers
+            .as_ref()
+            .expect("send_signal_to_peer called outside a multi-threaded runtime");
+        let fd = peers
+            .slot(thread_id)
+            .ring_fd()
+            .expect("peer ring fd unpublished; the startup barrier guarantees it");
+        self.push_msg_ring(fd, status, UserData::reply_signal(slot as u64).into_bits());
+    }
+
     /// Post a heap-allocated, type-erased message to peer `thread_id`. The
     /// strong reference held by `msg` passes to the wire: the pointer travels in
     /// the receiver's `user_data`, and the peer reclaims that reference in its
@@ -586,7 +615,7 @@ impl IODriver {
                             waker.wake();
                         }
                     }
-                    ReplySlot::Cancelled(drop_glue) => {
+                    ReplySlot::Cancelled(Some(drop_glue)) => {
                         // The awaiter walked away and left this glue behind: free
                         // the late reply in its concrete type and release the
                         // slot, now safe to reuse.
@@ -594,7 +623,13 @@ impl IODriver {
                         slab.remove(slab_index as usize);
                         drop_glue(msg);
                     }
-                    ReplySlot::Delivered(_) => {
+                    ReplySlot::Cancelled(None) => {
+                        // Signal-kind slot: no glue was stashed because a wakeup
+                        // owns nothing, so this message cannot be freed here.
+                        debug_assert!(false, "message delivered to a signal reply slot");
+                        self.push_msg_inbox(msg);
+                    }
+                    ReplySlot::Delivered(_) | ReplySlot::Signalled(_) => {
                         debug_assert!(false, "second reply delivered to one slot");
                         self.push_msg_inbox(msg);
                     }
@@ -603,6 +638,36 @@ impl IODriver {
             }
         }
         self.push_msg_inbox(msg);
+    }
+
+    /// Route an inbound pointer-free wakeup to the reply slot it names.
+    ///
+    /// There is no generic-inbox fallback, and there needs to be none: a wakeup
+    /// carries no payload, so a slot that is gone (or was never reserved) leaves
+    /// nothing to leak or misdeliver — dropping it is complete.
+    fn route_signal(&self, slot: u32, status: i32) {
+        let slab = unsafe { &mut *self.reply_slab.get() };
+        let Some(entry) = slab.get_mut(slot as usize) else {
+            return;
+        };
+        match entry {
+            ReplySlot::Waiting(waker) => {
+                let waker = waker.take();
+                *entry = ReplySlot::Signalled(status);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+            ReplySlot::Cancelled(_) => {
+                // The awaiter walked away; the slot was held only so its index
+                // could not be reused while this wakeup was in flight. Nothing
+                // is owned, so releasing it is all there is to do.
+                slab.remove(slot as usize);
+            }
+            ReplySlot::Delivered(_) | ReplySlot::Signalled(_) => {
+                debug_assert!(false, "second reply delivered to one slot");
+            }
+        }
     }
 
     /// Append a typed message to the generic inbox and wake any pending
@@ -639,6 +704,42 @@ impl IODriver {
                 *slot = ReplySlot::Waiting(Some(waker.clone()));
                 std::task::Poll::Pending
             }
+            Some(ReplySlot::Signalled(_)) => {
+                unreachable!("a signal answered a slot awaiting a message")
+            }
+            Some(ReplySlot::Cancelled(_)) => {
+                unreachable!("polled a reply slot after its future was cancelled")
+            }
+            None => panic!("polled a reply slot that no longer exists"),
+        }
+    }
+
+    /// Poll a reserved reply slot for a pointer-free wakeup: `Ready(status)`
+    /// once the peer has signalled it (removing the slot), otherwise parks
+    /// `waker` and returns `Pending`.
+    ///
+    /// The signal-kind counterpart of
+    /// [`poll_reply_slot`](Self::poll_reply_slot). A slot is answered one way or
+    /// the other for the whole of its life — which side it is on is fixed by the
+    /// requester's choice of API — so a message landing here is a protocol
+    /// error, and unlike the type cast it replaces, it is *caught* rather than
+    /// silently reinterpreted.
+    pub fn poll_reply_signal(&self, index: u32, waker: &Waker) -> std::task::Poll<i32> {
+        let slab = unsafe { &mut *self.reply_slab.get() };
+        match slab.get_mut(index as usize) {
+            Some(ReplySlot::Signalled(_)) => {
+                let ReplySlot::Signalled(status) = slab.remove(index as usize) else {
+                    unreachable!("slot was Signalled")
+                };
+                std::task::Poll::Ready(status)
+            }
+            Some(slot @ ReplySlot::Waiting(_)) => {
+                *slot = ReplySlot::Waiting(Some(waker.clone()));
+                std::task::Poll::Pending
+            }
+            Some(ReplySlot::Delivered(_)) => {
+                unreachable!("a message answered a slot awaiting a signal")
+            }
             Some(ReplySlot::Cancelled(_)) => {
                 unreachable!("polled a reply slot after its future was cancelled")
             }
@@ -665,7 +766,39 @@ impl IODriver {
                 drop_glue(msg);
             }
             Some(slot @ ReplySlot::Waiting(_)) => {
-                *slot = ReplySlot::Cancelled(drop_glue);
+                *slot = ReplySlot::Cancelled(Some(drop_glue));
+            }
+            Some(ReplySlot::Signalled(_)) => {
+                // Nothing to free: a wakeup owns nothing.
+                slab.remove(index as usize);
+            }
+            Some(ReplySlot::Cancelled(_)) => {
+                debug_assert!(false, "reply slot abandoned twice");
+            }
+            None => {}
+        }
+    }
+
+    /// Release a signal-kind reply slot whose awaiting future was dropped.
+    ///
+    /// The signal-kind counterpart of
+    /// [`abandon_reply_slot`](Self::abandon_reply_slot), and simpler for the
+    /// same reason throughout: a wakeup carries no allocation, so an already
+    /// delivered one is discarded by releasing the slot, and no drop glue has to
+    /// be stashed for a late one. The slot is still kept as `Cancelled` while a
+    /// wakeup may be racing toward it, so its index cannot be reused and resolve
+    /// somebody else's future.
+    pub fn abandon_signal_slot(&self, index: u32) {
+        let slab = unsafe { &mut *self.reply_slab.get() };
+        match slab.get_mut(index as usize) {
+            Some(ReplySlot::Signalled(_)) => {
+                slab.remove(index as usize);
+            }
+            Some(slot @ ReplySlot::Waiting(_)) => {
+                *slot = ReplySlot::Cancelled(None);
+            }
+            Some(ReplySlot::Delivered(_)) => {
+                debug_assert!(false, "message parked in a signal reply slot");
             }
             Some(ReplySlot::Cancelled(_)) => {
                 debug_assert!(false, "reply slot abandoned twice");

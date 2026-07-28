@@ -2,7 +2,7 @@ use io_uring::cqueue::{self, Entry, buffer_select};
 use libc::ECANCELED;
 
 use super::{
-    ErasedMessage, IO_MULTI, IO_SEND_BUFFER, MsgPtrUserData, MultiOpState,
+    ErasedMessage, IO_MULTI, IO_REPLY_SIGNAL, IO_SEND_BUFFER, MsgPtrUserData, MultiOpState,
     MultishotCompletionEvent, OpMetadata, PeerUserData, SingleOpState, TAG_IGNORED, TAG_IO,
     TAG_MESSAGE, TAG_MSG_PTR, UserData,
 };
@@ -33,6 +33,10 @@ pub(crate) enum Event {
     /// A heap-allocated, type-erased message delivered by another worker. The
     /// 62-bit `user_data` was a thin pointer; we own the allocation now.
     TypedMessage(ErasedMessage),
+    /// A pointer-free reply-slot wakeup from another worker: the peer answered
+    /// a request by naming our slot rather than sending it a payload. The slot
+    /// index rides in `slab_index`; `status` is the CQE `res`.
+    ReplySignal { status: i32 },
 }
 
 #[derive(Debug)]
@@ -73,6 +77,7 @@ impl CompletionEvent {
                 let event = match ud.io_kind() {
                     IO_SEND_BUFFER => Event::SendBuffer(data.result),
                     IO_MULTI => Event::MultiShot(data),
+                    IO_REPLY_SIGNAL => Event::ReplySignal { status: data.result },
                     _ /* IO_SINGLE */ => Event::SingleShot(data),
                 };
                 Some(CompletionEvent {

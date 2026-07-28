@@ -431,6 +431,91 @@ fn drop_erased_as<Rep: 'static>(erased: ErasedMessage) {
     drop(unsafe { erased.into_typed::<Rep>() });
 }
 
+/// Answer a request with a pointer-free wakeup instead of a message: nothing is
+/// allocated, and nothing crosses the ring but the slot index and `status`.
+///
+/// This serves the protocol where the requester still *holds* what it asked
+/// about — it shared the request rather than handing it over, so the answer has
+/// no payload to carry and only has to say "done". Note what that removes: with
+/// no pointer there is no transferred reference to reclaim and no cast to
+/// assert, so unlike [`reply_msg_to_peer`] this call is safe, and its
+/// counterpart [`ReplySignal`] carries no type contract at all.
+///
+/// `request_header` is the header of the received request; its two ends are
+/// swapped so the wakeup lands in the slot the requester reserved. The requester
+/// must be awaiting a [`ReplySignal`] and not a [`RecvMsgReply`] — a slot is
+/// answered one way for the whole of its life — and a request that reserved no
+/// slot (fire-and-forget, `sender.slab == None`) has nothing to wake, so the
+/// call does nothing.
+pub fn signal_reply_to_peer(request_header: &Header, status: i32) {
+    let header = request_header.swapped();
+    let Some(slot) = header.receiver.slab else {
+        return;
+    };
+    let peer = header.receiver.thread as usize;
+    crate::io_driver::IO_DRIVER.with(|d| d.send_signal_to_peer(peer, slot, status));
+}
+
+/// A reserved reply slot awaiting a pointer-free wakeup, resolving to the
+/// `status` the peer passed to [`signal_reply_to_peer`].
+///
+/// Unlike [`RecvMsgReply`], which [`request_msg_from_peer`] hands back already
+/// armed, this one is reserved *before* the request goes out: the caller needs
+/// the slot index to stamp into the header of a request it allocates and sends
+/// itself — typically with [`send_shared_to_peer`], keeping its own reference to
+/// the payload, which is what makes a payload-free answer possible at all.
+/// Reserve, read [`slot`](Self::slot), send, then await.
+///
+/// Dropping it before the wakeup arrives keeps the slot reserved as cancelled so
+/// its index cannot be reused while a wakeup is still racing toward it; the late
+/// wakeup releases it on arrival.
+pub struct ReplySignal {
+    slot: u32,
+    resolved: bool,
+}
+
+impl ReplySignal {
+    /// Reserve a slot on this worker for a peer to signal.
+    pub fn reserve() -> Self {
+        let slot = crate::io_driver::IO_DRIVER.with(|d| d.reserve_reply_slot());
+        ReplySignal {
+            slot,
+            resolved: false,
+        }
+    }
+
+    /// The reserved slot's index, to stamp into the outgoing request's
+    /// `sender.slab` so the peer knows what to wake.
+    #[inline]
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+}
+
+impl std::future::Future for ReplySignal {
+    type Output = i32;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<i32> {
+        let this = self.get_mut();
+        let polled =
+            crate::io_driver::IO_DRIVER.with(|d| d.poll_reply_signal(this.slot, cx.waker()));
+        if polled.is_ready() {
+            // `poll_reply_signal` removed the slot on the way out; remember it,
+            // so `drop` does not reach for an index the slab may have reused.
+            this.resolved = true;
+        }
+        polled
+    }
+}
+
+impl Drop for ReplySignal {
+    fn drop(&mut self) {
+        if !self.resolved {
+            crate::io_driver::IO_DRIVER.with(|d| d.abandon_signal_slot(self.slot));
+        }
+    }
+}
+
 /// Future returned by [`recv_from_peer`]. Resolves to the next inbound
 /// [`PeerMessage`], parking on the worker's inbox until one arrives.
 pub struct RecvFromPeer {
