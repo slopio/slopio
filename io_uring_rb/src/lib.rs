@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, marker::PhantomData, sync::atomic::Ordering};
+use std::{cell::UnsafeCell, marker::PhantomData, mem::MaybeUninit, sync::atomic::Ordering};
 
 pub mod buffer;
 mod buffer_pool;
@@ -54,20 +54,39 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
     }
 
     pub fn new(ring: &IoUring, flags: u16, buffer_group_id: u16) -> std::io::Result<Self> {
+        Self::build(buffer_group_id, |slice| unsafe {
+            ring.submitter().register_buf_ring_with_flags(
+                slice.as_ptr() as _,
+                RING_SIZE as _,
+                buffer_group_id,
+                flags,
+            )
+        })
+    }
+
+    /// The same ring, without publishing it to the kernel.
+    ///
+    /// Registration is the *only* thing a buffer ring needs a live io_uring
+    /// for: the ring itself and its buffer pool are ordinary anonymous
+    /// mappings, and every other operation — handing out pointers by `bid`,
+    /// recycling, the tail updates — is plain userspace memory traffic. Skip
+    /// the registration and the identical structure serves a simulated ring,
+    /// which reads the tail and fills buffers exactly as the kernel would.
+    pub fn new_unregistered(buffer_group_id: u16) -> std::io::Result<Self> {
+        Self::build(buffer_group_id, |_| Ok(()))
+    }
+
+    fn build(
+        buffer_group_id: u16,
+        register: impl FnOnce(&[MaybeUninit<BufRingEntry>]) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
         assert!(BUFFER_SIZE.is_power_of_two());
         assert!(RING_SIZE.is_power_of_two());
 
         let mut mmaped_ring: MmapedRing = MmapedRing::build(RING_SIZE as _)?;
         let slice = mmaped_ring.as_slice();
 
-        unsafe {
-            ring.submitter().register_buf_ring_with_flags(
-                slice.as_ptr() as _,
-                RING_SIZE as _,
-                buffer_group_id,
-                flags,
-            )?
-        };
+        register(slice)?;
 
         let bp = BufferPool::<BUFFER_SIZE, RING_SIZE>::new()?;
 

@@ -11,9 +11,7 @@
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
-use io_uring::IoUring;
-
-use crate::io_driver::IODriver;
+use crate::io_driver::{IODriver, RingHandle};
 
 /// A single provided-buffer ring known at compile time.
 ///
@@ -31,7 +29,7 @@ pub trait BufRingSpec: 'static + Sized {
 
     /// Build the underlying `RingBuffer` and stash it in this spec's
     /// per-thread cell. Called once per worker thread at runtime startup.
-    fn init(ring: &IoUring);
+    fn init(ring: RingHandle<'_>);
 
     /// Construct a typed `BorrowedBuffer<Self>` from a completion-event
     /// `(bid, len)` pair. The returned buffer recycles to this spec's ring
@@ -110,7 +108,7 @@ impl<S: BufRingSpec> Drop for BorrowedBuffer<S> {
 /// - tuples of arity 1..=12 of `BufRingSpec` — install several
 pub trait BufRingSet {
     /// Initialize every ring in this set against `ring` on the current thread.
-    fn init_all(ring: &IoUring);
+    fn init_all(ring: RingHandle<'_>);
 
     /// Register a `(bgid, recycle_fn)` entry for every ring in this set into
     /// `driver`'s cancel-fallback table. The driver uses this when a cancel
@@ -120,12 +118,12 @@ pub trait BufRingSet {
 }
 
 impl BufRingSet for () {
-    fn init_all(_: &IoUring) {}
+    fn init_all(_: RingHandle<'_>) {}
     fn register_fallbacks(_: &IODriver) {}
 }
 
 impl<A: BufRingSpec> BufRingSet for A {
-    fn init_all(ring: &IoUring) {
+    fn init_all(ring: RingHandle<'_>) {
         A::init(ring);
     }
     fn register_fallbacks(driver: &IODriver) {
@@ -136,7 +134,7 @@ impl<A: BufRingSpec> BufRingSet for A {
 macro_rules! impl_buf_ring_set_tuple {
     ( $( $t:ident ),+ $(,)? ) => {
         impl< $( $t: BufRingSpec ),+ > BufRingSet for ( $( $t, )+ ) {
-            fn init_all(ring: &IoUring) {
+            fn init_all(ring: RingHandle<'_>) {
                 $( <$t as BufRingSpec>::init(ring); )+
             }
             fn register_fallbacks(driver: &IODriver) {
@@ -200,11 +198,22 @@ macro_rules! define_buf_ring {
                 const BUFFER_SIZE: u32 = $bsize;
                 const RING_SIZE: u16 = $rsize;
 
-                fn init(ring: &$crate::__private::IoUring) {
+                fn init(ring: $crate::io_driver::RingHandle<'_>) {
                     RING.with(|cell| {
-                        let rb = <$crate::__private::RingBuffer<$bsize, $rsize>>::new(
-                            ring, 0, $bgid,
-                        )
+                        let rb = match ring {
+                            $crate::io_driver::RingHandle::Uring(ring) => {
+                                <$crate::__private::RingBuffer<$bsize, $rsize>>::new(
+                                    ring, 0, $bgid,
+                                )
+                            }
+                            // Registration is the only step that needs a kernel;
+                            // the mapping and its buffers are ordinary memory.
+                            $crate::io_driver::RingHandle::Simulated => {
+                                <$crate::__private::RingBuffer<$bsize, $rsize>>::new_unregistered(
+                                    $bgid,
+                                )
+                            }
+                        }
                         .expect("buf ring init failed");
                         if cell.set(rb).is_err() {
                             panic!(concat!(

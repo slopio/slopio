@@ -1,4 +1,4 @@
-use io_uring::cqueue::{self, Entry, buffer_select};
+use io_uring::cqueue::{self, buffer_select};
 use libc::ECANCELED;
 
 use super::{
@@ -11,15 +11,6 @@ use super::{
 pub(crate) struct CQEData {
     pub result: i32,
     pub flags: u32,
-}
-
-impl From<Entry> for CQEData {
-    fn from(entry: Entry) -> Self {
-        Self {
-            result: entry.result(),
-            flags: entry.flags(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -46,8 +37,13 @@ pub(crate) struct CompletionEvent {
 }
 
 impl CompletionEvent {
-    pub fn from_entry(entry: Entry) -> Option<Self> {
-        let raw = entry.user_data();
+    /// Decode one completion from the three fields a CQE carries.
+    ///
+    /// Takes the fields rather than an `io_uring::cqueue::Entry` because that
+    /// type has no public constructor: a simulated ring can post completions
+    /// only if the decoder accepts values, not kernel-built CQEs.
+    pub fn from_parts(user_data: u64, result: i32, flags: u32) -> Option<Self> {
+        let raw = user_data;
         match UserData::from_bits(raw).tag() {
             TAG_IGNORED => None,
             TAG_MESSAGE => {
@@ -57,7 +53,7 @@ impl CompletionEvent {
                     slab_index: 0,
                     event: Event::PeerMessage {
                         payload,
-                        data: entry.result(),
+                        data: result,
                     },
                 })
             }
@@ -73,7 +69,7 @@ impl CompletionEvent {
             }
             TAG_IO => {
                 let ud = UserData::from_bits(raw);
-                let data = CQEData::from(entry);
+                let data = CQEData { result, flags };
                 let event = match ud.io_kind() {
                     IO_SEND_BUFFER => Event::SendBuffer(data.result),
                     IO_MULTI => Event::MultiShot(data),

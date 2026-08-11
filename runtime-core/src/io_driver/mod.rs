@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use crate::deterministic_testing::FakeRing;
 use crate::runtime::peers::PeerTable;
 
 use crate::{
@@ -21,9 +22,7 @@ use crate::{
     scoped_thread_local,
 };
 use io_uring::{
-    IoUring,
-    cqueue::Entry,
-    opcode, squeue,
+    IoUring, opcode, squeue,
     types::{Fd, Timespec},
 };
 use slab::Slab;
@@ -121,15 +120,6 @@ struct MsgInbox {
 pub(crate) struct MultishotCompletionEvent {
     pub result: i32,
     pub flags: u32,
-}
-
-impl From<Entry> for MultishotCompletionEvent {
-    fn from(value: Entry) -> Self {
-        Self {
-            result: value.result(),
-            flags: value.flags(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -316,7 +306,7 @@ impl Default for Ring {
             .unwrap();
 
         Self {
-            inner: ring,
+            inner: RingBackend::Uring(ring),
             pending: 0,
             wakeup_timeout: Timespec::new(),
         }
@@ -427,7 +417,7 @@ impl IODriver {
     /// uses provided buffers is submitted.
     pub fn init_buf_rings<R: BufRingSet>(&self) {
         let ring_inner = unsafe { &*self.ring.get() };
-        R::init_all(&ring_inner.inner);
+        R::init_all(ring_inner.handle());
         R::register_fallbacks(self);
     }
 
@@ -441,14 +431,22 @@ impl IODriver {
     /// the registration's lifetime.
     pub unsafe fn register_fixed_buffers(&self, iovecs: &[libc::iovec]) -> std::io::Result<()> {
         let ring_inner = unsafe { &*self.ring.get() };
-        unsafe { ring_inner.inner.submitter().register_buffers(iovecs) }
+        match &ring_inner.inner {
+            RingBackend::Uring(ring) => unsafe { ring.submitter().register_buffers(iovecs) },
+            // Nothing to tell: a simulated ring reads the same memory the
+            // caller already owns, registered or not.
+            RingBackend::Fake(_) => Ok(()),
+        }
     }
 
     /// Tell the kernel to drop its references to the previously-registered
     /// fixed buffer set. Safe to call without a prior registration.
     pub fn unregister_fixed_buffers(&self) -> std::io::Result<()> {
         let ring_inner = unsafe { &*self.ring.get() };
-        ring_inner.inner.submitter().unregister_buffers()
+        match &ring_inner.inner {
+            RingBackend::Uring(ring) => ring.submitter().unregister_buffers(),
+            RingBackend::Fake(_) => Ok(()),
+        }
     }
 
     pub(crate) fn register_recycler(&self, bgid: u16, f: fn(u16)) {
@@ -505,7 +503,10 @@ impl IODriver {
     /// other threads (the fd table is shared process-wide).
     pub fn ring_fd(&self) -> RawFd {
         let ring = unsafe { &*self.ring.get() };
-        ring.inner.as_raw_fd()
+        match &ring.inner {
+            RingBackend::Uring(ring) => ring.as_raw_fd(),
+            RingBackend::Fake(ring) => ring.ring_fd(),
+        }
     }
 
     /// Publish our ring fd into the shared table, then rendezvous on the
@@ -932,32 +933,59 @@ impl IODriver {
     pub(crate) fn submit(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
-        match ring.inner.submit() {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                panic!("io_uring submit failed: {:?}", e);
-            }
+        match &mut ring.inner {
+            RingBackend::Uring(ring) => match ring.submit() {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    panic!("io_uring submit failed: {:?}", e);
+                }
+            },
+            RingBackend::Fake(ring) => ring.submit(),
         }
     }
 
     pub(crate) fn submit_and_wait(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
-        match ring.inner.submit_and_wait(1) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                panic!("io_uring submit_and_wait failed: {:?}", e);
-            }
+        match &mut ring.inner {
+            RingBackend::Uring(ring) => match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    panic!("io_uring submit_and_wait failed: {:?}", e);
+                }
+            },
+            RingBackend::Fake(ring) => ring.submit_and_wait(),
         }
     }
 
     pub(crate) fn process_completion_queue(&self) {
         let ring = unsafe { &mut *self.ring.get() };
-        for c_event in ring.inner.completion() {
-            if let Some(completion_event) = CompletionEvent::from_entry(c_event) {
-                self.process_cqe(completion_event);
+        match &mut ring.inner {
+            RingBackend::Uring(ring) => {
+                for c_event in ring.completion() {
+                    let decoded = CompletionEvent::from_parts(
+                        c_event.user_data(),
+                        c_event.result(),
+                        c_event.flags(),
+                    );
+                    if let Some(completion_event) = decoded {
+                        self.process_cqe(completion_event);
+                    }
+                }
+            }
+            RingBackend::Fake(ring) => {
+                while let Some(c_event) = ring.pop_completion() {
+                    let decoded = CompletionEvent::from_parts(
+                        c_event.user_data,
+                        c_event.result,
+                        c_event.flags,
+                    );
+                    if let Some(completion_event) = decoded {
+                        self.process_cqe(completion_event);
+                    }
+                }
             }
         }
     }
@@ -1307,16 +1335,46 @@ impl MultishotSlab {
 }
 
 struct Ring {
-    inner: IoUring,
+    inner: RingBackend,
     pending: u32,
     wakeup_timeout: Timespec,
 }
 
+/// Where submissions go and completions come from.
+///
+/// An enum rather than a type parameter on purpose: the set is closed — a real
+/// io_uring and a simulated one — and the driver is reached through a scoped
+/// thread-local of concrete type, which a type parameter would force onto every
+/// operation future and all 82 of the driver's call sites. The cost is one
+/// perfectly-predicted branch per submission.
+enum RingBackend {
+    Uring(IoUring),
+    Fake(FakeRing),
+}
+
+/// What a provided-buffer ring needs in order to install itself. Registration
+/// is the only step involving the kernel, so the simulated case carries nothing.
+#[derive(Clone, Copy)]
+pub enum RingHandle<'a> {
+    Uring(&'a IoUring),
+    Simulated,
+}
+
 impl Ring {
     pub(crate) fn add(&mut self, entry: &squeue::Entry) {
-        unsafe {
-            self.inner.submission().push(entry).unwrap();
+        match &mut self.inner {
+            RingBackend::Uring(ring) => unsafe {
+                ring.submission().push(entry).unwrap();
+            },
+            RingBackend::Fake(ring) => ring.add(entry),
         }
         self.pending += 1;
+    }
+
+    fn handle(&self) -> RingHandle<'_> {
+        match &self.inner {
+            RingBackend::Uring(ring) => RingHandle::Uring(ring),
+            RingBackend::Fake(_) => RingHandle::Simulated,
+        }
     }
 }

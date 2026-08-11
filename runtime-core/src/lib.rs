@@ -1,4 +1,5 @@
 pub mod channels;
+pub mod deterministic_testing;
 pub mod io_driver;
 pub mod macros;
 pub mod net;
