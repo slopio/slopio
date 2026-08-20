@@ -9,7 +9,7 @@
 //! Declaring it up front rather than driving the ring live is what keeps a test
 //! reproducible. A task that calls into the ring while the runtime runs makes
 //! the result depend on when that task happened to be polled, which is exactly
-//! the nondeterminism the seed exists to remove.
+//! the nondeterminism a simulator exists to remove.
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
@@ -78,7 +78,7 @@ pub enum ConnectEvent {
 /// A scripted response, and optionally when it lands.
 pub struct Scripted {
     pub outcome: Outcome,
-    /// When it completes, or `None` to draw a latency from the seed.
+    /// When it completes, or `None` for as soon as the ring is next waited on.
     pub delay: Option<Duration>,
 }
 
@@ -98,13 +98,12 @@ fn scheduled(outcome: Outcome, delay: Duration) -> Scripted {
 macro_rules! timed {
     ($event:ty) => {
         impl $event {
-            /// Pin the completion to `delay` after submission, instead of
-            /// a latency drawn from the seed.
+            /// Hold the completion back by `delay` instead of letting it land
+            /// as soon as the ring is next waited on.
             ///
-            /// Use it to reproduce one specific interleaving — "the read lands
-            /// before the write" — rather than to search for one. A pinned op
-            /// no longer varies with the seed, so pinning everything turns the
-            /// fuzzing off.
+            /// This is how a test states an interleaving — "the read lands
+            /// after the write", "this one times out". Nothing else invents a
+            /// latency, so an op nobody delays completes in submission order.
             ///
             /// Any duration: the timeline is ordered by due time, so nothing
             /// constrains it to a grid.

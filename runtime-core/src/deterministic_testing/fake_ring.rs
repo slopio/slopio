@@ -1,16 +1,15 @@
 //! A submission/completion ring that never reaches the kernel.
 //!
-//! Submissions are decoded into [`Sqe`] and scheduled on a seeded [`Timeline`],
-//! so
-//! a seed fixes the completion order exactly — orderings that are rare and
-//! unreproducible against a real kernel become things a test asks for.
+//! Submissions are decoded into [`Sqe`] and scheduled on a [`Timeline`]. The
+//! ring invents nothing: an op completes as soon as the ring is next waited on,
+//! unless a scenario entry held it back. Orderings that are rare and
+//! unreproducible against a real kernel are therefore things a test states.
 
 use std::cell::{RefCell, RefMut};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::time::Duration;
 
 use io_uring::{opcode, squeue};
 
@@ -474,7 +473,7 @@ impl FakeRingHandle {
     ///
     /// Declared before the runtime starts. The op is scheduled the moment it is
     /// submitted, so nothing has to touch the ring while it runs — which is
-    /// what keeps the interleaving a function of the seed alone.
+    /// what keeps the interleaving a property of the scenario alone.
     pub fn on_read(&self, fd: RawFd, event: impl Into<Scripted>) {
         self.script(Trigger::Read(fd), event.into());
     }
@@ -532,44 +531,12 @@ impl FakeRingHandle {
 ///
 /// As a pair on purpose: the two share one state, and a way to mint a second
 /// ring against the same handle would give the driver two views of one timeline.
+#[derive(Default)]
 pub struct FakeRingBuilder {
-    latency_step: Duration,
-    seed: u64,
     virtual_time: bool,
 }
 
-impl Default for FakeRingBuilder {
-    fn default() -> Self {
-        Self {
-            latency_step: Duration::from_millis(10),
-            seed: 0,
-            virtual_time: false,
-        }
-    }
-}
-
 impl FakeRingBuilder {
-    /// Latency granularity for ops the scenario did not time: each draws a
-    /// multiple of `step`, from one up to [`LATENCY_CLASSES`].
-    ///
-    /// Below roughly 1ms the classes stop being distinguishable — the sleep
-    /// enforcing them has a floor around 50µs, so neighbouring ones drain as
-    /// one batch. Same completion order, but fewer wakeups for tasks to
-    /// interleave between.
-    ///
-    /// [`LATENCY_CLASSES`]: super::timeline::LATENCY_CLASSES
-    pub fn latency_step(mut self, step: Duration) -> Self {
-        self.latency_step = step;
-        self
-    }
-
-    /// Seed for the drawn latencies. The same seed reproduces an interleaving
-    /// exactly; sweeping seeds explores the ordering space.
-    pub fn seed(mut self, seed: u64) -> Self {
-        self.seed = seed;
-        self
-    }
-
     /// Run on a clock the ring advances instead of the OS one, so nothing ever
     /// sleeps.
     ///
@@ -594,7 +561,7 @@ impl FakeRingBuilder {
         };
         let handle = FakeRingHandle(Rc::new(RefCell::new(FakeRingState {
             staged: Vec::new(),
-            timeline: Timeline::new(self.latency_step.as_nanos() as Nanos, self.seed),
+            timeline: Timeline::default(),
             waiting: Vec::new(),
             wakeup: None,
             scenario: Scenario::default(),

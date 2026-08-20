@@ -1,23 +1,15 @@
 //! When submitted ops complete.
 //!
 //! Ops are held in one list ordered by due time, so the front is always the
-//! next event. An op that a scenario timed gets exactly the delay it asked for;
-//! anything else draws one of a few latency classes from the seed, which is
-//! what makes completion order vary from seed to seed.
-//!
-//! Those two are deliberately separate concerns — the ordering *structure* and
-//! the latency *policy*. Merging them, as a fixed-slot wheel does, caps the
-//! delays a scenario can express at the number of slots.
+//! next event. An op the scenario timed gets exactly the delay it asked for.
+//! Everything else is due at once, so submission order is completion order
+//! unless a test says otherwise — nothing here invents a latency.
 
 use std::time::Duration;
 
 use super::clock::Nanos;
 use super::fds::FdKind;
 use super::sqe::Sqe;
-
-/// How many latencies an unscripted op can draw. Purely a policy knob: the
-/// list below holds any due time, whatever this is set to.
-pub const LATENCY_CLASSES: u64 = 6;
 
 /// What an op completes with.
 #[derive(Clone, Debug)]
@@ -61,59 +53,32 @@ struct Scheduled {
     due: Nanos,
 }
 
-/// SplitMix64: short, good quality, no dependency, and entirely determined by
-/// its seed — the only property that matters here.
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// A latency class, `1..=LATENCY_CLASSES`.
-    fn latency_class(&mut self) -> u64 {
-        self.next_u64() % LATENCY_CLASSES + 1
-    }
-}
-
 pub struct Timeline {
     /// Ordered by `(due, seq)`, so the front is the next event. Kept sorted on
     /// insert rather than searched: the front is read on every blocking wait.
     scheduled: Vec<Scheduled>,
-    step: Nanos,
-    rng: SplitMix64,
+}
+
+impl Default for Timeline {
+    fn default() -> Self {
+        Self {
+            scheduled: Vec::new(),
+        }
+    }
 }
 
 impl Timeline {
-    pub fn new(step: Nanos, seed: u64) -> Self {
-        Self {
-            scheduled: Vec::new(),
-            step,
-            rng: SplitMix64(seed),
-        }
-    }
-
-    /// Enqueue an op due `now` plus its latency — `delay` if the scenario timed
-    /// one, a drawn class otherwise.
+    /// Enqueue an op, due `now` plus whatever delay the scenario asked for.
+    ///
+    /// No delay means due immediately: an op nobody timed completes as soon as
+    /// the ring is next waited on, so a batch comes back in submission order.
+    /// Drawing a latency here would invent a schedule the test did not ask for.
     ///
     /// `now` is passed in rather than read here so a whole submission batch
-    /// shares one instant. Reading the clock per op would give two ops of the
-    /// same latency due times a few nanoseconds apart, making their order an
-    /// artefact of how long the submit loop took instead of the `seq` tie-break
-    /// below.
-    ///
-    /// A latency is drawn either way. Skipping the draw when a delay is given
-    /// would take a different number of values from the stream, so adding one
-    /// `after(..)` to a test would reshuffle every later op.
+    /// shares one instant, and `seq` decides the order within it rather than
+    /// however long the submit loop took.
     pub fn schedule(&mut self, pending: Pending, delay: Option<Duration>, now: Nanos) {
-        let drawn = self.step * self.rng.latency_class();
-        let after = delay.map_or(drawn, |d| {
-            Nanos::try_from(d.as_nanos()).unwrap_or(Nanos::MAX)
-        });
+        let after = delay.map_or(0, |d| Nanos::try_from(d.as_nanos()).unwrap_or(Nanos::MAX));
         let due = now.saturating_add(after);
 
         let key = (due, pending.seq);

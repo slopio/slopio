@@ -4,8 +4,8 @@
 //! at compile time by offset asserts, but those only prove `Sqe` matches
 //! itself — what matters is that it matches what the `io-uring` builders write,
 //! so these submit real entries and read the fields back. And completion order
-//! comes from a seed, so the same seed has to produce the same order every run
-//! or the design is worthless.
+//! is the scenario's to state: nothing here invents a latency, so an op nobody
+//! delayed completes in submission order.
 
 use std::time::{Duration, Instant};
 
@@ -30,12 +30,12 @@ fn recv_multi(fd: i32, bgid: u16, user_data: u64) -> io_uring::squeue::Entry {
         .user_data(user_data)
 }
 
-/// Fast enough to keep the suite quick, coarse enough that latency classes
-/// stay distinguishable against the ~50µs floor on the sleep.
+/// A convenient unit for scripted delays. Comfortably above the ~50µs floor on
+/// the sleep, so a pinned order is never in doubt.
 const STEP: Duration = Duration::from_millis(1);
 
-fn ring(seed: u64) -> (FakeRing, FakeRingHandle) {
-    FakeRing::builder().latency_step(STEP).seed(seed).build()
+fn ring() -> (FakeRing, FakeRingHandle) {
+    FakeRing::builder().build()
 }
 
 fn send(fd: i32, buf: &[u8], user_data: u64) -> io_uring::squeue::Entry {
@@ -54,7 +54,7 @@ fn recv(fd: i32, buf: &mut [u8], user_data: u64) -> io_uring::squeue::Entry {
 
 #[test]
 fn a_scripted_read_completes_without_anyone_touching_the_ring() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let mut buf = [0u8; 32];
 
     // Declared before anything is submitted, as a test would before block_on.
@@ -75,7 +75,7 @@ fn a_scripted_read_completes_without_anyone_touching_the_ring() {
 
 #[test]
 fn scripted_reads_are_consumed_in_order() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     handle.on_read(11, ReadEvent::data(b"first"));
     handle.on_read(11, ReadEvent::data(b"second"));
@@ -101,7 +101,7 @@ fn scripted_reads_are_consumed_in_order() {
 
 #[test]
 fn a_multishot_accept_consumes_scripted_connections_then_parks() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     handle.on_accept(3, AcceptEvent::Connection);
     handle.on_accept(3, AcceptEvent::Connection);
@@ -130,7 +130,7 @@ fn a_multishot_accept_consumes_scripted_connections_then_parks() {
 
 #[test]
 fn an_accept_can_hand_back_a_descriptor_the_test_made() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     // Created up front, so the test knows the number and can script what the
     // accepted connection does. Raw rather than a `SocketWrapper`: ownership
@@ -171,7 +171,7 @@ fn an_accept_can_hand_back_a_descriptor_the_test_made() {
 
 #[test]
 fn a_scripted_eof_ends_a_multishot_recv() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     TestRing::init(RingHandle::Simulated(&handle));
 
     handle.on_read(11, ReadEvent::Bytes(32));
@@ -197,7 +197,7 @@ fn a_scripted_eof_ends_a_multishot_recv() {
 
 #[test]
 fn a_scripted_error_ends_a_multishot_accept() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     handle.on_accept(3, AcceptEvent::Connection);
     handle.on_accept(3, AcceptEvent::Error(libc::ECONNABORTED));
@@ -226,7 +226,7 @@ fn a_scripted_error_ends_a_multishot_accept() {
 fn a_zero_from_an_accept_is_a_descriptor_not_an_ending() {
     // The asymmetry worth pinning: `0` ends a recv but is a valid fd from an
     // accept, so the two cannot share one "non-negative keeps going" rule.
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     handle.on_accept(3, AcceptEvent::On(0));
     ring.add(&opcode::AcceptMulti::new(Fd(3)).build().user_data(5));
@@ -240,12 +240,11 @@ fn a_zero_from_an_accept_is_a_descriptor_not_an_ending() {
 
 #[test]
 fn a_pinned_delay_decides_the_completion_order() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let mut slow = [0u8; 8];
     let mut fast = [0u8; 8];
 
-    // Submitted first, scheduled last: the ordering is the test's, not the
-    // seed's.
+    // Submitted first, completed last: the ordering is the test's.
     handle.on_read(11, ReadEvent::data(b"slow").after(STEP * 4));
     handle.on_read(12, ReadEvent::data(b"fast").after(STEP));
 
@@ -264,53 +263,12 @@ fn a_pinned_delay_decides_the_completion_order() {
     assert_eq!(order, vec![2, 1], "the pinned delays decided the order");
 }
 
-/// Completion order of eight sends, behind a read that is pinned or not.
-fn order_behind_a_read(pinned: bool) -> Vec<u64> {
-    let (mut ring, handle) = ring(0xBEEF);
-    let mut buf = [0u8; 8];
-
-    let event = ReadEvent::data(b"x");
-    if pinned {
-        handle.on_read(11, event.after(STEP * 3));
-    } else {
-        handle.on_read(11, event);
-    }
-
-    ring.add(&recv(11, &mut buf, 100));
-    for i in 0..8 {
-        ring.add(&send(3, b"x", i));
-    }
-    ring.submit();
-
-    let mut order = Vec::new();
-    while order.len() < 9 {
-        ring.submit_and_wait();
-        while let Some(completion) = ring.pop_completion() {
-            order.push(completion.user_data);
-        }
-    }
-    order.retain(|ud| *ud != 100);
-    order
-}
-
-#[test]
-fn pinning_one_delay_leaves_every_other_op_alone() {
-    // A latency is drawn even when the delay is pinned. Skipping the draw
-    // would take a different number of values from the stream, so adding one
-    // `after(..)` would silently reshuffle the whole test.
-    assert_eq!(
-        order_behind_a_read(false),
-        order_behind_a_read(true),
-        "pinning one op perturbed the others",
-    );
-}
-
 #[test]
 fn a_scripted_delay_needs_no_grid_and_has_no_ceiling() {
     // A fixed-slot design could only express a few multiples of the step. A list
     // ordered by due time takes any duration, so neither of these needs a
     // workaround.
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let mut late = [0u8; 8];
     let mut early = [0u8; 8];
 
@@ -335,11 +293,7 @@ fn a_scripted_delay_needs_no_grid_and_has_no_ceiling() {
 #[test]
 fn cancelling_a_read_gives_its_scripted_data_back() {
     // Virtual time so the long pin below costs nothing.
-    let (mut ring, handle) = FakeRing::builder()
-        .latency_step(STEP)
-        .seed(0)
-        .virtual_time()
-        .build();
+    let (mut ring, handle) = FakeRing::builder().virtual_time().build();
     let mut buf = [0u8; 32];
 
     // Pinned far out, so the cancel is certain to land first.
@@ -377,7 +331,7 @@ fn cancelling_a_read_gives_its_scripted_data_back() {
 
 #[test]
 fn a_read_on_an_unscripted_descriptor_still_parks() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let mut buf = [0u8; 32];
 
     handle.on_read(11, ReadEvent::data(b"meant for another socket"));
@@ -390,7 +344,7 @@ fn a_read_on_an_unscripted_descriptor_still_parks() {
 
 #[test]
 fn scenario_remaining_reports_what_was_never_claimed() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let mut buf = [0u8; 32];
 
     handle.on_read(11, ReadEvent::data(b"used"));
@@ -412,7 +366,7 @@ fn scenario_remaining_reports_what_was_never_claimed() {
 
 #[test]
 fn builder_yields_a_ring_and_a_handle_sharing_one_state() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     assert!(handle.inflight().is_empty());
     ring.add(&send(3, b"hi", 1));
@@ -427,7 +381,7 @@ fn builder_yields_a_ring_and_a_handle_sharing_one_state() {
 
 #[test]
 fn decodes_the_fields_a_send_was_built_with() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let buf = b"hello world";
 
     ring.add(&send(7, buf, 0xDEAD_BEEF));
@@ -443,7 +397,7 @@ fn decodes_the_fields_a_send_was_built_with() {
 
 #[test]
 fn decodes_a_multishot_recv_against_a_buffer_group() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&opcode::RecvMulti::new(Fd(11), 4).build().user_data(2));
     ring.submit();
@@ -458,7 +412,7 @@ fn decodes_a_multishot_recv_against_a_buffer_group() {
 
 #[test]
 fn async_cancel_carries_its_target_in_addr() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     // The driver cancels by naming the `user_data` of the op it wants stopped;
     // the fake has to be able to read that back to know what to retire.
@@ -474,7 +428,7 @@ fn async_cancel_carries_its_target_in_addr() {
 
 #[test]
 fn completing_retires_the_op_and_queues_a_completion() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&send(3, b"x", 42));
     ring.submit();
@@ -491,7 +445,7 @@ fn completing_retires_the_op_and_queues_a_completion() {
 
 #[test]
 fn a_multishot_completion_leaves_the_op_in_flight() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&opcode::RecvMulti::new(Fd(11), 0).build().user_data(7));
     ring.submit();
@@ -510,7 +464,7 @@ fn a_multishot_completion_leaves_the_op_in_flight() {
 #[test]
 #[should_panic(expected = "not in flight")]
 fn completing_an_unknown_token_panics() {
-    let (_ring, handle) = ring(0);
+    let (_ring, handle) = ring();
     // Nothing was submitted, so this would hand the driver a slab index it
     // dereferences unchecked. Caught here instead.
     handle.complete(0x99, 0, 0);
@@ -519,7 +473,7 @@ fn completing_an_unknown_token_panics() {
 #[test]
 #[should_panic(expected = "not in flight")]
 fn completing_the_same_op_twice_panics() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&send(3, b"x", 5));
     ring.submit();
@@ -531,31 +485,23 @@ fn completing_the_same_op_twice_panics() {
 // ------------------------------------------------------------ the schedule
 
 #[test]
-fn a_scheduled_op_completes_on_its_own_after_its_latency() {
-    let (mut ring, handle) = ring(0);
+fn a_scheduled_op_completes_without_anything_scripting_it() {
+    let (mut ring, handle) = ring();
     let buf = b"hello world";
 
     ring.add(&send(3, buf, 1));
-    let started = Instant::now();
     ring.submit_and_wait();
-    let waited = started.elapsed();
 
     let completion = ring.pop_completion().expect("the op completed on its own");
     assert_eq!(completion.user_data, 1);
     // A write-side op reports the byte count it was handed.
     assert_eq!(completion.result as usize, buf.len());
-
-    // An undeclared op draws one to six steps. Only the lower bound is worth
-    // asserting — a loaded machine can overshoot freely.
-    assert!(waited >= STEP, "returned after {waited:?}, before one tick");
-
-    // Firing empties the slot: a single-shot leaves nothing behind.
-    assert!(handle.inflight().is_empty());
+    assert!(handle.inflight().is_empty(), "nothing left behind");
 }
 
 #[test]
 fn ops_parked_on_an_external_event_never_complete_by_themselves() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     // Nobody has written to this socket, so a real kernel would leave the recv
     // outstanding indefinitely. Scheduling it would be a lie.
@@ -568,7 +514,7 @@ fn ops_parked_on_an_external_event_never_complete_by_themselves() {
 
 #[test]
 fn waking_a_parked_op_schedules_it_rather_than_completing_it() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&opcode::RecvMulti::new(Fd(11), 0).build().user_data(7));
     ring.submit();
@@ -588,7 +534,7 @@ fn waking_a_parked_op_schedules_it_rather_than_completing_it() {
 #[test]
 #[should_panic(expected = "would never wake up")]
 fn blocking_with_nothing_scheduled_panics_instead_of_hanging() {
-    let (mut ring, _handle) = ring(0);
+    let (mut ring, _handle) = ring();
 
     // Parked, and no wakeup timer armed — the runtime would sleep forever.
     ring.add(&opcode::RecvMulti::new(Fd(11), 0).build().user_data(1));
@@ -597,71 +543,29 @@ fn blocking_with_nothing_scheduled_panics_instead_of_hanging() {
 
 // ------------------------------------------------------------- determinism
 
-/// Submit `n` sends and drain them, returning the order they completed in.
-fn completion_order(seed: u64, n: u64) -> Vec<u64> {
-    let (mut ring, _handle) = ring(seed);
-    for i in 0..n {
-        ring.add(&send(3, b"x", i));
-    }
-    ring.submit();
-
-    let mut order = Vec::new();
-    while (order.len() as u64) < n {
-        ring.submit_and_wait();
-        while let Some(completion) = ring.pop_completion() {
-            order.push(completion.user_data);
-        }
-    }
-    order
-}
-
 #[test]
-fn the_same_seed_reproduces_the_same_completion_order() {
-    assert_eq!(
-        completion_order(0xC0FFEE, 12),
-        completion_order(0xC0FFEE, 12)
-    );
-}
-
-#[test]
-fn the_wheel_actually_reorders_against_submission_order() {
-    // Otherwise the seed would be buying nothing. Checked across several seeds
-    // rather than one, so the test doesn't rest on a lucky draw.
-    let submitted: Vec<u64> = (0..12).collect();
-    let reorders = (0..8u64).any(|seed| completion_order(seed, 12) != submitted);
-    assert!(
-        reorders,
-        "no seed produced an order other than submission order"
-    );
-}
-
-#[test]
-fn a_completion_batch_arrives_in_submission_order_within_its_tick() {
-    // Ops sharing a bucket share a tick, and FIFO within the slot is the whole
-    // ordering rule — no timestamps are compared.
-    let (mut ring, _handle) = ring(7);
+fn a_batch_completes_in_submission_order() {
+    // Nothing invents a latency, so ops nobody timed are all due at once and
+    // `seq` alone settles the order they come back in.
+    let (mut ring, _handle) = ring();
     for i in 0..24 {
         ring.add(&send(3, b"x", i));
     }
-    ring.submit();
-
     ring.submit_and_wait();
+
     let mut batch = Vec::new();
     while let Some(completion) = ring.pop_completion() {
         batch.push(completion.user_data);
     }
 
-    assert!(batch.len() > 1, "expected a batch, got {}", batch.len());
-    let mut sorted = batch.clone();
-    sorted.sort_unstable();
-    assert_eq!(batch, sorted, "a tick delivered out of submission order");
+    assert_eq!(batch, (0..24).collect::<Vec<u64>>());
 }
 
 // ------------------------------------------------------- the wakeup timeout
 
 #[test]
 fn the_wakeup_timer_is_not_an_io_op() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     let ts = Timespec::new().nsec(2_000_000);
     ring.add(&opcode::Timeout::new(&ts).count(1).build().user_data(0xFFFF));
@@ -675,13 +579,13 @@ fn the_wakeup_timer_is_not_an_io_op() {
 
 #[test]
 fn the_wakeup_timer_bounds_a_wait_that_would_otherwise_be_longer() {
-    // Latencies span 50..=300ms here, so a 5ms timer has to win.
-    let (mut ring, _handle) = FakeRing::builder()
-        .latency_step(Duration::from_millis(50))
-        .seed(0)
-        .build();
+    let (mut ring, handle) = ring();
+    let mut buf = [0u8; 8];
 
-    ring.add(&send(3, b"x", 1));
+    // A read the scenario put an hour out, against a 5ms timer.
+    handle.on_read(11, ReadEvent::data(b"x").after(Duration::from_secs(3600)));
+    ring.add(&recv(11, &mut buf, 1));
+
     let ts = Timespec::new().nsec(5_000_000);
     ring.add(&opcode::Timeout::new(&ts).count(1).build().user_data(0xFFFF));
 
@@ -690,7 +594,7 @@ fn the_wakeup_timer_bounds_a_wait_that_would_otherwise_be_longer() {
     let waited = started.elapsed();
 
     assert!(
-        waited < Duration::from_millis(50),
+        waited < Duration::from_secs(1),
         "waited {waited:?} — the timer did not bound the wait",
     );
     let completion = ring.pop_completion().expect("the timer fired");
@@ -702,7 +606,7 @@ fn the_wakeup_timer_bounds_a_wait_that_would_otherwise_be_longer() {
 fn a_wait_ended_by_io_also_completes_the_armed_timer() {
     // The runtime arms its timer with `.count(1)`, so it completes as soon as
     // any completion event lands, not only on elapse.
-    let (mut ring, _handle) = ring(0);
+    let (mut ring, _handle) = ring();
 
     ring.add(&send(3, b"x", 1));
     let ts = Timespec::new().sec(30);
@@ -733,7 +637,7 @@ fn open_at(path: &std::ffi::CStr, user_data: u64) -> io_uring::squeue::Entry {
 
 #[test]
 fn openat_completes_with_a_descriptor_that_really_works() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&open_at(c"/nonexistent", 3));
     ring.submit_and_wait();
@@ -763,7 +667,7 @@ fn openat_completes_with_a_descriptor_that_really_works() {
 
 #[test]
 fn each_open_mints_a_distinct_descriptor() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     for i in 0..4 {
         ring.add(&open_at(c"/nonexistent", i));
@@ -794,7 +698,7 @@ fn each_open_mints_a_distinct_descriptor() {
 
 #[test]
 fn accept_mints_a_socket_the_runtime_can_actually_use() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(
         &opcode::Accept::new(Fd(3), std::ptr::null_mut(), std::ptr::null_mut())
@@ -850,7 +754,7 @@ fn simulated_socket_takes_every_option_the_runtime_sets() {
 
 #[test]
 fn a_multishot_accept_stays_in_flight_across_connections() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&opcode::AcceptMulti::new(Fd(3)).build().user_data(5));
     ring.submit();
@@ -889,7 +793,7 @@ fn a_multishot_accept_stays_in_flight_across_connections() {
 
 #[test]
 fn a_multishot_recv_stays_in_flight_between_results() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&opcode::RecvMulti::new(Fd(11), 0).build().user_data(7));
     ring.submit();
@@ -907,7 +811,7 @@ fn a_multishot_recv_stays_in_flight_between_results() {
 
 #[test]
 fn a_failing_multishot_is_terminal() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&opcode::RecvMulti::new(Fd(11), 0).build().user_data(7));
     ring.submit();
@@ -927,7 +831,7 @@ fn a_failing_multishot_is_terminal() {
 
 #[test]
 fn cancelling_a_multishot_retires_it_with_ecanceled() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&opcode::RecvMulti::new(Fd(11), 0).build().user_data(7));
     ring.submit();
@@ -950,13 +854,15 @@ fn cancelling_a_multishot_retires_it_with_ecanceled() {
 
 #[test]
 fn cancelling_a_scheduled_op_takes_it_off_the_wheel() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(&send(3, b"x", 7));
     ring.add(&opcode::AsyncCancel::new(7).build().user_data(99));
     ring.submit();
 
-    // Both are on the wheel; drain until the cancel has had its say.
+    // Both are due at once and the send has the lower seq, so it completes
+    // first and the cancel finds nothing. Cancelling something now takes
+    // pinning its delay.
     let mut seen = Vec::new();
     while seen.len() < 2 {
         ring.submit_and_wait();
@@ -966,16 +872,13 @@ fn cancelling_a_scheduled_op_takes_it_off_the_wheel() {
     }
 
     assert!(handle.inflight().is_empty());
-    // Either the cancel landed first and the send was retired, or the send's own
-    // tick came first and the cancel found nothing — both are outcomes a real
-    // kernel produces, so only the end state is asserted.
     let cancel = seen.iter().find(|(ud, _)| *ud == 99).expect("the cancel");
-    assert!(cancel.1 == 0 || cancel.1 == -libc::ENOENT, "got {cancel:?}");
+    assert_eq!(cancel.1, -libc::ENOENT, "the send had already completed");
 }
 
 #[test]
 fn cancelling_an_unknown_token_reports_enoent() {
-    let (mut ring, _handle) = ring(0);
+    let (mut ring, _handle) = ring();
 
     ring.add(&opcode::AsyncCancel::new(0xDEAD).build().user_data(99));
     ring.submit_and_wait();
@@ -990,7 +893,7 @@ fn cancelling_an_unknown_token_reports_enoent() {
 
 #[test]
 fn delivering_bytes_writes_them_into_the_ops_own_buffer() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let mut buf = [0u8; 32];
 
     ring.add(
@@ -1014,7 +917,7 @@ fn delivering_bytes_writes_them_into_the_ops_own_buffer() {
 
 #[test]
 fn the_buffer_is_untouched_until_the_completion_is_posted() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let mut buf = [0u8; 32];
 
     ring.add(
@@ -1035,7 +938,7 @@ fn the_buffer_is_untouched_until_the_completion_is_posted() {
 
 #[test]
 fn a_delivery_larger_than_the_buffer_is_a_short_read() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     let mut buf = [0u8; 4];
 
     ring.add(
@@ -1055,7 +958,7 @@ fn a_delivery_larger_than_the_buffer_is_a_short_read() {
 
 #[test]
 fn a_managed_recv_lands_in_a_provided_buffer() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     TestRing::init(RingHandle::Simulated(&handle));
 
     handle.on_read(11, ReadEvent::data(b"hello"));
@@ -1078,7 +981,7 @@ fn a_managed_recv_lands_in_a_provided_buffer() {
 
 #[test]
 fn recycling_hands_the_same_buffer_back_out() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     TinyRing::init(RingHandle::Simulated(&handle));
 
     // Drain the ring: two buffers, two reads, both recycled straight away.
@@ -1107,7 +1010,7 @@ fn recycling_hands_the_same_buffer_back_out() {
 
 #[test]
 fn a_leaked_buffer_drains_the_ring() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
     TinyRing::init(RingHandle::Simulated(&handle));
 
     // Two buffers, taken and never given back.
@@ -1135,7 +1038,7 @@ fn a_leaked_buffer_drains_the_ring() {
 #[test]
 #[should_panic(expected = "no registered ring provides")]
 fn an_unregistered_buffer_group_is_refused() {
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     // Group 9 exists as a type, but nothing installed it on this thread.
     handle.on_read(11, ReadEvent::data(b"hello"));
@@ -1147,7 +1050,7 @@ fn an_unregistered_buffer_group_is_refused() {
 fn waking_without_data_still_reports_a_bare_result() {
     // Not every read-side completion carries bytes — an error, or an accept
     // returning a descriptor.
-    let (mut ring, handle) = ring(0);
+    let (mut ring, handle) = ring();
 
     ring.add(
         &opcode::Recv::new(Fd(11), std::ptr::null_mut(), 0)

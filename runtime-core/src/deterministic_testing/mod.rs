@@ -2,7 +2,7 @@
 //!
 //! Nothing here performs IO. A [`FakeRing`] accepts the same SQEs the real
 //! driver submits, decodes them into a readable [`Sqe`], and schedules them on
-//! a seeded timing [`Timeline`]. The driver above it — slabs, wakers, the
+//! a [`Timeline`]. The driver above it — slabs, wakers, the
 //! multishot state machine, buffer recycling — runs unmodified, so a test
 //! exercises the real thing against a kernel it controls.
 //!
@@ -28,5 +28,5 @@ pub use fake_ring::{Completion, FakeRing, FakeRingBuilder, FakeRingHandle, SIMUL
 pub use fds::{FdKind, mint, simulated_socket};
 pub use scenario::{AcceptEvent, ConnectEvent, ReadEvent, Scripted};
 pub use sqe::{IOSQE_BUFFER_SELECT, Sqe};
-pub use timeline::{LATENCY_CLASSES, Outcome};
+pub use timeline::Outcome;
 pub use virtual_clock::VirtualClock;

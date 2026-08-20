@@ -19,17 +19,13 @@ use runtime_streams::StreamExt;
 // simulated backend also registers the simulator as its consumer.
 runtime_core::define_buf_ring!(ManagedRing, bgid = 3, buffer_size = 64, ring_size = 2);
 
-fn simulated(seed: u64) -> (FakeRing, FakeRingHandle) {
-    FakeRing::builder()
-        .seed(seed)
-        .latency_step(Duration::from_millis(10))
-        .virtual_time()
-        .build()
+fn simulated() -> (FakeRing, FakeRingHandle) {
+    FakeRing::builder().virtual_time().build()
 }
 
 #[test]
 fn a_send_completes_through_the_whole_driver() {
-    let (fake, _handle) = simulated(42);
+    let (fake, _handle) = simulated();
     let socket = simulated_socket().expect("a real unconnected socket");
 
     let (result, _buf) = RuntimeInner::simulated(fake).block_on::<(), _>(
@@ -46,7 +42,7 @@ fn a_send_completes_through_the_whole_driver() {
 
 #[test]
 fn a_scripted_read_reaches_the_awaiting_task() {
-    let (fake, handle) = simulated(42);
+    let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a real unconnected socket");
 
     handle.on_read(socket.fd(), ReadEvent::data(b"hello"));
@@ -64,7 +60,7 @@ fn a_scripted_read_reaches_the_awaiting_task() {
 
 #[test]
 fn concurrent_sends_all_complete() {
-    let (fake, _handle) = simulated(7);
+    let (fake, _handle) = simulated();
 
     let total = RuntimeInner::simulated(fake).block_on::<(), _>(
         async move {
@@ -93,41 +89,10 @@ fn concurrent_sends_all_complete() {
 }
 
 #[test]
-fn the_same_seed_gives_the_same_completion_order() {
-    fn order(seed: u64) -> Vec<usize> {
-        let (fake, _handle) = simulated(seed);
-        RuntimeInner::simulated(fake).block_on::<(), _>(
-            async move {
-                let handles: Vec<_> = (0..8)
-                    .map(|i| {
-                        let socket = simulated_socket().expect("a socket");
-                        spawn(async move {
-                            let (result, _) = socket_send(&socket, b"x").await;
-                            result.expect("the send succeeded");
-                            i
-                        })
-                    })
-                    .collect();
-
-                let mut finished = Vec::new();
-                for handle in handles {
-                    finished.push(handle.await);
-                }
-                finished
-            },
-            None,
-            |run| run(),
-        )
-    }
-
-    assert_eq!(order(0xC0FFEE), order(0xC0FFEE));
-}
-
-#[test]
 fn a_timer_fires_without_any_time_actually_passing() {
     // The ring shares its clock with the timewheel, so a sleep is a jump. The
     // runtime is not told, and does not need to be.
-    let (fake, handle) = simulated(1);
+    let (fake, handle) = simulated();
     let clock = handle.clock().expect("built with virtual_time");
 
     let started = Instant::now();
@@ -163,7 +128,7 @@ fn select_resolves_on_whichever_sleep_is_shorter() {
 
     // Both orders, so "always the second arm" cannot pass either.
     for long_first in [true, false] {
-        let (fake, handle) = simulated(1);
+        let (fake, handle) = simulated();
         let clock = handle.clock().expect("built with virtual_time");
 
         RuntimeInner::simulated(fake).block_on::<(), _>(
@@ -190,7 +155,7 @@ fn select_resolves_on_whichever_sleep_is_shorter() {
 
 #[test]
 fn work_continues_normally_after_a_select() {
-    let (fake, _handle) = simulated(1);
+    let (fake, _handle) = simulated();
 
     RuntimeInner::simulated(fake).block_on::<(), _>(
         async move {
@@ -210,7 +175,7 @@ fn work_continues_normally_after_a_select() {
 
 #[test]
 fn a_managed_recv_hands_a_borrowed_buffer_to_the_task() {
-    let (fake, handle) = simulated(42);
+    let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a socket");
     handle.on_read(socket.fd(), ReadEvent::data(b"hello"));
 
@@ -231,7 +196,7 @@ fn a_managed_recv_hands_a_borrowed_buffer_to_the_task() {
 
 #[test]
 fn a_ring_of_two_serves_more_reads_than_it_has_buffers() {
-    let (fake, handle) = simulated(42);
+    let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a socket");
 
     for chunk in [b"one".as_slice(), b"two", b"three", b"four", b"five"] {
@@ -273,7 +238,7 @@ fn holding_every_buffer_drains_the_ring() {
     // The mirror of the test above: same ring, same reads, but the task keeps
     // its buffers instead of dropping them. If recycling were not what makes
     // that one pass, this one would pass too.
-    let (fake, handle) = simulated(42);
+    let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a socket");
 
     for chunk in [b"one".as_slice(), b"two", b"three"] {
@@ -312,7 +277,7 @@ fn holding_every_buffer_drains_the_ring() {
 
 #[test]
 fn a_timed_out_read_leaves_its_data_for_the_next_one() {
-    let (fake, handle) = simulated(42);
+    let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a socket");
 
     // Arrives long after the timeout below, so the first read never sees it.
