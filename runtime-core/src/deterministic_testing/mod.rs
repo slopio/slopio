@@ -16,15 +16,17 @@
 //!
 //! [`Timeline`]: timeline::Timeline
 
-mod clock;
+pub(crate) mod clock;
 pub mod fake_ring;
 pub mod fds;
 pub mod scenario;
 pub mod sqe;
 pub mod timeline;
+pub mod virtual_clock;
 
 pub use fake_ring::{Completion, FakeRing, FakeRingBuilder, FakeRingHandle, SIMULATED_RING_FD};
 pub use fds::{FdKind, mint, simulated_socket};
 pub use scenario::{AcceptEvent, ConnectEvent, ReadEvent, Scripted};
 pub use sqe::{IOSQE_BUFFER_SELECT, Sqe};
 pub use timeline::{LATENCY_CLASSES, Outcome};
+pub use virtual_clock::VirtualClock;

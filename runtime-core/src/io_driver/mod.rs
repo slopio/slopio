@@ -295,6 +295,17 @@ impl MultiOpState {
     }
 }
 
+impl Ring {
+    /// A ring backed by the simulator rather than the kernel.
+    fn simulated(fake: FakeRing) -> Self {
+        Self {
+            inner: RingBackend::Fake(fake),
+            pending: 0,
+            wakeup_timeout: Timespec::new(),
+        }
+    }
+}
+
 impl Default for Ring {
     fn default() -> Self {
         let mut builder = IoUring::builder();
@@ -316,6 +327,18 @@ impl Default for Ring {
 scoped_thread_local!(pub static IO_DRIVER: IODriver);
 
 impl IODriver {
+    /// A driver over a simulated ring.
+    ///
+    /// Everything above the ring — slabs, wakers, the multishot state machine,
+    /// buffer recycling — is exactly what `Default` builds for production, so a
+    /// test exercises the real driver rather than a variant of it.
+    pub fn simulated(fake: FakeRing) -> Self {
+        Self {
+            ring: UnsafeCell::new(Ring::simulated(fake)),
+            ..Default::default()
+        }
+    }
+
     pub fn shutdown(&self) -> bool {
         self.shutting_down.get()
     }

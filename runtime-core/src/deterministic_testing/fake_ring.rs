@@ -18,6 +18,35 @@ use super::fds::{self, FdKind};
 use super::scenario::{Scenario, Scripted, Trigger};
 use super::sqe::{IORING_ACCEPT_MULTISHOT, IORING_CQE_F_MORE, IORING_RECV_MULTISHOT, Sqe};
 use super::timeline::{Outcome, Pending, Timeline};
+use super::virtual_clock::VirtualClock;
+
+/// Where the simulated ring gets time, and what it does to wait.
+///
+/// Under `Real` it sleeps for as long as it says, which is what lets the
+/// runtime's own timewheel keep working on the same OS clock. Under `Virtual`
+/// nothing sleeps: the clock is shared with the timewheel and simply jumped, so
+/// a test spanning an hour runs in microseconds.
+#[derive(Clone)]
+enum Pace {
+    Real,
+    Virtual(Rc<VirtualClock>),
+}
+
+impl Pace {
+    fn now(&self) -> Nanos {
+        match self {
+            Self::Real => clock::now(),
+            Self::Virtual(clock) => clock.now_nanos(),
+        }
+    }
+
+    fn wait_until(&self, deadline: Nanos) {
+        match self {
+            Self::Real => clock::sleep_until(deadline),
+            Self::Virtual(clock) => clock.advance_to_nanos(deadline),
+        }
+    }
+}
 
 /// The `ring_fd` a simulated ring reports. Deliberately invalid, so a stray
 /// syscall on it fails instead of touching an unrelated fd.
@@ -249,6 +278,7 @@ struct FakeRingState {
     next_seq: u64,
     /// Descriptors handed to the runtime, in the order they were minted.
     opened: Vec<RawFd>,
+    pace: Pace,
 }
 
 /// A test's handle on a [`FakeRing`]: what the runtime submitted, and what
@@ -354,7 +384,7 @@ impl FakeRingHandle {
             .unwrap_or_else(|| panic!("waking user_data {user_data:#x}, which is not parked"));
         let mut pending = state.waiting.remove(i);
         pending.outcome = outcome;
-        let now = clock::now();
+        let now = state.pace.now();
         state.timeline.schedule(pending, None, now);
     }
 
@@ -398,6 +428,18 @@ impl FakeRingHandle {
         self.0.borrow().scenario.remaining()
     }
 
+    /// The clock this ring advances, if it was built with
+    /// [`virtual_time`](FakeRingBuilder::virtual_time).
+    ///
+    /// The handle outlives the ring — which disappears into the driver — so
+    /// this is how a test inspects how far simulated time actually moved.
+    pub fn clock(&self) -> Option<Rc<VirtualClock>> {
+        match &self.0.borrow().pace {
+            Pace::Virtual(clock) => Some(clock.clone()),
+            Pace::Real => None,
+        }
+    }
+
     /// Descriptors the simulator minted and handed to the runtime, oldest
     /// first. They are real and owned by whatever received them, so a test can
     /// check that each was closed — an fd still open at the end is a leak.
@@ -413,6 +455,7 @@ impl FakeRingHandle {
 pub struct FakeRingBuilder {
     latency_step: Duration,
     seed: u64,
+    virtual_time: bool,
 }
 
 impl Default for FakeRingBuilder {
@@ -420,6 +463,7 @@ impl Default for FakeRingBuilder {
         Self {
             latency_step: Duration::from_millis(10),
             seed: 0,
+            virtual_time: false,
         }
     }
 }
@@ -446,8 +490,28 @@ impl FakeRingBuilder {
         self
     }
 
+    /// Run on a clock the ring advances instead of the OS one, so nothing ever
+    /// sleeps.
+    ///
+    /// The runtime's timewheel is handed the same clock by
+    /// [`RuntimeInner::simulated`], so its timers expire when the ring says
+    /// time passed. Without this the ring sleeps for real, which is what keeps
+    /// an unmodified timewheel honest — at the cost of a test taking as long as
+    /// the delays it declares.
+    ///
+    /// [`RuntimeInner::simulated`]: crate::runtime::RuntimeInner::simulated
+    pub fn virtual_time(mut self) -> Self {
+        self.virtual_time = true;
+        self
+    }
+
     /// Give the ring to the runtime, keep the handle.
     pub fn build(self) -> (FakeRing, FakeRingHandle) {
+        let pace = if self.virtual_time {
+            Pace::Virtual(Rc::new(VirtualClock::new()))
+        } else {
+            Pace::Real
+        };
         let handle = FakeRingHandle(Rc::new(RefCell::new(FakeRingState {
             staged: Vec::new(),
             timeline: Timeline::new(self.latency_step.as_nanos() as Nanos, self.seed),
@@ -457,6 +521,7 @@ impl FakeRingBuilder {
             cq: VecDeque::new(),
             next_seq: 0,
             opened: Vec::new(),
+            pace,
         })));
         (FakeRing(handle.clone()), handle)
     }
@@ -497,7 +562,7 @@ impl FakeRing {
         // One instant for the whole batch: ops of the same latency then share a
         // due time exactly, and `seq` decides their order rather than however
         // long this loop happened to take.
-        let now = clock::now();
+        let now = state.pace.now();
 
         for sqe in staged.drain(..) {
             let seq = state.next_seq;
@@ -531,14 +596,15 @@ impl FakeRing {
     pub fn submit_and_wait(&mut self) {
         self.submit();
 
-        let wait = {
-            let mut state = self.state();
+        let (wait, pace) = {
+            let state = self.state();
             if !state.cq.is_empty() {
                 return;
             }
+            let pace = state.pace.clone();
             let due = state.timeline.next_due();
             let wakeup = state.wakeup.as_ref().map(|w| w.deadline);
-            match (due, wakeup) {
+            let wait = match (due, wakeup) {
                 (Some(d), Some(w)) if w < d => Wait::Wakeup(w),
                 (Some(d), _) => Wait::Due(d),
                 (None, Some(w)) => Wait::Wakeup(w),
@@ -547,12 +613,13 @@ impl FakeRing {
                      and nothing scheduled — the runtime would never wake up",
                     state.waiting.len(),
                 ),
-            }
+            };
+            (wait, pace)
         };
 
         match wait {
             Wait::Wakeup(deadline) => {
-                clock::sleep_until(deadline);
+                pace.wait_until(deadline);
                 let mut state = self.state();
                 if let Some(w) = state.wakeup.take() {
                     state.cq.push_back(Completion {
@@ -563,9 +630,9 @@ impl FakeRing {
                 }
             }
             Wait::Due(deadline) => {
-                clock::sleep_until(deadline);
+                pace.wait_until(deadline);
                 let mut state = self.state();
-                let fired_at = clock::now();
+                let fired_at = pace.now();
                 let fired = state.timeline.take_due(fired_at);
                 for pending in fired {
                     let sqe = pending.sqe;
@@ -621,5 +688,17 @@ impl FakeRing {
 
     pub fn ring_fd(&self) -> RawFd {
         SIMULATED_RING_FD
+    }
+
+    /// The clock this ring advances, if it was built with
+    /// [`virtual_time`](FakeRingBuilder::virtual_time).
+    ///
+    /// The runtime's timewheel needs the same one, or the two would disagree
+    /// about what time it is.
+    pub fn clock(&self) -> Option<Rc<VirtualClock>> {
+        match &self.state().pace {
+            Pace::Virtual(clock) => Some(clock.clone()),
+            Pace::Real => None,
+        }
     }
 }

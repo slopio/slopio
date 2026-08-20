@@ -1,9 +1,12 @@
 use std::{
     cell::UnsafeCell,
     future::Future,
+    rc::Rc,
     task::Waker,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
+
+use crate::deterministic_testing::VirtualClock;
 
 use crate::runtime::TIME_DRIVER;
 use crate::runtime::select::{SelectResult, select};
@@ -17,9 +20,48 @@ pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Outp
     }
 }
 
-#[derive(Default)]
+/// Where the timewheel gets the current time.
+///
+/// Two variants, chosen once when the runtime is built — the same shape as the
+/// io_driver's `RingBackend`, and for the same reason: the set is closed, so an
+/// enum keeps both arms inlinable instead of hiding them behind a call.
+pub enum ClockSource {
+    /// The OS clock. Every runtime that is not simulating.
+    System,
+    /// Advanced by hand by whatever is simulating the world.
+    Virtual(Rc<VirtualClock>),
+}
+
+impl ClockSource {
+    #[inline]
+    fn now(&self) -> Instant {
+        match self {
+            Self::System => Instant::now(),
+            Self::Virtual(clock) => clock.now(),
+        }
+    }
+
+    #[inline]
+    fn now_wall(&self) -> SystemTime {
+        match self {
+            Self::System => SystemTime::now(),
+            Self::Virtual(clock) => clock.now_wall(),
+        }
+    }
+}
+
 pub struct TimeDriver {
     inner: UnsafeCell<async_timers::TimeWheel>,
+    clock: ClockSource,
+}
+
+impl Default for TimeDriver {
+    fn default() -> Self {
+        Self {
+            inner: UnsafeCell::default(),
+            clock: ClockSource::System,
+        }
+    }
 }
 
 pub struct Sleep {
@@ -68,9 +110,18 @@ impl TimeDriver {
         this.now()
     }
 
+    /// Drive the wheel with whichever clock this runtime was built on.
     pub fn tick(&self) {
         let this = unsafe { &mut *self.inner.get() };
-        this.tick();
+        this.tick_at(self.clock.now(), self.clock.now_wall());
+    }
+
+    /// A driver on a clock a simulation advances rather than the OS.
+    pub fn simulated(clock: Rc<VirtualClock>) -> Self {
+        Self {
+            inner: UnsafeCell::default(),
+            clock: ClockSource::Virtual(clock),
+        }
     }
     fn register(&self, duration: Duration, waker: &Waker) -> Option<usize> {
         let this = unsafe { &mut *self.inner.get() };

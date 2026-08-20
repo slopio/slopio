@@ -77,6 +77,25 @@ impl RuntimeInner {
         }
     }
 
+    /// A runtime whose IO is simulated.
+    ///
+    /// If the ring was built with `virtual_time`, its clock is handed to the
+    /// time driver too: the two must agree about what time it is, or the ring
+    /// would jump ahead while the timewheel stayed put and no timer would ever
+    /// expire.
+    pub fn simulated(fake: crate::deterministic_testing::FakeRing) -> Self {
+        // Read before `fake` moves into the driver.
+        let time_driver = match fake.clock() {
+            Some(clock) => time::TimeDriver::simulated(clock),
+            None => time::TimeDriver::default(),
+        };
+        Self {
+            io_driver: IODriver::simulated(fake),
+            time_driver,
+            ..Default::default()
+        }
+    }
+
     /// Like [`with_thread_id`](Self::with_thread_id), but attaches the shared
     /// peer table to this worker's io_driver so it can MSG_RING its peers.
     pub fn with_peers(thread_id: usize, peers: std::sync::Arc<peers::PeerTable>) -> Self {
@@ -417,7 +436,8 @@ impl<Rep: 'static> Drop for RecvMsgReply<Rep> {
         // has arrived, the slot is kept as `Cancelled` (glue stashed) so the
         // late reply is freed when it lands, rather than leaking or mis-routing
         // into a reused slot.
-        crate::io_driver::IO_DRIVER.with(|d| d.abandon_reply_slot(self.slot, drop_erased_as::<Rep>));
+        crate::io_driver::IO_DRIVER
+            .with(|d| d.abandon_reply_slot(self.slot, drop_erased_as::<Rep>));
     }
 }
 
@@ -525,10 +545,7 @@ pub struct RecvFromPeer {
 impl std::future::Future for RecvFromPeer {
     type Output = PeerMessage;
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> std::task::Poll<PeerMessage> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<PeerMessage> {
         crate::io_driver::IO_DRIVER.with(|d| d.poll_peer_inbox(cx.waker()))
     }
 }

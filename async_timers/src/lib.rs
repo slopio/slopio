@@ -119,9 +119,19 @@ impl TimeWheel {
         }
     }
 
+    /// Advance the wheel to the current time.
+    #[inline]
     pub fn tick(&mut self) {
-        let now = Instant::now();
-        let now_wall = SystemTime::now();
+        self.tick_at(Instant::now(), SystemTime::now());
+    }
+
+    /// Advance the wheel to a caller-supplied instant.
+    ///
+    /// The wheel does not decide where time comes from. That lets a simulation
+    /// drive it from a clock it controls, without this crate learning what a
+    /// simulation is — and leaves [`tick`](Self::tick) as the only path
+    /// production takes.
+    pub fn tick_at(&mut self, now: Instant, now_wall: SystemTime) {
         let elapsed = now.duration_since(self.last_tick);
         let ticks_to_process = (elapsed.as_millis() / MS_TICK as u128) as usize;
 
