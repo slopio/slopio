@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use runtime_core::deterministic_testing::{FakeRing, FakeRingHandle, ReadEvent, simulated_socket};
 use runtime_core::io_driver::operations::sockets::recv::socket_recv;
 use runtime_core::io_driver::operations::sockets::send::socket_send;
+use runtime_core::runtime::select::{SelectResult, select};
 use runtime_core::runtime::{RuntimeInner, spawn, time::Sleep};
 
 fn simulated(seed: u64) -> (FakeRing, FakeRingHandle) {
@@ -140,5 +141,63 @@ fn a_timer_fires_without_any_time_actually_passing() {
         clock.elapsed() >= Duration::from_secs(30),
         "the sleep resolved after only {:?} of simulated time",
         clock.elapsed(),
+    );
+}
+
+/// A sleep that fails the test if it is ever reached.
+async fn never_reached(duration: Duration) {
+    Sleep::during(duration).await;
+    panic!("the {duration:?} arm resolved first");
+}
+
+#[test]
+fn select_resolves_on_whichever_sleep_is_shorter() {
+    let long = Duration::from_secs(3600);
+    let short = Duration::from_millis(100);
+
+    // Both orders, so "always the second arm" cannot pass either.
+    for long_first in [true, false] {
+        let (fake, handle) = simulated(1);
+        let clock = handle.clock().expect("built with virtual_time");
+
+        RuntimeInner::simulated(fake).block_on::<(), _>(
+            async move {
+                if long_first {
+                    select(never_reached(long), Sleep::during(short)).await;
+                } else {
+                    select(Sleep::during(short), never_reached(long)).await;
+                }
+            },
+            None,
+            |run| run(),
+        );
+
+        // The short arm was waited on rather than resolved on the spot — the
+        // one thing a panic on the long arm cannot show.
+        assert!(
+            clock.elapsed() >= short,
+            "resolved after only {:?} of simulated time",
+            clock.elapsed(),
+        );
+    }
+}
+
+#[test]
+fn work_continues_normally_after_a_select() {
+    let (fake, _handle) = simulated(1);
+
+    RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            select(
+                never_reached(Duration::from_secs(3600)),
+                Sleep::during(Duration::from_millis(100)),
+            )
+            .await;
+            // Armed after the select, so this takes another full pass of the
+            // loop — and must not queue behind the arm that lost.
+            Sleep::during(Duration::from_millis(50)).await;
+        },
+        None,
+        |run| run(),
     );
 }
