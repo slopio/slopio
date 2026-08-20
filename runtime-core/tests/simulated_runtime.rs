@@ -309,3 +309,41 @@ fn holding_every_buffer_drains_the_ring() {
         "the third read should have run the ring dry, got {failure:?}",
     );
 }
+
+#[test]
+fn a_timed_out_read_leaves_its_data_for_the_next_one() {
+    let (fake, handle) = simulated(42);
+    let socket = simulated_socket().expect("a socket");
+
+    // Arrives long after the timeout below, so the first read never sees it.
+    handle.on_read(
+        socket.fd(),
+        ReadEvent::data(b"hello").after(Duration::from_secs(10)),
+    );
+
+    let got = RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            // The timeout wins, and dropping the losing read cancels it.
+            let raced = select(
+                socket_recv(&socket, vec![0u8; 32]),
+                Sleep::during(Duration::from_millis(100)),
+            )
+            .await;
+            assert!(
+                matches!(raced, SelectResult::Second(_)),
+                "the read should have timed out",
+            );
+
+            // A kernel would still have those bytes buffered, so the next read
+            // collects them. The cancel must not have eaten the delivery.
+            let (result, buf) = socket_recv(&socket, vec![0u8; 32]).await;
+            let n = result.expect("the second read succeeded");
+            buf[..n].to_vec()
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(got, b"hello");
+    assert_eq!(handle.scenario_remaining(), 0);
+}

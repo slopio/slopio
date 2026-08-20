@@ -38,12 +38,22 @@ impl Outcome {
     }
 }
 
+/// Where a pending op's outcome came from.
+pub enum Source {
+    /// The op's own default. Nothing to give back if it is cancelled.
+    Default,
+    /// A scenario entry, which asked for this delay. Kept so a cancel can put
+    /// the entry back exactly as it was.
+    Scenario(Option<Duration>),
+}
+
 pub struct Pending {
     pub sqe: Sqe,
     /// Submission order. Breaks ties between ops due at the same instant, and
     /// is the order tests see in `inflight()`.
     pub seq: u64,
     pub outcome: Outcome,
+    pub source: Source,
 }
 
 struct Scheduled {

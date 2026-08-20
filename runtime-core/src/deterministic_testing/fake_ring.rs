@@ -21,7 +21,7 @@ use super::sqe::{
     IORING_ACCEPT_MULTISHOT, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE,
     IORING_RECV_MULTISHOT, Sqe,
 };
-use super::timeline::{Outcome, Pending, Timeline};
+use super::timeline::{Outcome, Pending, Source, Timeline};
 use super::virtual_clock::VirtualClock;
 
 /// Where the simulated ring gets time, and what it does to wait.
@@ -152,6 +152,7 @@ fn arm(state: &mut FakeRingState, mut pending: Pending, now: Nanos) {
     match scripted {
         Some(scripted) => {
             pending.outcome = scripted.outcome;
+            pending.source = Source::Scenario(scripted.delay);
             state.timeline.schedule(pending, scripted.delay, now);
         }
         None => state.waiting.push(pending),
@@ -282,21 +283,49 @@ struct Wakeup {
 /// The target's CQE carries no `F_MORE`, which is what tells the driver a
 /// multishot is finally done. Both are queued here, target first, matching the
 /// order a real ring reports them in.
-fn apply_cancel(state: &mut FakeRingState, target: u64) -> i32 {
-    let found = state.timeline.take_by_user_data(target).is_some() || {
-        match state.waiting.iter().position(|p| p.sqe.user_data == target) {
-            Some(i) => {
-                state.waiting.remove(i);
-                true
-            }
-            None => false,
-        }
-    };
-    if !found {
+fn apply_cancel(state: &mut FakeRingState, target: u64, now: Nanos) -> i32 {
+    let cancelled = state.timeline.take_by_user_data(target).or_else(|| {
+        let i = state
+            .waiting
+            .iter()
+            .position(|p| p.sqe.user_data == target)?;
+        Some(state.waiting.remove(i))
+    });
+    let Some(pending) = cancelled else {
         // Already gone. A cancel racing its target's own completion gets this
         // from a real kernel too — including when both land in one batch here.
         return -libc::ENOENT;
+    };
+
+    // Give the scenario entry back. A kernel does not discard buffered data
+    // because a read was cancelled — the next read on that socket still sees
+    // it — so neither does this. Without it a cancel silently eats what was
+    // scripted, and `scenario_remaining` reports it as delivered.
+    if let Source::Scenario(delay) = pending.source
+        && let Some(trigger) = trigger_for(&pending.sqe)
+    {
+        state.scenario.unshift(
+            trigger,
+            Scripted {
+                outcome: pending.outcome,
+                delay,
+            },
+        );
+
+        // An op that parked because the scenario was empty can be served now.
+        // Nothing else revisits `waiting`, so without this the entry would sit
+        // there while a read that wants it waits forever — which is exactly the
+        // shape of a read that timed out and was retried.
+        if let Some(i) = state
+            .waiting
+            .iter()
+            .position(|p| trigger_for(&p.sqe) == Some(trigger))
+        {
+            let parked = state.waiting.remove(i);
+            arm(state, parked, now);
+        }
     }
+
     state.cq.push_back(Completion {
         user_data: target,
         result: -libc::ECANCELED,
@@ -629,12 +658,26 @@ impl FakeRing {
                         user_data: sqe.user_data,
                     });
                 }
-                Class::Waiting => arm(state, Pending { sqe, seq, outcome }, now),
-                Class::Scheduled => {
-                    state
-                        .timeline
-                        .schedule(Pending { sqe, seq, outcome }, None, now)
-                }
+                Class::Waiting => arm(
+                    state,
+                    Pending {
+                        sqe,
+                        seq,
+                        outcome,
+                        source: Source::Default,
+                    },
+                    now,
+                ),
+                Class::Scheduled => state.timeline.schedule(
+                    Pending {
+                        sqe,
+                        seq,
+                        outcome,
+                        source: Source::Default,
+                    },
+                    None,
+                    now,
+                ),
             }
         }
 
@@ -693,7 +736,7 @@ impl FakeRing {
                     // op — so it is resolved against live state rather than
                     // through an outcome.
                     if sqe.opcode == OP_ASYNC_CANCEL {
-                        let result = apply_cancel(&mut state, sqe.addr);
+                        let result = apply_cancel(&mut state, sqe.addr, fired_at);
                         state.cq.push_back(Completion {
                             user_data: sqe.user_data,
                             result,
@@ -727,7 +770,16 @@ impl FakeRing {
                     if is_multishot(&sqe) && !ends_multishot(&sqe, completion.result) {
                         completion.flags |= IORING_CQE_F_MORE;
                         let outcome = default_outcome(&sqe);
-                        arm(&mut state, Pending { sqe, seq, outcome }, fired_at);
+                        arm(
+                            &mut state,
+                            Pending {
+                                sqe,
+                                seq,
+                                outcome,
+                                source: Source::Default,
+                            },
+                            fired_at,
+                        );
                     }
 
                     state.cq.push_back(completion);

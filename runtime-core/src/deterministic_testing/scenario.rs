@@ -168,6 +168,15 @@ impl Scenario {
         self.queued.entry(trigger).or_default().push_back(scripted);
     }
 
+    /// Put an entry back at the head, so it is the next one taken.
+    ///
+    /// A cancelled op has to give back what it claimed: a kernel does not
+    /// discard buffered data because a read was cancelled, and the next read
+    /// would see it.
+    pub fn unshift(&mut self, trigger: Trigger, scripted: Scripted) {
+        self.queued.entry(trigger).or_default().push_front(scripted);
+    }
+
     /// Take the next response for `trigger`, if the scenario has one left.
     pub fn take(&mut self, trigger: Trigger) -> Option<Scripted> {
         self.queued.get_mut(&trigger)?.pop_front()

@@ -333,6 +333,49 @@ fn a_scripted_delay_needs_no_grid_and_has_no_ceiling() {
 }
 
 #[test]
+fn cancelling_a_read_gives_its_scripted_data_back() {
+    // Virtual time so the long pin below costs nothing.
+    let (mut ring, handle) = FakeRing::builder()
+        .latency_step(STEP)
+        .seed(0)
+        .virtual_time()
+        .build();
+    let mut buf = [0u8; 32];
+
+    // Pinned far out, so the cancel is certain to land first.
+    handle.on_read(11, ReadEvent::data(b"hello").after(Duration::from_secs(1)));
+
+    ring.add(&recv(11, &mut buf, 7));
+    ring.submit();
+    assert_eq!(handle.scenario_remaining(), 0, "the read claimed the entry");
+
+    ring.add(&opcode::AsyncCancel::new(7).build().user_data(99));
+    ring.submit_and_wait();
+
+    let mut seen = Vec::new();
+    while let Some(completion) = ring.pop_completion() {
+        seen.push((completion.user_data, completion.result));
+    }
+    assert_eq!(seen, vec![(7, -libc::ECANCELED), (99, 0)]);
+
+    // Nothing was delivered, so the scenario still owes it. A kernel does not
+    // drop buffered data because a read was cancelled.
+    assert_eq!(
+        handle.scenario_remaining(),
+        1,
+        "the cancel swallowed the scripted data",
+    );
+
+    // And the next read on that socket collects it.
+    let mut second = [0u8; 32];
+    ring.add(&recv(11, &mut second, 8));
+    ring.submit_and_wait();
+
+    let completion = ring.pop_completion().expect("the second read completed");
+    assert_eq!(&second[..completion.result as usize], b"hello");
+}
+
+#[test]
 fn a_read_on_an_unscripted_descriptor_still_parks() {
     let (mut ring, handle) = ring(0);
     let mut buf = [0u8; 32];
