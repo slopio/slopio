@@ -1,24 +1,11 @@
 //! A submission/completion ring that never reaches the kernel.
 //!
-//! The fake accepts SQEs exactly as the real ring does, decodes them into
-//! [`Sqe`], and schedules them on a [`Wheel`]. Which bucket an op lands in is
-//! drawn from a seeded PRNG, so a seed fixes the completion order exactly —
-//! the orderings that are rare and unreproducible against a real kernel (a
-//! completion landing after its cancel, a zero-copy notification arriving
-//! before the send it belongs to) become things a test asks for by seed.
-//!
-//! Not every submission is scheduled. Ops fall into three classes:
-//!
-//! - **scheduled** — the kernel finishes these on its own, so a bucket is the
-//!   right model: sends, writes, opens, cancels.
-//! - **waiting** — these block on something external. A recv on a socket nobody
-//!   wrote to must never complete on its own, so it parks until a test says
-//!   otherwise.
-//! - **wakeup** — the `TIMEOUT` the runtime arms before it blocks. Not I/O at
-//!   all: it is the upper bound on how long this ring may wait, so it bounds
-//!   the sleep instead of taking a bucket.
+//! Submissions are decoded into [`Sqe`] and scheduled on a seeded [`Timeline`],
+//! so
+//! a seed fixes the completion order exactly — orderings that are rare and
+//! unreproducible against a real kernel become things a test asks for.
 
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::rc::Rc;
@@ -27,14 +14,13 @@ use std::time::Duration;
 use io_uring::{opcode, squeue};
 
 use super::clock::{self, Nanos};
-use super::sqe::Sqe;
-use super::wheel::{Outcome, Pending, Wheel};
+use super::fds::{self, FdKind};
+use super::scenario::{Scenario, Scripted, Trigger};
+use super::sqe::{IORING_ACCEPT_MULTISHOT, IORING_CQE_F_MORE, IORING_RECV_MULTISHOT, Sqe};
+use super::timeline::{Outcome, Pending, Timeline};
 
-/// The `ring_fd` a simulated ring reports.
-///
-/// Peer messaging looks up a target ring by fd and posts `MSG_RING` to it; a
-/// fake has no descriptor to give. The sentinel is deliberately invalid so a
-/// stray syscall on it fails loudly instead of touching an unrelated fd.
+/// The `ring_fd` a simulated ring reports. Deliberately invalid, so a stray
+/// syscall on it fails instead of touching an unrelated fd.
 pub const SIMULATED_RING_FD: RawFd = -1;
 
 /// One completion, as the three fields a CQE carries.
@@ -45,10 +31,8 @@ pub struct Completion {
     pub flags: u32,
 }
 
-// Opcodes are matched as constants rather than through `opcode::X::CODE` paths
-// so the arms below read as a table. Note the collisions the io-uring builders
-// hide: `Recv`/`RecvMulti`/`RecvBundle` are all `IORING_OP_RECV`, and the
-// recvmsg and accept pairs likewise share one opcode each.
+// Matched as constants because the builder types collide: `Recv`/`RecvMulti`/
+// `RecvBundle` are all `IORING_OP_RECV`, as are the recvmsg and accept pairs.
 const OP_TIMEOUT: u8 = opcode::Timeout::CODE;
 const OP_RECV: u8 = opcode::Recv::CODE;
 const OP_READ: u8 = opcode::Read::CODE;
@@ -62,11 +46,17 @@ const OP_SENDMSG: u8 = opcode::SendMsg::CODE;
 const OP_WRITE: u8 = opcode::Write::CODE;
 const OP_WRITEV: u8 = opcode::Writev::CODE;
 const OP_WRITE_FIXED: u8 = opcode::WriteFixed::CODE;
+const OP_OPENAT: u8 = opcode::OpenAt::CODE;
+const OP_ASYNC_CANCEL: u8 = opcode::AsyncCancel::CODE;
 
-/// How the simulator treats a submission. See the module docs.
 enum Class {
+    /// The kernel finishes these alone: sends, writes, opens, cancels.
     Scheduled,
+    /// Blocked on something external. A recv on a socket nobody wrote to must
+    /// never complete by itself, so it parks until a test says otherwise.
     Waiting,
+    /// The `TIMEOUT` the runtime arms before blocking. Not IO — it bounds how
+    /// long the ring may wait, so it is never scheduled.
     Wakeup,
 }
 
@@ -78,67 +68,191 @@ fn classify(sqe: &Sqe) -> Class {
     }
 }
 
-/// What an op completes with when a test hasn't said otherwise.
+/// Whether this op yields many completions rather than one.
+///
+/// The multishot builders are invisible from the opcode — `AcceptMulti` and
+/// `RecvMulti` share theirs with the single-shot versions and differ only by a
+/// bit in `ioprio`.
+fn is_multishot(sqe: &Sqe) -> bool {
+    match sqe.opcode {
+        OP_ACCEPT => sqe.ioprio & IORING_ACCEPT_MULTISHOT != 0,
+        OP_RECV | OP_RECVMSG => sqe.ioprio & IORING_RECV_MULTISHOT != 0,
+        _ => false,
+    }
+}
+
+/// Whether this completion is the last one a multishot will produce.
+///
+/// The rule differs by op, which is why it cannot just be "non-negative keeps
+/// going": a zero-length read is EOF and ends the stream, whereas a zero from
+/// an accept is a perfectly good descriptor.
+fn ends_multishot(sqe: &Sqe, result: i32) -> bool {
+    match sqe.opcode {
+        OP_RECV | OP_RECVMSG => result <= 0,
+        OP_ACCEPT => result < 0,
+        _ => true,
+    }
+}
+
+/// What a scenario entry would have to name to answer this op.
+fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
+    match sqe.opcode {
+        OP_RECV | OP_READ | OP_RECVMSG => Some(Trigger::Read(sqe.fd)),
+        OP_ACCEPT => Some(Trigger::Accept(sqe.fd)),
+        OP_CONNECT => Some(Trigger::Connect(sqe.fd)),
+        _ => None,
+    }
+}
+
+/// Put an op where it belongs: on the timeline if the scenario already says
+/// what happens to it, parked otherwise.
+fn arm(state: &mut FakeRingState, mut pending: Pending, now: Nanos) {
+    let scripted = trigger_for(&pending.sqe).and_then(|t| state.scenario.take(t));
+    match scripted {
+        Some(scripted) => {
+            pending.outcome = scripted.outcome;
+            state.timeline.schedule(pending, scripted.delay, now);
+        }
+        None => state.waiting.push(pending),
+    }
+}
+
 fn default_outcome(sqe: &Sqe) -> Outcome {
     let result = match sqe.opcode {
-        // A write-side op reports the byte count it was handed. (`WRITEV`'s
-        // `len` is an iovec count, not a byte count — close enough until
-        // something needs the real figure.)
+        OP_OPENAT => return Outcome::NewFd(FdKind::File),
+        // `WRITEV`'s `len` is an iovec count rather than a byte count — close
+        // enough until something needs the real figure.
         OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_WRITE | OP_WRITEV | OP_WRITE_FIXED => sqe.len as i32,
         _ => 0,
     };
-    Outcome { result, flags: 0 }
+    Outcome::Result { result, flags: 0 }
 }
 
-/// The kernel's `__kernel_timespec`.
-///
-/// `io_uring::types::Timespec` is `repr(transparent)` over it but exposes no
-/// accessors, so reading a `TIMEOUT`'s duration means restating the layout —
-/// the same reinterpretation [`Sqe`] already relies on.
+/// Retire an op: deliver its outcome and build the CQE. A CQE carries no
+/// payload, so data goes into the op's buffer and only the count is reported.
+fn complete_pending(pending: Pending) -> Completion {
+    let Pending { sqe, outcome, .. } = pending;
+    match outcome {
+        Outcome::Result { result, flags } => Completion {
+            user_data: sqe.user_data,
+            result,
+            flags,
+        },
+        Outcome::NewFd(kind) => Completion {
+            user_data: sqe.user_data,
+            result: match fds::mint(kind) {
+                Ok(fd) => fd,
+                // Report exhaustion the way the kernel would, rather than
+                // panicking inside what is meant to be a completion.
+                Err(e) => -e.raw_os_error().unwrap_or(libc::ENFILE),
+            },
+            flags: 0,
+        },
+        Outcome::Data(bytes) => {
+            assert!(
+                !sqe.uses_buffer_select(),
+                "delivering data to user_data {:#x}, a provided-buffer op: its \
+                 `addr` names no buffer, so the bytes would land on unrelated \
+                 memory. Managed recv needs a buffer group and a `bid`, which \
+                 the simulator does not model yet.",
+                sqe.user_data,
+            );
+            assert!(
+                sqe.addr != 0,
+                "delivering data to user_data {:#x}, which has no buffer",
+                sqe.user_data,
+            );
+
+            // Truncate rather than reject: that is a short read.
+            let n = bytes.len().min(sqe.len as usize);
+            if n > 0 {
+                // SAFETY: `addr`/`len` describe a buffer the submitting future
+                // keeps alive until its op completes — the same contract that
+                // lets the kernel write there. The op is being retired now, the
+                // write is capped at the declared length, and source and
+                // destination are distinct allocations.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), sqe.addr as *mut u8, n);
+                }
+            }
+            Completion {
+                user_data: sqe.user_data,
+                result: n as i32,
+                flags: 0,
+            }
+        }
+    }
+}
+
+/// `io_uring::types::Timespec` is `repr(transparent)` over this but exposes no
+/// accessors, so reading a `TIMEOUT`'s duration means restating the layout.
 #[repr(C)]
 struct KernelTimespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
 
-/// The duration a `TIMEOUT` sqe was armed with.
 fn timeout_duration(sqe: &Sqe) -> Nanos {
     if sqe.addr == 0 {
         return 0;
     }
-    // SAFETY: a `TIMEOUT` sqe carries a pointer to a `Timespec` the submitter
-    // keeps alive for as long as the op is in flight — the same contract the
-    // kernel itself relies on to read it. The runtime's wakeup timer holds it
-    // in a driver field, so it outlives this read.
+    // SAFETY: a `TIMEOUT` sqe points at a `Timespec` the submitter keeps alive
+    // while the op is in flight — the contract the kernel itself reads it under.
     let ts = unsafe { &*(sqe.addr as *const KernelTimespec) };
     (ts.tv_sec.max(0) as Nanos) * 1_000_000_000 + ts.tv_nsec.max(0) as Nanos
 }
 
-/// The runtime's armed idle timer.
 struct Wakeup {
     deadline: Nanos,
     user_data: u64,
 }
 
+/// Retire the op an `ASYNC_CANCEL` names, and report what the cancel itself
+/// should complete with.
+///
+/// The target's CQE carries no `F_MORE`, which is what tells the driver a
+/// multishot is finally done. Both are queued here, target first, matching the
+/// order a real ring reports them in.
+fn apply_cancel(state: &mut FakeRingState, target: u64) -> i32 {
+    let found = state.timeline.take_by_user_data(target).is_some() || {
+        match state.waiting.iter().position(|p| p.sqe.user_data == target) {
+            Some(i) => {
+                state.waiting.remove(i);
+                true
+            }
+            None => false,
+        }
+    };
+    if !found {
+        // Already gone. A cancel racing its target's own completion gets this
+        // from a real kernel too — including when both land in one batch here.
+        return -libc::ENOENT;
+    }
+    state.cq.push_back(Completion {
+        user_data: target,
+        result: -libc::ECANCELED,
+        flags: 0,
+    });
+    0
+}
+
 struct FakeRingState {
     /// Pushed by the driver, not yet flushed by a `submit`.
     staged: Vec<Sqe>,
-    /// Ops with a bucket, waiting for their tick.
-    wheel: Wheel,
+    timeline: Timeline,
     /// Ops blocked on an event the simulation hasn't produced.
     waiting: Vec<Pending>,
-    /// The bound on how long this ring may block, if the runtime armed one.
     wakeup: Option<Wakeup>,
-    /// Completions waiting for the driver to drain them.
+    /// Declared before the run; consulted as ops arrive.
+    scenario: Scenario,
     cq: VecDeque<Completion>,
     next_seq: u64,
+    /// Descriptors handed to the runtime, in the order they were minted.
+    opened: Vec<RawFd>,
 }
 
-/// A test's handle on a [`FakeRing`], for inspecting what the runtime submitted
-/// and deciding what comes back.
-///
-/// Cloneable and shared: the test keeps one, the runtime's driver holds the
-/// other, and both see the same ring.
+/// A test's handle on a [`FakeRing`]: what the runtime submitted, and what
+/// comes back. Cloneable and shared — the test keeps one, the driver the other.
 #[derive(Clone)]
 pub struct FakeRingHandle(Rc<RefCell<FakeRingState>>);
 
@@ -146,7 +260,7 @@ impl FakeRingHandle {
     /// Every op submitted and not yet completed, in submission order.
     pub fn inflight(&self) -> Vec<Sqe> {
         let state = self.0.borrow();
-        let mut all: Vec<&Pending> = state.wheel.iter().chain(state.waiting.iter()).collect();
+        let mut all: Vec<&Pending> = state.timeline.iter().chain(state.waiting.iter()).collect();
         all.sort_unstable_by_key(|p| p.seq);
         all.into_iter().map(|p| p.sqe).collect()
     }
@@ -161,16 +275,14 @@ impl FakeRingHandle {
         self.inflight().into_iter().filter(|s| pred(s)).collect()
     }
 
-    /// Complete an in-flight op now, ahead of whatever tick it was scheduled
-    /// for: queue a completion for `user_data` and retire the op.
+    /// Complete an op now, ahead of the tick it was scheduled for.
     ///
-    /// Panics if no op with that `user_data` is in flight. Completing an op
-    /// twice, or one that was never submitted, would hand the driver a slab
-    /// index it dereferences unchecked — so this is caught here, where the
-    /// mistake is, rather than as a crash somewhere unrelated.
+    /// Panics if it is not in flight: completing an unknown or already-retired
+    /// token would hand the driver a slab index it dereferences unchecked, so
+    /// the mistake is caught here rather than as a crash somewhere unrelated.
     pub fn complete(&self, user_data: u64, result: i32, flags: u32) {
         let mut state = self.0.borrow_mut();
-        let found = state.wheel.take_by_user_data(user_data).is_some() || {
+        let found = state.timeline.take_by_user_data(user_data).is_some() || {
             match state
                 .waiting
                 .iter()
@@ -194,17 +306,13 @@ impl FakeRingHandle {
         });
     }
 
-    /// Queue a completion for an op that stays in flight — a multishot yielding
-    /// one of many results, or a zero-copy send whose notification is still to
-    /// come. `flags` should carry `IORING_CQE_F_MORE`.
-    ///
-    /// Panics if the op is not in flight, for the same reason as [`complete`].
-    ///
-    /// [`complete`]: Self::complete
+    /// Complete an op that stays in flight — a multishot yielding one of many
+    /// results, or a zero-copy send still awaiting its notification. `flags`
+    /// should carry `IORING_CQE_F_MORE`.
     pub fn complete_keeping(&self, user_data: u64, result: i32, flags: u32) {
         let mut state = self.0.borrow_mut();
         assert!(
-            state.wheel.contains(user_data)
+            state.timeline.contains(user_data)
                 || state.waiting.iter().any(|p| p.sqe.user_data == user_data),
             "completing user_data {user_data:#x}, which is not in flight",
         );
@@ -215,12 +323,29 @@ impl FakeRingHandle {
         });
     }
 
-    /// Move a parked op onto the wheel, as though the event it was waiting for
-    /// just happened. It still serves its bucket delay rather than completing
-    /// on the spot.
-    ///
-    /// Panics if no waiting op has that `user_data`.
+    /// Schedule a parked op, as though the event it waited for just happened.
+    /// It still serves a latency rather than completing on the spot.
     pub fn wake(&self, user_data: u64, result: i32) {
+        self.schedule_parked(user_data, Outcome::Result { result, flags: 0 });
+    }
+
+    /// Schedule a parked `ACCEPT`, as though a connection arrived. It completes
+    /// with a real, unconnected TCP socket the runtime can set options on and
+    /// close like any other.
+    pub fn accept(&self, user_data: u64) {
+        self.schedule_parked(user_data, Outcome::NewFd(FdKind::Socket));
+    }
+
+    /// Deliver bytes to a parked read-side op. They are copied into its buffer
+    /// when the completion is posted, not now — that is where the kernel would
+    /// have written them. A delivery longer than the buffer is a short read.
+    ///
+    /// Panics if the op draws from a provided-buffer ring.
+    pub fn deliver(&self, user_data: u64, data: &[u8]) {
+        self.schedule_parked(user_data, Outcome::Data(data.to_vec()));
+    }
+
+    fn schedule_parked(&self, user_data: u64, outcome: Outcome) {
         let mut state = self.0.borrow_mut();
         let i = state
             .waiting
@@ -228,8 +353,9 @@ impl FakeRingHandle {
             .position(|p| p.sqe.user_data == user_data)
             .unwrap_or_else(|| panic!("waking user_data {user_data:#x}, which is not parked"));
         let mut pending = state.waiting.remove(i);
-        pending.outcome = Outcome { result, flags: 0 };
-        state.wheel.schedule(pending);
+        pending.outcome = outcome;
+        let now = clock::now();
+        state.timeline.schedule(pending, None, now);
     }
 
     /// Completions queued but not yet drained by the driver.
@@ -241,58 +367,96 @@ impl FakeRingHandle {
     pub fn parked(&self) -> usize {
         self.0.borrow().waiting.len()
     }
+
+    /// Queue what the next read on `fd` does. Call once per read the code under
+    /// test will perform; they are consumed in order.
+    ///
+    /// Declared before the runtime starts. The op is scheduled the moment it is
+    /// submitted, so nothing has to touch the ring while it runs — which is
+    /// what keeps the interleaving a function of the seed alone.
+    pub fn on_read(&self, fd: RawFd, event: impl Into<Scripted>) {
+        self.script(Trigger::Read(fd), event.into());
+    }
+
+    /// Queue what the next accept on `fd` does.
+    pub fn on_accept(&self, fd: RawFd, event: impl Into<Scripted>) {
+        self.script(Trigger::Accept(fd), event.into());
+    }
+
+    /// Queue what the next connect on `fd` does.
+    pub fn on_connect(&self, fd: RawFd, event: impl Into<Scripted>) {
+        self.script(Trigger::Connect(fd), event.into());
+    }
+
+    fn script(&self, trigger: Trigger, scripted: Scripted) {
+        self.0.borrow_mut().scenario.push(trigger, scripted);
+    }
+
+    /// Scripted responses that were never claimed — three reads declared
+    /// against code that performed two.
+    pub fn scenario_remaining(&self) -> usize {
+        self.0.borrow().scenario.remaining()
+    }
+
+    /// Descriptors the simulator minted and handed to the runtime, oldest
+    /// first. They are real and owned by whatever received them, so a test can
+    /// check that each was closed — an fd still open at the end is a leak.
+    pub fn opened_fds(&self) -> Vec<RawFd> {
+        self.0.borrow().opened.clone()
+    }
 }
 
-/// Builds a [`FakeRing`] together with the [`FakeRingHandle`] that drives it.
+/// Builds a [`FakeRing`] and its [`FakeRingHandle`].
 ///
-/// The two are made as a pair on purpose: a ring and its handle share one
-/// state, and handing out a way to mint a second ring against the same handle
-/// would give the driver two views of one in-flight list.
+/// As a pair on purpose: the two share one state, and a way to mint a second
+/// ring against the same handle would give the driver two views of one timeline.
 pub struct FakeRingBuilder {
-    bucket_step: Duration,
+    latency_step: Duration,
     seed: u64,
 }
 
 impl Default for FakeRingBuilder {
     fn default() -> Self {
         Self {
-            bucket_step: Duration::from_millis(10),
+            latency_step: Duration::from_millis(10),
             seed: 0,
         }
     }
 }
 
 impl FakeRingBuilder {
-    /// Latency granularity. Bucket `i` delays an op by `step * (i + 1)`, so the
-    /// default 10ms spans 10–60ms.
+    /// Latency granularity for ops the scenario did not time: each draws a
+    /// multiple of `step`, from one up to [`LATENCY_CLASSES`].
     ///
-    /// Shrinking it speeds a test up but changes more than the clock. The sleep
-    /// this is enforced with has a floor around 50µs, so below roughly 1ms
-    /// adjacent buckets stop being distinguishable and drain as one batch —
-    /// same completion order, fewer wakeups, and therefore fewer chances for
-    /// tasks to interleave between them.
-    pub fn bucket_step(mut self, step: Duration) -> Self {
-        self.bucket_step = step;
+    /// Below roughly 1ms the classes stop being distinguishable — the sleep
+    /// enforcing them has a floor around 50µs, so neighbouring ones drain as
+    /// one batch. Same completion order, but fewer wakeups for tasks to
+    /// interleave between.
+    ///
+    /// [`LATENCY_CLASSES`]: super::timeline::LATENCY_CLASSES
+    pub fn latency_step(mut self, step: Duration) -> Self {
+        self.latency_step = step;
         self
     }
 
-    /// Seed for bucket assignment. The same seed reproduces an interleaving
+    /// Seed for the drawn latencies. The same seed reproduces an interleaving
     /// exactly; sweeping seeds explores the ordering space.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
     }
 
-    /// Produce the ring and its handle. Give the ring to the runtime, keep the
-    /// handle.
+    /// Give the ring to the runtime, keep the handle.
     pub fn build(self) -> (FakeRing, FakeRingHandle) {
         let handle = FakeRingHandle(Rc::new(RefCell::new(FakeRingState {
             staged: Vec::new(),
-            wheel: Wheel::new(self.bucket_step.as_nanos() as Nanos, self.seed),
+            timeline: Timeline::new(self.latency_step.as_nanos() as Nanos, self.seed),
             waiting: Vec::new(),
             wakeup: None,
+            scenario: Scenario::default(),
             cq: VecDeque::new(),
             next_seq: 0,
+            opened: Vec::new(),
         })));
         (FakeRing(handle.clone()), handle)
     }
@@ -301,69 +465,82 @@ impl FakeRingBuilder {
 /// The ring itself. Held by the driver; driven through [`FakeRingHandle`].
 pub struct FakeRing(FakeRingHandle);
 
-/// What a blocking wait decided to do.
 enum Wait {
-    /// Sleep to a tick's deadline, then fire it.
-    Tick(super::wheel::Tick),
-    /// Sleep to the runtime's own wakeup deadline. Nothing completes.
+    /// Sleep to the next op's due time, then complete everything due.
+    Due(Nanos),
+    /// Sleep to the runtime's own deadline. Nothing completes.
     Wakeup(Nanos),
 }
 
 impl FakeRing {
-    /// Start building a ring and its handle.
     pub fn builder() -> FakeRingBuilder {
         FakeRingBuilder::default()
     }
 
+    fn state(&self) -> RefMut<'_, FakeRingState> {
+        self.0.0.borrow_mut()
+    }
+
     pub fn add(&mut self, entry: &squeue::Entry) {
-        self.0.0.borrow_mut().staged.push(Sqe::decode(entry));
+        self.state().staged.push(Sqe::decode(entry));
     }
 
     pub fn submit(&mut self) {
-        let mut state = self.0.0.borrow_mut();
-        let staged = std::mem::take(&mut state.staged);
-        for sqe in staged {
+        let mut guard = self.state();
+        let state = &mut *guard;
+
+        // Lifted out because the loop calls helpers that need all of `state`,
+        // which a live borrow of one field would block. Put back afterwards so
+        // the allocation is reused instead of rebuilt on every submit.
+        let mut staged = std::mem::take(&mut state.staged);
+
+        // One instant for the whole batch: ops of the same latency then share a
+        // due time exactly, and `seq` decides their order rather than however
+        // long this loop happened to take.
+        let now = clock::now();
+
+        for sqe in staged.drain(..) {
             let seq = state.next_seq;
             state.next_seq += 1;
+            let outcome = default_outcome(&sqe);
 
             match classify(&sqe) {
                 Class::Wakeup => {
-                    let deadline = clock::now() + timeout_duration(&sqe);
+                    let deadline = now + timeout_duration(&sqe);
                     state.wakeup = Some(Wakeup {
                         deadline,
                         user_data: sqe.user_data,
                     });
                 }
-                Class::Waiting => {
-                    let outcome = default_outcome(&sqe);
-                    state.waiting.push(Pending { sqe, seq, outcome });
-                }
+                Class::Waiting => arm(state, Pending { sqe, seq, outcome }, now),
                 Class::Scheduled => {
-                    let outcome = default_outcome(&sqe);
-                    state.wheel.schedule(Pending { sqe, seq, outcome });
+                    state
+                        .timeline
+                        .schedule(Pending { sqe, seq, outcome }, None, now)
                 }
             }
         }
+
+        state.staged = staged;
     }
 
-    /// Flush, then block until something completes.
-    ///
-    /// Whichever comes first: the next tick carrying work, or the deadline the
-    /// runtime armed. If neither exists the runtime would sleep forever, which
-    /// a test should see as a failure rather than a hang.
+    /// Flush, then block until whichever comes first: the next op falling due,
+    /// or the deadline the runtime armed. Neither existing means the runtime
+    /// would sleep forever, which a test should see as a failure rather than a
+    /// hang.
     pub fn submit_and_wait(&mut self) {
         self.submit();
 
         let wait = {
-            let mut state = self.0.0.borrow_mut();
+            let mut state = self.state();
             if !state.cq.is_empty() {
-                return; // the driver already has work to drain
+                return;
             }
-            let tick = state.wheel.next_tick();
+            let due = state.timeline.next_due();
             let wakeup = state.wakeup.as_ref().map(|w| w.deadline);
-            match (tick, wakeup) {
-                (Some(t), Some(w)) if w < t.deadline => Wait::Wakeup(w),
-                (Some(t), _) => Wait::Tick(t),
+            match (due, wakeup) {
+                (Some(d), Some(w)) if w < d => Wait::Wakeup(w),
+                (Some(d), _) => Wait::Due(d),
                 (None, Some(w)) => Wait::Wakeup(w),
                 (None, None) => panic!(
                     "simulated ring: {} op(s) parked with no event to complete them \
@@ -376,7 +553,7 @@ impl FakeRing {
         match wait {
             Wait::Wakeup(deadline) => {
                 clock::sleep_until(deadline);
-                let mut state = self.0.0.borrow_mut();
+                let mut state = self.state();
                 if let Some(w) = state.wakeup.take() {
                     state.cq.push_back(Completion {
                         user_data: w.user_data,
@@ -385,19 +562,47 @@ impl FakeRing {
                     });
                 }
             }
-            Wait::Tick(tick) => {
-                clock::sleep_until(tick.deadline);
-                let mut state = self.0.0.borrow_mut();
-                let fired = state.wheel.fire(tick);
+            Wait::Due(deadline) => {
+                clock::sleep_until(deadline);
+                let mut state = self.state();
+                let fired_at = clock::now();
+                let fired = state.timeline.take_due(fired_at);
                 for pending in fired {
-                    state.cq.push_back(Completion {
-                        user_data: pending.sqe.user_data,
-                        result: pending.outcome.result,
-                        flags: pending.outcome.flags,
-                    });
+                    let sqe = pending.sqe;
+
+                    // A cancel reports nothing of its own — it acts on another
+                    // op — so it is resolved against live state rather than
+                    // through an outcome.
+                    if sqe.opcode == OP_ASYNC_CANCEL {
+                        let result = apply_cancel(&mut state, sqe.addr);
+                        state.cq.push_back(Completion {
+                            user_data: sqe.user_data,
+                            result,
+                            flags: 0,
+                        });
+                        continue;
+                    }
+
+                    let seq = pending.seq;
+                    let minted = matches!(pending.outcome, Outcome::NewFd(_));
+                    let mut completion = complete_pending(pending);
+                    if minted && completion.result >= 0 {
+                        state.opened.push(completion.result);
+                    }
+
+                    // A multishot that is not finished gets `F_MORE` and goes
+                    // back to await its next event. A terminal result, or a
+                    // cancel, is what takes it out of flight.
+                    if is_multishot(&sqe) && !ends_multishot(&sqe, completion.result) {
+                        completion.flags |= IORING_CQE_F_MORE;
+                        let outcome = default_outcome(&sqe);
+                        arm(&mut state, Pending { sqe, seq, outcome }, fired_at);
+                    }
+
+                    state.cq.push_back(completion);
                 }
-                // The runtime arms its timer with `.count(1)`, so it completes
-                // as soon as one completion event lands — not only on elapse.
+                // Armed with `.count(1)`, so it completes as soon as one
+                // completion event lands — not only on elapse.
                 if let Some(w) = state.wakeup.take() {
                     state.cq.push_back(Completion {
                         user_data: w.user_data,
@@ -411,7 +616,7 @@ impl FakeRing {
 
     /// Take the next queued completion, oldest first.
     pub fn pop_completion(&mut self) -> Option<Completion> {
-        self.0.0.borrow_mut().cq.pop_front()
+        self.state().cq.pop_front()
     }
 
     pub fn ring_fd(&self) -> RawFd {

@@ -51,6 +51,16 @@ pub struct Sqe {
 /// [`Sqe::buf_group`]. Bit 5, per the kernel's `IOSQE_BUFFER_SELECT_BIT`.
 pub const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
 
+/// `IORING_CQE_F_MORE` — more completions are still coming for this
+/// `user_data`, so the op stays in flight.
+pub const IORING_CQE_F_MORE: u32 = 2;
+
+/// `IORING_ACCEPT_MULTISHOT`, in [`Sqe::ioprio`].
+pub const IORING_ACCEPT_MULTISHOT: u16 = 1;
+
+/// `IORING_RECV_MULTISHOT`, in [`Sqe::ioprio`].
+pub const IORING_RECV_MULTISHOT: u16 = 2;
+
 impl Sqe {
     /// Read an entry the runtime built as a plain struct.
     ///

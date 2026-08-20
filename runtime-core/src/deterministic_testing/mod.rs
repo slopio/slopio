@@ -2,28 +2,29 @@
 //!
 //! Nothing here performs IO. A [`FakeRing`] accepts the same SQEs the real
 //! driver submits, decodes them into a readable [`Sqe`], and schedules them on
-//! a seeded timing [`Wheel`] that decides when each one completes. The driver
-//! above it — slabs, wakers, the multishot state machine, buffer recycling —
-//! runs completely unmodified, so what a test exercises is the real thing,
-//! driven by a kernel it controls.
+//! a seeded timing [`Timeline`]. The driver above it — slabs, wakers, the
+//! multishot state machine, buffer recycling — runs unmodified, so a test
+//! exercises the real thing against a kernel it controls.
 //!
-//! Time is real: the wheel sleeps on `CLOCK_MONOTONIC` rather than inventing a
+//! Time is real: the timeline sleeps on `CLOCK_MONOTONIC` rather than inventing a
 //! virtual clock. That is what lets the runtime's own timewheel keep working
 //! untouched — it reads the same clock, and the simulation makes the time it
 //! believes in actually pass.
 //!
-//! This module is deliberately separate from [`io_driver`](crate::io_driver):
-//! nothing simulator-shaped lives in the driver. The one place they meet is the
-//! driver's `RingBackend` enum, which names [`FakeRing`] as the alternative to a
-//! real io_uring.
+//! Nothing simulator-shaped lives in [`io_driver`](crate::io_driver); the one
+//! place they meet is its `RingBackend` enum.
 //!
-//! [`Wheel`]: wheel::Wheel
+//! [`Timeline`]: timeline::Timeline
 
 mod clock;
 pub mod fake_ring;
+pub mod fds;
+pub mod scenario;
 pub mod sqe;
-pub mod wheel;
+pub mod timeline;
 
 pub use fake_ring::{Completion, FakeRing, FakeRingBuilder, FakeRingHandle, SIMULATED_RING_FD};
+pub use fds::{FdKind, mint, simulated_socket};
+pub use scenario::{AcceptEvent, ConnectEvent, ReadEvent, Scripted};
 pub use sqe::{IOSQE_BUFFER_SELECT, Sqe};
-pub use wheel::{BUCKETS, Outcome};
+pub use timeline::{LATENCY_CLASSES, Outcome};
