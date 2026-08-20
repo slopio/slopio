@@ -51,6 +51,13 @@ pub struct Sqe {
 /// [`Sqe::buf_group`]. Bit 5, per the kernel's `IOSQE_BUFFER_SELECT_BIT`.
 pub const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
 
+/// `IORING_CQE_F_BUFFER` — the completion names the provided buffer its data
+/// landed in, in the top bits of `flags`.
+pub const IORING_CQE_F_BUFFER: u32 = 1;
+
+/// Where the buffer id sits in a CQE's `flags`.
+pub const IORING_CQE_BUFFER_SHIFT: u32 = 16;
+
 /// `IORING_CQE_F_MORE` — more completions are still coming for this
 /// `user_data`, so the op stays in flight.
 pub const IORING_CQE_F_MORE: u32 = 2;

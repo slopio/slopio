@@ -208,7 +208,15 @@ macro_rules! define_buf_ring {
                             }
                             // Registration is the only step that needs a kernel;
                             // the mapping and its buffers are ordinary memory.
-                            $crate::io_driver::RingHandle::Simulated => {
+                            // Hand the simulator a way to consume the ring,
+                            // since no kernel will.
+                            $crate::io_driver::RingHandle::Simulated(handle) => {
+                                handle.register_buf_ring($bgid, || {
+                                    RING.with(|cell| {
+                                        let rb = cell.get()?;
+                                        rb.take().map(|(bid, ptr)| (bid, ptr, $bsize))
+                                    })
+                                });
                                 <$crate::__private::RingBuffer<$bsize, $rsize>>::new_unregistered(
                                     $bgid,
                                 )

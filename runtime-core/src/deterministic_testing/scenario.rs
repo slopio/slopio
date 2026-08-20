@@ -39,11 +39,11 @@ pub enum ReadEvent {
     Data(Vec<u8>),
     /// The peer closed. Reported as `0`, which also ends a multishot.
     Eof,
-    /// This many bytes arrived, without saying which.
+    /// This many bytes arrived, contents unspecified — zeros.
     ///
-    /// For provided-buffer ops, where there is no caller buffer to write into.
-    /// On an op that *does* have one this reports arrivals that never landed,
-    /// so the reader sees whatever was in the buffer before.
+    /// For when a test cares about the count and not the payload. The bytes are
+    /// still written, so the reader never sees stale contents behind a length
+    /// that claims otherwise.
     Bytes(u32),
     /// The read fails with this errno, given positive.
     Error(i32),
@@ -133,7 +133,7 @@ impl From<ReadEvent> for Outcome {
         match event {
             ReadEvent::Data(bytes) => Outcome::Data(bytes),
             ReadEvent::Eof => Outcome::result(0),
-            ReadEvent::Bytes(n) => Outcome::result(n as i32),
+            ReadEvent::Bytes(n) => Outcome::Data(vec![0; n as usize]),
             ReadEvent::Error(errno) => Outcome::result(as_errno(errno)),
         }
     }

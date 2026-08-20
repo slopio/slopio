@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::deterministic_testing::FakeRing;
+use crate::deterministic_testing::{FakeRing, FakeRingHandle};
 use crate::runtime::peers::PeerTable;
 
 use crate::{
@@ -1375,12 +1375,16 @@ enum RingBackend {
     Fake(FakeRing),
 }
 
-/// What a provided-buffer ring needs in order to install itself. Registration
-/// is the only step involving the kernel, so the simulated case carries nothing.
+/// What a provided-buffer ring needs in order to install itself.
+///
+/// Registration is the only step involving the kernel — the mapping and its
+/// buffers are ordinary memory either way. The simulated arm carries the ring's
+/// handle instead, because something then has to play the consumer, and it
+/// reaches the buffers by group id rather than by type.
 #[derive(Clone, Copy)]
 pub enum RingHandle<'a> {
     Uring(&'a IoUring),
-    Simulated,
+    Simulated(&'a FakeRingHandle),
 }
 
 impl Ring {
@@ -1397,7 +1401,7 @@ impl Ring {
     fn handle(&self) -> RingHandle<'_> {
         match &self.inner {
             RingBackend::Uring(ring) => RingHandle::Uring(ring),
-            RingBackend::Fake(_) => RingHandle::Simulated,
+            RingBackend::Fake(fake) => RingHandle::Simulated(fake.handle()),
         }
     }
 }

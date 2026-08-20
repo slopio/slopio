@@ -8,10 +8,16 @@
 use std::time::{Duration, Instant};
 
 use runtime_core::deterministic_testing::{FakeRing, FakeRingHandle, ReadEvent, simulated_socket};
+use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
 use runtime_core::io_driver::operations::sockets::recv::socket_recv;
 use runtime_core::io_driver::operations::sockets::send::socket_send;
 use runtime_core::runtime::select::{SelectResult, select};
 use runtime_core::runtime::{RuntimeInner, spawn, time::Sleep};
+use runtime_streams::StreamExt;
+
+// A real provided-buffer ring. `block_on::<R, _>` installs it, which on a
+// simulated backend also registers the simulator as its consumer.
+runtime_core::define_buf_ring!(ManagedRing, bgid = 3, buffer_size = 64, ring_size = 2);
 
 fn simulated(seed: u64) -> (FakeRing, FakeRingHandle) {
     FakeRing::builder()
@@ -199,5 +205,107 @@ fn work_continues_normally_after_a_select() {
         },
         None,
         |run| run(),
+    );
+}
+
+#[test]
+fn a_managed_recv_hands_a_borrowed_buffer_to_the_task() {
+    let (fake, handle) = simulated(42);
+    let socket = simulated_socket().expect("a socket");
+    handle.on_read(socket.fd(), ReadEvent::data(b"hello"));
+
+    let got = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ManagedRing>::new(socket.fd());
+            let buffer = recv.next().await.expect("a chunk").expect("no error");
+            buffer.as_ref().to_vec()
+        },
+        None,
+        |run| run(),
+    );
+
+    // The bytes went into a buffer the ring provided, the CQE named it in its
+    // flags, and the driver turned that into a typed BorrowedBuffer.
+    assert_eq!(got, b"hello");
+}
+
+#[test]
+fn a_ring_of_two_serves_more_reads_than_it_has_buffers() {
+    let (fake, handle) = simulated(42);
+    let socket = simulated_socket().expect("a socket");
+
+    for chunk in [b"one".as_slice(), b"two", b"three", b"four", b"five"] {
+        handle.on_read(socket.fd(), ReadEvent::data(chunk));
+    }
+
+    let got = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ManagedRing>::new(socket.fd());
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..5 {
+                let buffer = recv.next().await.expect("a chunk").expect("no error");
+                got.push(buffer.as_ref().to_vec());
+                // Dropped here, which recycles it.
+            }
+            got
+        },
+        None,
+        |run| run(),
+    );
+
+    // Five reads through a ring of two only works if each buffer went back
+    // after the task was done with it. The negative control is below.
+    assert_eq!(
+        got,
+        vec![
+            b"one".to_vec(),
+            b"two".to_vec(),
+            b"three".to_vec(),
+            b"four".to_vec(),
+            b"five".to_vec()
+        ]
+    );
+    assert_eq!(handle.scenario_remaining(), 0);
+}
+
+#[test]
+fn holding_every_buffer_drains_the_ring() {
+    // The mirror of the test above: same ring, same reads, but the task keeps
+    // its buffers instead of dropping them. If recycling were not what makes
+    // that one pass, this one would pass too.
+    let (fake, handle) = simulated(42);
+    let socket = simulated_socket().expect("a socket");
+
+    for chunk in [b"one".as_slice(), b"two", b"three"] {
+        handle.on_read(socket.fd(), ReadEvent::data(chunk));
+    }
+
+    let (delivered, failure) = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ManagedRing>::new(socket.fd());
+            let mut held = Vec::new();
+            let mut failure = None;
+
+            for _ in 0..3 {
+                match recv.next().await {
+                    // Pushed, not dropped: this buffer never goes back.
+                    Some(Ok(buffer)) => held.push(buffer),
+                    Some(Err(error)) => {
+                        failure = Some(error);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            (held.len(), failure)
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(delivered, 2, "the ring holds exactly two buffers");
+    assert!(
+        matches!(failure, Some(CompletionError::Other(code)) if code == -libc::ENOBUFS),
+        "the third read should have run the ring dry, got {failure:?}",
     );
 }

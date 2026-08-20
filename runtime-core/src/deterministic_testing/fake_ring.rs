@@ -8,6 +8,7 @@
 use std::cell::{RefCell, RefMut};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -16,7 +17,10 @@ use io_uring::{opcode, squeue};
 use super::clock::{self, Nanos};
 use super::fds::{self, FdKind};
 use super::scenario::{Scenario, Scripted, Trigger};
-use super::sqe::{IORING_ACCEPT_MULTISHOT, IORING_CQE_F_MORE, IORING_RECV_MULTISHOT, Sqe};
+use super::sqe::{
+    IORING_ACCEPT_MULTISHOT, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE,
+    IORING_RECV_MULTISHOT, Sqe,
+};
 use super::timeline::{Outcome, Pending, Timeline};
 use super::virtual_clock::VirtualClock;
 
@@ -51,6 +55,14 @@ impl Pace {
 /// The `ring_fd` a simulated ring reports. Deliberately invalid, so a stray
 /// syscall on it fails instead of touching an unrelated fd.
 pub const SIMULATED_RING_FD: RawFd = -1;
+
+/// Hands out the next buffer of one group, as `(bid, pointer, capacity)`.
+///
+/// A plain function pointer because the ring is reached by `bgid` — a number
+/// off the SQE — while the buffers live in a per-spec thread-local keyed by
+/// type. The driver already erases its buffer specs the same way for the
+/// cancel-recycle path.
+pub type BufRingTake = fn() -> Option<(u16, NonNull<u8>, u32)>;
 
 /// One completion, as the three fields a CQE carries.
 #[derive(Clone, Copy, Debug)]
@@ -159,7 +171,7 @@ fn default_outcome(sqe: &Sqe) -> Outcome {
 
 /// Retire an op: deliver its outcome and build the CQE. A CQE carries no
 /// payload, so data goes into the op's buffer and only the count is reported.
-fn complete_pending(pending: Pending) -> Completion {
+fn complete_pending(pending: Pending, provider: Option<BufRingTake>) -> Completion {
     let Pending { sqe, outcome, .. } = pending;
     match outcome {
         Outcome::Result { result, flags } => Completion {
@@ -177,15 +189,43 @@ fn complete_pending(pending: Pending) -> Completion {
             },
             flags: 0,
         },
+        Outcome::Data(bytes) if sqe.uses_buffer_select() => {
+            let take = provider.unwrap_or_else(|| {
+                panic!(
+                    "user_data {:#x} draws from buffer group {}, which no registered ring \
+                     provides — was the spec passed to the entry point?",
+                    sqe.user_data, sqe.buf_group,
+                )
+            });
+            let Some((bid, ptr, capacity)) = take() else {
+                // Every buffer handed out and none recycled. A real ring says
+                // the same, and a leaked `BorrowedBuffer` is how a test gets
+                // here.
+                return Completion {
+                    user_data: sqe.user_data,
+                    result: -libc::ENOBUFS,
+                    flags: 0,
+                };
+            };
+
+            let n = bytes.len().min(capacity as usize);
+            if n > 0 {
+                // SAFETY: the pointer comes from the ring's own entry for
+                // `bid`, so it addresses that buffer, and the write is capped
+                // at the buffer size the ring was built with.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), n);
+                }
+            }
+            Completion {
+                user_data: sqe.user_data,
+                result: n as i32,
+                // Which buffer the data landed in. The driver reads it back
+                // with `cqueue::buffer_select`.
+                flags: IORING_CQE_F_BUFFER | ((bid as u32) << IORING_CQE_BUFFER_SHIFT),
+            }
+        }
         Outcome::Data(bytes) => {
-            assert!(
-                !sqe.uses_buffer_select(),
-                "delivering data to user_data {:#x}, a provided-buffer op: its \
-                 `addr` names no buffer, so the bytes would land on unrelated \
-                 memory. Managed recv needs a buffer group and a `bid`, which \
-                 the simulator does not model yet.",
-                sqe.user_data,
-            );
             assert!(
                 sqe.addr != 0,
                 "delivering data to user_data {:#x}, which has no buffer",
@@ -278,6 +318,8 @@ struct FakeRingState {
     next_seq: u64,
     /// Descriptors handed to the runtime, in the order they were minted.
     opened: Vec<RawFd>,
+    /// Registered buffer rings, by group id.
+    buf_rings: Vec<(u16, BufRingTake)>,
     pace: Pace,
 }
 
@@ -428,6 +470,15 @@ impl FakeRingHandle {
         self.0.borrow().scenario.remaining()
     }
 
+    /// Install a provided-buffer ring under `bgid`.
+    ///
+    /// Called from a spec's `init` when the runtime starts on a simulated ring.
+    /// Without it the simulator has no way to reach the buffers a
+    /// `BUFFER_SELECT` op draws from.
+    pub fn register_buf_ring(&self, bgid: u16, take: BufRingTake) {
+        self.0.borrow_mut().buf_rings.push((bgid, take));
+    }
+
     /// The clock this ring advances, if it was built with
     /// [`virtual_time`](FakeRingBuilder::virtual_time).
     ///
@@ -521,6 +572,7 @@ impl FakeRingBuilder {
             cq: VecDeque::new(),
             next_seq: 0,
             opened: Vec::new(),
+            buf_rings: Vec::new(),
             pace,
         })));
         (FakeRing(handle.clone()), handle)
@@ -652,7 +704,19 @@ impl FakeRing {
 
                     let seq = pending.seq;
                     let minted = matches!(pending.outcome, Outcome::NewFd(_));
-                    let mut completion = complete_pending(pending);
+                    // Resolved before the call so no borrow of `state` is held
+                    // across it.
+                    let provider = sqe
+                        .uses_buffer_select()
+                        .then(|| {
+                            state
+                                .buf_rings
+                                .iter()
+                                .find(|(bgid, _)| *bgid == sqe.buf_group)
+                                .map(|(_, take)| *take)
+                        })
+                        .flatten();
+                    let mut completion = complete_pending(pending, provider);
                     if minted && completion.result >= 0 {
                         state.opened.push(completion.result);
                     }
@@ -688,6 +752,11 @@ impl FakeRing {
 
     pub fn ring_fd(&self) -> RawFd {
         SIMULATED_RING_FD
+    }
+
+    /// The handle onto this ring's state, for installing buffer rings.
+    pub fn handle(&self) -> &FakeRingHandle {
+        &self.0
     }
 
     /// The clock this ring advances, if it was built with

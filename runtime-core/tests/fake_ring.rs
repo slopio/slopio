@@ -16,6 +16,19 @@ use runtime_core::deterministic_testing::{
     simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::SocketWrapper;
+use runtime_core::io_driver::{BufRingSpec, RingHandle};
+
+// Real provided-buffer rings: anonymous mappings and a buffer pool, exactly as
+// production builds them. Only the kernel registration is skipped, so the
+// simulator has to consume them itself.
+runtime_core::define_buf_ring!(TestRing, bgid = 9, buffer_size = 64, ring_size = 4);
+runtime_core::define_buf_ring!(TinyRing, bgid = 10, buffer_size = 16, ring_size = 2);
+
+fn recv_multi(fd: i32, bgid: u16, user_data: u64) -> io_uring::squeue::Entry {
+    opcode::RecvMulti::new(Fd(fd), bgid)
+        .build()
+        .user_data(user_data)
+}
 
 /// Fast enough to keep the suite quick, coarse enough that latency classes
 /// stay distinguishable against the ~50µs floor on the sleep.
@@ -159,19 +172,17 @@ fn an_accept_can_hand_back_a_descriptor_the_test_made() {
 #[test]
 fn a_scripted_eof_ends_a_multishot_recv() {
     let (mut ring, handle) = ring(0);
+    TestRing::init(RingHandle::Simulated(&handle));
 
-    // Bare counts rather than `on_read`: a multishot recv draws from a provided
-    // buffer ring, so there is no caller buffer to write bytes into. Scripting
-    // data on one is refused, and rightly.
-    handle.on_read(11, ReadEvent::Bytes(128));
+    handle.on_read(11, ReadEvent::Bytes(32));
     handle.on_read(11, ReadEvent::Eof); // closes the stream
 
-    ring.add(&opcode::RecvMulti::new(Fd(11), 0).build().user_data(7));
+    ring.add(&recv_multi(11, 9, 7));
     ring.submit();
 
     ring.submit_and_wait();
     let first = ring.pop_completion().expect("the chunk");
-    assert_eq!(first.result, 128);
+    assert_eq!(first.result, 32);
     assert!(cqueue::more(first.flags), "more was still coming");
 
     ring.submit_and_wait();
@@ -1000,16 +1011,92 @@ fn a_delivery_larger_than_the_buffer_is_a_short_read() {
 }
 
 #[test]
-#[should_panic(expected = "provided-buffer op")]
-fn delivering_data_to_a_managed_recv_panics() {
+fn a_managed_recv_lands_in_a_provided_buffer() {
+    let (mut ring, handle) = ring(0);
+    TestRing::init(RingHandle::Simulated(&handle));
+
+    handle.on_read(11, ReadEvent::data(b"hello"));
+    ring.add(&recv_multi(11, 9, 7));
+    ring.submit_and_wait();
+
+    let completion = ring.pop_completion().expect("the recv completed");
+    assert_eq!(completion.result, 5);
+
+    // The buffer the data went to is named in the CQE flags, which is how the
+    // driver finds it.
+    let bid = cqueue::buffer_select(completion.flags).expect("F_BUFFER was set");
+    let buffer = TestRing::make_buffer(bid, 5);
+    assert_eq!(
+        buffer.as_ref(),
+        b"hello",
+        "the bytes reached the ring's buffer"
+    );
+}
+
+#[test]
+fn recycling_hands_the_same_buffer_back_out() {
+    let (mut ring, handle) = ring(0);
+    TinyRing::init(RingHandle::Simulated(&handle));
+
+    // Drain the ring: two buffers, two reads, both recycled straight away.
+    let mut seen = Vec::new();
+    for token in 0..4u64 {
+        handle.on_read(11, ReadEvent::data(b"x"));
+        ring.add(&recv_multi(11, 10, token));
+        ring.submit_and_wait();
+
+        let completion = ring.pop_completion().expect("a completion");
+        let bid = cqueue::buffer_select(completion.flags).expect("F_BUFFER");
+        seen.push(bid);
+        // Dropping recycles it, which is plain userspace memory traffic — the
+        // same code production runs.
+        drop(TinyRing::make_buffer(bid, 1));
+    }
+
+    // Four reads through a ring of two: the ids had to come back around.
+    assert_eq!(seen.len(), 4);
+    assert_eq!(
+        seen[0], seen[2],
+        "a recycled buffer was not handed out again"
+    );
+    assert_eq!(seen[1], seen[3]);
+}
+
+#[test]
+fn a_leaked_buffer_drains_the_ring() {
+    let (mut ring, handle) = ring(0);
+    TinyRing::init(RingHandle::Simulated(&handle));
+
+    // Two buffers, taken and never given back.
+    for token in 0..2u64 {
+        handle.on_read(11, ReadEvent::data(b"x"));
+        ring.add(&recv_multi(11, 10, token));
+        ring.submit_and_wait();
+
+        let completion = ring.pop_completion().expect("a completion");
+        let bid = cqueue::buffer_select(completion.flags).expect("F_BUFFER");
+        std::mem::forget(TinyRing::make_buffer(bid, 1));
+    }
+
+    // The ring is dry, and a real one says exactly this. Today a leaked
+    // BorrowedBuffer is invisible; here it fails a read.
+    handle.on_read(11, ReadEvent::data(b"x"));
+    ring.add(&recv_multi(11, 10, 99));
+    ring.submit_and_wait();
+
+    let completion = ring.pop_completion().expect("a completion");
+    assert_eq!(completion.result, -libc::ENOBUFS);
+    assert_eq!(cqueue::buffer_select(completion.flags), None);
+}
+
+#[test]
+#[should_panic(expected = "no registered ring provides")]
+fn an_unregistered_buffer_group_is_refused() {
     let (mut ring, handle) = ring(0);
 
-    // `addr` on a BUFFER_SELECT op names no buffer, so copying there would land
-    // on unrelated memory. Caught at the point the write would happen.
-    ring.add(&opcode::RecvMulti::new(Fd(11), 4).build().user_data(7));
-    ring.submit();
-
-    handle.deliver(7, b"hello");
+    // Group 9 exists as a type, but nothing installed it on this thread.
+    handle.on_read(11, ReadEvent::data(b"hello"));
+    ring.add(&recv_multi(11, 9, 7));
     ring.submit_and_wait();
 }
 

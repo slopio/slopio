@@ -1,4 +1,9 @@
-use std::{cell::UnsafeCell, marker::PhantomData, mem::MaybeUninit, sync::atomic::Ordering};
+use std::{
+    cell::{Cell, UnsafeCell},
+    marker::PhantomData,
+    mem::MaybeUninit,
+    sync::atomic::Ordering,
+};
 
 pub mod buffer;
 mod buffer_pool;
@@ -46,6 +51,14 @@ pub struct RingBuffer<const BUFFER_SIZE: u32, const RING_SIZE: u16> {
     buffer_pool: UnsafeCell<BufferPool<BUFFER_SIZE, RING_SIZE>>,
     mapped_ring: UnsafeCell<MmapedRing>,
     id: u16,
+    /// How many entries have been handed out, for a ring consumed in
+    /// userspace.
+    ///
+    /// The shared ring carries only a tail, written when a buffer is published
+    /// or recycled; a kernel keeps its consumption cursor privately and never
+    /// exposes it. So does whoever takes its place — see [`take`](Self::take).
+    /// Unused when the ring is registered, since then the kernel keeps its own.
+    consumed: Cell<u16>,
 }
 
 impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_SIZE> {
@@ -105,7 +118,43 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
             buffer_pool: UnsafeCell::new(bp),
             mapped_ring: UnsafeCell::new(mmaped_ring),
             id: buffer_group_id,
+            consumed: Cell::new(0),
         })
+    }
+
+    /// Take the next buffer the ring has published, the way a kernel would.
+    ///
+    /// For a ring nobody registered: something has to play the consumer, and
+    /// the entries say where each buffer is and which id it carries.
+    ///
+    /// `None` once the ring is drained — every buffer handed out and none
+    /// recycled — which is the `-ENOBUFS` a real ring reports.
+    pub fn take(&self) -> Option<(BufferId, std::ptr::NonNull<u8>)> {
+        let ring = unsafe { &*self.mapped_ring.get() };
+        let ring_ptr = ring.inner().as_ptr();
+        let tail = unsafe { get_tail(ring_ptr) };
+        let head = self.consumed.get();
+
+        let outstanding = tail.wrapping_sub(head);
+        assert!(
+            outstanding <= RING_SIZE,
+            "buffer group {}: {outstanding} buffers published into a ring of {RING_SIZE}. \
+             A buffer was recycled twice, and the second push overwrote an entry that was \
+             still live — two operations now share one buffer.",
+            self.id,
+        );
+        if outstanding == 0 {
+            return None;
+        }
+
+        let idx = (head as usize) & ((RING_SIZE - 1) as usize);
+        // SAFETY: `idx` is masked into the mapping, which holds `RING_SIZE`
+        // initialized entries from `build` onwards.
+        let entry = unsafe { &*ring_ptr.add(idx) };
+        let (bid, addr) = (entry.bid(), entry.addr());
+
+        self.consumed.set(head.wrapping_add(1));
+        std::ptr::NonNull::new(addr as *mut u8).map(|ptr| (bid, ptr))
     }
 
     pub fn get_buffer(&self, bid: BufferId, len: usize) -> Option<Buffer<BUFFER_SIZE>> {
