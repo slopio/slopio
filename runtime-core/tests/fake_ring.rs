@@ -329,6 +329,89 @@ fn cancelling_a_read_gives_its_scripted_data_back() {
     assert_eq!(&second[..completion.result as usize], b"hello");
 }
 
+/// Completion order of reads on two descriptors, each held back by a drawn
+/// delay from the same range.
+fn drawn_order(seed: u64) -> Vec<u64> {
+    let (mut ring, handle) = FakeRing::builder().seed(seed).virtual_time().build();
+    let mut a = [0u8; 8];
+    let mut b = [0u8; 8];
+
+    for fd in [11, 12] {
+        handle.on_read(fd, ReadEvent::data(b"x").after_between(STEP, STEP * 50));
+    }
+    ring.add(&recv(11, &mut a, 1));
+    ring.add(&recv(12, &mut b, 2));
+    ring.submit();
+
+    let mut order = Vec::new();
+    while order.len() < 2 {
+        ring.submit_and_wait();
+        while let Some(completion) = ring.pop_completion() {
+            order.push(completion.user_data);
+        }
+    }
+    order
+}
+
+#[test]
+fn a_drawn_delay_repeats_for_the_same_seed() {
+    assert_eq!(drawn_order(0xC0FFEE), drawn_order(0xC0FFEE));
+}
+
+#[test]
+fn different_seeds_can_draw_a_different_order() {
+    // Otherwise the range would be buying nothing. Checked across several
+    // seeds rather than one, so it does not rest on a lucky draw.
+    let first = drawn_order(0);
+    assert!(
+        (1..16u64).any(|seed| drawn_order(seed) != first),
+        "no seed produced an order other than {first:?}",
+    );
+}
+
+#[test]
+fn nothing_draws_unless_a_range_asked_for_it() {
+    // Two seeds, no range anywhere: the order is the scenario's, not chance's.
+    let order = |seed: u64| {
+        let (mut ring, _handle) = FakeRing::builder().seed(seed).build();
+        for i in 0..8 {
+            ring.add(&send(3, b"x", i));
+        }
+        ring.submit_and_wait();
+
+        let mut got = Vec::new();
+        while let Some(completion) = ring.pop_completion() {
+            got.push(completion.user_data);
+        }
+        got
+    };
+
+    let submitted: Vec<u64> = (0..8).collect();
+    assert_eq!(order(1), submitted);
+    assert_eq!(order(999), submitted);
+}
+
+#[test]
+fn a_drawn_delay_lands_inside_its_range() {
+    let (mut ring, handle) = FakeRing::builder().seed(7).virtual_time().build();
+    let clock = handle.clock().expect("built with virtual_time");
+    let mut buf = [0u8; 8];
+
+    handle.on_read(
+        11,
+        ReadEvent::data(b"x").after_between(STEP * 10, STEP * 20),
+    );
+    ring.add(&recv(11, &mut buf, 1));
+    ring.submit_and_wait();
+
+    ring.pop_completion().expect("the read completed");
+    assert!(
+        (STEP * 10..=STEP * 20).contains(&clock.elapsed()),
+        "drew {:?}, outside the range asked for",
+        clock.elapsed(),
+    );
+}
+
 #[test]
 fn a_read_on_an_unscripted_descriptor_still_parks() {
     let (mut ring, handle) = ring();

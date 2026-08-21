@@ -75,11 +75,38 @@ pub enum ConnectEvent {
     Error(i32),
 }
 
+/// How long an entry is held back.
+#[derive(Clone, Copy, Debug)]
+pub enum Delay {
+    /// Exactly this long.
+    Exact(Duration),
+    /// Drawn from this range, inclusive, when the op is armed.
+    Between(Duration, Duration),
+}
+
 /// A scripted response, and optionally when it lands.
 pub struct Scripted {
     pub outcome: Outcome,
     /// When it completes, or `None` for as soon as the ring is next waited on.
-    pub delay: Option<Duration>,
+    pub delay: Option<Delay>,
+}
+
+/// SplitMix64: short, good quality, no dependency, and entirely determined by
+/// its seed.
+///
+/// The scenario is the only thing that draws. Nothing else in the simulator
+/// decides a schedule, so a test that never asks for a range never meets a
+/// random number — and one that does knows exactly where it came from.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
 }
 
 /// Errnos are stored negated in a CQE; taking them positive means a caller
@@ -88,7 +115,7 @@ fn as_errno(errno: i32) -> i32 {
     -errno.abs()
 }
 
-fn scheduled(outcome: Outcome, delay: Duration) -> Scripted {
+fn scheduled(outcome: Outcome, delay: Delay) -> Scripted {
     Scripted {
         outcome,
         delay: Some(delay),
@@ -108,7 +135,22 @@ macro_rules! timed {
             /// Any duration: the timeline is ordered by due time, so nothing
             /// constrains it to a grid.
             pub fn after(self, delay: Duration) -> Scripted {
-                scheduled(self.into(), delay)
+                scheduled(self.into(), Delay::Exact(delay))
+            }
+
+            /// Hold the completion back by a duration drawn from `min..=max`,
+            /// inclusive, when the op is armed.
+            ///
+            /// The only randomness in the simulator, and only because a test
+            /// asked for it here. Which value comes out is settled by the
+            /// ring's seed and the order entries are armed in, so a run
+            /// repeats.
+            pub fn after_between(self, min: Duration, max: Duration) -> Scripted {
+                assert!(
+                    min <= max,
+                    "after_between({min:?}, {max:?}) is an empty range"
+                );
+                scheduled(self.into(), Delay::Between(min, max))
             }
         }
 
@@ -157,12 +199,36 @@ impl From<ConnectEvent> for Outcome {
     }
 }
 
-#[derive(Default)]
 pub struct Scenario {
     queued: HashMap<Trigger, VecDeque<Scripted>>,
+    rng: SplitMix64,
 }
 
 impl Scenario {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            queued: HashMap::new(),
+            rng: SplitMix64(seed),
+        }
+    }
+
+    /// A range becomes a duration here, once per entry.
+    ///
+    /// Resolved at the single point entries leave the scenario, so the draw
+    /// order is the order ops were armed in and nothing else consumes the
+    /// stream.
+    fn resolve(&mut self, delay: Delay) -> Duration {
+        match delay {
+            Delay::Exact(exact) => exact,
+            Delay::Between(min, max) => {
+                let span = max.saturating_sub(min).as_nanos() as u64;
+                if span == 0 {
+                    return min;
+                }
+                min + Duration::from_nanos(self.rng.next_u64() % (span + 1))
+            }
+        }
+    }
     pub fn push(&mut self, trigger: Trigger, scripted: Scripted) {
         self.queued.entry(trigger).or_default().push_back(scripted);
     }
@@ -176,9 +242,11 @@ impl Scenario {
         self.queued.entry(trigger).or_default().push_front(scripted);
     }
 
-    /// Take the next response for `trigger`, if the scenario has one left.
-    pub fn take(&mut self, trigger: Trigger) -> Option<Scripted> {
-        self.queued.get_mut(&trigger)?.pop_front()
+    /// Take the next response for `trigger`, with any range already drawn.
+    pub fn take(&mut self, trigger: Trigger) -> Option<(Outcome, Option<Duration>)> {
+        let scripted = self.queued.get_mut(&trigger)?.pop_front()?;
+        let delay = scripted.delay.map(|d| self.resolve(d));
+        Some((scripted.outcome, delay))
     }
 
     /// Responses declared but never claimed. A test that scripted three reads

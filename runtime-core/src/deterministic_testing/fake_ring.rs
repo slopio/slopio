@@ -15,7 +15,7 @@ use io_uring::{opcode, squeue};
 
 use super::clock::{self, Nanos};
 use super::fds::{self, FdKind};
-use super::scenario::{Scenario, Scripted, Trigger};
+use super::scenario::{Delay, Scenario, Scripted, Trigger};
 use super::sqe::{
     IORING_ACCEPT_MULTISHOT, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE,
     IORING_RECV_MULTISHOT, Sqe,
@@ -149,10 +149,10 @@ fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
 fn arm(state: &mut FakeRingState, mut pending: Pending, now: Nanos) {
     let scripted = trigger_for(&pending.sqe).and_then(|t| state.scenario.take(t));
     match scripted {
-        Some(scripted) => {
-            pending.outcome = scripted.outcome;
-            pending.source = Source::Scenario(scripted.delay);
-            state.timeline.schedule(pending, scripted.delay, now);
+        Some((outcome, delay)) => {
+            pending.outcome = outcome;
+            pending.source = Source::Scenario(delay);
+            state.timeline.schedule(pending, delay, now);
         }
         None => state.waiting.push(pending),
     }
@@ -307,7 +307,9 @@ fn apply_cancel(state: &mut FakeRingState, target: u64, now: Nanos) -> i32 {
             trigger,
             Scripted {
                 outcome: pending.outcome,
-                delay,
+                // Already drawn: one entry, one draw, so a retry after a cancel
+                // lands where the first attempt would have.
+                delay: delay.map(Delay::Exact),
             },
         );
 
@@ -534,9 +536,19 @@ impl FakeRingHandle {
 #[derive(Default)]
 pub struct FakeRingBuilder {
     virtual_time: bool,
+    seed: u64,
 }
 
 impl FakeRingBuilder {
+    /// Seed for the ranges a scenario asks to have drawn.
+    ///
+    /// Nothing else in the simulator draws, so this changes only entries
+    /// written with `after_between`.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
     /// Run on a clock the ring advances instead of the OS one, so nothing ever
     /// sleeps.
     ///
@@ -564,7 +576,7 @@ impl FakeRingBuilder {
             timeline: Timeline::default(),
             waiting: Vec::new(),
             wakeup: None,
-            scenario: Scenario::default(),
+            scenario: Scenario::new(self.seed),
             cq: VecDeque::new(),
             next_seq: 0,
             opened: Vec::new(),
