@@ -199,8 +199,79 @@ impl From<ConnectEvent> for Outcome {
     }
 }
 
+/// Completions declared to land together, as one drain of the completion
+/// queue.
+///
+/// How many arrive at once is not cosmetic: two in one drain is one round of
+/// task polling, two in separate drains is two, with the program making
+/// progress in between.
+pub struct Batch(pub Vec<Scripted>);
+
+impl Batch {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<T: Into<Scripted>> From<Vec<T>> for Batch {
+    fn from(events: Vec<T>) -> Self {
+        Batch(events.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<T: Into<Scripted>, const N: usize> From<[T; N]> for Batch {
+    fn from(events: [T; N]) -> Self {
+        Batch(events.into_iter().map(Into::into).collect())
+    }
+}
+
+impl From<Scripted> for Batch {
+    fn from(scripted: Scripted) -> Self {
+        Batch(vec![scripted])
+    }
+}
+
+macro_rules! batch_of_one {
+    ($event:ty) => {
+        impl From<$event> for Batch {
+            fn from(event: $event) -> Self {
+                Batch(vec![event.into()])
+            }
+        }
+    };
+}
+
+batch_of_one!(ReadEvent);
+batch_of_one!(AcceptEvent);
+batch_of_one!(ConnectEvent);
+
+/// One declaration in a scenario.
+///
+/// A multishot is one op with a lifetime, not a run of unrelated completions,
+/// so it is declared as one thing. Kept apart from single completions because
+/// the two are told apart at arming time: a stream handed to a single-shot op,
+/// or the reverse, is a test describing something other than what it runs.
+pub enum Entry {
+    /// One completion, for one op.
+    Once(Scripted),
+    /// Everything one multishot op produces, in order, grouped by what lands
+    /// together. A sequence ending on a terminal outcome closes the op; an open
+    /// one leaves it armed.
+    Stream(VecDeque<Batch>),
+}
+
+impl Entry {
+    /// Completions still to be delivered.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Once(_) => 1,
+            Self::Stream(rest) => rest.iter().map(Batch::len).sum(),
+        }
+    }
+}
+
 pub struct Scenario {
-    queued: HashMap<Trigger, VecDeque<Scripted>>,
+    queued: HashMap<Trigger, VecDeque<Entry>>,
     rng: SplitMix64,
 }
 
@@ -217,7 +288,7 @@ impl Scenario {
     /// Resolved at the single point entries leave the scenario, so the draw
     /// order is the order ops were armed in and nothing else consumes the
     /// stream.
-    fn resolve(&mut self, delay: Delay) -> Duration {
+    pub fn resolve(&mut self, delay: Delay) -> Duration {
         match delay {
             Delay::Exact(exact) => exact,
             Delay::Between(min, max) => {
@@ -229,8 +300,13 @@ impl Scenario {
             }
         }
     }
-    pub fn push(&mut self, trigger: Trigger, scripted: Scripted) {
-        self.queued.entry(trigger).or_default().push_back(scripted);
+    pub fn push(&mut self, trigger: Trigger, entry: Entry) {
+        self.queued.entry(trigger).or_default().push_back(entry);
+    }
+
+    /// A range becomes a duration, once per element.
+    pub fn resolve_delay(&mut self, delay: Option<Delay>) -> Option<Duration> {
+        delay.map(|d| self.resolve(d))
     }
 
     /// Put an entry back at the head, so it is the next one taken.
@@ -238,20 +314,22 @@ impl Scenario {
     /// A cancelled op has to give back what it claimed: a kernel does not
     /// discard buffered data because a read was cancelled, and the next read
     /// would see it.
-    pub fn unshift(&mut self, trigger: Trigger, scripted: Scripted) {
-        self.queued.entry(trigger).or_default().push_front(scripted);
+    pub fn unshift(&mut self, trigger: Trigger, entry: Entry) {
+        self.queued.entry(trigger).or_default().push_front(entry);
     }
 
-    /// Take the next response for `trigger`, with any range already drawn.
-    pub fn take(&mut self, trigger: Trigger) -> Option<(Outcome, Option<Duration>)> {
-        let scripted = self.queued.get_mut(&trigger)?.pop_front()?;
-        let delay = scripted.delay.map(|d| self.resolve(d));
-        Some((scripted.outcome, delay))
+    /// Take the next declaration for `trigger`.
+    pub fn take(&mut self, trigger: Trigger) -> Option<Entry> {
+        self.queued.get_mut(&trigger)?.pop_front()
     }
 
-    /// Responses declared but never claimed. A test that scripted three reads
-    /// against code that only performed two should hear about it.
+    /// Completions declared but not yet claimed by any op. A stream already
+    /// taken lives on the op that took it, and is counted there.
     pub fn remaining(&self) -> usize {
-        self.queued.values().map(VecDeque::len).sum()
+        self.queued
+            .values()
+            .flat_map(|entries| entries.iter())
+            .map(Entry::len)
+            .sum()
     }
 }

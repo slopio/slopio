@@ -103,8 +103,7 @@ fn scripted_reads_are_consumed_in_order() {
 fn a_multishot_accept_consumes_scripted_connections_then_parks() {
     let (mut ring, handle) = ring();
 
-    handle.on_accept(3, AcceptEvent::Connection);
-    handle.on_accept(3, AcceptEvent::Connection);
+    handle.on_multishot_accept(3, [AcceptEvent::Connection, AcceptEvent::Connection]);
 
     ring.add(&opcode::AcceptMulti::new(Fd(3)).build().user_data(5));
     ring.submit();
@@ -174,8 +173,8 @@ fn a_scripted_eof_ends_a_multishot_recv() {
     let (mut ring, handle) = ring();
     TestRing::init(RingHandle::Simulated(&handle));
 
-    handle.on_read(11, ReadEvent::Bytes(32));
-    handle.on_read(11, ReadEvent::Eof); // closes the stream
+    // One op's whole life: a chunk, then the peer closes.
+    handle.on_multishot_read(11, [ReadEvent::Bytes(32), ReadEvent::Eof]);
 
     ring.add(&recv_multi(11, 9, 7));
     ring.submit();
@@ -199,8 +198,13 @@ fn a_scripted_eof_ends_a_multishot_recv() {
 fn a_scripted_error_ends_a_multishot_accept() {
     let (mut ring, handle) = ring();
 
-    handle.on_accept(3, AcceptEvent::Connection);
-    handle.on_accept(3, AcceptEvent::Error(libc::ECONNABORTED));
+    handle.on_multishot_accept(
+        3,
+        [
+            AcceptEvent::Connection,
+            AcceptEvent::Error(libc::ECONNABORTED),
+        ],
+    );
 
     ring.add(&opcode::AcceptMulti::new(Fd(3)).build().user_data(5));
     ring.submit();
@@ -228,7 +232,7 @@ fn a_zero_from_an_accept_is_a_descriptor_not_an_ending() {
     // accept, so the two cannot share one "non-negative keeps going" rule.
     let (mut ring, handle) = ring();
 
-    handle.on_accept(3, AcceptEvent::On(0));
+    handle.on_multishot_accept(3, [AcceptEvent::On(0)]);
     ring.add(&opcode::AcceptMulti::new(Fd(3)).build().user_data(5));
     ring.submit_and_wait();
 
@@ -301,7 +305,8 @@ fn cancelling_a_read_gives_its_scripted_data_back() {
 
     ring.add(&recv(11, &mut buf, 7));
     ring.submit();
-    assert_eq!(handle.scenario_remaining(), 0, "the read claimed the entry");
+    // Claimed from the queue, but nothing delivered yet, so still owed.
+    assert_eq!(handle.scenario_remaining(), 1);
 
     ring.add(&opcode::AsyncCancel::new(7).build().user_data(99));
     ring.submit_and_wait();
@@ -327,6 +332,7 @@ fn cancelling_a_read_gives_its_scripted_data_back() {
 
     let completion = ring.pop_completion().expect("the second read completed");
     assert_eq!(&second[..completion.result as usize], b"hello");
+    assert_eq!(handle.scenario_remaining(), 0, "and now nothing is owed");
 }
 
 /// Completion order of reads on two descriptors, each held back by a drawn
@@ -410,6 +416,203 @@ fn a_drawn_delay_lands_inside_its_range() {
         "drew {:?}, outside the range asked for",
         clock.elapsed(),
     );
+}
+
+/// How many completions each successive drain of the completion queue yields.
+fn drains(ring: &mut FakeRing, rounds: usize) -> Vec<usize> {
+    (0..rounds)
+        .map(|_| {
+            ring.submit_and_wait();
+            let mut n = 0;
+            while ring.pop_completion().is_some() {
+                n += 1;
+            }
+            n
+        })
+        .collect()
+}
+
+#[test]
+fn a_batch_lands_in_one_drain() {
+    let (mut ring, handle) = ring();
+    TestRing::init(RingHandle::Simulated(&handle));
+
+    handle.on_multishot_read(
+        11,
+        [
+            vec![ReadEvent::data(b"a"), ReadEvent::data(b"b")], // together
+            vec![ReadEvent::data(b"c")],                        // alone
+        ],
+    );
+    ring.add(&recv_multi(11, 9, 7));
+
+    // Not cosmetic: two in one drain is one round of task polling, two in
+    // separate drains is two, with the program progressing in between.
+    assert_eq!(drains(&mut ring, 2), vec![2, 1]);
+}
+
+#[test]
+fn an_ungrouped_stream_is_one_completion_per_drain() {
+    let (mut ring, handle) = ring();
+    TestRing::init(RingHandle::Simulated(&handle));
+
+    // The flat form is three batches of one, which is what it used to be by
+    // accident — now it is what it says.
+    handle.on_multishot_read(
+        11,
+        [
+            ReadEvent::data(b"a"),
+            ReadEvent::data(b"b"),
+            ReadEvent::data(b"c"),
+        ],
+    );
+    ring.add(&recv_multi(11, 9, 7));
+
+    assert_eq!(drains(&mut ring, 3), vec![1, 1, 1]);
+}
+
+#[test]
+fn only_the_completion_that_ends_a_batch_drops_f_more() {
+    let (mut ring, handle) = ring();
+    TestRing::init(RingHandle::Simulated(&handle));
+
+    handle.on_multishot_read(11, [vec![ReadEvent::data(b"a"), ReadEvent::Eof]]);
+    ring.add(&recv_multi(11, 9, 7));
+    ring.submit_and_wait();
+
+    let first = ring.pop_completion().expect("the chunk");
+    let last = ring.pop_completion().expect("the EOF, in the same drain");
+    assert!(ring.pop_completion().is_none());
+
+    assert!(cqueue::more(first.flags), "more was still coming after it");
+    assert!(!cqueue::more(last.flags), "EOF closes the op");
+    assert!(handle.inflight().is_empty(), "and it left flight");
+}
+
+#[test]
+fn cancelling_mid_batch_gives_the_whole_batch_back() {
+    let (mut ring, handle) = FakeRing::builder().virtual_time().build();
+    TestRing::init(RingHandle::Simulated(&handle));
+
+    handle.on_multishot_read(
+        11,
+        [vec![
+            ReadEvent::data(b"a").after(Duration::from_secs(1)),
+            ReadEvent::data(b"b").into(),
+        ]],
+    );
+    ring.add(&recv_multi(11, 9, 7));
+    ring.submit();
+    assert_eq!(handle.scenario_remaining(), 2);
+
+    ring.add(&opcode::AsyncCancel::new(7).build().user_data(99));
+    ring.submit_and_wait();
+    while ring.pop_completion().is_some() {}
+
+    // Neither half of the batch was delivered, so both come back.
+    assert_eq!(handle.scenario_remaining(), 2);
+}
+
+#[test]
+fn two_readers_of_one_descriptor_do_not_share_a_stream() {
+    // The reason a stream travels with its op: on the flat model these two
+    // would have taken turns from one queue on fd 11.
+    let (mut ring, handle) = ring();
+    TestRing::init(RingHandle::Simulated(&handle));
+    let mut solo = [0u8; 32];
+
+    handle.on_multishot_read(11, [ReadEvent::data(b"stream one"), ReadEvent::Eof]);
+    handle.on_read(11, ReadEvent::data(b"the single read"));
+
+    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv(11, &mut solo, 8));
+    ring.submit_and_wait();
+
+    let mut got: Vec<(u64, i32)> = Vec::new();
+    while let Some(completion) = ring.pop_completion() {
+        got.push((completion.user_data, completion.result));
+    }
+
+    // The multishot took its own first element, the single read took the only
+    // `Once` — neither reached into the other's declaration.
+    assert_eq!(got, vec![(7, 10), (8, 15)]);
+    assert_eq!(&solo[..15], b"the single read");
+}
+
+#[test]
+#[should_panic(expected = "use on_multishot_")]
+fn a_single_completion_declared_for_a_multishot_is_refused() {
+    let (mut ring, handle) = ring();
+    TestRing::init(RingHandle::Simulated(&handle));
+
+    handle.on_read(11, ReadEvent::data(b"hello"));
+    ring.add(&recv_multi(11, 9, 7));
+    ring.submit();
+}
+
+#[test]
+#[should_panic(expected = "a stream describes one multishot")]
+fn a_stream_declared_for_a_single_shot_op_is_refused() {
+    let (mut ring, handle) = ring();
+    let mut buf = [0u8; 32];
+
+    handle.on_multishot_read(11, [ReadEvent::data(b"hello")]);
+    ring.add(&recv(11, &mut buf, 7));
+    ring.submit();
+}
+
+#[test]
+fn a_stream_still_owed_counts_as_remaining() {
+    let (mut ring, handle) = ring();
+    TestRing::init(RingHandle::Simulated(&handle));
+
+    handle.on_multishot_read(
+        11,
+        [
+            ReadEvent::data(b"one"),
+            ReadEvent::data(b"two"),
+            ReadEvent::data(b"three"),
+        ],
+    );
+    assert_eq!(handle.scenario_remaining(), 3);
+
+    ring.add(&recv_multi(11, 9, 7));
+    ring.submit_and_wait();
+    ring.pop_completion().expect("the first chunk");
+
+    // The rest travels with the op now, but it is still owed — otherwise a
+    // multishot stopped early would look fully delivered.
+    assert_eq!(
+        handle.scenario_remaining(),
+        2,
+        "an unfinished stream stopped being counted",
+    );
+}
+
+#[test]
+fn cancelling_a_multishot_gives_its_whole_stream_back() {
+    let (mut ring, handle) = FakeRing::builder().virtual_time().build();
+    TestRing::init(RingHandle::Simulated(&handle));
+
+    handle.on_multishot_read(
+        11,
+        [
+            ReadEvent::data(b"one").after(Duration::from_secs(1)),
+            ReadEvent::data(b"two").into(),
+        ],
+    );
+
+    ring.add(&recv_multi(11, 9, 7));
+    ring.submit();
+    assert_eq!(handle.scenario_remaining(), 2, "both still owed");
+
+    ring.add(&opcode::AsyncCancel::new(7).build().user_data(99));
+    ring.submit_and_wait();
+    while ring.pop_completion().is_some() {}
+
+    // Nothing was delivered, so the whole declaration comes back — including
+    // the completion that was pending when the cancel landed.
+    assert_eq!(handle.scenario_remaining(), 2);
 }
 
 #[test]
@@ -1044,7 +1247,7 @@ fn a_managed_recv_lands_in_a_provided_buffer() {
     let (mut ring, handle) = ring();
     TestRing::init(RingHandle::Simulated(&handle));
 
-    handle.on_read(11, ReadEvent::data(b"hello"));
+    handle.on_multishot_read(11, [ReadEvent::data(b"hello")]);
     ring.add(&recv_multi(11, 9, 7));
     ring.submit_and_wait();
 
@@ -1070,7 +1273,7 @@ fn recycling_hands_the_same_buffer_back_out() {
     // Drain the ring: two buffers, two reads, both recycled straight away.
     let mut seen = Vec::new();
     for token in 0..4u64 {
-        handle.on_read(11, ReadEvent::data(b"x"));
+        handle.on_multishot_read(11, [ReadEvent::data(b"x")]);
         ring.add(&recv_multi(11, 10, token));
         ring.submit_and_wait();
 
@@ -1098,7 +1301,7 @@ fn a_leaked_buffer_drains_the_ring() {
 
     // Two buffers, taken and never given back.
     for token in 0..2u64 {
-        handle.on_read(11, ReadEvent::data(b"x"));
+        handle.on_multishot_read(11, [ReadEvent::data(b"x")]);
         ring.add(&recv_multi(11, 10, token));
         ring.submit_and_wait();
 
@@ -1109,7 +1312,7 @@ fn a_leaked_buffer_drains_the_ring() {
 
     // The ring is dry, and a real one says exactly this. Today a leaked
     // BorrowedBuffer is invisible; here it fails a read.
-    handle.on_read(11, ReadEvent::data(b"x"));
+    handle.on_multishot_read(11, [ReadEvent::data(b"x")]);
     ring.add(&recv_multi(11, 10, 99));
     ring.submit_and_wait();
 
@@ -1124,7 +1327,7 @@ fn an_unregistered_buffer_group_is_refused() {
     let (mut ring, handle) = ring();
 
     // Group 9 exists as a type, but nothing installed it on this thread.
-    handle.on_read(11, ReadEvent::data(b"hello"));
+    handle.on_multishot_read(11, [ReadEvent::data(b"hello")]);
     ring.add(&recv_multi(11, 9, 7));
     ring.submit_and_wait();
 }

@@ -15,7 +15,7 @@ use io_uring::{opcode, squeue};
 
 use super::clock::{self, Nanos};
 use super::fds::{self, FdKind};
-use super::scenario::{Delay, Scenario, Scripted, Trigger};
+use super::scenario::{Batch, Delay, Entry, Scenario, Scripted, Trigger};
 use super::sqe::{
     IORING_ACCEPT_MULTISHOT, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE,
     IORING_RECV_MULTISHOT, Sqe,
@@ -147,15 +147,95 @@ fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
 /// Put an op where it belongs: on the timeline if the scenario already says
 /// what happens to it, parked otherwise.
 fn arm(state: &mut FakeRingState, mut pending: Pending, now: Nanos) {
-    let scripted = trigger_for(&pending.sqe).and_then(|t| state.scenario.take(t));
-    match scripted {
-        Some((outcome, delay)) => {
-            pending.outcome = outcome;
-            pending.source = Source::Scenario(delay);
-            state.timeline.schedule(pending, delay, now);
+    let entry = trigger_for(&pending.sqe).and_then(|t| state.scenario.take(t));
+    let multishot = is_multishot(&pending.sqe);
+
+    let (outcome, delay, source) = match entry {
+        None => {
+            state.waiting.push(pending);
+            return;
         }
-        None => state.waiting.push(pending),
+        Some(Entry::Once(scripted)) => {
+            assert!(
+                !multishot,
+                "user_data {:#x} is a multishot, but the scenario declared a single \
+                 completion for it — use on_multishot_* to describe its whole life",
+                pending.sqe.user_data,
+            );
+            let delay = state.scenario.resolve_delay(scripted.delay);
+            (scripted.outcome, delay, Source::Scenario(delay))
+        }
+        Some(Entry::Stream(mut rest)) => {
+            assert!(
+                multishot,
+                "user_data {:#x} is a single-shot op, but the scenario declared a stream \
+                 for it — a stream describes one multishot's whole life",
+                pending.sqe.user_data,
+            );
+            let Some(first) = next_batch(&mut rest) else {
+                // An empty stream declares an op that stays armed and yields
+                // nothing, which is the same as saying nothing.
+                state.waiting.push(pending);
+                return;
+            };
+            let (head, also) = split_batch(first);
+            let delay = state.scenario.resolve_delay(head.delay);
+            (head.outcome, delay, Source::Stream { also, rest, delay })
+        }
+    };
+
+    pending.outcome = outcome;
+    pending.source = source;
+    state.timeline.schedule(pending, delay, now);
+}
+
+/// Skip past any batch a test left empty.
+fn next_batch(rest: &mut VecDeque<Batch>) -> Option<Batch> {
+    while let Some(batch) = rest.pop_front() {
+        if !batch.0.is_empty() {
+            return Some(batch);
+        }
     }
+    None
+}
+
+/// A batch as its first completion and whatever lands alongside it.
+fn split_batch(batch: Batch) -> (Scripted, Vec<Scripted>) {
+    let mut elements = batch.0;
+    let head = elements.remove(0);
+    (head, elements)
+}
+
+/// Continue a multishot from its own declared sequence, or park it once the
+/// sequence runs out.
+fn advance_stream(
+    state: &mut FakeRingState,
+    sqe: Sqe,
+    seq: u64,
+    mut rest: VecDeque<Batch>,
+    now: Nanos,
+) {
+    let Some(batch) = next_batch(&mut rest) else {
+        state.waiting.push(Pending {
+            sqe,
+            seq,
+            outcome: default_outcome(&sqe),
+            source: Source::Default,
+        });
+        return;
+    };
+    let (head, also) = split_batch(batch);
+    let delay = state.scenario.resolve_delay(head.delay);
+    state.timeline.schedule(
+        Pending {
+            sqe,
+            seq,
+            outcome: head.outcome,
+            source: Source::Stream { also, rest, delay },
+        },
+        delay,
+        now,
+    );
 }
 
 fn default_outcome(sqe: &Sqe) -> Outcome {
@@ -171,8 +251,7 @@ fn default_outcome(sqe: &Sqe) -> Outcome {
 
 /// Retire an op: deliver its outcome and build the CQE. A CQE carries no
 /// payload, so data goes into the op's buffer and only the count is reported.
-fn complete_pending(pending: Pending, provider: Option<BufRingTake>) -> Completion {
-    let Pending { sqe, outcome, .. } = pending;
+fn complete_outcome(sqe: Sqe, outcome: Outcome, provider: Option<BufRingTake>) -> Completion {
     match outcome {
         Outcome::Result { result, flags } => Completion {
             user_data: sqe.user_data,
@@ -276,6 +355,37 @@ struct Wakeup {
     user_data: u64,
 }
 
+/// What a cancelled op owes the scenario back.
+///
+/// Delays come back already drawn — one element, one draw — so a retry after a
+/// cancel lands where the first attempt would have.
+fn give_back(source: Source, outcome: Outcome) -> Option<Entry> {
+    match source {
+        Source::Default => None,
+        Source::Scenario(delay) => Some(Entry::Once(Scripted {
+            outcome,
+            delay: delay.map(Delay::Exact),
+        })),
+        Source::Stream {
+            mut also,
+            mut rest,
+            delay,
+        } => {
+            // Nothing in this batch was delivered, so the whole of it heads the
+            // sequence again.
+            also.insert(
+                0,
+                Scripted {
+                    outcome,
+                    delay: delay.map(Delay::Exact),
+                },
+            );
+            rest.push_front(Batch(also));
+            Some(Entry::Stream(rest))
+        }
+    }
+}
+
 /// Retire the op an `ASYNC_CANCEL` names, and report what the cancel itself
 /// should complete with.
 ///
@@ -300,18 +410,10 @@ fn apply_cancel(state: &mut FakeRingState, target: u64, now: Nanos) -> i32 {
     // because a read was cancelled — the next read on that socket still sees
     // it — so neither does this. Without it a cancel silently eats what was
     // scripted, and `scenario_remaining` reports it as delivered.
-    if let Source::Scenario(delay) = pending.source
-        && let Some(trigger) = trigger_for(&pending.sqe)
+    if let Some(trigger) = trigger_for(&pending.sqe)
+        && let Some(entry) = give_back(pending.source, pending.outcome)
     {
-        state.scenario.unshift(
-            trigger,
-            Scripted {
-                outcome: pending.outcome,
-                // Already drawn: one entry, one draw, so a retry after a cancel
-                // lands where the first attempt would have.
-                delay: delay.map(Delay::Exact),
-            },
-        );
+        state.scenario.unshift(trigger, entry);
 
         // An op that parked because the scenario was empty can be served now.
         // Nothing else revisits `waiting`, so without this the entry would sit
@@ -490,14 +592,67 @@ impl FakeRingHandle {
         self.script(Trigger::Connect(fd), event.into());
     }
 
-    fn script(&self, trigger: Trigger, scripted: Scripted) {
-        self.0.borrow_mut().scenario.push(trigger, scripted);
+    /// Queue everything one multishot read on `fd` produces, in order.
+    ///
+    /// A stream describes one op's whole life rather than a run of unrelated
+    /// completions, so two readers of the same descriptor cannot consume each
+    /// other's script. Ending on a terminal outcome — `Eof`, an error — closes
+    /// the op; an open sequence leaves it armed and waiting.
+    pub fn on_multishot_read<B: Into<Batch>>(
+        &self,
+        fd: RawFd,
+        batches: impl IntoIterator<Item = B>,
+    ) {
+        self.stream(Trigger::Read(fd), batches);
     }
 
-    /// Scripted responses that were never claimed — three reads declared
-    /// against code that performed two.
+    /// Queue everything one multishot accept on `fd` produces, in order.
+    pub fn on_multishot_accept<B: Into<Batch>>(
+        &self,
+        fd: RawFd,
+        batches: impl IntoIterator<Item = B>,
+    ) {
+        self.stream(Trigger::Accept(fd), batches);
+    }
+
+    fn script(&self, trigger: Trigger, scripted: Scripted) {
+        self.0
+            .borrow_mut()
+            .scenario
+            .push(trigger, Entry::Once(scripted));
+    }
+
+    fn stream<B: Into<Batch>>(&self, trigger: Trigger, batches: impl IntoIterator<Item = B>) {
+        let sequence = batches.into_iter().map(Into::into).collect();
+        self.0
+            .borrow_mut()
+            .scenario
+            .push(trigger, Entry::Stream(sequence));
+    }
+
+    /// Scripted completions never delivered — three reads declared against code
+    /// that performed two.
+    ///
+    /// Counts what a stream still owes as well: once taken, its remainder
+    /// travels with the op rather than sitting in the scenario.
     pub fn scenario_remaining(&self) -> usize {
-        self.0.borrow().scenario.remaining()
+        let state = self.0.borrow();
+        let undelivered: usize = state
+            .timeline
+            .iter()
+            .chain(state.waiting.iter())
+            .map(|p| match &p.source {
+                Source::Default => 0,
+                // Taken from the scenario but not yet posted, so still owed.
+                Source::Scenario(_) => 1,
+                // The pending completion, the rest of its batch, and every
+                // batch after it.
+                Source::Stream { also, rest, .. } => {
+                    1 + also.len() + rest.iter().map(Batch::len).sum::<usize>()
+                }
+            })
+            .sum();
+        state.scenario.remaining() + undelivered
     }
 
     /// Install a provided-buffer ring under `bgid`.
@@ -708,7 +863,7 @@ impl FakeRing {
                 let mut state = self.state();
                 let fired_at = pace.now();
                 let fired = state.timeline.take_due(fired_at);
-                for pending in fired {
+                for mut pending in fired {
                     let sqe = pending.sqe;
 
                     // A cancel reports nothing of its own — it acts on another
@@ -725,9 +880,11 @@ impl FakeRing {
                     }
 
                     let seq = pending.seq;
-                    let minted = matches!(pending.outcome, Outcome::NewFd(_));
-                    // Resolved before the call so no borrow of `state` is held
-                    // across it.
+                    // Lifted out before the outcome is consumed, so a stream can
+                    // carry on from where it left off.
+                    let source = std::mem::replace(&mut pending.source, Source::Default);
+                    // Resolved before the calls below so no borrow of `state` is
+                    // held across them.
                     let provider = sqe
                         .uses_buffer_select()
                         .then(|| {
@@ -738,30 +895,52 @@ impl FakeRing {
                                 .map(|(_, take)| *take)
                         })
                         .flatten();
-                    let mut completion = complete_pending(pending, provider);
-                    if minted && completion.result >= 0 {
-                        state.opened.push(completion.result);
+
+                    // Everything the scenario declared to land in this drain,
+                    // and what the op has left afterwards.
+                    let (also, rest) = match source {
+                        Source::Stream { also, rest, .. } => (also, Some(rest)),
+                        _ => (Vec::new(), None),
+                    };
+                    let batch =
+                        std::iter::once(pending.outcome).chain(also.into_iter().map(|s| s.outcome));
+
+                    let multishot = is_multishot(&sqe);
+                    let mut ended = false;
+                    for outcome in batch {
+                        let minted = matches!(outcome, Outcome::NewFd(_));
+                        let mut completion = complete_outcome(sqe, outcome, provider);
+                        if minted && completion.result >= 0 {
+                            state.opened.push(completion.result);
+                        }
+                        // `F_MORE` is per completion: the last of a batch that
+                        // closes the op does not carry it, the others do.
+                        if multishot && !ends_multishot(&sqe, completion.result) {
+                            completion.flags |= IORING_CQE_F_MORE;
+                        } else if multishot {
+                            ended = true;
+                        }
+                        state.cq.push_back(completion);
                     }
 
-                    // A multishot that is not finished gets `F_MORE` and goes
-                    // back to await its next event. A terminal result, or a
-                    // cancel, is what takes it out of flight.
-                    if is_multishot(&sqe) && !ends_multishot(&sqe, completion.result) {
-                        completion.flags |= IORING_CQE_F_MORE;
-                        let outcome = default_outcome(&sqe);
-                        arm(
-                            &mut state,
-                            Pending {
-                                sqe,
-                                seq,
-                                outcome,
-                                source: Source::Default,
-                            },
-                            fired_at,
-                        );
+                    if multishot && !ended {
+                        match rest {
+                            // Declared as one op's life: take the next of its
+                            // own batches rather than reconsulting the trigger,
+                            // which another reader may share.
+                            Some(rest) => advance_stream(&mut state, sqe, seq, rest, fired_at),
+                            None => arm(
+                                &mut state,
+                                Pending {
+                                    sqe,
+                                    seq,
+                                    outcome: default_outcome(&sqe),
+                                    source: Source::Default,
+                                },
+                                fired_at,
+                            ),
+                        }
                     }
-
-                    state.cq.push_back(completion);
                 }
                 // Armed with `.count(1)`, so it completes as soon as one
                 // completion event lands — not only on elapse.

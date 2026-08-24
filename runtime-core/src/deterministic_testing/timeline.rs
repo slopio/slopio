@@ -7,8 +7,11 @@
 
 use std::time::Duration;
 
+use std::collections::VecDeque;
+
 use super::clock::Nanos;
 use super::fds::FdKind;
+use super::scenario::{Batch, Scripted};
 use super::sqe::Sqe;
 
 /// What an op completes with.
@@ -34,9 +37,22 @@ impl Outcome {
 pub enum Source {
     /// The op's own default. Nothing to give back if it is cancelled.
     Default,
-    /// A scenario entry, which asked for this delay. Kept so a cancel can put
-    /// the entry back exactly as it was.
+    /// A single scenario entry, which asked for this delay. Kept so a cancel
+    /// can put the entry back exactly as it was.
     Scenario(Option<Duration>),
+    /// A multishot's declared life, travelling with the op rather than sitting
+    /// on the trigger — so two ops reading the same descriptor cannot consume
+    /// each other's script.
+    Stream {
+        /// The rest of the batch the pending completion belongs to — declared
+        /// to land in the same drain as it.
+        also: Vec<Scripted>,
+        /// Batches after the current one.
+        rest: VecDeque<Batch>,
+        /// The delay the current batch asked for, for putting it back on
+        /// cancel.
+        delay: Option<Duration>,
+    },
 }
 
 pub struct Pending {

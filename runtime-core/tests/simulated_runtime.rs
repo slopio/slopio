@@ -5,6 +5,8 @@
 //! — slab, wakers, the completion routing, the event loop — with the kernel
 //! swapped out from under it.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use runtime_core::deterministic_testing::{FakeRing, FakeRingHandle, ReadEvent, simulated_socket};
@@ -12,12 +14,15 @@ use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, 
 use runtime_core::io_driver::operations::sockets::recv::socket_recv;
 use runtime_core::io_driver::operations::sockets::send::socket_send;
 use runtime_core::runtime::select::{SelectResult, select};
-use runtime_core::runtime::{RuntimeInner, spawn, time::Sleep};
+use runtime_core::runtime::{RuntimeInner, spawn, time::Sleep, yield_now};
 use runtime_streams::StreamExt;
 
 // A real provided-buffer ring. `block_on::<R, _>` installs it, which on a
 // simulated backend also registers the simulator as its consumer.
 runtime_core::define_buf_ring!(ManagedRing, bgid = 3, buffer_size = 64, ring_size = 2);
+// Room for a whole batch at once: every buffer of a batch is taken before any
+// of them is recycled, so a batch cannot outgrow its ring.
+runtime_core::define_buf_ring!(BigRing, bgid = 4, buffer_size = 64, ring_size = 8);
 
 fn simulated() -> (FakeRing, FakeRingHandle) {
     FakeRing::builder().virtual_time().build()
@@ -177,7 +182,7 @@ fn work_continues_normally_after_a_select() {
 fn a_managed_recv_hands_a_borrowed_buffer_to_the_task() {
     let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a socket");
-    handle.on_read(socket.fd(), ReadEvent::data(b"hello"));
+    handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"hello")]);
 
     let got = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
         async move {
@@ -199,9 +204,11 @@ fn a_ring_of_two_serves_more_reads_than_it_has_buffers() {
     let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a socket");
 
-    for chunk in [b"one".as_slice(), b"two", b"three", b"four", b"five"] {
-        handle.on_read(socket.fd(), ReadEvent::data(chunk));
-    }
+    // One op's whole life, declared as one thing.
+    handle.on_multishot_read(
+        socket.fd(),
+        [b"one".as_slice(), b"two", b"three", b"four", b"five"].map(ReadEvent::data),
+    );
 
     let got = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
         async move {
@@ -241,9 +248,10 @@ fn holding_every_buffer_drains_the_ring() {
     let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a socket");
 
-    for chunk in [b"one".as_slice(), b"two", b"three"] {
-        handle.on_read(socket.fd(), ReadEvent::data(chunk));
-    }
+    handle.on_multishot_read(
+        socket.fd(),
+        [b"one".as_slice(), b"two", b"three"].map(ReadEvent::data),
+    );
 
     let (delivered, failure) = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
         async move {
@@ -311,4 +319,101 @@ fn a_timed_out_read_leaves_its_data_for_the_next_one() {
 
     assert_eq!(got, b"hello");
     assert_eq!(handle.scenario_remaining(), 0);
+}
+
+/// Whether the second completion was already queued when the task asked for
+/// it, rather than needing another round of the event loop.
+///
+/// Raced against `yield_now`, which resolves only once the task has gone back
+/// to the loop. It is polled first, so it wins any tie: `Second` therefore means
+/// the completion was there on the very first poll, without a round trip — the
+/// two landed in one drain.
+fn second_completion_was_already_there(batched: bool) -> bool {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket().expect("a socket");
+
+    if batched {
+        handle.on_multishot_read(
+            socket.fd(),
+            [vec![ReadEvent::data(b"a"), ReadEvent::data(b"b")]],
+        );
+    } else {
+        handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"a"), ReadEvent::data(b"b")]);
+    }
+
+    RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ManagedRing>::new(socket.fd());
+            recv.next().await.expect("a chunk").expect("no error");
+            matches!(
+                select(yield_now(), recv.next()).await,
+                SelectResult::Second(_),
+            )
+        },
+        None,
+        |run| run(),
+    )
+}
+
+#[test]
+fn a_batch_reaches_the_task_in_one_go() {
+    assert!(
+        second_completion_was_already_there(true),
+        "the task had to go back to the loop for a completion declared alongside",
+    );
+}
+
+#[test]
+fn separate_batches_let_the_program_run_in_between() {
+    // The same two completions, declared apart. This is the difference batching
+    // makes, and the reason it is worth stating rather than inheriting.
+    assert!(
+        !second_completion_was_already_there(false),
+        "a completion declared in its own batch arrived with the previous one",
+    );
+}
+
+#[test]
+fn a_whole_batch_is_drained_in_one_pass() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket().expect("a socket");
+
+    handle.on_multishot_read(
+        socket.fd(),
+        [vec![
+            ReadEvent::data(b"a"),
+            ReadEvent::data(b"b"),
+            ReadEvent::data(b"c"),
+            ReadEvent::data(b"d"),
+            ReadEvent::data(b"e"),
+        ]],
+    );
+
+    let drained = RuntimeInner::simulated(fake).block_on::<BigRing, _>(
+        async move {
+            let mut recv = MultiRecv::<BigRing>::new(socket.fd());
+            recv.next().await.expect("a chunk").expect("no error");
+
+            // The rest of the batch, raced against a single round of the loop.
+            let rest = async {
+                let mut taken = 0;
+                while taken < 4 {
+                    recv.next().await.expect("a chunk").expect("no error");
+                    taken += 1;
+                }
+                taken
+            };
+            match select(yield_now(), rest).await {
+                SelectResult::First(_) => 0,
+                SelectResult::Second(taken) => taken,
+            }
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(
+        drained, 4,
+        "the task went back to the loop before the batch was exhausted",
+    );
 }
