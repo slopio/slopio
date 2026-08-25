@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
-use crate::deterministic_testing::{FakeRing, FakeRingHandle};
+#[cfg(feature = "simulation")]
+use crate::deterministic_testing::FakeRing;
+#[cfg(feature = "simulation")]
+use crate::deterministic_testing::FakeRingHandle;
 use crate::runtime::peers::PeerTable;
 
 use crate::{
@@ -41,7 +44,7 @@ pub(crate) use user_data::{
 
 pub use message::{Endpoint, ErasedMessage, Header, Message};
 
-pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec};
+pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec, BufRingTake, install_buf_ring};
 pub use fixed_buf_pool::{Acquire as FixedBufAcquire, FixedSendBufPool, PooledBuf};
 pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
@@ -297,6 +300,7 @@ impl MultiOpState {
 
 impl Ring {
     /// A ring backed by the simulator rather than the kernel.
+    #[cfg(feature = "simulation")]
     fn simulated(fake: FakeRing) -> Self {
         Self {
             inner: RingBackend::Fake(fake),
@@ -332,6 +336,7 @@ impl IODriver {
     /// Everything above the ring — slabs, wakers, the multishot state machine,
     /// buffer recycling — is exactly what `Default` builds for production, so a
     /// test exercises the real driver rather than a variant of it.
+    #[cfg(feature = "simulation")]
     pub fn simulated(fake: FakeRing) -> Self {
         Self {
             ring: UnsafeCell::new(Ring::simulated(fake)),
@@ -458,6 +463,7 @@ impl IODriver {
             RingBackend::Uring(ring) => unsafe { ring.submitter().register_buffers(iovecs) },
             // Nothing to tell: a simulated ring reads the same memory the
             // caller already owns, registered or not.
+            #[cfg(feature = "simulation")]
             RingBackend::Fake(_) => Ok(()),
         }
     }
@@ -468,6 +474,7 @@ impl IODriver {
         let ring_inner = unsafe { &*self.ring.get() };
         match &ring_inner.inner {
             RingBackend::Uring(ring) => ring.submitter().unregister_buffers(),
+            #[cfg(feature = "simulation")]
             RingBackend::Fake(_) => Ok(()),
         }
     }
@@ -528,6 +535,7 @@ impl IODriver {
         let ring = unsafe { &*self.ring.get() };
         match &ring.inner {
             RingBackend::Uring(ring) => ring.as_raw_fd(),
+            #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.ring_fd(),
         }
     }
@@ -964,6 +972,7 @@ impl IODriver {
                     panic!("io_uring submit failed: {:?}", e);
                 }
             },
+            #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.submit(),
         }
     }
@@ -979,6 +988,7 @@ impl IODriver {
                     panic!("io_uring submit_and_wait failed: {:?}", e);
                 }
             },
+            #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.submit_and_wait(),
         }
     }
@@ -998,6 +1008,7 @@ impl IODriver {
                     }
                 }
             }
+            #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => {
                 while let Some(c_event) = ring.pop_completion() {
                     let decoded = CompletionEvent::from_parts(
@@ -1372,6 +1383,7 @@ struct Ring {
 /// perfectly-predicted branch per submission.
 enum RingBackend {
     Uring(IoUring),
+    #[cfg(feature = "simulation")]
     Fake(FakeRing),
 }
 
@@ -1384,6 +1396,7 @@ enum RingBackend {
 #[derive(Clone, Copy)]
 pub enum RingHandle<'a> {
     Uring(&'a IoUring),
+    #[cfg(feature = "simulation")]
     Simulated(&'a FakeRingHandle),
 }
 
@@ -1393,6 +1406,7 @@ impl Ring {
             RingBackend::Uring(ring) => unsafe {
                 ring.submission().push(entry).unwrap();
             },
+            #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.add(entry),
         }
         self.pending += 1;
@@ -1401,6 +1415,7 @@ impl Ring {
     fn handle(&self) -> RingHandle<'_> {
         match &self.inner {
             RingBackend::Uring(ring) => RingHandle::Uring(ring),
+            #[cfg(feature = "simulation")]
             RingBackend::Fake(fake) => RingHandle::Simulated(fake.handle()),
         }
     }

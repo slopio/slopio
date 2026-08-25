@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+#[cfg(feature = "simulation")]
 use crate::deterministic_testing::VirtualClock;
 
 use crate::runtime::TIME_DRIVER;
@@ -29,6 +30,7 @@ pub enum ClockSource {
     /// The OS clock. Every runtime that is not simulating.
     System,
     /// Advanced by hand by whatever is simulating the world.
+    #[cfg(feature = "simulation")]
     Virtual(Rc<VirtualClock>),
 }
 
@@ -37,6 +39,7 @@ impl ClockSource {
     fn now(&self) -> Instant {
         match self {
             Self::System => Instant::now(),
+            #[cfg(feature = "simulation")]
             Self::Virtual(clock) => clock.now(),
         }
     }
@@ -45,6 +48,7 @@ impl ClockSource {
     fn now_wall(&self) -> SystemTime {
         match self {
             Self::System => SystemTime::now(),
+            #[cfg(feature = "simulation")]
             Self::Virtual(clock) => clock.now_wall(),
         }
     }
@@ -117,6 +121,7 @@ impl TimeDriver {
     }
 
     /// A driver on a clock a simulation advances rather than the OS.
+    #[cfg(feature = "simulation")]
     pub fn simulated(clock: Rc<VirtualClock>) -> Self {
         Self {
             inner: UnsafeCell::default(),

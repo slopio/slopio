@@ -5,8 +5,6 @@
 //! — slab, wakers, the completion routing, the event loop — with the kernel
 //! swapped out from under it.
 
-use std::cell::Cell;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use runtime_core::deterministic_testing::{FakeRing, FakeRingHandle, ReadEvent, simulated_socket};

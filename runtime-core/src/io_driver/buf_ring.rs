@@ -13,6 +13,37 @@ use std::ptr::NonNull;
 
 use crate::io_driver::{IODriver, RingHandle};
 
+/// Hands out the next buffer of one group, as `(bid, pointer, capacity)`.
+///
+/// A plain function pointer because a ring is reached by `bgid` — a number off
+/// the SQE — while the buffers live in a per-spec thread-local keyed by type.
+pub type BufRingTake = fn() -> Option<(u16, NonNull<u8>, u32)>;
+
+/// Build this spec's ring, registering it with whichever backend the driver is
+/// on.
+///
+/// The branch lives here rather than in [`define_buf_ring!`] because the macro
+/// expands into the caller's crate, where a `cfg` on *this* crate's features
+/// would mean nothing. `take` is ignored unless the ring is simulated.
+pub fn install_buf_ring<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
+    ring: RingHandle<'_>,
+    bgid: u16,
+    take: BufRingTake,
+) -> std::io::Result<io_uring_rb::RingBuffer<BUFFER_SIZE, RING_SIZE>> {
+    let _ = take;
+    match ring {
+        RingHandle::Uring(ring) => io_uring_rb::RingBuffer::new(ring, 0, bgid),
+        // Registration is the only step that needs a kernel; the mapping and
+        // its buffers are ordinary memory. Hand the simulator a way to consume
+        // the ring, since no kernel will.
+        #[cfg(feature = "simulation")]
+        RingHandle::Simulated(handle) => {
+            handle.register_buf_ring(bgid, take);
+            io_uring_rb::RingBuffer::new_unregistered(bgid)
+        }
+    }
+}
+
 /// A single provided-buffer ring known at compile time.
 ///
 /// Implementors are produced by [`define_buf_ring!`](crate::define_buf_ring).
@@ -200,28 +231,16 @@ macro_rules! define_buf_ring {
 
                 fn init(ring: $crate::io_driver::RingHandle<'_>) {
                     RING.with(|cell| {
-                        let rb = match ring {
-                            $crate::io_driver::RingHandle::Uring(ring) => {
-                                <$crate::__private::RingBuffer<$bsize, $rsize>>::new(
-                                    ring, 0, $bgid,
-                                )
-                            }
-                            // Registration is the only step that needs a kernel;
-                            // the mapping and its buffers are ordinary memory.
-                            // Hand the simulator a way to consume the ring,
-                            // since no kernel will.
-                            $crate::io_driver::RingHandle::Simulated(handle) => {
-                                handle.register_buf_ring($bgid, || {
-                                    RING.with(|cell| {
-                                        let rb = cell.get()?;
-                                        rb.take().map(|(bid, ptr)| (bid, ptr, $bsize))
-                                    })
-                                });
-                                <$crate::__private::RingBuffer<$bsize, $rsize>>::new_unregistered(
-                                    $bgid,
-                                )
-                            }
-                        }
+                        let rb = $crate::io_driver::install_buf_ring::<$bsize, $rsize>(
+                            ring,
+                            $bgid,
+                            || {
+                                RING.with(|cell| {
+                                    let rb = cell.get()?;
+                                    rb.take().map(|(bid, ptr)| (bid, ptr, $bsize))
+                                })
+                            },
+                        )
                         .expect("buf ring init failed");
                         if cell.set(rb).is_err() {
                             panic!(concat!(

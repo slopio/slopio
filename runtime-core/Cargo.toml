@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# The simulated ring and its virtual clock. Off in production: with it off the
+# backend enums have a single variant each, so the driver's dispatch on them
+# compiles away entirely.
+simulation = []
 tracing = []
 local_debug_collector = ["tracing"]
 ebpf_balancer = ["dep:runtime_ebpf_balancer"]
@@ -42,3 +46,13 @@ bitfield-struct = "0.13.0"
 
 [dev-dependencies]
 libc = "0.2.178"
+
+# Skipped outright without the feature, rather than compiled to an empty binary:
+# `cargo test` then says nothing about them instead of reporting "0 passed, ok".
+[[test]]
+name = "fake_ring"
+required-features = ["simulation"]
+
+[[test]]
+name = "simulated_runtime"
+required-features = ["simulation"]

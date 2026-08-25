@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# Forwarded so a test crate can build the simulated ring.
+simulation = ["runtime-core/simulation"]
 tracing               = ["runtime-core/tracing"]
 otlp                  = ["tracing", "dep:runtime-h2"]
 local_debug_collector = ["runtime-core/local_debug_collector"]

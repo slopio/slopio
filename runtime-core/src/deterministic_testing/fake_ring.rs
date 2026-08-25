@@ -8,10 +8,11 @@
 use std::cell::{RefCell, RefMut};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
-use std::ptr::NonNull;
 use std::rc::Rc;
 
 use io_uring::{opcode, squeue};
+
+use crate::io_driver::BufRingTake;
 
 use super::clock::{self, Nanos};
 use super::fds::{self, FdKind};
@@ -54,14 +55,6 @@ impl Pace {
 /// The `ring_fd` a simulated ring reports. Deliberately invalid, so a stray
 /// syscall on it fails instead of touching an unrelated fd.
 pub const SIMULATED_RING_FD: RawFd = -1;
-
-/// Hands out the next buffer of one group, as `(bid, pointer, capacity)`.
-///
-/// A plain function pointer because the ring is reached by `bgid` — a number
-/// off the SQE — while the buffers live in a per-spec thread-local keyed by
-/// type. The driver already erases its buffer specs the same way for the
-/// cancel-recycle path.
-pub type BufRingTake = fn() -> Option<(u16, NonNull<u8>, u32)>;
 
 /// One completion, as the three fields a CQE carries.
 #[derive(Clone, Copy, Debug)]

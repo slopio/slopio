@@ -83,6 +83,7 @@ impl RuntimeInner {
     /// time driver too: the two must agree about what time it is, or the ring
     /// would jump ahead while the timewheel stayed put and no timer would ever
     /// expire.
+    #[cfg(feature = "simulation")]
     pub fn simulated(fake: crate::deterministic_testing::FakeRing) -> Self {
         // Read before `fake` moves into the driver.
         let time_driver = match fake.clock() {
