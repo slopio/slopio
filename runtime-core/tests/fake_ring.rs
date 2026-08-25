@@ -1223,23 +1223,55 @@ fn the_buffer_is_untouched_until_the_completion_is_posted() {
 }
 
 #[test]
-fn a_delivery_larger_than_the_buffer_is_a_short_read() {
+#[should_panic(expected = "cannot exceed its buffer")]
+fn a_delivery_larger_than_the_buffer_is_refused() {
     let (mut ring, handle) = ring();
     let mut buf = [0u8; 4];
 
-    ring.add(
-        &opcode::Recv::new(Fd(11), buf.as_mut_ptr(), buf.len() as u32)
-            .build()
-            .user_data(7),
-    );
-    ring.submit();
+    // Eleven bytes will not arrive in one completion on a four-byte buffer. How
+    // the payload divides changes what the reader sees, so the test says.
+    handle.on_read(11, ReadEvent::data(b"hello world"));
+    ring.add(&recv(11, &mut buf, 7));
+    ring.submit_and_wait();
+}
 
-    handle.deliver(7, b"hello world");
+#[test]
+#[should_panic(expected = "cannot exceed its buffer")]
+fn a_delivery_larger_than_a_provided_buffer_is_refused() {
+    let (mut ring, handle) = ring();
+    TinyRing::init(RingHandle::Simulated(&handle));
+
+    // TinyRing hands out sixteen-byte buffers.
+    handle.on_multishot_read(11, [ReadEvent::data(vec![b'x'; 100])]);
+    ring.add(&recv_multi(11, 10, 7));
+    ring.submit_and_wait();
+}
+
+#[test]
+fn a_payload_split_across_a_batch_fills_successive_buffers() {
+    let (mut ring, handle) = ring();
+    TinyRing::init(RingHandle::Simulated(&handle));
+    let payload: Vec<u8> = (0..24u8).collect();
+
+    // Sixteen-byte buffers, so the test declares where the seam falls.
+    handle.on_multishot_read(
+        11,
+        [vec![
+            ReadEvent::data(&payload[..16]),
+            ReadEvent::data(&payload[16..]),
+        ]],
+    );
+    ring.add(&recv_multi(11, 10, 7));
     ring.submit_and_wait();
 
-    let completion = ring.pop_completion().expect("the recv completed");
-    assert_eq!(completion.result, 4, "should report only what fit");
-    assert_eq!(&buf, b"hell");
+    let mut got = Vec::new();
+    while let Some(completion) = ring.pop_completion() {
+        let bid = cqueue::buffer_select(completion.flags).expect("F_BUFFER");
+        let len = completion.result as usize;
+        got.extend_from_slice(TinyRing::make_buffer(bid, len).as_ref());
+    }
+
+    assert_eq!(got, payload, "the two halves did not reassemble");
 }
 
 #[test]

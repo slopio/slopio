@@ -287,7 +287,18 @@ fn complete_outcome(sqe: Sqe, outcome: Outcome, provider: Option<BufRingTake>) -
                 };
             };
 
-            let n = bytes.len().min(capacity as usize);
+            assert!(
+                bytes.len() <= capacity as usize,
+                "user_data {:#x}: {} bytes declared for one completion, into a {}-byte \
+                 buffer from group {}. A completion cannot exceed its buffer — declare \
+                 the split, since how the payload divides is what the reader sees.",
+                sqe.user_data,
+                bytes.len(),
+                capacity,
+                sqe.buf_group,
+            );
+
+            let n = bytes.len();
             if n > 0 {
                 // SAFETY: the pointer comes from the ring's own entry for
                 // `bid`, so it addresses that buffer, and the write is capped
@@ -311,8 +322,18 @@ fn complete_outcome(sqe: Sqe, outcome: Outcome, provider: Option<BufRingTake>) -
                 sqe.user_data,
             );
 
-            // Truncate rather than reject: that is a short read.
-            let n = bytes.len().min(sqe.len as usize);
+            assert!(
+                bytes.len() <= sqe.len as usize,
+                "user_data {:#x}: {} bytes declared for one completion, into a {}-byte \
+                 buffer. A completion cannot exceed its buffer — declare the split, \
+                 since how the payload divides is what the reader sees.",
+                sqe.user_data,
+                bytes.len(),
+                sqe.len,
+            );
+
+            // Fewer bytes than the buffer holds is an ordinary short read.
+            let n = bytes.len();
             if n > 0 {
                 // SAFETY: `addr`/`len` describe a buffer the submitting future
                 // keeps alive until its op completes — the same contract that
