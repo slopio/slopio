@@ -15,6 +15,19 @@ use crate::{buffer::Buffer, buffer_pool::BufferPool, mapped_ring::MmapedRing};
 
 type BufferId = u16;
 
+/// Flags for the anonymous mappings a buffer ring is made of.
+///
+/// `MAP_POPULATE` prefaults the pages, so the first buffer handed out does not
+/// take a fault. It is only a hint about when the memory is paged in, never
+/// about what the mapping is — so a simulated build drops it and gets the same
+/// ring, which is what lets Miri run the simulation suites: it accepts nothing
+/// beyond a bare `MAP_PRIVATE|MAP_ANONYMOUS`.
+pub(crate) const MAP_FLAGS: rustix::mm::MapFlags = if cfg!(feature = "simulation") {
+    rustix::mm::MapFlags::PRIVATE
+} else {
+    rustix::mm::MapFlags::PRIVATE.union(rustix::mm::MapFlags::POPULATE)
+};
+
 /// Helper to get the current tail value from a ring buffer
 unsafe fn get_tail(ring_ptr: *const BufRingEntry) -> u16 {
     unsafe {
@@ -24,9 +37,15 @@ unsafe fn get_tail(ring_ptr: *const BufRingEntry) -> u16 {
 }
 
 /// Helper to set the tail value on a ring buffer
-unsafe fn set_tail(ring_ptr: *const BufRingEntry, new_tail: u16) {
+///
+/// Takes `*mut` where reading takes `*const`, because the write has to inherit
+/// write permission from whatever the caller derived the pointer from. Handed a
+/// pointer that came through a shared reborrow, the store is undefined
+/// behaviour whatever the tail itself allows.
+unsafe fn set_tail(ring_ptr: *mut BufRingEntry, new_tail: u16) {
     unsafe {
-        let tail_ptr = BufRingEntry::tail(ring_ptr) as *const std::sync::atomic::AtomicU16;
+        let tail_ptr =
+            BufRingEntry::tail(ring_ptr).cast_mut() as *const std::sync::atomic::AtomicU16;
         (*tail_ptr).store(new_tail, Ordering::Release);
     }
 }
@@ -111,7 +130,7 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
         }
 
         unsafe {
-            set_tail(slice.as_ptr() as *const BufRingEntry, RING_SIZE);
+            set_tail(slice.as_mut_ptr().cast::<BufRingEntry>(), RING_SIZE);
         }
 
         Ok(RingBuffer {

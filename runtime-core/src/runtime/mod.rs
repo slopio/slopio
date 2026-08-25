@@ -90,10 +90,13 @@ impl RuntimeInner {
             Some(clock) => time::TimeDriver::simulated(clock),
             None => time::TimeDriver::default(),
         };
+        // Field by field: `..Default::default()` would build a whole second
+        // runtime, real io_uring included, just to discard it.
         Self {
+            tasks: TaskList::default(),
             io_driver: IODriver::simulated(fake),
             time_driver,
-            ..Default::default()
+            thread_id: 0,
         }
     }
 

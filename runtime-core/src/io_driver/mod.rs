@@ -50,7 +50,6 @@ pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
 pub const DEFAULT_QUEUE_SIZE: usize = 32;
 
-#[derive(Default)]
 pub struct IODriver {
     ring: UnsafeCell<Ring>,
     slab: Rc<UnsafeCell<OneshotSlab>>,
@@ -330,7 +329,33 @@ impl Default for Ring {
 
 scoped_thread_local!(pub static IO_DRIVER: IODriver);
 
+impl Default for IODriver {
+    fn default() -> Self {
+        Self::around(Ring::default())
+    }
+}
+
 impl IODriver {
+    /// A driver around `ring`, everything above it fresh.
+    ///
+    /// Spelled out field by field rather than `..Default::default()`, because
+    /// that would build a whole second driver — and with it a real io_uring —
+    /// only to drop it on the floor.
+    fn around(ring: Ring) -> Self {
+        Self {
+            ring: UnsafeCell::new(ring),
+            slab: Default::default(),
+            multishot_slab: Default::default(),
+            sending_buffers: Default::default(),
+            shutting_down: Default::default(),
+            recyclers: Default::default(),
+            peers: Default::default(),
+            peer_inbox: Default::default(),
+            msg_inbox: Default::default(),
+            reply_slab: Default::default(),
+        }
+    }
+
     /// A driver over a simulated ring.
     ///
     /// Everything above the ring — slabs, wakers, the multishot state machine,
@@ -338,10 +363,7 @@ impl IODriver {
     /// test exercises the real driver rather than a variant of it.
     #[cfg(feature = "simulation")]
     pub fn simulated(fake: FakeRing) -> Self {
-        Self {
-            ring: UnsafeCell::new(Ring::simulated(fake)),
-            ..Default::default()
-        }
+        Self::around(Ring::simulated(fake))
     }
 
     pub fn shutdown(&self) -> bool {

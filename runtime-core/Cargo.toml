@@ -7,7 +7,7 @@ edition = "2024"
 # The simulated ring and its virtual clock. Off in production: with it off the
 # backend enums have a single variant each, so the driver's dispatch on them
 # compiles away entirely.
-simulation = []
+simulation = ["io_uring_rb/simulation"]
 tracing = []
 local_debug_collector = ["tracing"]
 ebpf_balancer = ["dep:runtime_ebpf_balancer"]
@@ -55,4 +55,20 @@ required-features = ["simulation"]
 
 [[test]]
 name = "simulated_runtime"
+required-features = ["simulation"]
+
+[[test]]
+name = "cancellation"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_unbounded"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_bounded"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_vec"
 required-features = ["simulation"]

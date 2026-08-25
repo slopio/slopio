@@ -93,17 +93,27 @@ impl<T> Drop for Sender<T> {
 }
 
 impl<T> Receiver<T> {
-    #[inline]
-    pub fn peek(&self) -> &[T] {
-        let state = unsafe { &*(*self.shared.0).get() };
-        &state.data
-    }
-
-    #[inline]
-    pub fn get_mut(&mut self) -> &mut Vec<T> {
-        let state = unsafe { &mut *(*self.shared.0).get() };
-        &mut state.data
-    }
+    // Commented out, not deleted, pending a check of the repos outside this
+    // workspace — nothing in here has ever called it, but it is reachable
+    // through the `runtime` facade.
+    //
+    // It is unsound. The `&mut Vec<T>` points into state the `Sender` shares,
+    // and a sender is a separate object, so the borrow checker permits this:
+    //
+    //     let v = rx.get_mut();
+    //     tx.push(1);            // second &mut to the same SharedState
+    //     v.push(2);
+    //
+    // Two live `&mut` to one allocation, from safe code. Quieter than the
+    // `peek` that used to sit above it — that one reallocated the buffer out
+    // from under the slice it had handed out, so it failed natively too, while
+    // this shows no symptom at all until Miri calls it a forbidden reborrow.
+    //
+    // #[inline]
+    // pub fn get_mut(&mut self) -> &mut Vec<T> {
+    //     let state = unsafe { &mut *(*self.shared.0).get() };
+    //     &mut state.data
+    // }
 
     #[inline]
     pub fn take(&self) -> Vec<T> {

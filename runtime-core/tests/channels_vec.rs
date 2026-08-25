@@ -1,9 +1,25 @@
-use runtime::{channels::vec_channel, main_thread, runtime::spawn};
+//! The vec channel, driven by a real runtime over a simulated ring.
+//!
+//! Migrated from `runtime/tests/vec_channel_test.rs`. See
+//! `channels_unbounded.rs` for why, and `channels.rs` for the same channel
+//! polled by hand with no runtime at all.
+//!
+//! Two of the original cases are missing. `peek` was removed outright — it
+//! handed out a slice into the shared buffer that the sender could realloc
+//! from under it, a use-after-free reachable from safe code. `get_mut` has the
+//! same shape and is commented out in the channel for now, so its test is
+//! commented out here to match; both come back or go for good together.
+
+mod common;
+
+use common::{on_runtime, scaled};
+use runtime_core::channels::vec_channel;
+use runtime_core::runtime::spawn;
 
 // Basic: push items then recv batches them into one Vec.
 #[test]
 fn push_then_recv_batches() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         tx.push(1);
         tx.push(2);
@@ -17,7 +33,7 @@ fn push_then_recv_batches() {
 // recv on empty channel waits until a push arrives, then returns the batch.
 #[test]
 fn recv_waits_when_empty() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
 
         let consumer = spawn(async move { rx.recv().await });
@@ -32,7 +48,7 @@ fn recv_waits_when_empty() {
 // recv returns None once sender is dropped and buffer is empty.
 #[test]
 fn recv_returns_none_on_closed_empty() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         drop(tx);
         assert_eq!(rx.recv().await, None);
@@ -42,7 +58,7 @@ fn recv_returns_none_on_closed_empty() {
 // recv drains remaining items before returning None.
 #[test]
 fn recv_drains_before_none() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         tx.push(1);
         tx.push(2);
@@ -57,7 +73,7 @@ fn recv_drains_before_none() {
 // extend with a slice appends in order.
 #[test]
 fn extend_appends_in_order() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         tx.push(1);
         tx.extend(&[2, 3, 4]);
@@ -71,7 +87,7 @@ fn extend_appends_in_order() {
 // extend on empty wakes a waiting receiver.
 #[test]
 fn extend_wakes_receiver() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
 
         let consumer = spawn(async move { rx.recv().await });
@@ -85,10 +101,10 @@ fn extend_wakes_receiver() {
 // extend with an empty slice must not wake the receiver.
 #[test]
 fn extend_empty_does_not_wake() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         tx.extend(&[]);
-        assert!(rx.peek().is_empty());
+        assert!(rx.take().is_empty());
 
         // recv would still block here; verify by dropping sender after.
         drop(tx);
@@ -96,36 +112,10 @@ fn extend_empty_does_not_wake() {
     });
 }
 
-// peek observes accumulated items without consuming them.
-#[test]
-fn peek_does_not_consume() {
-    main_thread(async {
-        let (tx, rx) = vec_channel::<i32>();
-        tx.push(1);
-        tx.push(2);
-        tx.push(3);
-
-        assert_eq!(rx.peek(), &[1, 2, 3]);
-        assert_eq!(rx.peek(), &[1, 2, 3]);
-
-        let batch = rx.recv().await.unwrap();
-        assert_eq!(batch, vec![1, 2, 3]);
-    });
-}
-
-// peek on empty returns an empty slice.
-#[test]
-fn peek_empty() {
-    main_thread(async {
-        let (_tx, rx) = vec_channel::<i32>();
-        assert!(rx.peek().is_empty());
-    });
-}
-
 // take returns the whole batch and leaves the buffer empty.
 #[test]
 fn take_returns_and_empties() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         tx.push(7);
         tx.push(8);
@@ -133,7 +123,7 @@ fn take_returns_and_empties() {
 
         let batch = rx.take();
         assert_eq!(batch, vec![7, 8, 9]);
-        assert!(rx.peek().is_empty());
+        assert!(rx.take().is_empty());
 
         tx.push(10);
         assert_eq!(rx.take(), vec![10]);
@@ -143,7 +133,7 @@ fn take_returns_and_empties() {
 // take on empty returns an empty Vec.
 #[test]
 fn take_empty_returns_empty_vec() {
-    main_thread(async {
+    on_runtime(async {
         let (_tx, rx) = vec_channel::<i32>();
         let batch = rx.take();
         assert!(batch.is_empty());
@@ -151,27 +141,30 @@ fn take_empty_returns_empty_vec() {
 }
 
 // get_mut allows in-place mutation of the buffer.
-#[test]
-fn get_mut_modifies_in_place() {
-    main_thread(async {
-        let (tx, mut rx) = vec_channel::<i32>();
-        tx.push(1);
-        tx.push(2);
-        tx.push(3);
-
-        for v in rx.get_mut().iter_mut() {
-            *v *= 10;
-        }
-        rx.get_mut().push(40);
-
-        assert_eq!(rx.take(), vec![10, 20, 30, 40]);
-    });
-}
+//
+// Commented out alongside `Receiver::get_mut` itself; see the note there.
+//
+// #[test]
+// fn get_mut_modifies_in_place() {
+//     on_runtime(async {
+//         let (tx, mut rx) = vec_channel::<i32>();
+//         tx.push(1);
+//         tx.push(2);
+//         tx.push(3);
+//
+//         for v in rx.get_mut().iter_mut() {
+//             *v *= 10;
+//         }
+//         rx.get_mut().push(40);
+//
+//         assert_eq!(rx.take(), vec![10, 20, 30, 40]);
+//     });
+// }
 
 // Drop receiver: sender pushes become silent no-ops.
 #[test]
 fn drop_receiver_sender_continues() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         tx.push(1);
         drop(rx);
@@ -183,7 +176,7 @@ fn drop_receiver_sender_continues() {
 // Drop both ends without sending anything.
 #[test]
 fn drop_empty_channel() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         drop(tx);
         drop(rx);
@@ -193,7 +186,7 @@ fn drop_empty_channel() {
 // recv coalesces everything sent before consumer wakes into one batch.
 #[test]
 fn recv_coalesces_multiple_pushes() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
 
         let consumer = spawn(async move { rx.recv().await });
@@ -212,9 +205,9 @@ fn recv_coalesces_multiple_pushes() {
 // Concurrent producer/consumer over many batches.
 #[test]
 fn concurrent_producer_consumer() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
-        let count = 1000;
+        let count = scaled(1000) as i32;
 
         let producer = spawn(async move {
             for i in 0..count {
@@ -243,7 +236,7 @@ fn concurrent_producer_consumer() {
 // FIFO ordering preserved across pushes and extends.
 #[test]
 fn fifo_ordering() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         for i in 0..100 {
             tx.push(i);
@@ -262,7 +255,7 @@ fn fifo_ordering() {
 // Zero-sized types round-trip correctly.
 #[test]
 fn zero_sized_type() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<()>();
         tx.push(());
         tx.push(());
@@ -276,7 +269,7 @@ fn zero_sized_type() {
 // Owned heap types (no Clone needed for push/take).
 #[test]
 fn owned_string_messages() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<String>();
         tx.push("hello".to_string());
         tx.push("world".to_string());
@@ -289,7 +282,7 @@ fn owned_string_messages() {
 // After draining via take(), recv() blocks again until the next push.
 #[test]
 fn take_then_recv_waits() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = vec_channel::<i32>();
         tx.push(1);
         assert_eq!(rx.take(), vec![1]);

@@ -1,5 +1,16 @@
 TEMPO_CONFIG := "tempo.yaml"
 
+# What Miri needs to get through the simulated ring. `disable-isolation` is for
+# the clock; `permissive-provenance` and `tree-borrows` go together, because the
+# buf-ring ABI parks buffer addresses in a u64 and reads them back as pointers —
+# Stacked Borrows refuses the resulting retag, Tree Borrows allows it.
+MIRIFLAGS := "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-tree-borrows"
+
+# Every suite that runs without a kernel. Naming them is not optional: with no
+# `--test`, Miri also builds the lib's inline unit tests, which open a real
+# io_uring and take the whole run down with an unsupported syscall.
+MIRI_SUITES := "--test channels --test channels_unbounded --test channels_bounded --test channels_vec --test simulated_runtime --test cancellation"
+
 # Launch Tempo + Grafana, then run the HTTP example
 dev: observability
     cargo run --example http
@@ -16,24 +27,24 @@ tempo:
     fi
     if ! [ -f {{TEMPO_CONFIG}} ]; then
         cat > {{TEMPO_CONFIG}} <<'EOF'
-server:
-  http_listen_port: 3200
+    server:
+      http_listen_port: 3200
 
-distributor:
-  receivers:
-    otlp:
-      protocols:
-        http:
-          endpoint: 0.0.0.0:4318
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            http:
+              endpoint: 0.0.0.0:4318
 
-storage:
-  trace:
-    backend: local
-    local:
-      path: /tmp/tempo/blocks
-    wal:
-      path: /tmp/tempo/wal
-EOF
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /tmp/tempo/blocks
+        wal:
+          path: /tmp/tempo/wal
+    EOF
     fi
     if [ -z "$(docker ps --filter name=^tempo$ --filter status=running -q)" ]; then
         docker run -d --name tempo --network observability \
@@ -64,6 +75,23 @@ grafana:
 down:
     docker rm -f tempo grafana 2>/dev/null || true
     docker network rm observability 2>/dev/null || true
+
+# Install the nightly toolchain and Miri (idempotent)
+miri-setup:
+    rustup toolchain install nightly
+    rustup component add miri --toolchain nightly
+
+# Check every Miri-able suite for undefined behaviour and leaks
+miri:
+    MIRIFLAGS="{{MIRIFLAGS}}" cargo +nightly miri test -p runtime-core --features simulation {{MIRI_SUITES}}
+
+# One suite, optionally one test:  just miri-one cancellation a_multishot
+miri-one suite filter="":
+    MIRIFLAGS="{{MIRIFLAGS}}" cargo +nightly miri test -p runtime-core --features simulation --test {{suite}} {{filter}}
+
+# The channels alone, which need neither a ring nor a clock
+miri-channels:
+    MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p runtime-core --test channels
 
 # Run the thread_per_core multithread stress test with eBPF balancer
 test-multithread:

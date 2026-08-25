@@ -1,7 +1,9 @@
 use std::{mem::MaybeUninit, ptr::NonNull};
 
 use io_uring::types::BufRingEntry;
-use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous};
+use rustix::mm::{ProtFlags, mmap_anonymous};
+
+use crate::MAP_FLAGS;
 
 pub struct MmapedRing {
     ptr: NonNull<BufRingEntry>,
@@ -35,7 +37,7 @@ impl MmapedRing {
                 core::ptr::null_mut(),
                 ring_size * size_of::<io_uring::types::BufRingEntry>(),
                 ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::PRIVATE | MapFlags::POPULATE,
+                MAP_FLAGS,
             )
         }?;
 

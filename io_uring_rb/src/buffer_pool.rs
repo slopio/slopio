@@ -1,8 +1,8 @@
 use std::ptr::{NonNull, null_mut};
 
-use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous};
+use rustix::mm::{ProtFlags, mmap_anonymous};
 
-use crate::BufferId;
+use crate::{BufferId, MAP_FLAGS};
 
 pub struct BufferPool<const BUFFER_SIZE: u32, const RING_SIZE: u16> {
     ptr: *mut u8,
@@ -16,7 +16,7 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> BufferPool<BUFFER_SIZE, RING_
                 null_mut(),
                 total_size,
                 ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::PRIVATE | MapFlags::POPULATE,
+                MAP_FLAGS,
             )?
         };
         Ok(Self { ptr: ptr.cast() })

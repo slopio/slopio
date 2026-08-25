@@ -1,11 +1,21 @@
-use runtime::{channels::bounded_channel, main_thread, runtime::spawn};
+//! The bounded channel, driven by a real runtime over a simulated ring.
+//!
+//! Migrated from `runtime/tests/bounded_channels_test.rs`. See
+//! `channels_unbounded.rs` for why, and `channels.rs` for the same channel
+//! polled by hand with no runtime at all.
+
+mod common;
+
+use common::{on_runtime, scaled};
+use runtime_core::channels::bounded_channel;
+use runtime_core::runtime::spawn;
 
 // --- recv_all ---
 
 // Basic: fill buffer then drain everything at once.
 #[test]
 fn recv_all_basic() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(8);
         tx.send(1).await.unwrap();
         tx.send(2).await.unwrap();
@@ -19,7 +29,7 @@ fn recv_all_basic() {
 // recv_all on an empty channel waits until at least one item arrives.
 #[test]
 fn recv_all_waits_when_empty() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
 
         let consumer = spawn(async move { rx.recv_all().await });
@@ -37,7 +47,7 @@ fn recv_all_waits_when_empty() {
 // recv_all returns None when sender is dropped and buffer is empty.
 #[test]
 fn recv_all_returns_none_on_closed_empty() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
         drop(tx);
         assert_eq!(rx.recv_all().await, None);
@@ -47,7 +57,7 @@ fn recv_all_returns_none_on_closed_empty() {
 // recv_all drains remaining items before returning None after sender drop.
 #[test]
 fn recv_all_drains_before_none() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(8);
         tx.send(1).await.unwrap();
         tx.send(2).await.unwrap();
@@ -62,7 +72,7 @@ fn recv_all_drains_before_none() {
 // recv_all frees the whole buffer at once, unblocking a sender that was waiting.
 #[test]
 fn recv_all_unblocks_full_sender() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(3);
         tx.send(1).await.unwrap();
         tx.send(2).await.unwrap();
@@ -88,7 +98,7 @@ fn recv_all_unblocks_full_sender() {
 // Multiple recv_all calls, each collecting whatever is buffered at that moment.
 #[test]
 fn recv_all_multiple_batches() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(8);
 
         tx.send(1).await.unwrap();
@@ -107,7 +117,7 @@ fn recv_all_multiple_batches() {
 // recv_all preserves FIFO order within the batch.
 #[test]
 fn recv_all_fifo_order() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(64);
         for i in 0..50 {
             tx.send(i).await.unwrap();
@@ -121,7 +131,7 @@ fn recv_all_fifo_order() {
 
 #[test]
 fn basic_send_recv() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
         tx.send(42).await.unwrap();
         assert_eq!(rx.recv().await, Some(42));
@@ -130,7 +140,7 @@ fn basic_send_recv() {
 
 #[test]
 fn multiple_sends_before_recv() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(8);
         for i in 0..5 {
             tx.send(i).await.unwrap();
@@ -143,7 +153,7 @@ fn multiple_sends_before_recv() {
 
 #[test]
 fn interleaved_send_recv() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
 
         tx.send(1).await.unwrap();
@@ -161,7 +171,7 @@ fn interleaved_send_recv() {
 
 #[test]
 fn fifo_ordering() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(128);
         for i in 0..100 {
             tx.send(i).await.unwrap();
@@ -174,7 +184,7 @@ fn fifo_ordering() {
 
 #[test]
 fn zero_sized_type() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<()>(4);
         tx.send(()).await.unwrap();
         tx.send(()).await.unwrap();
@@ -185,7 +195,7 @@ fn zero_sized_type() {
 
 #[test]
 fn string_messages() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<String>(4);
         tx.send("hello".to_string()).await.unwrap();
         tx.send("world".to_string()).await.unwrap();
@@ -199,7 +209,7 @@ fn string_messages() {
 // Sender blocks when the buffer is full and is unblocked by the receiver.
 #[test]
 fn send_blocks_when_full() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(2);
         tx.send(1).await.unwrap();
         tx.send(2).await.unwrap(); // now full
@@ -223,7 +233,7 @@ fn send_blocks_when_full() {
 // Fill to capacity, drain completely, then fill again.
 #[test]
 fn fill_drain_refill() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(3);
 
         for i in 0..3 {
@@ -245,7 +255,7 @@ fn fill_drain_refill() {
 // Capacity of 1: every send must wait for the previous item to be consumed.
 #[test]
 fn capacity_one() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(1);
 
         let receiver = spawn(async move {
@@ -268,7 +278,7 @@ fn capacity_one() {
 // Receiver blocks waiting for a sender.
 #[test]
 fn receiver_waits_for_sender() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
 
         let consumer = spawn(async move { rx.recv().await });
@@ -283,9 +293,9 @@ fn receiver_waits_for_sender() {
 // Concurrent producer / consumer.
 #[test]
 fn concurrent_producer_consumer() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(8);
-        let count = 200;
+        let count = scaled(200) as i32;
 
         let producer = spawn(async move {
             for i in 0..count {
@@ -310,7 +320,7 @@ fn concurrent_producer_consumer() {
 // Ping-pong between two tasks.
 #[test]
 fn ping_pong() {
-    main_thread(async {
+    on_runtime(async {
         let (tx1, rx1) = bounded_channel::<i32>(4);
         let (tx2, rx2) = bounded_channel::<i32>(4);
 
@@ -338,7 +348,7 @@ fn ping_pong() {
 // Sender dropped with buffered items: receiver drains them then gets None.
 #[test]
 fn drop_sender_with_pending_messages() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(8);
         tx.send(1).await.unwrap();
         tx.send(2).await.unwrap();
@@ -355,7 +365,7 @@ fn drop_sender_with_pending_messages() {
 // Sender dropped on an empty channel: receiver gets None immediately.
 #[test]
 fn drop_sender_empty_channel() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
         drop(tx);
         assert_eq!(rx.recv().await, None);
@@ -365,7 +375,7 @@ fn drop_sender_empty_channel() {
 // Receiver dropped while sender has a pending send: send resolves with Err.
 #[test]
 fn drop_receiver_unblocks_pending_send() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(1);
         tx.send(1).await.unwrap(); // fill the channel
 
@@ -386,7 +396,7 @@ fn drop_receiver_unblocks_pending_send() {
 // Receiver dropped: subsequent sends resolve with Err immediately.
 #[test]
 fn send_after_receiver_dropped() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
         drop(rx);
         assert_eq!(tx.send(1).await, Err(1));
@@ -397,7 +407,7 @@ fn send_after_receiver_dropped() {
 // Both ends dropped on an empty channel: no panic or leak.
 #[test]
 fn drop_both_empty() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
         drop(tx);
         drop(rx);
@@ -407,7 +417,7 @@ fn drop_both_empty() {
 // Receiver dropped first, then sender.
 #[test]
 fn drop_receiver_then_sender() {
-    main_thread(async {
+    on_runtime(async {
         let (tx, rx) = bounded_channel::<i32>(4);
         tx.send(1).await.unwrap();
         drop(rx);
@@ -418,8 +428,8 @@ fn drop_receiver_then_sender() {
 // Rapid channel create/destroy cycles.
 #[test]
 fn rapid_channel_lifecycle() {
-    main_thread(async {
-        for _ in 0..1000 {
+    on_runtime(async {
+        for _ in 0..scaled(1000) {
             let (tx, rx) = bounded_channel::<i32>(4);
             tx.send(1).await.unwrap();
             let _ = rx.recv().await;
