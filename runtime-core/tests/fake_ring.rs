@@ -7,6 +7,7 @@
 //! is the scenario's to state: nothing here invents a latency, so an op nobody
 //! delayed completes in submission order.
 
+use std::os::fd::FromRawFd;
 use std::time::{Duration, Instant};
 
 use io_uring::types::Timespec;
@@ -1009,7 +1010,8 @@ fn accept_mints_a_socket_the_runtime_can_actually_use() {
 
     // These are the syscalls the runtime makes outside the ring, and they are
     // exactly what a memfd or an AF_UNIX pair would have failed.
-    let socket = SocketWrapper { fd };
+    // SAFETY: the fake ring's accept opened this fd and nothing else owns it.
+    let socket = unsafe { SocketWrapper::from_raw_fd(fd) };
     socket.set_nodelay(true).expect("TCP_NODELAY");
     socket.set_quickack(true).expect("TCP_QUICKACK");
     socket.set_reuseaddr(true).expect("SO_REUSEADDR");

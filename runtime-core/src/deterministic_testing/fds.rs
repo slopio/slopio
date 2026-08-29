@@ -54,7 +54,7 @@ pub fn mint(kind: FdKind) -> io::Result<RawFd> {
 /// runtime makes outside the ring works, and the wrapper's `Drop` closes a
 /// descriptor that genuinely exists.
 pub fn simulated_socket() -> io::Result<SocketWrapper> {
-    Ok(SocketWrapper {
-        fd: mint(FdKind::Socket)?,
-    })
+    use std::os::fd::FromRawFd;
+    // SAFETY: `mint` opened the fd and nothing else owns it.
+    Ok(unsafe { SocketWrapper::from_raw_fd(mint(FdKind::Socket)?) })
 }

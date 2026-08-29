@@ -25,7 +25,19 @@ pub mod udp;
 
 #[derive(Debug)]
 pub struct SocketWrapper {
-    pub fd: i32,
+    fd: i32,
+}
+
+/// The only way to build a `SocketWrapper` from a bare descriptor.
+///
+/// # Safety
+///
+/// The wrapper takes ownership: `fd` must be an open socket that nothing
+/// else will close, and the wrapper's `Drop` closes it.
+impl std::os::fd::FromRawFd for SocketWrapper {
+    unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
+        Self { fd }
+    }
 }
 
 impl SocketWrapper {
