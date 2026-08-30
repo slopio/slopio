@@ -9,12 +9,18 @@ use std::{
 use crate::io_driver::{
     BorrowedBuffer, BufRingSpec, DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult,
     MultishotCompletionEvent,
-    operations::{IoOP, MultishotToken},
+    operations::{IoOP, MultishotToken, sockets::SocketWrapper},
 };
 
+/// Owns its socket for as long as it streams: the fd cannot close under the
+/// armed multishot, and a second stream cannot be armed on the same socket.
+/// Send on the connection through [`MultiRecv::socket`]; take the socket back
+/// with [`MultiRecv::into_inner`]. Dropping the stream cancels the multishot
+/// and then closes the socket, in that order.
 pub struct MultiRecv<S: BufRingSpec, const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
     id: Option<MultishotToken>,
-    fd: i32,
+    /// `Some` until `into_inner` moves the socket out.
+    socket: Option<SocketWrapper>,
     reads: MultiOpQueue,
     _spec: PhantomData<S>,
 }
@@ -52,21 +58,37 @@ impl CompletionError {
 }
 
 impl<S: BufRingSpec> MultiRecv<S, DEFAULT_QUEUE_SIZE> {
-    pub fn new(fd: i32) -> Self {
-        Self::with_queue_size(fd)
+    pub fn new(socket: SocketWrapper) -> Self {
+        Self::with_queue_size(socket)
     }
 }
 
 impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
-    pub fn with_queue_size(fd: i32) -> Self {
+    pub fn with_queue_size(socket: SocketWrapper) -> Self {
         let mut multi_recv = Self {
             id: None,
-            fd,
+            socket: Some(socket),
             reads: MultiOpQueue::new(QUEUE_SIZE),
             _spec: PhantomData,
         };
         multi_recv.register_to_driver();
         multi_recv
+    }
+
+    /// The socket this stream reads from — the write half of the connection,
+    /// and socket options.
+    pub fn socket(&self) -> &SocketWrapper {
+        self.socket.as_ref().expect("socket present")
+    }
+
+    /// Stop streaming and take the socket back. Cancels the multishot the
+    /// same way `Drop` does; the driver absorbs the cancelled op's final
+    /// CQEs and recycles their buffers.
+    pub fn into_inner(mut self) -> SocketWrapper {
+        self.recycle_pending_buffers();
+        self.driver_cleanup();
+        // Drop then finds `id` and `socket` both empty and does nothing.
+        self.socket.take().expect("socket present")
     }
 
     fn try_parse(
@@ -161,12 +183,12 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for MultiRecv<S, QUEUE_SIZE
 impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for MultiRecv<S, QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd, QUEUE_SIZE));
+        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket().fd(), QUEUE_SIZE));
         self.id = Some(token);
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::RecvMulti::new(Fd(self.fd), S::BGID).build()
+        opcode::RecvMulti::new(Fd(self.socket().fd()), S::BGID).build()
     }
 
     fn driver_cleanup(&mut self) {

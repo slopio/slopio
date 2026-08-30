@@ -12,6 +12,7 @@ use io_uring::{
 };
 use runtime_streams::Stream;
 
+use super::UdpSocket;
 use crate::io_driver::{
     BorrowedBuffer, BufRingSpec, DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult,
     MultishotCompletionEvent,
@@ -41,9 +42,13 @@ impl MsgHdrBox {
     }
 }
 
+/// Owns its socket for as long as it streams, like `MultiRecv` does for TCP.
+/// Reply through [`UdpMultiRecv::socket`]'s `send_to`; take the socket back
+/// with [`UdpMultiRecv::into_inner`].
 pub struct UdpMultiRecv<S: BufRingSpec, const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
     id: Option<MultishotToken>,
-    fd: i32,
+    /// `Some` until `into_inner` moves the socket out.
+    socket: Option<UdpSocket>,
     reads: MultiOpQueue,
     /// `Some` until `driver_cleanup` runs in `Drop`, at which point the Box
     /// is moved into the driver's keepalive slot.
@@ -78,20 +83,35 @@ impl<S: BufRingSpec> UdpDatagram<S> {
 }
 
 impl<S: BufRingSpec> UdpMultiRecv<S, DEFAULT_QUEUE_SIZE> {
-    pub fn new(fd: i32) -> Self {
-        Self::with_queue_size(fd)
+    pub fn new(socket: UdpSocket) -> Self {
+        Self::with_queue_size(socket)
     }
 }
 
 impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
-    pub fn with_queue_size(fd: i32) -> Self {
+    pub fn with_queue_size(socket: UdpSocket) -> Self {
         Self {
             id: None,
-            fd,
+            socket: Some(socket),
             reads: MultiOpQueue::new(QUEUE_SIZE),
             hdr: Some(MsgHdrBox::new()),
             _spec: PhantomData,
         }
+    }
+
+    /// The socket this stream reads from — replies go through its `send_to`.
+    pub fn socket(&self) -> &UdpSocket {
+        self.socket.as_ref().expect("socket present")
+    }
+
+    /// Stop streaming and take the socket back. Cancels the multishot the
+    /// same way `Drop` does; the driver absorbs the cancelled op's final
+    /// CQEs and recycles their buffers.
+    pub fn into_inner(mut self) -> UdpSocket {
+        self.recycle_pending_buffers();
+        self.driver_cleanup();
+        // Drop then finds `id` and `socket` both empty and does nothing.
+        self.socket.take().expect("socket present")
     }
 
     fn ensure_registered(&mut self) {
@@ -209,13 +229,13 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for UdpMultiRecv<S, QUEUE_S
 impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for UdpMultiRecv<S, QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.fd, QUEUE_SIZE));
+        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket().fd(), QUEUE_SIZE));
         self.id = Some(token);
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
         opcode::RecvMsgMulti::new(
-            Fd(self.fd),
+            Fd(self.socket().fd()),
             self.hdr.as_ref().expect("hdr present").msghdr_ptr(),
             S::BGID,
         )

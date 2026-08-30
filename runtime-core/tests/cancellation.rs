@@ -149,7 +149,7 @@ fn a_multishot_dropped_in_flight_is_cancelled() {
 
     let first = RuntimeInner::simulated(fake).block_on::<CancelRing, _>(
         async move {
-            let mut recv = MultiRecv::<CancelRing>::new(socket.fd());
+            let mut recv = MultiRecv::<CancelRing>::new(socket);
             let chunk = recv.next().await.expect("a chunk").expect("no error");
             let bytes = chunk.as_ref().to_vec();
 
@@ -189,10 +189,10 @@ fn a_stream_dropped_mid_batch_gives_the_ring_its_buffers_back() {
     let scripted = handle.clone();
     let held = RuntimeInner::simulated(fake).block_on::<CancelRing, _>(
         async move {
-            let mut recv = MultiRecv::<CancelRing>::new(socket.fd());
+            let mut recv = MultiRecv::<CancelRing>::new(socket);
             let chunk = recv.next().await.expect("a chunk").expect("no error");
             drop(chunk);
-            drop(recv);
+            let socket = recv.into_inner();
             settle().await;
 
             // Scripted here rather than up front, so what follows measures the
@@ -206,7 +206,7 @@ fn a_stream_dropped_mid_batch_gives_the_ring_its_buffers_back() {
             // Both buffers are held at once on purpose: a ring that lost the
             // undelivered one to the cancel has a single buffer left, and the
             // second read comes back `ENOBUFS` instead of a chunk.
-            let mut again = MultiRecv::<CancelRing>::new(socket.fd());
+            let mut again = MultiRecv::<CancelRing>::new(socket);
             let mut held = Vec::new();
             for _ in 0..2 {
                 match again.next().await {

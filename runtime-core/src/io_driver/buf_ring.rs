@@ -200,7 +200,7 @@ impl_buf_ring_set_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
 /// runtime::define_buf_ring!(pub SmallRecv, bgid = 0, buffer_size = 4096, ring_size = 8192);
 ///
 /// runtime::main_thread_with::<SmallRecv, _>(async {
-///     let mr = MultiRecv::<SmallRecv>::new(fd);
+///     let mr = MultiRecv::<SmallRecv>::new(socket);
 ///     // ...
 /// });
 /// ```

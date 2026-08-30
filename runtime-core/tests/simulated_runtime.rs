@@ -184,7 +184,7 @@ fn a_managed_recv_hands_a_borrowed_buffer_to_the_task() {
 
     let got = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
         async move {
-            let mut recv = MultiRecv::<ManagedRing>::new(socket.fd());
+            let mut recv = MultiRecv::<ManagedRing>::new(socket);
             let buffer = recv.next().await.expect("a chunk").expect("no error");
             buffer.as_ref().to_vec()
         },
@@ -210,7 +210,7 @@ fn a_ring_of_two_serves_more_reads_than_it_has_buffers() {
 
     let got = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
         async move {
-            let mut recv = MultiRecv::<ManagedRing>::new(socket.fd());
+            let mut recv = MultiRecv::<ManagedRing>::new(socket);
             let mut got: Vec<Vec<u8>> = Vec::new();
             for _ in 0..5 {
                 let buffer = recv.next().await.expect("a chunk").expect("no error");
@@ -253,7 +253,7 @@ fn holding_every_buffer_drains_the_ring() {
 
     let (delivered, failure) = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
         async move {
-            let mut recv = MultiRecv::<ManagedRing>::new(socket.fd());
+            let mut recv = MultiRecv::<ManagedRing>::new(socket);
             let mut held = Vec::new();
             let mut failure = None;
 
@@ -341,7 +341,7 @@ fn second_completion_was_already_there(batched: bool) -> bool {
 
     RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
         async move {
-            let mut recv = MultiRecv::<ManagedRing>::new(socket.fd());
+            let mut recv = MultiRecv::<ManagedRing>::new(socket);
             recv.next().await.expect("a chunk").expect("no error");
             matches!(
                 select(yield_now(), recv.next()).await,
@@ -389,7 +389,7 @@ fn a_whole_batch_is_drained_in_one_pass() {
 
     let drained = RuntimeInner::simulated(fake).block_on::<BigRing, _>(
         async move {
-            let mut recv = MultiRecv::<BigRing>::new(socket.fd());
+            let mut recv = MultiRecv::<BigRing>::new(socket);
             recv.next().await.expect("a chunk").expect("no error");
 
             // The rest of the batch, raced against a single round of the loop.
