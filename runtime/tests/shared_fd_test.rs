@@ -1,8 +1,8 @@
-use std::{io::Read, net::TcpStream, time::Duration};
+use std::{io::Read, net::TcpStream, os::fd::FromRawFd, time::Duration};
 
 use runtime::{
     main_thread_with,
-    net::{socket_recv, socket_send, MultiAccept},
+    net::{socket_recv, socket_send, MultiAccept, SocketWrapper},
     runtime::{select::select, time::Sleep},
 };
 use runtime_streams::StreamExt;
@@ -77,4 +77,19 @@ fn test_last_handle_dropped_mid_op() {
     let n = client.read(&mut [0u8; 8]).unwrap();
     assert_eq!(n, 0, "peer should see EOF once the close lands");
     server.join().unwrap();
+}
+
+/// -EBADF is an fd-ownership violation: the driver must panic, not return an error.
+#[test]
+fn test_ebadf_completion_panics() {
+    let result = std::thread::spawn(|| {
+        main_thread_with::<Small, _>(async {
+            // Never-open fd: the send completes with -EBADF.
+            let socket = unsafe { SocketWrapper::from_raw_fd(1_000_000) };
+            let (res, _buf) = socket_send(&socket, GREETING).await;
+            drop(res);
+        })
+    })
+    .join();
+    assert!(result.is_err(), "EBADF completion must panic the runtime");
 }

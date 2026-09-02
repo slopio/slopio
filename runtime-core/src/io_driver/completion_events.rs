@@ -72,9 +72,20 @@ impl CompletionEvent {
                 let data = CQEData { result, flags };
                 let event = match ud.io_kind() {
                     IO_SEND_BUFFER => Event::SendBuffer(data.result),
-                    IO_MULTI => Event::MultiShot(data),
                     IO_REPLY_SIGNAL => Event::ReplySignal { status: data.result },
-                    _ /* IO_SINGLE */ => Event::SingleShot(data),
+                    kind /* IO_MULTI or IO_SINGLE */ => {
+                        // EBADF means an SQE named a closed fd: fd ownership is broken.
+                        assert!(
+                            result != -libc::EBADF,
+                            "op completed with EBADF (user_data {raw:#x}, slab index {})",
+                            ud.index(),
+                        );
+                        if kind == IO_MULTI {
+                            Event::MultiShot(data)
+                        } else {
+                            Event::SingleShot(data)
+                        }
+                    }
                 };
                 Some(CompletionEvent {
                     slab_index: ud.index() as usize,
