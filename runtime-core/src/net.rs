@@ -7,6 +7,9 @@
 
 pub use crate::io_driver::operations::sockets::connect::{connect_tcp, ConnectTcp};
 pub use crate::io_driver::operations::sockets::SocketWrapper;
+pub use crate::io_driver::operations::sockets::split::{
+    OwnedReadHalf, OwnedWriteHalf, ReuniteError, SocketOwner,
+};
 
 // send
 pub use crate::io_driver::operations::{FixedBufIndex, IoBuf, IoBufMut, Slice};

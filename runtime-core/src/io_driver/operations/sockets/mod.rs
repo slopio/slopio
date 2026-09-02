@@ -24,6 +24,7 @@ pub mod send_fixed;
 pub mod send_fixed_zc;
 pub mod send_vectored;
 pub mod send_zc;
+pub mod split;
 pub mod udp;
 
 /// Owns the fd. The wrapper, each split half, and every prepared or in-flight
@@ -84,6 +85,19 @@ impl SocketWrapper {
     /// A strong ref for an operation to hold until completion.
     pub(crate) fn share(&self) -> OpSocket {
         OpSocket(Some(self.inner.clone()))
+    }
+
+    /// A second wrapper over the same fd, for `into_split`. Not a `Clone`
+    /// impl: user code must not duplicate exclusive handles.
+    pub(crate) fn share_wrapper(&self) -> SocketWrapper {
+        SocketWrapper {
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// Same socket, not just the same fd number.
+    pub(crate) fn same_socket(&self, other: &SocketWrapper) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// A parked ref by clone, for handles that must survive the cancellation

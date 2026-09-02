@@ -9,18 +9,27 @@ use std::{
 use crate::io_driver::{
     BorrowedBuffer, BufRingSpec, DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult,
     MultishotCompletionEvent,
-    operations::{IoOP, MultishotToken, sockets::SocketWrapper},
+    operations::{
+        IoOP, MultishotToken,
+        sockets::{SocketWrapper, split::SocketOwner},
+    },
 };
 
-/// Owns its socket for as long as it streams: the fd cannot close under the
-/// armed multishot, and a second stream cannot be armed on the same socket.
-/// Send on the connection through [`MultiRecv::socket`]; take the socket back
-/// with [`MultiRecv::into_inner`]. Dropping the stream cancels the multishot
-/// and then closes the socket, in that order.
-pub struct MultiRecv<S: BufRingSpec, const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
+/// Owns its socket handle for as long as it streams: the fd cannot close
+/// under the armed multishot, and a second stream cannot be armed on the same
+/// socket. The handle is a whole [`SocketWrapper`], or an
+/// [`OwnedReadHalf`](super::split::OwnedReadHalf) when the write half lives
+/// in another task. Send on the connection through [`MultiRecv::socket`];
+/// take the handle back with [`MultiRecv::into_inner`]. Dropping the stream
+/// cancels the multishot and then drops the handle, in that order.
+pub struct MultiRecv<
+    S: BufRingSpec,
+    O: SocketOwner = SocketWrapper,
+    const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE,
+> {
     id: Option<MultishotToken>,
-    /// `Some` until `into_inner` moves the socket out.
-    socket: Option<SocketWrapper>,
+    /// `Some` until `into_inner` moves the socket handle out.
+    socket: Option<O>,
     reads: MultiOpQueue,
     _spec: PhantomData<S>,
 }
@@ -57,14 +66,14 @@ impl CompletionError {
     }
 }
 
-impl<S: BufRingSpec> MultiRecv<S, DEFAULT_QUEUE_SIZE> {
-    pub fn new(socket: SocketWrapper) -> Self {
+impl<S: BufRingSpec, O: SocketOwner> MultiRecv<S, O, DEFAULT_QUEUE_SIZE> {
+    pub fn new(socket: O) -> Self {
         Self::with_queue_size(socket)
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
-    pub fn with_queue_size(socket: SocketWrapper) -> Self {
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QUEUE_SIZE> {
+    pub fn with_queue_size(socket: O) -> Self {
         let mut multi_recv = Self {
             id: None,
             socket: Some(socket),
@@ -78,13 +87,13 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
     /// The socket this stream reads from — the write half of the connection,
     /// and socket options.
     pub fn socket(&self) -> &SocketWrapper {
-        self.socket.as_ref().expect("socket present")
+        self.socket.as_ref().expect("socket present").socket()
     }
 
-    /// Stop streaming and take the socket back. Cancels the multishot the
-    /// same way `Drop` does; the driver absorbs the cancelled op's final
+    /// Stop streaming and take the socket handle back. Cancels the multishot
+    /// the same way `Drop` does; the driver absorbs the cancelled op's final
     /// CQEs and recycles their buffers.
-    pub fn into_inner(mut self) -> SocketWrapper {
+    pub fn into_inner(mut self) -> O {
         self.recycle_pending_buffers();
         self.driver_cleanup();
         // Drop then finds `id` and `socket` both empty and does nothing.
@@ -104,7 +113,7 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> Drop for MultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Drop for MultiRecv<S, O, QUEUE_SIZE> {
     fn drop(&mut self) {
         // Recycle kernel buffers from any unprocessed completion events
         // before cancelling the op, otherwise these buffer ring entries leak.
@@ -113,7 +122,7 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> Drop for MultiRecv<S, QUEUE_SIZE> 
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QUEUE_SIZE> {
     fn recycle_pending_buffers(&mut self) {
         while let Some(event) = self.reads.pop() {
             if event.result > 0 {
@@ -125,9 +134,9 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> Unpin for MultiRecv<S, QUEUE_SIZE> {}
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Unpin for MultiRecv<S, O, QUEUE_SIZE> {}
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QUEUE_SIZE> {
     fn try_drain_one(&mut self) -> Poll<Option<Result<BorrowedBuffer<S>, CompletionError>>> {
         while let Some(completion_event) = self.reads.pop() {
             match self.try_parse(completion_event) {
@@ -141,7 +150,7 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> MultiRecv<S, QUEUE_SIZE> {
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for MultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream for MultiRecv<S, O, QUEUE_SIZE> {
     type Item = Result<BorrowedBuffer<S>, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -180,7 +189,7 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for MultiRecv<S, QUEUE_SIZE
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for MultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> IoOP for MultiRecv<S, O, QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
         let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket().fd(), QUEUE_SIZE));
