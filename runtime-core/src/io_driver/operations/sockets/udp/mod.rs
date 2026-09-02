@@ -13,6 +13,7 @@ use std::{
 
 use socket2::{Domain, Protocol, Socket as S, Type};
 
+use crate::io_driver::ParkedFd;
 use crate::io_driver::operations::{IoBuf, IoBufMut};
 use crate::io_driver::operations::sockets::SocketWrapper;
 
@@ -41,7 +42,7 @@ impl UdpSocket {
         let fd = socket.into_raw_fd();
 
         Ok(Self {
-            socket: SocketWrapper { fd },
+            socket: SocketWrapper::from_fd(fd),
         })
     }
 
@@ -49,11 +50,15 @@ impl UdpSocket {
         self.socket.fd()
     }
 
+    pub(crate) fn park(&self) -> ParkedFd {
+        self.socket.park()
+    }
+
     pub fn recv_from<B: IoBufMut>(&self, buf: B) -> UdpRecvFrom<B> {
-        UdpRecvFrom::new(self.socket.fd(), buf)
+        UdpRecvFrom::new(self.socket.share(), buf)
     }
 
     pub fn send_to<B: IoBuf>(&self, buf: B, dest: SocketAddr) -> UdpSendTo<B> {
-        UdpSendTo::new(self.socket.fd(), buf, dest)
+        UdpSendTo::new(self.socket.share(), buf, dest)
     }
 }

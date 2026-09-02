@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{OneshotToken, sockets::SocketWrapper},
+    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
 };
 
 const SOL_TLS: libc::c_int = 282;
@@ -39,7 +39,7 @@ pub fn socket_send_control_record<'a>(
         ctrl: ControlBuf { words: [0; 4] },
     });
     WriteControlRecord {
-        fd: socket.fd(),
+        socket: socket.share(),
         id: None,
         payload,
         record_type,
@@ -48,7 +48,7 @@ pub fn socket_send_control_record<'a>(
 }
 
 pub struct WriteControlRecord<'a> {
-    fd: i32,
+    socket: OpSocket,
     id: Option<OneshotToken>,
     payload: &'a [u8],
     record_type: u8,
@@ -90,7 +90,7 @@ impl<'a> WriteControlRecord<'a> {
             msg_flags: 0,
         };
 
-        let entry = opcode::SendMsg::new(Fd(this.fd), &state.msghdr).build();
+        let entry = opcode::SendMsg::new(Fd(this.socket.fd()), &state.msghdr).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         this.id = Some(token);
     }
@@ -124,7 +124,8 @@ impl<'a> Drop for WriteControlRecord<'a> {
             // Move the boxed msghdr/iovec/ctrl into keepalive — kernel may
             // still dereference msghdr → iovec/ctrl until cancel completes.
             let keep = self.state.take().map(|s| s as Box<dyn Any>);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
+            let parked = Some(self.socket.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
     }
 }

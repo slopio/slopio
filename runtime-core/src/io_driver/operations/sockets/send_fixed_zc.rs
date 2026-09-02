@@ -7,7 +7,7 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER, PooledBuf,
-    operations::{OneshotToken, sockets::SocketWrapper},
+    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
 };
 
 /// Zero-copy send (`IORING_OP_SEND_ZC`) over a pre-registered ("fixed")
@@ -23,14 +23,14 @@ use crate::io_driver::{
 /// released only once the cancelled op's final (no-`F_MORE`) CQE arrives.
 pub fn socket_write_fixed_zc(socket: &SocketWrapper, buf: PooledBuf) -> WriteFixedSocketZc {
     WriteFixedSocketZc {
-        fd: socket.fd(),
+        socket: socket.share(),
         id: None,
         buf: Some(buf),
     }
 }
 
 pub struct WriteFixedSocketZc {
-    fd: i32,
+    socket: OpSocket,
     id: Option<OneshotToken>,
     buf: Option<PooledBuf>,
 }
@@ -40,7 +40,7 @@ impl WriteFixedSocketZc {
         let buf = self.buf.as_ref().expect("buf taken before submit");
         // `buf_index` flips IORING_RECVSEND_FIXED_BUF: the kernel reads from
         // the registered region addressed by the index.
-        let entry = opcode::SendZc::new(Fd(self.fd), buf.ptr(), buf.len() as u32)
+        let entry = opcode::SendZc::new(Fd(self.socket.fd()), buf.ptr(), buf.len() as u32)
             .buf_index(Some(buf.buf_index().get()))
             .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
@@ -82,7 +82,8 @@ impl Drop for WriteFixedSocketZc {
             // arm waits past any `F_MORE` completion, so an in-flight zero-copy
             // send still releases its slot only on the notification.
             let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
+            let parked = Some(self.socket.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
     }
 }

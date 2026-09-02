@@ -79,7 +79,7 @@ impl<B: IoBufMut> Drop for ReadFile<B> {
             // Kernel writes into the buffer — must keep it alive until the
             // cancel CQE arrives.
             let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, None));
         }
     }
 }

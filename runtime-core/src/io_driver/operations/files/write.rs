@@ -71,7 +71,7 @@ impl<B: IoBuf> Drop for WriteFile<B> {
             } else {
                 None
             };
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, None));
         }
     }
 }

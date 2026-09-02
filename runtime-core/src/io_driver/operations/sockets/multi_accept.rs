@@ -50,7 +50,7 @@ impl TryFrom<MultishotCompletionEvent> for SocketWrapper {
         if value.result < 0 {
             Err(AcceptError::from_result(value.result))
         } else {
-            let socket = SocketWrapper { fd: value.result };
+            let socket = SocketWrapper::from_fd(value.result);
             let _ = socket.set_nodelay(true);
             Ok(socket)
         }
@@ -75,7 +75,7 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
 
         let mut multi_accept = Self {
             id: None,
-            socket: SocketWrapper { fd },
+            socket: SocketWrapper::from_fd(fd),
             sockets: MultiOpQueue::new(QUEUE_SIZE),
             cancel_sent: false,
         };
@@ -88,7 +88,7 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
     }
 
     pub fn set_backlog(&self, backlog: i32) -> std::io::Result<()> {
-        let ret = unsafe { libc::listen(self.socket.fd, backlog) };
+        let ret = unsafe { libc::listen(self.socket.fd(), backlog) };
         if ret < 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -186,12 +186,12 @@ impl<const QUEUE_SIZE: usize> Stream for MultiAccept<QUEUE_SIZE> {
 impl<const QUEUE_SIZE: usize> IoOP for MultiAccept<QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket.fd, QUEUE_SIZE));
+        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket.fd(), QUEUE_SIZE));
         self.id = Some(token);
     }
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
-        opcode::AcceptMulti::new(Fd(self.socket.fd))
+        opcode::AcceptMulti::new(Fd(self.socket.fd()))
             .flags(libc::SOCK_NONBLOCK)
             .build()
     }
@@ -199,9 +199,11 @@ impl<const QUEUE_SIZE: usize> IoOP for MultiAccept<QUEUE_SIZE> {
     fn driver_cleanup(&mut self) {
         // Cancel the multishot accept via the accept-aware path so any
         // already-queued or in-flight accept fds get closed instead of
-        // leaked. Listener fd is closed separately by `SocketWrapper`'s Drop.
+        // leaked. The parked listener ref (we are its only holder) posts the
+        // close after the cancel's terminal CQE.
         if let Some(token) = self.id.take() {
-            IO_DRIVER.with(|d| d.cancel_multishot_op_accept(token));
+            let parked = Some(self.socket.park());
+            IO_DRIVER.with(|d| d.cancel_multishot_op_accept(token, parked));
         }
     }
 }

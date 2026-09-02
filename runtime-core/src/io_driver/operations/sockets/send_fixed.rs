@@ -7,7 +7,7 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER, PooledBuf,
-    operations::{OneshotToken, sockets::SocketWrapper},
+    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
 };
 
 /// Cancellation-safe send over a pre-registered ("fixed") buffer.
@@ -23,14 +23,14 @@ use crate::io_driver::{
 /// registered region addressed by `buf.buf_index()`.
 pub fn socket_write_fixed(socket: &SocketWrapper, buf: PooledBuf) -> WriteFixedSocket {
     WriteFixedSocket {
-        fd: socket.fd(),
+        socket: socket.share(),
         id: None,
         buf: Some(buf),
     }
 }
 
 pub struct WriteFixedSocket {
-    fd: i32,
+    socket: OpSocket,
     id: Option<OneshotToken>,
     buf: Option<PooledBuf>,
 }
@@ -39,7 +39,7 @@ impl WriteFixedSocket {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_ref().expect("buf taken before submit");
         let entry =
-            opcode::WriteFixed::new(Fd(self.fd), buf.ptr(), buf.len() as u32, buf.buf_index().get())
+            opcode::WriteFixed::new(Fd(self.socket.fd()), buf.ptr(), buf.len() as u32, buf.buf_index().get())
                 .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
@@ -78,7 +78,8 @@ impl Drop for WriteFixedSocket {
             // which point the kernel is guaranteed done with the registered
             // slot.
             let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
+            let parked = Some(self.socket.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
     }
 }

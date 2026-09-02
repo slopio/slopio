@@ -1,3 +1,4 @@
+use crate::io_driver::operations::sockets::OpSocket;
 use std::{
     any::Any,
     future::Future,
@@ -27,14 +28,14 @@ struct UdpSendState {
 /// state are both kept alive via the driver's keepalive slot until the
 /// cancelled CQE arrives.
 pub struct UdpSendTo<B: IoBuf> {
-    fd: i32,
+    socket: OpSocket,
     id: Option<OneshotToken>,
     buf: Option<B>,
     state: Option<Box<UdpSendState>>,
 }
 
 impl<B: IoBuf> UdpSendTo<B> {
-    pub(super) fn new(fd: i32, buf: B, dest: SocketAddr) -> Self {
+    pub(super) fn new(socket: OpSocket, buf: B, dest: SocketAddr) -> Self {
         let (ip, port) = match dest {
             SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
             SocketAddr::V6(_) => panic!("IPv6 not supported"),
@@ -54,7 +55,7 @@ impl<B: IoBuf> UdpSendTo<B> {
         });
 
         Self {
-            fd,
+            socket,
             id: None,
             buf: Some(buf),
             state: Some(state),
@@ -76,7 +77,7 @@ impl<B: IoBuf> UdpSendTo<B> {
         state.msghdr.msg_iov = iovec_ptr;
         state.msghdr.msg_iovlen = 1;
 
-        let entry = opcode::SendMsg::new(Fd(self.fd), &state.msghdr).build();
+        let entry = opcode::SendMsg::new(Fd(self.socket.fd()), &state.msghdr).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
@@ -116,13 +117,14 @@ impl<B: IoBuf> Drop for UdpSendTo<B> {
             // until cancel completes). The buffer only needs keeping if
             // `B::NEEDS_KEEPALIVE` says so — `&'static` data lives forever
             // and the const branch is elided at monomorphization.
+            let parked = Some(self.socket.park());
             let keep: Box<dyn Any> = if B::NEEDS_KEEPALIVE {
                 let buf = self.buf.take().expect("buf present");
                 Box::new((buf, state))
             } else {
                 Box::new(state)
             };
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep)));
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep), parked));
         }
     }
 }

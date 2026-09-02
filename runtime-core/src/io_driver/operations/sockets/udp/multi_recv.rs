@@ -251,7 +251,8 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for UdpMultiRecv<S, QUEUE_SIZ
                 .hdr
                 .take()
                 .map(|h| h as Box<dyn std::any::Any>);
-            IO_DRIVER.with(|d| d.cancel_multishot_op_keep(token, S::BGID, keep));
+            let parked = Some(self.socket().park());
+            IO_DRIVER.with(|d| d.cancel_multishot_op_keep(token, S::BGID, keep, parked));
         }
     }
 }

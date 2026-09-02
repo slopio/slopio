@@ -252,7 +252,7 @@ pub(crate) fn process_multi(
             MultiProcessResult::InvalidState("received CQE while paused")
         }
 
-        MultiOpState::AcceptCancelled { last_cqe } => {
+        MultiOpState::AcceptCancelled { last_cqe, .. } => {
             if !cqueue::more(event.flags) {
                 *last_cqe = true;
             }

@@ -193,7 +193,10 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for MultiRecv<S, QUEUE_SIZE> 
 
     fn driver_cleanup(&mut self) {
         if let Some(token) = self.id.take() {
-            IO_DRIVER.with(|d| d.cancel_multishot_op(token, S::BGID));
+            // Park the fd ref so a Drop-path close posts only after the
+            // cancel's terminal CQE.
+            let parked = Some(self.socket().park());
+            IO_DRIVER.with(|d| d.cancel_multishot_op_keep(token, S::BGID, None, parked));
         }
     }
 }

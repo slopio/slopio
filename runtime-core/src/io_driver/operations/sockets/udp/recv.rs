@@ -1,3 +1,4 @@
+use crate::io_driver::operations::sockets::OpSocket;
 use std::{
     any::Any,
     future::Future,
@@ -28,19 +29,19 @@ struct UdpRecvState {
 /// `IoBufMut::set_init`. If dropped mid-flight, both buffer and boxed kernel
 /// state are kept alive via the driver's keepalive slot.
 pub struct UdpRecvFrom<B: IoBufMut> {
-    fd: i32,
+    socket: OpSocket,
     id: Option<OneshotToken>,
     buf: Option<B>,
     state: Option<Box<UdpRecvState>>,
 }
 
 impl<B: IoBufMut> UdpRecvFrom<B> {
-    pub(super) fn new(fd: i32, buf: B) -> Self {
+    pub(super) fn new(socket: OpSocket, buf: B) -> Self {
         // All-zero state is fine: addr will be overwritten by the kernel,
         // msghdr/iovec are populated in `register_to_driver`.
         let state = Box::new(unsafe { std::mem::zeroed::<UdpRecvState>() });
         Self {
-            fd,
+            socket,
             id: None,
             buf: Some(buf),
             state: Some(state),
@@ -62,7 +63,7 @@ impl<B: IoBufMut> UdpRecvFrom<B> {
         state.msghdr.msg_iov = iovec_ptr;
         state.msghdr.msg_iovlen = 1;
 
-        let entry = opcode::RecvMsg::new(Fd(self.fd), &mut state.msghdr).build();
+        let entry = opcode::RecvMsg::new(Fd(self.socket.fd()), &mut state.msghdr).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
@@ -134,7 +135,8 @@ impl<B: IoBufMut> Drop for UdpRecvFrom<B> {
             let state = self.state.take().expect("state present");
             let buf = self.buf.take().expect("buf present");
             let keep: Box<dyn Any> = Box::new((buf, state));
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep)));
+            let parked = Some(self.socket.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep), parked));
         }
     }
 }

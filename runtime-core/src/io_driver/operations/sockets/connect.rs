@@ -44,7 +44,7 @@ impl ConnectTcp {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.socket = Some(SocketWrapper { fd });
+        self.socket = Some(SocketWrapper::from_fd(fd));
 
         let mut storage: Box<AddrStorage> = Box::new(AddrStorage {
             sa: unsafe { mem::zeroed() },
@@ -137,7 +137,8 @@ impl Drop for ConnectTcp {
                 .addr_storage
                 .take()
                 .map(|b| b as Box<dyn std::any::Any>);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
+            let parked = self.socket.take().map(|s| s.into_parked());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
     }
 }

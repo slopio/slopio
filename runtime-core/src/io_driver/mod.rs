@@ -73,6 +73,18 @@ pub struct IODriver {
     /// reply names its slot in `receiver.slab`; delivery routes it here and
     /// wakes the awaiting future instead of the generic `msg_inbox`.
     reply_slab: UnsafeCell<Slab<ReplySlot>>,
+    /// Fds whose last ref dropped, awaiting a close SQE at the next submit.
+    /// Deferred because a ref parked in a slab keepalive drops mid-CQ-
+    /// processing, where pushing an SQE would alias the ring borrow.
+    pending_closes: UnsafeCell<Vec<i32>>,
+}
+
+impl Drop for IODriver {
+    fn drop(&mut self) {
+        for fd in self.pending_closes.get_mut().drain(..) {
+            unsafe { libc::close(fd) };
+        }
+    }
 }
 
 /// A reserved slot awaiting the reply to a request this worker sent out. Its
@@ -210,6 +222,9 @@ enum MultiOpState {
         /// entry is reaped on `CancelComplete`.
         #[allow(dead_code)]
         keepalive: Option<CancelKeepalive>,
+        /// Holds the fd open until the cancel's terminal CQE.
+        #[allow(dead_code)]
+        parked_fd: Option<ParkedFd>,
     },
     /// Cancelled multishot accept. Separate from `Cancelled` because for
     /// accept-style ops `event.result > 0` means "a freshly-accepted fd",
@@ -217,6 +232,9 @@ enum MultiOpState {
     /// instead of trying to recycle them as buffers.
     AcceptCancelled {
         last_cqe: bool,
+        /// Parked listener ref: dropped at the terminal CQE, posting the close.
+        #[allow(dead_code)]
+        parked_fd: Option<ParkedFd>,
     },
 }
 
@@ -353,6 +371,7 @@ impl IODriver {
             peer_inbox: Default::default(),
             msg_inbox: Default::default(),
             reply_slab: Default::default(),
+            pending_closes: Default::default(),
         }
     }
 
@@ -980,10 +999,11 @@ impl IODriver {
 
     pub(crate) fn has_pending_sqes(&self) -> bool {
         let ring = unsafe { &*self.ring.get() };
-        ring.pending > 0
+        ring.pending > 0 || !unsafe { &*self.pending_closes.get() }.is_empty()
     }
 
     pub(crate) fn submit(&self) {
+        self.flush_pending_closes();
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
         match &mut ring.inner {
@@ -1000,6 +1020,7 @@ impl IODriver {
     }
 
     pub(crate) fn submit_and_wait(&self) {
+        self.flush_pending_closes();
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
         match &mut ring.inner {
@@ -1050,18 +1071,19 @@ impl IODriver {
     /// used provided buffers (so the buffer can be recycled on late completion),
     /// or `None` for operations that manage their own buffers.
     pub fn cancel_single_op(&self, token: OneshotToken, bgid: Option<u16>) {
-        self.cancel_single_op_keep(token, bgid, None);
+        self.cancel_single_op_keep(token, bgid, None, None);
     }
 
     /// Cancel a single-shot operation, transferring ownership of `keepalive`
     /// to the driver. The kernel may still be reading from memory referenced
     /// by the in-flight SQE; `keepalive` is dropped only when the cancelled
     /// op's CQE arrives.
-    pub fn cancel_single_op_keep(
+    pub(crate) fn cancel_single_op_keep(
         &self,
         token: OneshotToken,
         bgid: Option<u16>,
         keepalive: Option<Box<dyn std::any::Any>>,
+        parked_fd: Option<ParkedFd>,
     ) {
         // Only transition to Cancelled (and stash the keepalive) if the cancel
         // SQE was actually submitted. For ops already in `Ended` state,
@@ -1072,6 +1094,7 @@ impl IODriver {
             *slab.get_mut(token).unwrap() = SingleOpState::Cancelled {
                 bgid,
                 keepalive: keepalive.map(CancelKeepalive),
+                parked_fd,
             };
         }
     }
@@ -1095,19 +1118,49 @@ impl IODriver {
         true
     }
 
+    /// Queue a fire-and-forget close for `fd`, flushed at the next submit.
+    pub(crate) fn close_fd(&self, fd: i32) {
+        unsafe { (*self.pending_closes.get()).push(fd) };
+    }
+
+    /// Turn queued closes into `IORING_OP_CLOSE` SQEs with ignored CQEs. The
+    /// simulator closes synchronously — its fds are real, and close is
+    /// bookkeeping rather than scriptable IO.
+    fn flush_pending_closes(&self) {
+        let fds = unsafe { &mut *self.pending_closes.get() };
+        if fds.is_empty() {
+            return;
+        }
+        let ring = unsafe { &mut *self.ring.get() };
+        #[cfg(feature = "simulation")]
+        if matches!(ring.inner, RingBackend::Fake(_)) {
+            for fd in fds.drain(..) {
+                unsafe { libc::close(fd) };
+            }
+            return;
+        }
+        for fd in fds.drain(..) {
+            let entry = opcode::Close::new(io_uring::types::Fd(fd))
+                .build()
+                .user_data(UserData::ignored_only().into_bits());
+            ring.add(&entry);
+        }
+    }
+
     pub fn cancel_multishot_op(&self, token: MultishotToken, bgid: u16) {
-        self.cancel_multishot_op_keep(token, bgid, None);
+        self.cancel_multishot_op_keep(token, bgid, None, None);
     }
 
     /// Cancel a multishot op, transferring ownership of `keepalive` to the
     /// driver. The kernel may still write to memory referenced by the op
     /// (e.g. a UDP recvmsg's msghdr) until the cancelled CQE arrives;
     /// `keepalive` is dropped only at that point.
-    pub fn cancel_multishot_op_keep(
+    pub(crate) fn cancel_multishot_op_keep(
         &self,
         token: MultishotToken,
         bgid: u16,
         keepalive: Option<Box<dyn std::any::Any>>,
+        parked_fd: Option<ParkedFd>,
     ) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
         let Some(entry) = slab.get_mut(token) else {
@@ -1150,6 +1203,7 @@ impl IODriver {
                 bgid,
                 last_cqe: false,
                 keepalive: keepalive.map(CancelKeepalive),
+                parked_fd,
             },
         );
         self.recycle_multiop_queue(old, bgid);
@@ -1163,7 +1217,11 @@ impl IODriver {
     /// before cancel, and submits the cancel SQE. Subsequent accept CQEs
     /// arriving during the cancel window have their fds closed in
     /// `process_multi`'s `AcceptCancelled` arm.
-    pub(crate) fn cancel_multishot_op_accept(&self, token: MultishotToken) {
+    pub(crate) fn cancel_multishot_op_accept(
+        &self,
+        token: MultishotToken,
+        parked_fd: Option<ParkedFd>,
+    ) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
         let Some(entry) = slab.get_mut(token) else {
             return;
@@ -1189,7 +1247,13 @@ impl IODriver {
 
         let pause_cancel_in_flight = matches!(entry, MultiOpState::TringToPause { .. });
 
-        let old = std::mem::replace(entry, MultiOpState::AcceptCancelled { last_cqe: false });
+        let old = std::mem::replace(
+            entry,
+            MultiOpState::AcceptCancelled {
+                last_cqe: false,
+                parked_fd,
+            },
+        );
         // Close any fds the kernel queued before we cancelled.
         Self::close_queued_fds(old);
         if !pause_cancel_in_flight {
@@ -1284,6 +1348,15 @@ impl std::fmt::Debug for CancelKeepalive {
     }
 }
 
+/// A parked fd owner, held by a cancelled op until its terminal CQE so the
+/// close posts only after the kernel is done with the fd. Socket-only today;
+/// a `File` variant slots in when file fds get refcounted ownership.
+#[derive(Debug)]
+pub(crate) enum ParkedFd {
+    #[allow(dead_code)]
+    Socket(Rc<operations::sockets::SocketInner>),
+}
+
 #[derive(Debug)]
 enum SingleOpState {
     Init,
@@ -1301,12 +1374,15 @@ enum SingleOpState {
     LinkedSent(u64),
     /// The operation was cancelled. `bgid` is set when the op used provided
     /// buffers so a late-arriving completion can recycle the buffer.
-    /// `keepalive` owns memory the kernel may still be reading; it is dropped
-    /// when the cancelled op's CQE arrives.
+    /// `keepalive` owns memory the kernel may still be reading; `parked_fd`
+    /// holds the fd open when the op was its last owner. Both dropped when
+    /// the cancelled op's CQE arrives.
     Cancelled {
         bgid: Option<u16>,
         #[allow(dead_code)]
         keepalive: Option<CancelKeepalive>,
+        #[allow(dead_code)]
+        parked_fd: Option<ParkedFd>,
     },
 }
 

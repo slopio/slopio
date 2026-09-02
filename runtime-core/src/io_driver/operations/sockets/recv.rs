@@ -8,14 +8,14 @@ use std::task::{Context, Poll};
 use crate::io_driver::IO_DRIVER;
 use crate::io_driver::operations::{IoBufMut, OneshotToken};
 
-use super::SocketWrapper;
+use super::{OpSocket, SocketWrapper};
 
 /// Cancellation-safe socket recv: takes ownership of the buffer, returns it
 /// on completion with the kernel-written byte count reflected in
 /// `IoBufMut::set_init`. If dropped mid-flight, the buffer is moved into the
 /// driver's keepalive slot so the kernel never writes into freed memory.
 pub struct ClassicRecv<B: IoBufMut> {
-    fd: i32,
+    socket: OpSocket,
     id: Option<OneshotToken>,
     buf: Option<B>,
 }
@@ -23,7 +23,7 @@ pub struct ClassicRecv<B: IoBufMut> {
 impl<B: IoBufMut> ClassicRecv<B> {
     fn from_socket(socket: &SocketWrapper, buf: B) -> Self {
         Self {
-            fd: socket.fd(),
+            socket: socket.share(),
             id: None,
             buf: Some(buf),
         }
@@ -32,7 +32,7 @@ impl<B: IoBufMut> ClassicRecv<B> {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_mut().expect("buf taken before submit");
         let entry = opcode::Recv::new(
-            Fd(self.fd),
+            Fd(self.socket.fd()),
             buf.stable_mut_ptr(),
             buf.bytes_total() as u32,
         )
@@ -84,7 +84,8 @@ impl<B: IoBufMut> Drop for ClassicRecv<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
             let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
+            let parked = Some(self.socket.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
     }
 }

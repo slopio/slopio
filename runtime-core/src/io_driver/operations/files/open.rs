@@ -66,7 +66,7 @@ impl Drop for OpenFile {
             // any in-flight kernel access after cancel.
             let filename = std::mem::take(&mut self.filename);
             let keep: Box<dyn Any> = Box::new(filename);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep)));
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep), None));
         }
     }
 }

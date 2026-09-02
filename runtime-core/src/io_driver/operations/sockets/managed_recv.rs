@@ -9,12 +9,12 @@ use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 
 use crate::io_driver::{
     BorrowedBuffer, BufRingSpec, IO_DRIVER, OpMetadata,
-    operations::{OneshotToken, sockets::SocketWrapper},
+    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
 };
 
 pub struct ManagedRecv<S: BufRingSpec> {
     id: Option<OneshotToken>,
-    fd: i32,
+    socket: OpSocket,
     _spec: PhantomData<S>,
 }
 
@@ -26,13 +26,13 @@ impl<S: BufRingSpec> ManagedRecv<S> {
     fn from_socket(socket: &SocketWrapper) -> Self {
         Self {
             id: None,
-            fd: socket.fd(),
+            socket: socket.share(),
             _spec: PhantomData,
         }
     }
 
     fn register_to_driver(&mut self) {
-        let entry = opcode::Recv::new(Fd(self.fd), null::<u8>() as _, 0)
+        let entry = opcode::Recv::new(Fd(self.socket.fd()), null::<u8>() as _, 0)
             .buf_group(S::BGID)
             .build()
             .flags(io_uring::squeue::Flags::BUFFER_SELECT);
@@ -76,7 +76,8 @@ impl<S: BufRingSpec> Future for ManagedRecv<S> {
 impl<S: BufRingSpec> Drop for ManagedRecv<S> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, Some(S::BGID)))
+            let parked = Some(self.socket.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, Some(S::BGID), None, parked))
         }
     }
 }

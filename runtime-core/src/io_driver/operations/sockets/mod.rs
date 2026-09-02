@@ -1,4 +1,7 @@
 use libc::c_int;
+use std::rc::Rc;
+
+use crate::io_driver::ParkedFd;
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -23,9 +26,39 @@ pub mod send_vectored;
 pub mod send_zc;
 pub mod udp;
 
+/// Owns the fd. The wrapper, each split half, and every prepared or in-flight
+/// operation hold a strong ref, so no SQE can ever name a closed fd.
+/// An op dropped mid-flight parks its ref in the cancelled slab slot
+/// ([`park`]), so zero refs means no op is in flight on the fd at all and
+/// the close is strictly the last thing queued for it.
+#[derive(Debug)]
+pub(crate) struct SocketInner {
+    fd: i32,
+}
+
+impl SocketInner {
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd
+    }
+}
+
+impl Drop for SocketInner {
+    fn drop(&mut self) {
+        let fd = self.fd;
+        // Close through the ring when inside the runtime; synchronously
+        // otherwise (socket dropped outside the driver scope).
+        crate::io_driver::IO_DRIVER.try_with(|driver| match driver {
+            Some(d) => d.close_fd(fd),
+            None => unsafe {
+                libc::close(fd);
+            },
+        });
+    }
+}
+
 #[derive(Debug)]
 pub struct SocketWrapper {
-    fd: i32,
+    inner: Rc<SocketInner>,
 }
 
 /// The only way to build a `SocketWrapper` from a bare descriptor.
@@ -33,16 +66,39 @@ pub struct SocketWrapper {
 /// # Safety
 ///
 /// The wrapper takes ownership: `fd` must be an open socket that nothing
-/// else will close, and the wrapper's `Drop` closes it.
+/// else will close; the fd is closed when the wrapper and every operation
+/// prepared on it are gone.
 impl std::os::fd::FromRawFd for SocketWrapper {
     unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
-        Self { fd }
+        Self::from_fd(fd)
     }
 }
 
 impl SocketWrapper {
+    pub(crate) fn from_fd(fd: i32) -> Self {
+        Self {
+            inner: Rc::new(SocketInner { fd }),
+        }
+    }
+
+    /// A strong ref for an operation to hold until completion.
+    pub(crate) fn share(&self) -> OpSocket {
+        OpSocket(Some(self.inner.clone()))
+    }
+
+    /// A parked ref by clone, for handles that must survive the cancellation
+    /// (a multishot's owner, which `into_inner` may hand back to the user).
+    pub(crate) fn park(&self) -> ParkedFd {
+        ParkedFd::Socket(self.inner.clone())
+    }
+
+    /// Park by consuming the wrapper — for ops that own their socket outright.
+    pub(crate) fn into_parked(self) -> ParkedFd {
+        ParkedFd::Socket(self.inner)
+    }
+
     pub fn fd(&self) -> i32 {
-        self.fd
+        self.inner.fd
     }
 
     pub fn vectored_write<B: IoBuf>(&self, bufs: Vec<B>) -> WriteVectoredSocket<B> {
@@ -113,18 +169,18 @@ impl SocketWrapper {
 
     /// Local end of the connection (`getsockname`). One syscall per call.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        getname(|sa, len| unsafe { libc::getsockname(self.fd, sa, len) })
+        getname(|sa, len| unsafe { libc::getsockname(self.fd(), sa, len) })
     }
 
     /// Remote end of the connection (`getpeername`). One syscall per call.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        getname(|sa, len| unsafe { libc::getpeername(self.fd, sa, len) })
+        getname(|sa, len| unsafe { libc::getpeername(self.fd(), sa, len) })
     }
 
     fn set_opt<T>(&self, level: c_int, name: c_int, value: &T) -> io::Result<()> {
         let ret = unsafe {
             libc::setsockopt(
-                self.fd,
+                self.fd(),
                 level,
                 name,
                 value as *const T as *const libc::c_void,
@@ -142,18 +198,27 @@ impl SocketWrapper {
 impl SocketWrapper {
     pub fn sync_shutdown(self) {
         unsafe {
-            libc::shutdown(self.fd, libc::SHUT_RDWR);
+            libc::shutdown(self.fd(), libc::SHUT_RDWR);
         }
-        // self is dropped here, which calls close(fd)
+        // self is dropped here; the fd closes once no operation holds a ref
     }
 }
 
-impl Drop for SocketWrapper {
-    fn drop(&mut self) {
-        unsafe {
-            let fd = self.fd as c_int;
-            libc::close(fd); //synchronous close to avoid fd conflicts
-        }
+/// An op's ref to its socket, movable into the cancelled slab slot. Parking
+/// is unconditional: releasing at drop instead would let the wrapper's later
+/// drop post the close while this op's cancel is still in flight.
+#[derive(Debug)]
+pub(crate) struct OpSocket(Option<Rc<SocketInner>>);
+
+impl OpSocket {
+    pub(crate) fn fd(&self) -> i32 {
+        self.0.as_ref().expect("taken only in Drop").fd()
+    }
+
+    /// Move the ref out for parking. Only from `Drop` — the op must not
+    /// touch the socket afterwards.
+    pub(crate) fn park(&mut self) -> ParkedFd {
+        ParkedFd::Socket(self.0.take().expect("parked twice"))
     }
 }
 

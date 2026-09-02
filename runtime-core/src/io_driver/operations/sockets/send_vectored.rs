@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, Slice, sockets::SocketWrapper},
+    operations::{IoBuf, OneshotToken, Slice, sockets::{OpSocket, SocketWrapper}},
 };
 
 /// Cancellation-safe vectored send: takes ownership of every chunk, returns
@@ -28,7 +28,7 @@ pub fn socket_send_vectored<B: IoBuf>(
         })
         .collect();
     WriteVectoredSocket {
-        fd: socket.fd(),
+        socket: socket.share(),
         id: None,
         bufs: Some(bufs),
         iovecs,
@@ -36,7 +36,7 @@ pub fn socket_send_vectored<B: IoBuf>(
 }
 
 pub struct WriteVectoredSocket<B: IoBuf> {
-    fd: i32,
+    socket: OpSocket,
     id: Option<OneshotToken>,
     bufs: Option<Vec<B>>,
     /// Built once at construction. The Vec's heap allocation is what the
@@ -48,7 +48,7 @@ pub struct WriteVectoredSocket<B: IoBuf> {
 impl<B: IoBuf> WriteVectoredSocket<B> {
     fn register_to_driver(&mut self) {
         let entry = opcode::Writev::new(
-            Fd(self.fd),
+            Fd(self.socket.fd()),
             self.iovecs.as_ptr(),
             self.iovecs.len() as u32,
         )
@@ -100,7 +100,8 @@ impl<B: IoBuf> Drop for WriteVectoredSocket<B> {
             } else {
                 Some(Box::new(std::mem::take(&mut self.iovecs)))
             };
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep));
+            let parked = Some(self.socket.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
     }
 }
