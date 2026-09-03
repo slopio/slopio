@@ -7,10 +7,13 @@
 
 use std::time::{Duration, Instant};
 
-use runtime_core::deterministic_testing::{FakeRing, FakeRingHandle, ReadEvent, simulated_socket};
+use runtime_core::deterministic_testing::{
+    FakeRing, FakeRingHandle, ReadEvent, WriteEvent, simulated_socket,
+};
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
 use runtime_core::io_driver::operations::sockets::recv::socket_recv;
 use runtime_core::io_driver::operations::sockets::send::socket_send;
+use runtime_core::io_driver::operations::sockets::send_vectored::socket_send_vectored;
 use runtime_core::runtime::select::{SelectResult, select};
 use runtime_core::runtime::{RuntimeInner, spawn, time::Sleep, yield_now};
 use runtime_streams::StreamExt;
@@ -41,6 +44,57 @@ fn a_send_completes_through_the_whole_driver() {
     // byte count back means the token round-tripped through the slab and the
     // waker actually woke the task.
     assert_eq!(result.expect("the send succeeded"), 5);
+}
+
+#[test]
+fn a_scripted_write_reports_and_records_what_it_accepted() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket().expect("a real unconnected socket");
+    let fd = socket.fd();
+
+    handle.on_write(fd, WriteEvent::Short(3));
+    handle.on_write(fd, WriteEvent::Error(libc::EPIPE));
+
+    let (short, broken) = RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            let (short, _) = socket_send(&socket, b"hello").await;
+            let (broken, _) = socket_send(&socket, b"world").await;
+            (short, broken)
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(short.expect("a short write is a success"), 3);
+    assert_eq!(
+        broken.expect_err("the pipe broke").raw_os_error(),
+        Some(libc::EPIPE)
+    );
+    // Only what the peer would have received, with the failed send absent.
+    assert_eq!(handle.writes(fd), vec![b"hel".to_vec()]);
+    assert_eq!(handle.scenario_remaining(), 0);
+}
+
+#[test]
+fn a_vectored_send_is_recorded_as_one_write() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket().expect("a real unconnected socket");
+    let fd = socket.fd();
+    let head = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+    let body = b"hello".to_vec();
+    let whole = [&head[..], &body[..]].concat();
+
+    let (result, bufs) = RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move { socket_send_vectored(&socket, vec![head, body]).await },
+        None,
+        |run| run(),
+    );
+
+    // The count is bytes across every chunk, not the number of chunks, and
+    // the peer sees one contiguous write — the chunking was the sender's.
+    assert_eq!(result.expect("the send succeeded"), whole.len());
+    assert_eq!(bufs.len(), 2, "every chunk came back");
+    assert_eq!(handle.writes(fd), vec![whole]);
 }
 
 #[test]

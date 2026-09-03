@@ -27,6 +27,9 @@ pub enum Trigger {
     Accept(RawFd),
     /// A connect on this socket.
     Connect(RawFd),
+    /// Any write-side op on this descriptor — `SEND`, `SEND_ZC`, `SENDMSG`,
+    /// `WRITE`, `WRITEV` or `WRITE_FIXED`.
+    Write(RawFd),
 }
 
 /// What a scripted read does.
@@ -72,6 +75,20 @@ pub enum AcceptEvent {
 pub enum ConnectEvent {
     Ok,
     /// Fails with this errno, given positive.
+    Error(i32),
+}
+
+/// What a scripted write does.
+///
+/// Nothing declared means [`All`](Self::All), now — a socket with room in its
+/// buffer — so a test that never scripts a write sees no change.
+pub enum WriteEvent {
+    /// Everything the op offers is accepted.
+    All,
+    /// Only the first `n` bytes are accepted — a short write. Capped at what
+    /// the op offered, since a kernel cannot take more than it was given.
+    Short(u32),
+    /// The write fails with this errno, given positive. Nothing is accepted.
     Error(i32),
 }
 
@@ -168,6 +185,7 @@ macro_rules! timed {
 timed!(ReadEvent);
 timed!(AcceptEvent);
 timed!(ConnectEvent);
+timed!(WriteEvent);
 
 impl From<ReadEvent> for Outcome {
     fn from(event: ReadEvent) -> Self {
@@ -195,6 +213,16 @@ impl From<ConnectEvent> for Outcome {
         match event {
             ConnectEvent::Ok => Outcome::result(0),
             ConnectEvent::Error(errno) => Outcome::result(as_errno(errno)),
+        }
+    }
+}
+
+impl From<WriteEvent> for Outcome {
+    fn from(event: WriteEvent) -> Self {
+        match event {
+            WriteEvent::All => Outcome::Accept(None),
+            WriteEvent::Short(n) => Outcome::Accept(Some(n)),
+            WriteEvent::Error(errno) => Outcome::result(as_errno(errno)),
         }
     }
 }
@@ -244,6 +272,7 @@ macro_rules! batch_of_one {
 batch_of_one!(ReadEvent);
 batch_of_one!(AcceptEvent);
 batch_of_one!(ConnectEvent);
+batch_of_one!(WriteEvent);
 
 /// One declaration in a scenario.
 ///

@@ -6,7 +6,7 @@
 //! unreproducible against a real kernel are therefore things a test states.
 
 use std::cell::{RefCell, RefMut};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
@@ -83,7 +83,9 @@ const OP_OPENAT: u8 = opcode::OpenAt::CODE;
 const OP_ASYNC_CANCEL: u8 = opcode::AsyncCancel::CODE;
 
 enum Class {
-    /// The kernel finishes these alone: sends, writes, opens, cancels.
+    /// The kernel finishes these alone: sends, writes, opens, cancels. A
+    /// scenario may still say how — a short write, an `EPIPE` — but silence
+    /// means success, not waiting.
     Scheduled,
     /// Blocked on something external. A recv on a socket nobody wrote to must
     /// never complete by itself, so it parks until a test says otherwise.
@@ -133,19 +135,26 @@ fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
         OP_RECV | OP_READ | OP_RECVMSG => Some(Trigger::Read(sqe.fd)),
         OP_ACCEPT => Some(Trigger::Accept(sqe.fd)),
         OP_CONNECT => Some(Trigger::Connect(sqe.fd)),
+        OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_WRITE | OP_WRITEV | OP_WRITE_FIXED => {
+            Some(Trigger::Write(sqe.fd))
+        }
         _ => None,
     }
 }
 
 /// Put an op where it belongs: on the timeline if the scenario already says
-/// what happens to it, parked otherwise.
+/// what happens to it, parked otherwise — unless it is one the kernel finishes
+/// alone, which then completes with its default.
 fn arm(state: &mut FakeRingState, mut pending: Pending, now: Nanos) {
     let entry = trigger_for(&pending.sqe).and_then(|t| state.scenario.take(t));
     let multishot = is_multishot(&pending.sqe);
 
     let (outcome, delay, source) = match entry {
         None => {
-            state.waiting.push(pending);
+            match classify(&pending.sqe) {
+                Class::Waiting => state.waiting.push(pending),
+                _ => state.timeline.schedule(pending, None, now),
+            }
             return;
         }
         Some(Entry::Once(scripted)) => {
@@ -232,25 +241,77 @@ fn advance_stream(
 }
 
 fn default_outcome(sqe: &Sqe) -> Outcome {
-    let result = match sqe.opcode {
-        OP_OPENAT => return Outcome::NewFd(FdKind::File),
-        // `WRITEV`'s `len` is an iovec count rather than a byte count — close
-        // enough until something needs the real figure.
-        OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_WRITE | OP_WRITEV | OP_WRITE_FIXED => sqe.len as i32,
-        _ => 0,
-    };
-    Outcome::Result { result, flags: 0 }
+    match sqe.opcode {
+        OP_OPENAT => Outcome::NewFd(FdKind::File),
+        OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_WRITE | OP_WRITEV | OP_WRITE_FIXED => {
+            Outcome::Accept(None)
+        }
+        _ => Outcome::result(0),
+    }
+}
+
+/// The bytes a write-side op offers, gathered from wherever its opcode keeps
+/// them: a flat buffer, an iovec array, or the iovecs behind a `msghdr`.
+fn offered(sqe: &Sqe) -> Vec<u8> {
+    // SAFETY: `addr`/`len` describe memory the submitting future keeps alive
+    // until its op completes — the contract the kernel reads it under. The op
+    // is being retired now, so nothing has freed it yet.
+    unsafe {
+        match sqe.opcode {
+            OP_SEND | OP_SEND_ZC | OP_WRITE | OP_WRITE_FIXED => {
+                std::slice::from_raw_parts(sqe.addr as *const u8, sqe.len as usize).to_vec()
+            }
+            OP_WRITEV => gather(sqe.addr as *const libc::iovec, sqe.len as usize),
+            OP_SENDMSG => {
+                let hdr = &*(sqe.addr as *const libc::msghdr);
+                gather(hdr.msg_iov, hdr.msg_iovlen)
+            }
+            other => unreachable!("opcode {other} offers no bytes"),
+        }
+    }
+}
+
+/// Concatenate an iovec array, as a `writev` would send it.
+unsafe fn gather(iov: *const libc::iovec, count: usize) -> Vec<u8> {
+    // SAFETY: the array and every buffer it names are kept alive by the
+    // submitting future until completion, same as a flat buffer.
+    unsafe {
+        std::slice::from_raw_parts(iov, count)
+            .iter()
+            .flat_map(|v| std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len))
+            .copied()
+            .collect()
+    }
 }
 
 /// Retire an op: deliver its outcome and build the CQE. A CQE carries no
-/// payload, so data goes into the op's buffer and only the count is reported.
-fn complete_outcome(sqe: Sqe, outcome: Outcome, provider: Option<BufRingTake>) -> Completion {
+/// payload, so data goes into the op's buffer and only the count is reported;
+/// data going the other way is recorded in `written`.
+fn complete_outcome(
+    sqe: Sqe,
+    outcome: Outcome,
+    provider: Option<BufRingTake>,
+    written: &mut HashMap<RawFd, Vec<Vec<u8>>>,
+) -> Completion {
     match outcome {
         Outcome::Result { result, flags } => Completion {
             user_data: sqe.user_data,
             result,
             flags,
         },
+        Outcome::Accept(cap) => {
+            let mut bytes = offered(&sqe);
+            if let Some(n) = cap {
+                bytes.truncate(n as usize);
+            }
+            let n = bytes.len() as i32;
+            written.entry(sqe.fd).or_default().push(bytes);
+            Completion {
+                user_data: sqe.user_data,
+                result: n,
+                flags: 0,
+            }
+        }
         Outcome::NewFd(kind) => Completion {
             user_data: sqe.user_data,
             result: match fds::mint(kind) {
@@ -464,6 +525,9 @@ struct FakeRingState {
     next_seq: u64,
     /// Descriptors handed to the runtime, in the order they were minted.
     opened: Vec<RawFd>,
+    /// What the runtime wrote and the simulation accepted, per descriptor, one
+    /// entry per completed op in completion order.
+    written: HashMap<RawFd, Vec<Vec<u8>>>,
     /// Registered buffer rings, by group id.
     buf_rings: Vec<(u16, BufRingTake)>,
     pace: Pace,
@@ -606,6 +670,12 @@ impl FakeRingHandle {
         self.script(Trigger::Connect(fd), event.into());
     }
 
+    /// Queue what the next write-side op on `fd` does — `SEND`, `WRITE`,
+    /// `WRITEV`, … alike. A write nobody scripted is accepted whole.
+    pub fn on_write(&self, fd: RawFd, event: impl Into<Scripted>) {
+        self.script(Trigger::Write(fd), event.into());
+    }
+
     /// Queue everything one multishot read on `fd` produces, in order.
     ///
     /// A stream describes one op's whole life rather than a run of unrelated
@@ -696,6 +766,14 @@ impl FakeRingHandle {
     pub fn opened_fds(&self) -> Vec<RawFd> {
         self.0.borrow().opened.clone()
     }
+
+    /// Every write accepted on `fd`, one entry per completed op, oldest first
+    /// — what a peer reading the socket would have seen, with the op
+    /// boundaries kept. A short write records only what was accepted; a failed
+    /// one records nothing.
+    pub fn writes(&self, fd: RawFd) -> Vec<Vec<u8>> {
+        self.0.borrow().written.get(&fd).cloned().unwrap_or_default()
+    }
 }
 
 /// Builds a [`FakeRing`] and its [`FakeRingHandle`].
@@ -749,6 +827,7 @@ impl FakeRingBuilder {
             cq: VecDeque::new(),
             next_seq: 0,
             opened: Vec::new(),
+            written: HashMap::new(),
             buf_rings: Vec::new(),
             pace,
         })));
@@ -806,7 +885,7 @@ impl FakeRing {
                         user_data: sqe.user_data,
                     });
                 }
-                Class::Waiting => arm(
+                Class::Waiting | Class::Scheduled => arm(
                     state,
                     Pending {
                         sqe,
@@ -814,16 +893,6 @@ impl FakeRing {
                         outcome,
                         source: Source::Default,
                     },
-                    now,
-                ),
-                Class::Scheduled => state.timeline.schedule(
-                    Pending {
-                        sqe,
-                        seq,
-                        outcome,
-                        source: Source::Default,
-                    },
-                    None,
                     now,
                 ),
             }
@@ -923,7 +992,8 @@ impl FakeRing {
                     let mut ended = false;
                     for outcome in batch {
                         let minted = matches!(outcome, Outcome::NewFd(_));
-                        let mut completion = complete_outcome(sqe, outcome, provider);
+                        let mut completion =
+                            complete_outcome(sqe, outcome, provider, &mut state.written);
                         if minted && completion.result >= 0 {
                             state.opened.push(completion.result);
                         }

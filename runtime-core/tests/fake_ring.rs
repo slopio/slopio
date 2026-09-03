@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use io_uring::types::Timespec;
 use io_uring::{cqueue, opcode, types::Fd};
 use runtime_core::deterministic_testing::{
-    AcceptEvent, FakeRing, FakeRingHandle, FdKind, IOSQE_BUFFER_SELECT, ReadEvent, mint,
-    simulated_socket,
+    AcceptEvent, FakeRing, FakeRingHandle, FdKind, IOSQE_BUFFER_SELECT, ReadEvent, WriteEvent,
+    mint, simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::SocketWrapper;
 use runtime_core::io_driver::{BufRingSpec, RingHandle};
@@ -1384,4 +1384,152 @@ fn waking_without_data_still_reports_a_bare_result() {
 
     let completion = ring.pop_completion().expect("the recv completed");
     assert_eq!(completion.result, -libc::ECONNRESET);
+}
+
+// ------------------------------------------------------------- the write side
+
+fn complete_one(ring: &mut FakeRing) -> i32 {
+    ring.submit_and_wait();
+    ring.pop_completion().expect("the op completed").result
+}
+
+#[test]
+fn a_write_nobody_scripted_is_accepted_whole_and_recorded() {
+    let (mut ring, handle) = ring();
+
+    ring.add(&send(11, b"hello", 7));
+    assert_eq!(complete_one(&mut ring), 5);
+
+    // What a peer reading the socket would have seen.
+    assert_eq!(handle.writes(11), vec![b"hello".to_vec()]);
+    assert_eq!(handle.scenario_remaining(), 0);
+}
+
+#[test]
+fn a_short_write_accepts_a_prefix_and_reports_it() {
+    let (mut ring, handle) = ring();
+
+    handle.on_write(11, WriteEvent::Short(3));
+    // A kernel cannot take more than it was offered.
+    handle.on_write(11, WriteEvent::Short(100));
+
+    ring.add(&send(11, b"hello", 7));
+    assert_eq!(complete_one(&mut ring), 3);
+
+    ring.add(&send(11, b"lo", 8));
+    assert_eq!(complete_one(&mut ring), 2);
+
+    assert_eq!(handle.writes(11), vec![b"hel".to_vec(), b"lo".to_vec()]);
+    assert_eq!(handle.scenario_remaining(), 0);
+}
+
+#[test]
+fn a_failed_write_records_nothing() {
+    let (mut ring, handle) = ring();
+
+    handle.on_write(11, WriteEvent::Error(libc::EPIPE));
+
+    ring.add(&send(11, b"hello", 7));
+    assert_eq!(complete_one(&mut ring), -libc::EPIPE);
+
+    // Nothing reached the peer, so nothing is recorded — and the next write
+    // falls back to the default rather than inheriting the failure.
+    assert!(handle.writes(11).is_empty());
+    ring.add(&send(11, b"again", 8));
+    assert_eq!(complete_one(&mut ring), 5);
+    assert_eq!(handle.writes(11), vec![b"again".to_vec()]);
+}
+
+#[test]
+fn a_writev_is_gathered_across_its_iovecs() {
+    let (mut ring, handle) = ring();
+    let head = b"HTTP/1.1 200 OK\r\n\r\n";
+    let body = b"hello";
+    let iov = [
+        libc::iovec {
+            iov_base: head.as_ptr() as *mut _,
+            iov_len: head.len(),
+        },
+        libc::iovec {
+            iov_base: body.as_ptr() as *mut _,
+            iov_len: body.len(),
+        },
+    ];
+
+    ring.add(
+        &opcode::Writev::new(Fd(11), iov.as_ptr(), iov.len() as u32)
+            .build()
+            .user_data(7),
+    );
+
+    // A byte count, not the iovec count `len` carries.
+    assert_eq!(complete_one(&mut ring), (head.len() + body.len()) as i32);
+    assert_eq!(handle.writes(11), vec![[&head[..], &body[..]].concat()]);
+}
+
+#[test]
+fn a_sendmsg_is_gathered_from_its_msghdr() {
+    let (mut ring, handle) = ring();
+    let a = b"ab";
+    let b = b"cd";
+    let mut iov = [
+        libc::iovec {
+            iov_base: a.as_ptr() as *mut _,
+            iov_len: a.len(),
+        },
+        libc::iovec {
+            iov_base: b.as_ptr() as *mut _,
+            iov_len: b.len(),
+        },
+    ];
+    // SAFETY: all-zero is a valid `msghdr` — null name and control, no iovecs.
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = iov.as_mut_ptr();
+    hdr.msg_iovlen = iov.len() as _;
+
+    handle.on_write(11, WriteEvent::Short(3));
+    ring.add(&opcode::SendMsg::new(Fd(11), &hdr).build().user_data(7));
+
+    // The short write cuts across the iovec boundary, as a kernel's would.
+    assert_eq!(complete_one(&mut ring), 3);
+    assert_eq!(handle.writes(11), vec![b"abc".to_vec()]);
+}
+
+#[test]
+fn each_descriptor_keeps_its_own_writes() {
+    let (mut ring, handle) = ring();
+
+    ring.add(&send(11, b"to eleven", 7));
+    ring.add(&send(12, b"to twelve", 8));
+    ring.submit_and_wait();
+    ring.pop_completion().expect("first");
+    ring.pop_completion().expect("second");
+
+    assert_eq!(handle.writes(11), vec![b"to eleven".to_vec()]);
+    assert_eq!(handle.writes(12), vec![b"to twelve".to_vec()]);
+    assert!(handle.writes(13).is_empty());
+}
+
+#[test]
+fn a_delayed_write_lands_after_an_undelayed_one() {
+    let (mut ring, handle) = ring();
+
+    handle.on_write(11, WriteEvent::All.after(STEP));
+
+    // Submitted first, but held back; the read on another descriptor is not.
+    ring.add(&send(11, b"late", 7));
+    let mut buf = [0u8; 8];
+    handle.on_read(12, ReadEvent::data(b"now"));
+    ring.add(&recv(12, &mut buf, 8));
+
+    ring.submit_and_wait();
+    let first = ring.pop_completion().expect("the read");
+    assert_eq!(first.user_data, 8);
+    assert!(ring.pop_completion().is_none(), "the write was not held back");
+    assert!(handle.writes(11).is_empty(), "recorded before it completed");
+
+    ring.submit_and_wait();
+    let second = ring.pop_completion().expect("the write");
+    assert_eq!(second.user_data, 7);
+    assert_eq!(handle.writes(11), vec![b"late".to_vec()]);
 }

@@ -24,6 +24,10 @@ pub enum Outcome {
     Data(Vec<u8>),
     /// Complete with a freshly minted descriptor, for ops that hand one back.
     NewFd(FdKind),
+    /// Take the bytes the op offers — all of them, or the first `n` — record
+    /// them against the descriptor, and complete with the count. The mirror of
+    /// `Data`, for the write side.
+    Accept(Option<u32>),
 }
 
 impl Outcome {
