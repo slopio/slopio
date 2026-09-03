@@ -822,3 +822,137 @@ fn test_fired_timer_releases_slab_slot_on_poll() {
     assert_eq!(wheel.poll(id, &waker), Poll::Ready(()));
     assert_eq!(wheel.active_timers(), 0);
 }
+
+// Synthetic clock driving the wheel through `tick_at` in 10ms steps.
+struct Clock {
+    origin: std::time::Instant,
+    wall: std::time::SystemTime,
+    elapsed: Duration,
+}
+
+impl Clock {
+    fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn advance(&mut self, wheel: &mut TimeWheel, by: Duration) {
+        self.elapsed += by;
+        wheel.tick_at(self.origin + self.elapsed, self.wall + self.elapsed);
+    }
+
+    // Elapsed clock time at the first wake, panicking past `limit`.
+    fn run_until_fired(
+        &mut self,
+        wheel: &mut TimeWheel,
+        counter: &common::CountingWaker,
+        limit: Duration,
+    ) -> Duration {
+        while counter.count() == 0 {
+            assert!(self.elapsed < limit, "timer never fired within {limit:?}");
+            self.advance(wheel, Duration::from_millis(10));
+        }
+        self.elapsed
+    }
+}
+
+// A whole-tick deadline fires on the tick that closes its 10ms window.
+fn assert_fired_within_tick(fired_at: Duration, deadline: Duration) {
+    let lo = deadline - Duration::from_millis(deadline.as_millis() as u64 % 10);
+    assert!(fired_at >= lo, "{deadline:?} timer fired early at {fired_at:?}");
+    assert!(
+        fired_at <= lo + Duration::from_millis(10),
+        "{deadline:?} timer fired late at {fired_at:?}"
+    );
+}
+
+fn assert_fires_at(duration: Duration) {
+    let mut wheel = TimeWheel::new();
+    let mut clock = Clock::new();
+    let (counter, waker) = make_waker();
+    let id = wheel.init_timer(duration, &waker).unwrap();
+
+    let fired_at = clock.run_until_fired(&mut wheel, &counter, duration + Duration::from_secs(1));
+
+    assert_eq!(wheel.poll(id, &waker), Poll::Ready(()));
+    assert_fired_within_tick(fired_at, duration);
+}
+
+#[test]
+fn test_timer_one_and_a_half_seconds_keeps_sub_second_remainder() {
+    assert_fires_at(Duration::from_millis(1_500));
+}
+
+#[test]
+fn test_timer_crossing_minute_level() {
+    assert_fires_at(Duration::from_secs(61));
+}
+
+#[test]
+fn test_timer_crossing_minute_level_with_remainder() {
+    assert_fires_at(Duration::from_millis(90_250));
+}
+
+#[test]
+fn test_timer_crossing_hour_level() {
+    assert_fires_at(Duration::from_secs(2 * 3600 + 3));
+}
+
+#[test]
+fn test_timer_just_under_max_duration() {
+    assert_fires_at(Duration::from_hours(24) - Duration::from_millis(10));
+}
+
+#[test]
+fn test_timer_inserted_mid_second_fires_at_its_own_deadline() {
+    let mut wheel = TimeWheel::new();
+    let mut clock = Clock::new();
+    let (counter, waker) = make_waker();
+
+    let idle = Duration::from_millis(370);
+    clock.advance(&mut wheel, idle);
+    wheel.init_timer(Duration::from_millis(1_500), &waker).unwrap();
+
+    let fired_at = clock.run_until_fired(&mut wheel, &counter, Duration::from_secs(3));
+    assert_fired_within_tick(fired_at, idle + Duration::from_millis(1_500));
+}
+
+#[test]
+fn test_far_timer_inserted_late_in_its_hour() {
+    let mut wheel = TimeWheel::new();
+    let mut clock = Clock::new();
+    let (counter, waker) = make_waker();
+
+    // Insert 1s before the wheel's hour boundary; the deadline sits 24
+    // hour-slots ahead, the aliasing case that needs the 25th slot.
+    let idle = Duration::from_secs(3599);
+    clock.advance(&mut wheel, idle);
+    let duration = Duration::from_hours(24) - Duration::from_millis(10);
+    wheel.init_timer(duration, &waker).unwrap();
+
+    let fired_at = clock.run_until_fired(&mut wheel, &counter, idle + duration + Duration::from_secs(1));
+    assert_fired_within_tick(fired_at, idle + duration);
+}
+
+#[test]
+fn test_cancelled_timer_freed_on_cascade() {
+    let mut wheel = TimeWheel::new();
+    let mut clock = Clock::new();
+    let (_, waker) = make_waker();
+
+    let id = wheel.init_timer(Duration::from_secs(5), &waker).unwrap();
+    wheel.drop(id);
+    assert_eq!(wheel.active_timers(), 1);
+
+    // The seconds slot cascades at t=5s; the cancelled id must be released then.
+    clock.advance(&mut wheel, Duration::from_millis(5_010));
+    assert_eq!(wheel.active_timers(), 0);
+}
+
+#[test]
+fn test_timer_at_ten_seconds_fires_on_time() {
+    assert_fires_at(Duration::from_secs(10));
+}

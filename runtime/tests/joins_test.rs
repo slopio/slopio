@@ -42,9 +42,8 @@ fn join5_test() {
 // Three sleeping futures driven by one join3: the join only completes once all
 // three have produced a value (proven by the tuple), and runs them concurrently
 // rather than summing their durations.
-// NOTE: this runtime's timewheel runs its seconds level ~5x fast and fires
-// timers in batches, so multi-second sleeps resolve early — timing bounds are
-// deliberately loose. Correctness rides on the returned tuple, not the clock.
+// Timing bounds are deliberately loose; correctness rides on the returned
+// tuple, not the clock.
 #[test]
 fn join3_sleep_runs_concurrently() {
     let start = Instant::now();

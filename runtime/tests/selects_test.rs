@@ -28,10 +28,8 @@ fn select3_skips_pending() {
 
 // The winner is the 1s sleep in the SECOND slot, so passing proves select3
 // resolves on whichever future is ready first — not merely the first in
-// declaration order. The losers are 7s/9s: far enough out that this runtime's
-// coarse seconds cascade doesn't fire them in the winner's wake batch (its
-// timewheel fires multi-second timers early and in bunches), and select3
-// returns on the winner without ever waiting for them.
+// declaration order. The losers are 7s/9s: select3 returns on the winner
+// without ever waiting for them.
 #[test]
 fn select3_ready_future_wins_regardless_of_slot() {
     let start = Instant::now();
