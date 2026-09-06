@@ -14,7 +14,8 @@ use crate::io_driver::operations::IoBuf;
 
 pub mod connect;
 pub mod managed_recv;
-pub mod managed_recv_bundle;
+// Unused; kept out of the build so the runtime needs no 6.10 kernel for RecvBundle.
+// pub mod managed_recv_bundle;
 pub mod multi_accept;
 pub mod multi_recv;
 pub mod recv;

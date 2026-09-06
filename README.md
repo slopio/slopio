@@ -1,0 +1,86 @@
+# runtime
+
+A thread-per-core async runtime for Rust, built directly on io_uring. Linux only, no tokio, no epoll fallback.
+This runtime was the opportunity for me to try a lot of things
+
+
+## Why
+
+io_uring can do things a readiness-based runtime cannot express: the kernel picks the receive buffer, one submission delivers a stream of results, memory is registered once and sent without copies, and workers wake each other through the ring itself. This runtime exposes those as first-class operations instead of hiding them behind `AsyncRead` and `AsyncWrite`.
+
+The rules that follow from that:
+
+- **One thread, one ring, no sharing.** Each worker owns its tasks, sockets and buffers. Futures need not be `Send`, and there is not a single lock in the hot path.
+- **No hidden copy, no hidden allocation.** Every I/O call says which buffer it uses and who owns it afterwards. See [ways of doing I/O](docs/io-model.md).
+- **Correct by construction.** Cancelled operations never leave the kernel writing into freed memory, descriptors close only after their last completion, and invariant violations abort rather than corrupt.
+
+## Status
+
+Experimental. The API changes without notice, there is no release on crates.io, and some subsystems are stubs. Read [requirements](docs/requirements.md) before trying it: a 6.1 kernel is the floor and containers need a seccomp profile that allows io_uring.
+
+## A first look
+
+An echo server on one core, receiving through a kernel-provided buffer ring and streaming connections and bytes with multishot operations:
+
+```rust
+use runtime::net::{MultiAccept, MultiRecv, socket_send};
+use runtime::runtime::spawn;
+use runtime_streams::StreamExt;
+
+runtime::define_buf_ring!(pub Ring, bgid = 1, buffer_size = 4096, ring_size = 256);
+
+fn main() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let mut accept = MultiAccept::new(8080).expect("bind");
+        while let Some(socket) = accept.next().await {
+            spawn(async move {
+                let mut recv = MultiRecv::<Ring>::new(socket);
+                while let Some(Ok(buf)) = recv.next().await {
+                    let (_, _) = socket_send(recv.socket(), buf.as_ref().to_vec()).await;
+                }
+            });
+        }
+    });
+}
+```
+
+Use `thread_per_core` instead of `main_thread` to run one such loop per core, with the workers able to [message each other](docs/messaging.md).
+
+## Documentation
+
+- [Requirements](docs/requirements.md). Kernel versions, containers, capabilities, toolchain.
+- [Ways of doing I/O](docs/io-model.md). Owned buffers, provided rings, multishot, registered and zero-copy, and why there is no single interface.
+- [Streams and backpressure](docs/streams.md). How multishot accept and receive pause a fast peer and resume on their own.
+- [Cancelling I/O](docs/cancellation.md). What dropping a future guarantees and what it does not.
+- [Time and the timing wheel](docs/time.md). Sleeps, timeouts, resolution, and why reading the clock is free.
+- [Messaging between workers](docs/messaging.md). Raw, typed, shared and request/reply messages over `MSG_RING`.
+- [Telemetry](docs/telemetry.md). Spans, events, propagation and export, all behind features.
+- [Deterministic simulation testing](docs/deterministic-testing.md). Running the runtime against a scripted kernel.
+
+## Crates
+
+| Crate | Role |
+|-------|------|
+| `runtime` | The facade to depend on: entry points, buffer ring declarations, telemetry wiring, global allocator. |
+| `runtime-core` | The runtime itself: tasks, I/O driver, timers, channels, tracing, simulator. |
+| `runtime-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
+| `async_timers` | The hierarchical timing wheel. |
+| `io_uring_rb` | Provided buffer ring memory management. |
+| `runtime_ebpf_balancer` | Optional eBPF program steering QUIC connections to the right core under `SO_REUSEPORT`. |
+
+## Building and testing
+
+```sh
+cargo build --workspace
+cargo test --workspace
+```
+
+The simulated suites run the runtime against a scripted kernel and need the `simulation` feature:
+
+```sh
+cargo test -p runtime-core --features simulation --test simulated_runtime --test cancellation
+```
+
+Those same suites run under Miri; the exact flags are in the header of each test file.
+
+Optional features on the `runtime` crate: `tracing`, `local_debug_collector`, `otlp`, `ebpf_balancer` (needs `clang`), `simulation`.
