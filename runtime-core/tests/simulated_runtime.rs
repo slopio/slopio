@@ -469,3 +469,64 @@ fn a_whole_batch_is_drained_in_one_pass() {
         "the task went back to the loop before the batch was exhausted",
     );
 }
+
+#[test]
+fn a_ring_buffer_is_sent_back_as_is() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket().expect("a socket");
+    let fd = socket.fd();
+    handle.on_multishot_read(fd, [ReadEvent::data(b"hello")]);
+
+    let sent = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ManagedRing>::new(socket);
+            let buffer = recv.next().await.expect("a chunk").expect("no error");
+            // The kernel's own receive buffer goes straight back out.
+            let (result, _buffer) = socket_send(recv.socket(), buffer).await;
+            result.expect("the send succeeded")
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(sent, 5);
+    // What the peer got is the bytes of the ring buffer, no copy in between.
+    assert_eq!(handle.writes(fd), vec![b"hello".to_vec()]);
+}
+
+#[test]
+fn a_sent_ring_buffer_returns_to_the_ring_once_the_send_completes() {
+    // Five reads through a ring of two, each buffer sent before the next read:
+    // only possible if a buffer handed to a send comes back to the ring after
+    // the send completes, rather than being lost to it.
+    let (fake, handle) = simulated();
+    let socket = simulated_socket().expect("a socket");
+    let fd = socket.fd();
+    handle.on_multishot_read(
+        fd,
+        [b"one".as_slice(), b"two", b"three", b"four", b"five"].map(ReadEvent::data),
+    );
+
+    let echoed = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ManagedRing>::new(socket);
+            let mut echoed = 0;
+            for _ in 0..5 {
+                let buffer = recv.next().await.expect("a chunk").expect("no error");
+                let (result, _buffer) = socket_send(recv.socket(), buffer).await;
+                result.expect("the send succeeded");
+                echoed += 1;
+            }
+            echoed
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(echoed, 5);
+    assert_eq!(
+        handle.writes(fd),
+        [b"one".as_slice(), b"two", b"three", b"four", b"five"].map(<[u8]>::to_vec)
+    );
+    assert_eq!(handle.scenario_remaining(), 0);
+}

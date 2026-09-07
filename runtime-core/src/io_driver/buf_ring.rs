@@ -124,6 +124,20 @@ impl<S: BufRingSpec> AsMut<[u8]> for BorrowedBuffer<S> {
     }
 }
 
+// Only a pointer, a length and a bid; the spec is a ZST marker.
+impl<S: BufRingSpec> Unpin for BorrowedBuffer<S> {}
+
+// SAFETY: ring memory never moves and outlives the borrow; the slot is recycled
+// only on drop, which the keepalive defers past a cancelled op's terminal CQE.
+unsafe impl<S: BufRingSpec> crate::io_driver::operations::IoBuf for BorrowedBuffer<S> {
+    fn stable_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+    fn bytes_init(&self) -> usize {
+        self.len
+    }
+}
+
 impl<S: BufRingSpec> Drop for BorrowedBuffer<S> {
     fn drop(&mut self) {
         S::recycle_bid(self.bid);

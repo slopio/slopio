@@ -36,7 +36,12 @@ fn main() {
             spawn(async move {
                 let mut recv = MultiRecv::<Ring>::new(socket);
                 while let Some(Ok(buf)) = recv.next().await {
-                    let (_, _) = socket_send(recv.socket(), buf.as_ref().to_vec()).await;
+                    // The kernel's receive buffer is sent back as is: no copy, no
+                    // allocation. It returns to the ring once the send completes.
+                    let (result, _buf) = socket_send(recv.socket(), buf).await;
+                    if result.is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -56,6 +61,7 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 - [Messaging between workers](docs/messaging.md). Raw, typed, shared and request/reply messages over `MSG_RING`.
 - [Telemetry](docs/telemetry.md). Spans, events, propagation and export, all behind features.
 - [Deterministic simulation testing](docs/deterministic-testing.md). Running the runtime against a scripted kernel.
+- [Potential improvements](docs/future-work.md). Queue-to-core alignment, NAPI busy polling, NUMA and topology awareness, and when each pays.
 
 ## Crates
 
@@ -82,5 +88,11 @@ cargo test -p runtime-core --features simulation --test simulated_runtime --test
 ```
 
 Those same suites run under Miri; the exact flags are in the header of each test file.
+
+To exercise the HTTP/3 path against a running server by hand, a `curl` built with HTTP/3 support works:
+
+```sh
+curl --http3 -k https://localhost:4433/{1,2,3} --parallel
+```
 
 Optional features on the `runtime` crate: `tracing`, `local_debug_collector`, `otlp`, `ebpf_balancer` (needs `clang`), `simulation`.

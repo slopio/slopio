@@ -1,4 +1,5 @@
 #include <linux/bpf.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 
 #define MAX_SOCKETS 256
@@ -22,7 +23,8 @@ struct {
 SEC("sk_reuseport")
 int quic_select_reuseport(struct sk_reuseport_md *ctx)
 {
-	__u8 *data = (__u8 *)(long)ctx->data;
+	/* ctx->data starts at the UDP header; the QUIC packet is the payload after it. */
+	__u8 *data = (__u8 *)(long)ctx->data + sizeof(struct udphdr);
 	__u8 *data_end = (__u8 *)(long)ctx->data_end;
 
 	__u32 zero = 0;
