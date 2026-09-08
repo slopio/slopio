@@ -11,7 +11,7 @@ use runtime_core::deterministic_testing::{
     FakeRing, FakeRingHandle, ReadEvent, WriteEvent, simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
-use runtime_core::io_driver::operations::sockets::recv::socket_recv;
+use runtime_core::io_driver::operations::sockets::recv::{socket_peek, socket_recv};
 use runtime_core::io_driver::operations::sockets::send::socket_send;
 use runtime_core::io_driver::operations::sockets::send_vectored::socket_send_vectored;
 use runtime_core::runtime::select::{SelectResult, select};
@@ -112,6 +112,55 @@ fn a_scripted_read_reaches_the_awaiting_task() {
 
     let n = result.expect("the read succeeded");
     assert_eq!(&buf[..n], b"hello");
+    assert_eq!(handle.scenario_remaining(), 0);
+}
+
+#[test]
+fn a_peek_leaves_the_scripted_read_for_the_next_recv() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket().expect("a real unconnected socket");
+
+    // One delivery scripted; two peeks and a recv all see it, then EOF.
+    handle.on_read(
+        socket.fd(),
+        ReadEvent::data(b"hello").after(Duration::from_millis(50)),
+    );
+    handle.on_read(socket.fd(), ReadEvent::Eof);
+
+    let got = RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            let (result, buf) = socket_peek(&socket, vec![0u8; 32]).await;
+            let first = buf[..result.expect("the first peek succeeded")].to_vec();
+
+            // The bytes have landed, so this one must not wait out the delay
+            // again: it beats a sleep shorter than the scripted 50ms.
+            let raced = select(
+                socket_peek(&socket, vec![0u8; 32]),
+                Sleep::during(Duration::from_millis(25)),
+            )
+            .await;
+            let SelectResult::First((result, buf)) = raced else {
+                panic!("a peek re-armed the scripted delay");
+            };
+            let second = buf[..result.expect("the second peek succeeded")].to_vec();
+
+            let (result, buf) = socket_recv(&socket, vec![0u8; 32]).await;
+            let consumed = buf[..result.expect("the recv succeeded")].to_vec();
+
+            // Peeking EOF leaves it too; the recv after it still sees the close.
+            let (peeked_eof, _) = socket_peek(&socket, vec![0u8; 32]).await;
+            let (eof, _) = socket_recv(&socket, vec![0u8; 32]).await;
+            (first, second, consumed, peeked_eof.unwrap(), eof.unwrap())
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(got.0, b"hello");
+    assert_eq!(got.1, b"hello");
+    assert_eq!(got.2, b"hello");
+    assert_eq!(got.3, 0);
+    assert_eq!(got.4, 0);
     assert_eq!(handle.scenario_remaining(), 0);
 }
 

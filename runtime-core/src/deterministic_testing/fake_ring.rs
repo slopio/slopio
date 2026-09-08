@@ -116,6 +116,12 @@ fn is_multishot(sqe: &Sqe) -> bool {
     }
 }
 
+/// A recv that reads without consuming: what it sees stays queued for the
+/// next read on the descriptor, as `MSG_PEEK` leaves it in the kernel's queue.
+fn is_peek(sqe: &Sqe) -> bool {
+    sqe.opcode == OP_RECV && sqe.op_flags & libc::MSG_PEEK as u32 != 0
+}
+
 /// Whether this completion is the last one a multishot will produce.
 ///
 /// The rule differs by op, which is why it cannot just be "non-negative keeps
@@ -488,20 +494,7 @@ fn apply_cancel(state: &mut FakeRingState, target: u64, now: Nanos) -> i32 {
     if let Some(trigger) = trigger_for(&pending.sqe)
         && let Some(entry) = give_back(pending.source, pending.outcome)
     {
-        state.scenario.unshift(trigger, entry);
-
-        // An op that parked because the scenario was empty can be served now.
-        // Nothing else revisits `waiting`, so without this the entry would sit
-        // there while a read that wants it waits forever — which is exactly the
-        // shape of a read that timed out and was retried.
-        if let Some(i) = state
-            .waiting
-            .iter()
-            .position(|p| trigger_for(&p.sqe) == Some(trigger))
-        {
-            let parked = state.waiting.remove(i);
-            arm(state, parked, now);
-        }
+        restore(state, trigger, entry, now);
     }
 
     state.cq.push_back(Completion {
@@ -510,6 +503,24 @@ fn apply_cancel(state: &mut FakeRingState, target: u64, now: Nanos) -> i32 {
         flags: 0,
     });
     0
+}
+
+/// Return an entry to the head of its trigger's queue and serve it to any op
+/// already parked on that trigger.
+///
+/// Nothing else revisits `waiting`, so without the second step the entry would
+/// sit there while a read that wants it waits forever — which is exactly the
+/// shape of a read that timed out and was retried.
+fn restore(state: &mut FakeRingState, trigger: Trigger, entry: Entry, now: Nanos) {
+    state.scenario.unshift(trigger, entry);
+    if let Some(i) = state
+        .waiting
+        .iter()
+        .position(|p| trigger_for(&p.sqe) == Some(trigger))
+    {
+        let parked = state.waiting.remove(i);
+        arm(state, parked, now);
+    }
 }
 
 struct FakeRingState {
@@ -985,10 +996,15 @@ impl FakeRing {
                         Source::Stream { also, rest, .. } => (also, Some(rest)),
                         _ => (Vec::new(), None),
                     };
+                    let multishot = is_multishot(&sqe);
+                    // A peek delivers the scripted read but does not consume
+                    // it. The kernel would still hold those bytes, so they go
+                    // back for the next read — with no delay, since they have
+                    // by now arrived. An error is consumed even by a peek.
+                    let mut peeked = (is_peek(&sqe) && !multishot).then(|| pending.outcome.clone());
                     let batch =
                         std::iter::once(pending.outcome).chain(also.into_iter().map(|s| s.outcome));
 
-                    let multishot = is_multishot(&sqe);
                     let mut ended = false;
                     for outcome in batch {
                         let minted = matches!(outcome, Outcome::NewFd(_));
@@ -1003,6 +1019,13 @@ impl FakeRing {
                             completion.flags |= IORING_CQE_F_MORE;
                         } else if multishot {
                             ended = true;
+                        }
+                        if let Some(outcome) = peeked.take().filter(|_| completion.result >= 0) {
+                            let entry = Entry::Once(Scripted {
+                                outcome,
+                                delay: None,
+                            });
+                            restore(&mut state, Trigger::Read(sqe.fd), entry, fired_at);
                         }
                         state.cq.push_back(completion);
                     }

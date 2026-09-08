@@ -34,7 +34,7 @@ The ring is consumed by the runtime; the handle stays with the test to script ev
 
 Scripts are keyed by what an operation is, not by when it is submitted: a read on this descriptor, an accept on that listener. Responses queue per descriptor and are consumed in order.
 
-- **Reads**: `ReadEvent::data(bytes)`, `Eof`, `Bytes(n)` for a count without caring about contents, `Error(errno)`.
+- **Reads**: `ReadEvent::data(bytes)`, `Eof`, `Bytes(n)` for a count without caring about contents, `Error(errno)`. A `socket_peek` sees the next read without consuming it: the same data or EOF is delivered again to the read that follows, immediately, as a kernel would from its receive queue. An error is consumed by a peek, as it is by a kernel.
 - **Writes**: `WriteEvent::All`, `Short(n)`, `Error(errno)`. Unscripted writes succeed in full. The handle records what each descriptor was sent, so you can assert on `handle.writes(fd)`.
 - **Accepts**: `AcceptEvent::Connection` mints a new socket, `On(fd)` hands back one you created in advance so you can script what it then does, `Error(errno)`.
 - **Connects**: `ConnectEvent::Ok` or `Error(errno)`.
