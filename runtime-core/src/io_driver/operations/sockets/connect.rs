@@ -13,9 +13,13 @@ use crate::io_driver::operations::OneshotToken;
 
 use super::SocketWrapper;
 
+/// Connect to `addr`. Defaults: non-blocking fd, `TCP_NODELAY` on. Both are
+/// adjustable through the builder methods before the first `.await`.
 pub fn connect_tcp(addr: SocketAddr) -> ConnectTcp {
     ConnectTcp {
         addr,
+        nodelay: true,
+        nonblocking: true,
         socket: None,
         addr_storage: None,
         token: None,
@@ -29,22 +33,44 @@ struct AddrStorage {
 
 pub struct ConnectTcp {
     addr: SocketAddr,
+    nodelay: bool,
+    nonblocking: bool,
     socket: Option<SocketWrapper>,
     addr_storage: Option<Box<AddrStorage>>,
     token: Option<OneshotToken>,
 }
 
 impl ConnectTcp {
+    /// `TCP_NODELAY` on the connected socket. Default: on (no Nagle).
+    pub fn nodelay(mut self, on: bool) -> Self {
+        self.nodelay = on;
+        self
+    }
+
+    /// `SOCK_NONBLOCK` on the connected socket. Default: on.
+    pub fn nonblocking(mut self, on: bool) -> Self {
+        self.nonblocking = on;
+        self
+    }
+
     fn submit(&mut self) -> io::Result<()> {
         let af = match self.addr {
             SocketAddr::V4(_) => libc::AF_INET,
             SocketAddr::V6(_) => libc::AF_INET6,
         };
-        let fd = unsafe { libc::socket(af, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let mut ty = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+        if self.nonblocking {
+            ty |= libc::SOCK_NONBLOCK;
+        }
+        let fd = unsafe { libc::socket(af, ty, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.socket = Some(SocketWrapper::from_fd(fd));
+        let socket = SocketWrapper::from_fd(fd);
+        if self.nodelay {
+            socket.set_nodelay(true)?;
+        }
+        self.socket = Some(socket);
 
         let mut storage: Box<AddrStorage> = Box::new(AddrStorage {
             sa: unsafe { mem::zeroed() },
