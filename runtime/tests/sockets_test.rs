@@ -1,6 +1,6 @@
 use runtime::io_driver::operations::sockets::connect::connect_tcp;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime::io_driver::operations::sockets::recv::socket_recv;
+use runtime::io_driver::operations::sockets::recv::{socket_peek, socket_recv};
 use runtime::io_driver::operations::sockets::send::socket_send;
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::main_thread;
@@ -264,6 +264,49 @@ fn test_zero_length_recv() {
     let (bytes_recv, zero_recv) = handle.join().unwrap();
     assert_eq!(bytes_recv, 4);
     assert_eq!(zero_recv, 0);
+}
+
+#[test]
+fn test_socket_peek_leaves_data_in_queue() {
+    let handle = std::thread::spawn(|| {
+        main_thread(async {
+            let mut ma = MultiAccept::new(8092).unwrap();
+
+            if let Some(socket) = ma.next().await {
+                // Peek twice: both see the bytes, neither consumes them.
+                let (result, buffer) = socket_peek(&socket, Vec::<u8>::with_capacity(64)).await;
+                let peeked1 = buffer[..result.unwrap()].to_vec();
+
+                let (result, buffer) = socket_peek(&socket, Vec::<u8>::with_capacity(64)).await;
+                let peeked2 = buffer[..result.unwrap()].to_vec();
+
+                // A real recv still finds them, and then the peer's close.
+                let (result, buffer) = socket_recv(&socket, Vec::<u8>::with_capacity(64)).await;
+                let received = buffer[..result.unwrap()].to_vec();
+
+                let (result, _buffer) = socket_recv(&socket, Vec::<u8>::with_capacity(64)).await;
+                let eof = result.unwrap();
+
+                (peeked1, peeked2, received, eof)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), usize::MAX)
+            }
+        })
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut client = TcpStream::connect("127.0.0.1:8092").unwrap();
+    client.write_all(b"peekaboo").unwrap();
+    // Let the bytes land before the server's first peek is answered.
+    std::thread::sleep(Duration::from_millis(100));
+    drop(client);
+
+    let (peeked1, peeked2, received, eof) = handle.join().unwrap();
+    assert_eq!(peeked1, b"peekaboo");
+    assert_eq!(peeked2, b"peekaboo");
+    assert_eq!(received, b"peekaboo");
+    assert_eq!(eof, 0);
 }
 
 #[test]

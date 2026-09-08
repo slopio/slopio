@@ -29,7 +29,7 @@ pub use crate::io_driver::operations::sockets::send_zc::{
 };
 
 // recv
-pub use crate::io_driver::operations::sockets::recv::{ClassicRecv, socket_recv};
+pub use crate::io_driver::operations::sockets::recv::{ClassicRecv, socket_peek, socket_recv};
 pub use crate::io_driver::operations::sockets::managed_recv::socket_managed_recv;
 
 // streaming (multishot)

@@ -18,14 +18,17 @@ pub struct ClassicRecv<B: IoBufMut> {
     socket: OpSocket,
     id: Option<OneshotToken>,
     buf: Option<B>,
+    // `MSG_*` flags handed to the kernel; `MSG_PEEK` for `socket_peek`.
+    flags: i32,
 }
 
 impl<B: IoBufMut> ClassicRecv<B> {
-    fn from_socket(socket: &SocketWrapper, buf: B) -> Self {
+    fn from_socket(socket: &SocketWrapper, buf: B, flags: i32) -> Self {
         Self {
             socket: socket.share(),
             id: None,
             buf: Some(buf),
+            flags,
         }
     }
 
@@ -36,6 +39,7 @@ impl<B: IoBufMut> ClassicRecv<B> {
             buf.stable_mut_ptr(),
             buf.bytes_total() as u32,
         )
+        .flags(self.flags)
         .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
@@ -43,7 +47,13 @@ impl<B: IoBufMut> ClassicRecv<B> {
 }
 
 pub fn socket_recv<B: IoBufMut>(socket: &SocketWrapper, buf: B) -> ClassicRecv<B> {
-    ClassicRecv::from_socket(socket, buf)
+    ClassicRecv::from_socket(socket, buf, 0)
+}
+
+/// Like [`socket_recv`], but leaves the bytes in the socket's receive queue:
+/// the next recv (or peek) on the socket sees them again.
+pub fn socket_peek<B: IoBufMut>(socket: &SocketWrapper, buf: B) -> ClassicRecv<B> {
+    ClassicRecv::from_socket(socket, buf, libc::MSG_PEEK)
 }
 
 impl<B: IoBufMut> Future for ClassicRecv<B> {

@@ -38,11 +38,9 @@ fn main() {
                 while let Some(Ok(buf)) = recv.next().await {
                     // The kernel's receive buffer is sent back as is: no copy, no
                     // allocation. It returns to the ring once the send completes.
-                    let (result, _buf) = socket_send(recv.socket(), buf).await;
-                    if result.is_err() {
-                        break;
-                    }
+                    socket_send(recv.socket(), buf).await.0?;
                 }
+                std::io::Result::Ok(())
             });
         }
     });
