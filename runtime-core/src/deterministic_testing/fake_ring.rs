@@ -76,6 +76,7 @@ const OP_WAITID: u8 = opcode::WaitId::CODE;
 const OP_SEND: u8 = opcode::Send::CODE;
 const OP_SEND_ZC: u8 = opcode::SendZc::CODE;
 const OP_SENDMSG: u8 = opcode::SendMsg::CODE;
+const OP_SENDMSG_ZC: u8 = opcode::SendMsgZc::CODE;
 const OP_WRITE: u8 = opcode::Write::CODE;
 const OP_WRITEV: u8 = opcode::Writev::CODE;
 const OP_WRITE_FIXED: u8 = opcode::WriteFixed::CODE;
@@ -141,9 +142,8 @@ fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
         OP_RECV | OP_READ | OP_RECVMSG => Some(Trigger::Read(sqe.fd)),
         OP_ACCEPT => Some(Trigger::Accept(sqe.fd)),
         OP_CONNECT => Some(Trigger::Connect(sqe.fd)),
-        OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_WRITE | OP_WRITEV | OP_WRITE_FIXED => {
-            Some(Trigger::Write(sqe.fd))
-        }
+        OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_SENDMSG_ZC | OP_WRITE | OP_WRITEV
+        | OP_WRITE_FIXED => Some(Trigger::Write(sqe.fd)),
         _ => None,
     }
 }
@@ -249,9 +249,8 @@ fn advance_stream(
 fn default_outcome(sqe: &Sqe) -> Outcome {
     match sqe.opcode {
         OP_OPENAT => Outcome::NewFd(FdKind::File),
-        OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_WRITE | OP_WRITEV | OP_WRITE_FIXED => {
-            Outcome::Accept(None)
-        }
+        OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_SENDMSG_ZC | OP_WRITE | OP_WRITEV
+        | OP_WRITE_FIXED => Outcome::Accept(None),
         _ => Outcome::result(0),
     }
 }
@@ -268,7 +267,7 @@ fn offered(sqe: &Sqe) -> Vec<u8> {
                 std::slice::from_raw_parts(sqe.addr as *const u8, sqe.len as usize).to_vec()
             }
             OP_WRITEV => gather(sqe.addr as *const libc::iovec, sqe.len as usize),
-            OP_SENDMSG => {
+            OP_SENDMSG | OP_SENDMSG_ZC => {
                 let hdr = &*(sqe.addr as *const libc::msghdr);
                 gather(hdr.msg_iov, hdr.msg_iovlen)
             }

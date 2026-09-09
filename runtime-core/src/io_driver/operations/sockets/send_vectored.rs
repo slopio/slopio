@@ -12,6 +12,9 @@ use crate::io_driver::{
     operations::{IoBuf, OneshotToken, Slice, sockets::{OpSocket, SocketWrapper}},
 };
 
+/// Kernel cap on iovecs per submission.
+pub(super) const IOV_MAX: usize = libc::UIO_MAXIOV as usize;
+
 /// Cancellation-safe vectored send: takes ownership of every chunk, returns
 /// the chunk list on completion. If the future is dropped mid-flight, both
 /// the chunks AND the kernel-visible iovec array are moved into the driver's
@@ -106,12 +109,8 @@ impl<B: IoBuf> Drop for WriteVectoredSocket<B> {
     }
 }
 
-/// Send every byte across all chunks, looping over short writes until the
-/// whole list is drained or an error occurs. Returns the original `Vec<B>`
-/// alongside the result so the caller keeps their allocations.
-///
-/// Internally wraps each chunk in a [`Slice`] for per-chunk offset tracking
-/// so a partial first write doesn't force a copy of the remaining tail.
+/// Send every byte across all chunks, looping over short writes and over the
+/// `IOV_MAX` chunk limit. Returns the original `Vec<B>`.
 pub async fn send_vectored_all<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
@@ -127,8 +126,10 @@ pub async fn send_vectored_all<B: IoBuf>(
     let mut sent = 0usize;
 
     while sent < total {
-        let (result, returned) = socket_send_vectored(socket, chunks).await;
-        chunks = returned;
+        let tail = chunks.split_off(chunks.len().min(IOV_MAX));
+        let (result, mut head) = socket_send_vectored(socket, chunks).await;
+        head.extend(tail);
+        chunks = head;
         match result {
             Ok(0) => {
                 return (
@@ -149,13 +150,13 @@ pub async fn send_vectored_all<B: IoBuf>(
     (Ok(()), unwrap_chunks(chunks))
 }
 
-fn unwrap_chunks<B: IoBuf>(chunks: Vec<Slice<B>>) -> Vec<B> {
+pub(super) fn unwrap_chunks<B: IoBuf>(chunks: Vec<Slice<B>>) -> Vec<B> {
     chunks.into_iter().map(|s| s.into_inner()).collect()
 }
 
 /// Consume `n` bytes from the front of the chunk list: drain fully-consumed
 /// chunks, advance the boundary chunk's begin offset.
-fn advance_chunks<B: IoBuf>(chunks: &mut Vec<Slice<B>>, mut n: usize) {
+pub(super) fn advance_chunks<B: IoBuf>(chunks: &mut Vec<Slice<B>>, mut n: usize) {
     let mut to_drain = 0;
     for chunk in chunks.iter_mut() {
         let len = chunk.len();

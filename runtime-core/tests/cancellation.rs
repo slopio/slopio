@@ -18,6 +18,7 @@ use runtime_core::deterministic_testing::{FakeRing, FakeRingHandle, ReadEvent, s
 use runtime_core::io_driver::operations::sockets::multi_recv::MultiRecv;
 use runtime_core::io_driver::operations::sockets::recv::socket_recv;
 use runtime_core::io_driver::operations::sockets::send::socket_send;
+use runtime_core::io_driver::operations::sockets::send_vectored_zc::socket_send_vectored_zc;
 use runtime_core::runtime::select::{SelectResult, select};
 use runtime_core::runtime::{RuntimeInner, spawn, time::Sleep};
 use runtime_streams::StreamExt;
@@ -124,6 +125,33 @@ fn a_send_dropped_in_flight_outlives_its_own_future() {
             // one in flight is to lose the race on the very first poll.
             let owned = vec![b'x'; 512];
             let raced = select(socket_send(&socket, owned), std::future::ready(())).await;
+            assert!(
+                matches!(raced, SelectResult::Second(_)),
+                "the send completed before it could be dropped in flight",
+            );
+            settle().await;
+        },
+        None,
+        |run| run(),
+    );
+
+    assert!(handle.inflight().is_empty());
+}
+
+#[test]
+fn a_zero_copy_gather_send_dropped_in_flight_outlives_its_own_future() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket().expect("a socket");
+
+    RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            // Chunks, iovec array and msghdr must all reach the keepalive; Miri is the assertion.
+            let chunks = vec![vec![b'h'; 256], vec![b'b'; 512]];
+            let raced = select(
+                socket_send_vectored_zc(&socket, chunks),
+                std::future::ready(()),
+            )
+            .await;
             assert!(
                 matches!(raced, SelectResult::Second(_)),
                 "the send completed before it could be dropped in flight",

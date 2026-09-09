@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use self::send_control_record::{socket_send_control_record, WriteControlRecord};
 use self::send_vectored::{socket_send_vectored, WriteVectoredSocket};
+use self::send_vectored_zc::{socket_send_vectored_zc, WriteVectoredSocketZc};
 use self::send_zc::{socket_send_zc, WriteSocketZc};
 use crate::io_driver::operations::IoBuf;
 
@@ -24,6 +25,7 @@ pub mod send_control_record;
 pub mod send_fixed;
 pub mod send_fixed_zc;
 pub mod send_vectored;
+pub mod send_vectored_zc;
 pub mod send_zc;
 pub mod split;
 pub mod udp;
@@ -125,6 +127,13 @@ impl SocketWrapper {
     /// kernel's notification confirms it is free. Best for large payloads.
     pub fn send_zc<B: IoBuf>(&self, buf: B) -> WriteSocketZc<B> {
         socket_send_zc(self, buf)
+    }
+
+    /// Zero-copy gather send (`IORING_OP_SENDMSG_ZC`): every chunk goes out
+    /// in one submission straight from user memory, returned once the
+    /// kernel's notification confirms all of them are free.
+    pub fn send_vectored_zc<B: IoBuf>(&self, bufs: Vec<B>) -> WriteVectoredSocketZc<B> {
+        socket_send_vectored_zc(self, bufs)
     }
 
     pub fn send_control_record<'a>(

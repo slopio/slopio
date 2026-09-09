@@ -6,7 +6,7 @@ The runtime offers several ways to do I/O. You pick one per call, not per socket
 - **Provided buffer rings.** Declare a ring with `define_buf_ring!`, giving it an id, a buffer size and a ring size. Receive calls made against that ring let the kernel pick the buffer, and you get a borrowed buffer that returns to the ring when you drop it. Several rings with different sizes can coexist, so small control messages and large payloads each get their own pool. A borrowed buffer is also a valid send buffer, so an echo or a proxy can send received bytes straight back out without a copy. This is a niche case: a buffer being sent is a buffer the kernel cannot receive into, so keep such sends short-lived and size the ring for them, and copy out instead whenever the bytes have to be held for any length of time.
 - **Multishot.** Accept and receive have streaming variants where a single submission keeps delivering results as they arrive, instead of one submission per result.
 - **Registered buffers.** A pool of memory is pinned with the ring once, and sends from it are issued as fixed or zero-copy operations with no per-call setup.
-- **Zero-copy send.** Any owned buffer can also be sent zero-copy, for large payloads where the copy into kernel memory is what costs.
+- **Zero-copy send.** Any owned buffer can also be sent zero-copy, for large payloads where the copy into kernel memory is what costs. A list of buffers can be gathered into a single zero-copy send too, so a header and a body held separately go out as one write without being joined first.
 
 Everything is chosen at the call site: which ring, which buffer type, whether to stream or receive once, whether to copy or not.
 

@@ -23,7 +23,12 @@ pub use crate::io_driver::operations::sockets::send_fixed::{
 pub use crate::io_driver::operations::sockets::send_fixed_zc::{
     WriteFixedSocketZc, socket_write_fixed_zc,
 };
-pub use crate::io_driver::operations::sockets::send_vectored::socket_send_vectored;
+pub use crate::io_driver::operations::sockets::send_vectored::{
+    WriteVectoredSocket, send_vectored_all, socket_send_vectored,
+};
+pub use crate::io_driver::operations::sockets::send_vectored_zc::{
+    WriteVectoredSocketZc, send_vectored_all_zc, socket_send_vectored_zc,
+};
 pub use crate::io_driver::operations::sockets::send_zc::{
     WriteSocketZc, send_all_zc, socket_send_zc,
 };
