@@ -1,7 +1,9 @@
 use std::io::Read;
 use std::net::TcpListener;
 
-use runtime_core::net::{connect_tcp, send_vectored_all_zc, socket_send_vectored_zc};
+use runtime_core::net::{
+    connect_tcp, send_vectored_all, send_vectored_all_zc, socket_send_vectored_zc,
+};
 use runtime_core::runtime::main_thread;
 
 fn serve_read_to_end() -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
@@ -92,6 +94,27 @@ fn zero_copy_gather_send_splits_past_iov_max() {
     });
 
     assert_eq!(server.join().unwrap(), expected);
+}
+
+// Same split for the copying loop; every chunk comes back even across short writes.
+#[test]
+fn gather_send_splits_past_iov_max() {
+    let (addr, server) = serve_read_to_end();
+
+    let count = libc::UIO_MAXIOV as usize + 100;
+    let chunks: Vec<Vec<u8>> = (0..count).map(|i| vec![(i % 251) as u8; 4096]).collect();
+    let expected: Vec<u8> = chunks.concat();
+
+    main_thread(async move {
+        let socket = connect_tcp(addr).await.unwrap();
+        let (result, returned) = send_vectored_all(&socket, chunks).await;
+        result.unwrap();
+        assert_eq!(returned.len(), count);
+        assert_eq!(returned.concat(), expected);
+        drop(socket);
+    });
+
+    server.join().unwrap();
 }
 
 #[test]

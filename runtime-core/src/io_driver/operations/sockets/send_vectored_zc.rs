@@ -4,10 +4,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use super::send_vectored::{IOV_MAX, advance_chunks, unwrap_chunks};
+use super::send_vectored::send_all_with;
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, Slice, sockets::{OpSocket, SocketWrapper}},
+    operations::{IoBuf, OneshotToken, sockets::{OpSocket, SocketWrapper}},
 };
 
 /// Boxed: `msghdr.msg_iov` points at the Vec's heap and the msghdr itself must not move.
@@ -107,35 +107,5 @@ pub async fn send_vectored_all_zc<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> (std::io::Result<()>, Vec<B>) {
-    let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
-    if total == 0 {
-        return (Ok(()), bufs);
-    }
-
-    let mut chunks: Vec<Slice<B>> = bufs.into_iter().map(|b| b.slice(..)).collect();
-    let mut sent = 0usize;
-
-    while sent < total {
-        let tail = chunks.split_off(chunks.len().min(IOV_MAX));
-        let (result, mut head) = socket_send_vectored_zc(socket, chunks).await;
-        head.extend(tail);
-        chunks = head;
-        match result {
-            Ok(0) => {
-                return (
-                    Err(std::io::ErrorKind::WriteZero.into()),
-                    unwrap_chunks(chunks),
-                );
-            }
-            Ok(n) => {
-                sent += n;
-                if sent >= total {
-                    break;
-                }
-                advance_chunks(&mut chunks, n);
-            }
-            Err(e) => return (Err(e), unwrap_chunks(chunks)),
-        }
-    }
-    (Ok(()), unwrap_chunks(chunks))
+    send_all_with(socket, bufs, socket_send_vectored_zc).await
 }

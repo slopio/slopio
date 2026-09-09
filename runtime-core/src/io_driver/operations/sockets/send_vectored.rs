@@ -115,21 +115,36 @@ pub async fn send_vectored_all<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> (std::io::Result<()>, Vec<B>) {
+    send_all_with(socket, bufs, socket_send_vectored).await
+}
+
+/// The `_all` loop shared by the copying and zero-copy gather sends. Each
+/// iteration submits at most `IOV_MAX` chunks from the first unsent one on.
+pub(super) async fn send_all_with<B, S, Fut>(
+    socket: &SocketWrapper,
+    bufs: Vec<B>,
+    submit: S,
+) -> (std::io::Result<()>, Vec<B>)
+where
+    B: IoBuf,
+    S: Fn(&SocketWrapper, Vec<Slice<B>>) -> Fut,
+    Fut: Future<Output = (std::io::Result<usize>, Vec<Slice<B>>)>,
+{
     let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
     if total == 0 {
         return (Ok(()), bufs);
     }
 
-    // Wrap each buf in a full slice so partial-write advancement only mutates
-    // begin offsets — no allocations or copies on the slow path.
     let mut chunks: Vec<Slice<B>> = bufs.into_iter().map(|b| b.slice(..)).collect();
     let mut sent = 0usize;
+    let mut first = 0usize;
 
     while sent < total {
-        let tail = chunks.split_off(chunks.len().min(IOV_MAX));
-        let (result, mut head) = socket_send_vectored(socket, chunks).await;
-        head.extend(tail);
-        chunks = head;
+        let mut window = chunks.split_off(first);
+        let tail = window.split_off(window.len().min(IOV_MAX));
+        let (result, window) = submit(socket, window).await;
+        chunks.extend(window);
+        chunks.extend(tail);
         match result {
             Ok(0) => {
                 return (
@@ -142,7 +157,7 @@ pub async fn send_vectored_all<B: IoBuf>(
                 if sent >= total {
                     break;
                 }
-                advance_chunks(&mut chunks, n);
+                first = advance_chunks(&mut chunks, first, n);
             }
             Err(e) => return (Err(e), unwrap_chunks(chunks)),
         }
@@ -150,28 +165,25 @@ pub async fn send_vectored_all<B: IoBuf>(
     (Ok(()), unwrap_chunks(chunks))
 }
 
-pub(super) fn unwrap_chunks<B: IoBuf>(chunks: Vec<Slice<B>>) -> Vec<B> {
+fn unwrap_chunks<B: IoBuf>(chunks: Vec<Slice<B>>) -> Vec<B> {
     chunks.into_iter().map(|s| s.into_inner()).collect()
 }
 
-/// Consume `n` bytes from the front of the chunk list: drain fully-consumed
-/// chunks, advance the boundary chunk's begin offset.
-pub(super) fn advance_chunks<B: IoBuf>(chunks: &mut Vec<Slice<B>>, mut n: usize) {
-    let mut to_drain = 0;
-    for chunk in chunks.iter_mut() {
-        let len = chunk.len();
+/// Consume `n` bytes from `chunks[first..]` in place; returns the new first
+/// chunk with bytes left to send.
+fn advance_chunks<B: IoBuf>(chunks: &mut [Slice<B>], mut first: usize, mut n: usize) -> usize {
+    while n > 0 {
+        let len = chunks[first].len();
         if n >= len {
-            to_drain += 1;
             n -= len;
-            if n == 0 {
-                break;
-            }
+            first += 1;
         } else {
-            chunk.advance(n);
-            break;
+            chunks[first].advance(n);
+            n = 0;
         }
     }
-    if to_drain > 0 {
-        chunks.drain(..to_drain);
+    while first < chunks.len() && chunks[first].is_empty() {
+        first += 1;
     }
+    first
 }
