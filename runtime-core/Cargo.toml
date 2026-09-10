@@ -29,7 +29,7 @@ up_to_debug_in_release = []
 up_to_trace_in_release = []
 
 [dependencies]
-io-uring = "0.7.11"
+io-uring = "0.7.15"
 libc = "0.2.178"
 io_uring_rb = { path = "../io_uring_rb" }
 runtime_ebpf_balancer = { path = "../runtime_ebpf_balancer", optional = true }
