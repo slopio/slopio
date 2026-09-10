@@ -206,3 +206,85 @@ async fn send_round(
     }
     indices
 }
+
+// `try_acquire` is the non-parking door into the pool: callers that share it
+// across connections need to degrade to another path rather than block
+// everyone behind one stalled peer.
+#[test]
+fn try_acquire_never_parks() {
+    main_thread(async move {
+        let pool = FixedSendBufPool::new(2, 64).unwrap();
+
+        let a = pool.try_acquire().expect("slot free");
+        let b = pool.try_acquire().expect("slot free");
+        assert_ne!(a.buf_index().get(), b.buf_index().get());
+
+        assert!(
+            pool.try_acquire().is_none(),
+            "drained pool must report empty, not park"
+        );
+
+        let a_idx = a.buf_index().get();
+        drop(a);
+        let revived = pool.try_acquire().expect("released slot is takeable again");
+        assert_eq!(revived.buf_index().get(), a_idx);
+
+        drop(revived);
+        drop(b);
+    });
+}
+
+// `advance` exists so a caller can fill a slot in place and only then say how
+// far it got — here the pattern the HTTP/2 body writer needs: payload written
+// first, fixed-size header stamped in front once its length is known, both
+// committed in one go. The bytes must reach the wire in that order.
+#[test]
+fn advance_commits_a_header_written_after_its_payload() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        buf
+    });
+
+    main_thread(async move {
+        let pool = FixedSendBufPool::new(1, 64).unwrap();
+        let socket = connect_tcp(addr).await.unwrap();
+
+        let mut b = pool.acquire().await;
+        const HDR: usize = 9;
+        let payload = b"world";
+        {
+            let dst = b.remaining_mut();
+            // Payload after the reserved header, header in front afterwards.
+            dst[HDR..HDR + payload.len()].copy_from_slice(payload);
+            dst[..HDR].copy_from_slice(b"HDR:0005:");
+        }
+        assert_eq!(b.len(), 0, "nothing committed before advance");
+        b.advance(HDR + payload.len());
+        assert_eq!(b.len(), HDR + payload.len());
+        assert_eq!(b.as_slice(), b"HDR:0005:world");
+
+        let (res, b) = socket_write_fixed(&socket, b).await;
+        assert_eq!(res.unwrap(), HDR + payload.len());
+        drop(b);
+        drop(socket);
+    });
+
+    assert_eq!(server.join().unwrap(), b"HDR:0005:world");
+}
+
+// Committing past the slot would hand the kernel a length outside the
+// registered buffer.
+#[test]
+#[should_panic(expected = "advance")]
+fn advance_past_the_slot_panics() {
+    main_thread(async move {
+        let pool = FixedSendBufPool::new(1, 16).unwrap();
+        let mut b = pool.acquire().await;
+        b.advance(17);
+    });
+}

@@ -104,6 +104,27 @@ impl FixedSendBufPool {
         }
     }
 
+    /// Take a free slot if one is available right now, `None` otherwise.
+    ///
+    /// For callers that must degrade rather than wait: on a pool shared by
+    /// every connection on the thread, parking makes one connection's stall
+    /// everyone's stall. A zero-copy send path uses this to fall back to a
+    /// copying one instead of blocking.
+    ///
+    /// May take a slot a woken [`Acquire`] was about to claim. That race
+    /// already exists between two `Acquire`s and is handled the same way —
+    /// the loser re-enqueues its waker on the next poll.
+    pub fn try_acquire(&self) -> Option<PooledBuf> {
+        let idx = self.state.borrow_mut().free.pop()?;
+        Some(PooledBuf {
+            pool: NonNull::from(self),
+            slot_base: self.slot_ptr(idx),
+            cap: self.size,
+            index: FixedBufIndex::new(idx),
+            write_pos: 0,
+        })
+    }
+
     /// Number of buffers in the pool.
     pub fn capacity(&self) -> usize {
         self.count as usize
@@ -213,6 +234,26 @@ impl PooledBuf {
                 self.cap as usize - written,
             )
         }
+    }
+
+    /// Commit `n` bytes written through [`Self::remaining_mut`].
+    ///
+    /// The companion `remaining_mut` needs to be useful: `io::Write` is the
+    /// only other way to move the cursor and it copies, so a caller that fills
+    /// the slot in place — serializing a response body straight into it, then
+    /// writing the frame header in front once the length is known — has no way
+    /// to say how far it got.
+    ///
+    /// Safe rather than `unsafe`: the slot is zero-initialized at pool
+    /// construction, so committing bytes the caller never wrote transmits
+    /// stale zeros, not uninitialized memory.
+    ///
+    /// Panics if `n` runs past the slot — the kernel would otherwise be handed
+    /// a length beyond the registered slot.
+    pub fn advance(&mut self, n: usize) {
+        let free = self.cap as usize - self.write_pos as usize;
+        assert!(n <= free, "advance({n}) past the slot's {free} free bytes");
+        self.write_pos += n as u32;
     }
 
     /// Rewind the write cursor to 0 for reuse without giving the slot back.
