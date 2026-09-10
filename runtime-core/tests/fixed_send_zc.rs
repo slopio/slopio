@@ -52,3 +52,36 @@ fn fixed_send_zc_end_to_end() {
     let expected: String = (0..6u32).map(|i| format!("zc-{i:02} ")).collect();
     assert_eq!(s, expected);
 }
+
+// `MSG_WAITALL` (the zero-copy default) must make one submission cover the
+// whole buffer even when it is far larger than the socket's send buffer.
+// Without it the kernel returns a partial count and the caller has to
+// resubmit, paying a notification round trip per round.
+#[test]
+fn zc_send_completes_in_one_submission() {
+    use runtime_core::net::socket_send_zc;
+
+    const TOTAL: usize = 8 * 1024 * 1024;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        buf.len()
+    });
+
+    main_thread(async move {
+        let socket = connect_tcp(addr).await.unwrap();
+        let payload = vec![b'z'; TOTAL];
+        // One `socket_send_zc`, not `send_all_zc`: no retry loop to hide a
+        // short send.
+        let (result, _payload) = socket_send_zc(&socket, payload).await;
+        assert_eq!(result.unwrap(), TOTAL, "short send: MSG_WAITALL not applied");
+        drop(socket);
+    });
+
+    assert_eq!(server.join().unwrap(), TOTAL);
+}

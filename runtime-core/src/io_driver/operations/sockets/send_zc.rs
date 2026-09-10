@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use super::send_vectored_zc::ZC_DEFAULT_MSG_FLAGS;
 use crate::io_driver::{
     IO_DRIVER,
     operations::{IoBuf, OneshotToken, sockets::{OpSocket, SocketWrapper}},
@@ -27,10 +28,20 @@ use crate::io_driver::{
 /// may transparently fall back to a copy (a single CQE, no notification),
 /// which this future handles like an ordinary send.
 pub fn socket_send_zc<B: IoBuf>(socket: &SocketWrapper, buf: B) -> WriteSocketZc<B> {
+    socket_send_zc_with_flags(socket, buf, ZC_DEFAULT_MSG_FLAGS)
+}
+
+/// As above with explicit `msg_flags`. `0` restores short-write behaviour.
+pub fn socket_send_zc_with_flags<B: IoBuf>(
+    socket: &SocketWrapper,
+    buf: B,
+    msg_flags: u32,
+) -> WriteSocketZc<B> {
     WriteSocketZc {
         socket: socket.share(),
         id: None,
         buf: Some(buf),
+        msg_flags,
     }
 }
 
@@ -38,13 +49,16 @@ pub struct WriteSocketZc<B: IoBuf> {
     socket: OpSocket,
     id: Option<OneshotToken>,
     buf: Option<B>,
+    msg_flags: u32,
 }
 
 impl<B: IoBuf> WriteSocketZc<B> {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_ref().expect("buf taken before submit");
         let entry =
-            opcode::SendZc::new(Fd(self.socket.fd()), buf.stable_ptr(), buf.bytes_init() as u32).build();
+            opcode::SendZc::new(Fd(self.socket.fd()), buf.stable_ptr(), buf.bytes_init() as u32)
+                .flags(self.msg_flags as i32)
+                .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
