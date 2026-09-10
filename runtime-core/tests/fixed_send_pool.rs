@@ -30,16 +30,15 @@ fn fixed_send_pool_end_to_end() {
         let socket = connect_tcp(addr).await.unwrap();
 
         // --- 1. Concurrent acquire exercises every slot in the pool ---
+        // The slab is one registered region, so `buf_index` is the same for
+        // every slot; the slot pointer is what identifies one.
         let round_one = send_round(&pool, &socket, 0).await;
-        let set_one: HashSet<u16> = round_one.iter().copied().collect();
-        assert_eq!(set_one.len(), 3, "round 1 indices not distinct: {round_one:?}");
-        for &i in &round_one {
-            assert!(i < 3, "round 1 index {i} out of range");
-        }
+        let set_one: HashSet<*const u8> = round_one.iter().copied().collect();
+        assert_eq!(set_one.len(), 3, "round 1 slots not distinct: {round_one:?}");
 
         // --- 2. Recycling: a second round draws from the same slot set ---
         let round_two = send_round(&pool, &socket, 3).await;
-        let set_two: HashSet<u16> = round_two.iter().copied().collect();
+        let set_two: HashSet<*const u8> = round_two.iter().copied().collect();
         assert_eq!(set_one, set_two, "round 2 didn't recycle the same slots");
 
         // --- 3. Cancel-safety: a dropped Acquire future must not strand the
@@ -57,12 +56,12 @@ fn fixed_send_pool_end_to_end() {
         assert!(timed_out.is_err(), "acquire should have timed out on empty pool");
 
         let [a, b, c] = held;
-        let a_idx = a.buf_index().get();
+        let a_slot = a.ptr();
         drop(a); // returns the slot to the pool
 
         // Slot just freed should be the one a fresh acquire receives.
         let revived = pool.acquire().await;
-        assert_eq!(revived.buf_index().get(), a_idx);
+        assert_eq!(revived.ptr(), a_slot);
         drop(revived);
         drop(b);
         drop(c);
@@ -71,7 +70,7 @@ fn fixed_send_pool_end_to_end() {
         let h0 = pool.acquire().await;
         let h1 = pool.acquire().await;
         let h2 = pool.acquire().await;
-        let h2_idx = h2.buf_index().get();
+        let h2_slot = h2.ptr();
 
         // race a parked acquire against a small sleep that triggers a release
         use runtime_core::runtime::select::{SelectResult, select};
@@ -91,7 +90,7 @@ fn fixed_send_pool_end_to_end() {
         // After the release fires the parked acquire is gone (we dropped it
         // when select picked Second), but the slot is now free.
         let woken = pool.acquire().await;
-        assert_eq!(woken.buf_index().get(), h2_idx);
+        assert_eq!(woken.ptr(), h2_slot);
         drop(woken);
         drop(h0);
         drop(h1);
@@ -183,12 +182,12 @@ fn fixed_send_cancel_returns_slot_once() {
 }
 
 /// Acquire 3 slots concurrently, send each, let each release on drop. Returns
-/// the indices used (in send order).
+/// the slot pointers used (in send order).
 async fn send_round(
     pool: &Rc<FixedSendBufPool>,
     socket: &SocketWrapper,
     base: u32,
-) -> Vec<u16> {
+) -> Vec<*const u8> {
     let mut bufs: Vec<PooledBuf> = Vec::new();
     for i in 0..3u32 {
         let mut b = pool.acquire().await;
@@ -197,7 +196,7 @@ async fn send_round(
     }
     let mut indices = Vec::new();
     for buf in bufs {
-        let idx = buf.buf_index().get();
+        let idx = buf.ptr();
         let expect_len = buf.len();
         indices.push(idx);
         let (result, buf) = socket_write_fixed(socket, buf).await;
@@ -217,17 +216,18 @@ fn try_acquire_never_parks() {
 
         let a = pool.try_acquire().expect("slot free");
         let b = pool.try_acquire().expect("slot free");
-        assert_ne!(a.buf_index().get(), b.buf_index().get());
+        // One registered region for the slab, so slots differ by pointer.
+        assert_ne!(a.ptr(), b.ptr());
 
         assert!(
             pool.try_acquire().is_none(),
             "drained pool must report empty, not park"
         );
 
-        let a_idx = a.buf_index().get();
+        let a_slot = a.ptr();
         drop(a);
         let revived = pool.try_acquire().expect("released slot is takeable again");
-        assert_eq!(revived.buf_index().get(), a_idx);
+        assert_eq!(revived.ptr(), a_slot);
 
         drop(revived);
         drop(b);

@@ -26,6 +26,10 @@ pub use crate::io_driver::operations::sockets::send_fixed_zc::{
 pub use crate::io_driver::operations::sockets::send_vectored::{
     WriteVectoredSocket, send_vectored_all, socket_send_vectored,
 };
+pub use crate::io_driver::operations::sockets::send_vectored_fixed_zc::{
+    WriteVectoredFixedSocketZc, send_vectored_fixed_all_zc, socket_send_vectored_fixed_zc,
+    socket_send_vectored_fixed_zc_with_flags,
+};
 pub use crate::io_driver::operations::sockets::send_vectored_zc::{
     WriteVectoredSocketZc, send_vectored_all_zc, socket_send_vectored_zc,
 };
@@ -50,4 +54,5 @@ pub use crate::io_driver::operations::sockets::udp::UdpMultiRecv;
 
 pub use crate::io_driver::{
     BorrowedBuffer, BufRingSet, BufRingSpec, FixedBufAcquire, FixedSendBufPool, PooledBuf,
+    SLAB_BUF_INDEX,
 };

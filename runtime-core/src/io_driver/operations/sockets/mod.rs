@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use self::send_control_record::{socket_send_control_record, WriteControlRecord};
 use self::send_vectored::{socket_send_vectored, WriteVectoredSocket};
+use self::send_vectored_fixed_zc::{socket_send_vectored_fixed_zc, WriteVectoredFixedSocketZc};
 use self::send_vectored_zc::{socket_send_vectored_zc, WriteVectoredSocketZc};
+use crate::io_driver::PooledBuf;
 use self::send_zc::{socket_send_zc, WriteSocketZc};
 use crate::io_driver::operations::IoBuf;
 
@@ -25,6 +27,7 @@ pub mod send_control_record;
 pub mod send_fixed;
 pub mod send_fixed_zc;
 pub mod send_vectored;
+pub mod send_vectored_fixed_zc;
 pub mod send_vectored_zc;
 pub mod send_zc;
 pub mod split;
@@ -134,6 +137,13 @@ impl SocketWrapper {
     /// kernel's notification confirms all of them are free.
     pub fn send_vectored_zc<B: IoBuf>(&self, bufs: Vec<B>) -> WriteVectoredSocketZc<B> {
         socket_send_vectored_zc(self, bufs)
+    }
+
+    /// Zero-copy gather send from pre-registered buffers: one submission for
+    /// every chunk, and no per-request page pinning. All chunks must come from
+    /// the same [`FixedSendBufPool`].
+    pub fn send_vectored_fixed_zc(&self, bufs: Vec<PooledBuf>) -> WriteVectoredFixedSocketZc {
+        socket_send_vectored_fixed_zc(self, bufs)
     }
 
     pub fn send_control_record<'a>(

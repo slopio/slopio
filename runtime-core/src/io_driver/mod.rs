@@ -45,7 +45,9 @@ pub(crate) use user_data::{
 pub use message::{Endpoint, ErasedMessage, Header, Message};
 
 pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec, BufRingTake, install_buf_ring};
-pub use fixed_buf_pool::{Acquire as FixedBufAcquire, FixedSendBufPool, PooledBuf};
+pub use fixed_buf_pool::{
+    Acquire as FixedBufAcquire, FixedSendBufPool, PooledBuf, SLAB_BUF_INDEX,
+};
 pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
 pub const DEFAULT_QUEUE_SIZE: usize = 32;

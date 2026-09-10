@@ -2,8 +2,12 @@
 //!
 //! Allocates a contiguous region of `count * size` bytes and registers it
 //! with the io_uring instance on the current worker via
-//! [`IODriver::register_fixed_buffers`]. Slot `i` covers bytes
-//! `[i * size, (i + 1) * size)` and corresponds to [`FixedBufIndex::new(i)`].
+//! [`IODriver::register_fixed_buffers`] as one single region. Slot `i` covers
+//! bytes `[i * size, (i + 1) * size)` within it, addressed by pointer/length
+//! inside [`SLAB_BUF_INDEX`].
+//!
+//! One region, not one per slot: an SQE carries a single `buf_index`, so
+//! per-slot registration would `EFAULT` any gather send spanning two slots.
 //!
 //! The pool is `!Send + !Sync` — registration belongs to one ring on one
 //! thread. Acquire with [`FixedSendBufPool::acquire`] (async, waits when the
@@ -35,6 +39,10 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use crate::io_driver::{IO_DRIVER, operations::FixedBufIndex};
+
+/// The pool owns the whole registration (`register_buffers` replaces the set)
+/// and registers one region, so the slab is always index 0.
+pub const SLAB_BUF_INDEX: FixedBufIndex = FixedBufIndex::new(0);
 
 pub struct FixedSendBufPool {
     state: RefCell<PoolState>,
@@ -70,17 +78,16 @@ impl FixedSendBufPool {
         let mut storage: Box<[u8]> = vec![0u8; total].into_boxed_slice();
         let base_ptr = storage.as_mut_ptr();
 
-        let iovecs: Vec<libc::iovec> = (0..count as usize)
-            .map(|i| libc::iovec {
-                iov_base: unsafe { base_ptr.add(i * size as usize) } as *mut _,
-                iov_len: size as usize,
-            })
-            .collect();
+        // The whole slab as one region; slots are offsets inside it.
+        let iovec = libc::iovec {
+            iov_base: base_ptr as *mut _,
+            iov_len: total,
+        };
 
         // SAFETY: `storage` is owned by `Self` as a `Box<[u8]>`; the heap
-        // allocation cannot move and the iovecs stay valid until `Drop` calls
+        // allocation cannot move and the iovec stays valid until `Drop` calls
         // unregister.
-        IO_DRIVER.with(|d| unsafe { d.register_fixed_buffers(&iovecs) })?;
+        IO_DRIVER.with(|d| unsafe { d.register_fixed_buffers(std::slice::from_ref(&iovec)) })?;
 
         let free: Vec<u16> = (0..count).rev().collect();
         Ok(Self {
@@ -115,12 +122,12 @@ impl FixedSendBufPool {
     /// already exists between two `Acquire`s and is handled the same way —
     /// the loser re-enqueues its waker on the next poll.
     pub fn try_acquire(&self) -> Option<PooledBuf> {
-        let idx = self.state.borrow_mut().free.pop()?;
+        let slot = self.state.borrow_mut().free.pop()?;
         Some(PooledBuf {
             pool: NonNull::from(self),
-            slot_base: self.slot_ptr(idx),
+            slot_base: self.slot_ptr(slot),
             cap: self.size,
-            index: FixedBufIndex::new(idx),
+            slot,
             write_pos: 0,
         })
     }
@@ -135,15 +142,15 @@ impl FixedSendBufPool {
         self.size as usize
     }
 
-    fn slot_ptr(&self, index: u16) -> *mut u8 {
-        unsafe { self.base_ptr.add(index as usize * self.size as usize) }
+    fn slot_ptr(&self, slot: u16) -> *mut u8 {
+        unsafe { self.base_ptr.add(slot as usize * self.size as usize) }
     }
 
-    /// Hand `index` back to the free-list and wake the next live waiter.
-    fn release(&self, index: FixedBufIndex) {
+    /// Hand `slot` back to the free-list and wake the next live waiter.
+    fn release(&self, slot: u16) {
         let waker_to_wake = {
             let mut state = self.state.borrow_mut();
-            state.free.push(index.get());
+            state.free.push(slot);
             loop {
                 match state.waiters.pop_front() {
                     Some(slot) => {
@@ -192,13 +199,15 @@ pub struct PooledBuf {
     /// on every `Write` call.
     slot_base: *mut u8,
     cap: u32,
-    index: FixedBufIndex,
+    /// Free-list slot, not a kernel buffer index — the slab is one region.
+    slot: u16,
     write_pos: u32,
 }
 
 impl PooledBuf {
+    /// Shared by every slot; `ptr()`/`len()` select the slot inside it.
     pub fn buf_index(&self) -> FixedBufIndex {
-        self.index
+        SLAB_BUF_INDEX
     }
 
     /// Pointer to the start of the slot (offset 0, not the write cursor).
@@ -279,7 +288,7 @@ impl io::Write for PooledBuf {
 impl Drop for PooledBuf {
     fn drop(&mut self) {
         // SAFETY: the pool outlives every PooledBuf it issued (module contract).
-        unsafe { self.pool.as_ref().release(self.index) };
+        unsafe { self.pool.as_ref().release(self.slot) };
     }
 }
 
@@ -296,7 +305,7 @@ impl Future for Acquire {
         // SAFETY: the pool outlives this future (module contract).
         let pool = unsafe { self.pool.as_ref() };
         let mut state = pool.state.borrow_mut();
-        if let Some(idx) = state.free.pop() {
+        if let Some(slot) = state.free.pop() {
             drop(state);
             // Drop our queued waker slot (if any) so release won't try to wake
             // a future that's already completed.
@@ -305,9 +314,9 @@ impl Future for Acquire {
             }
             return Poll::Ready(PooledBuf {
                 pool: self.pool,
-                slot_base: pool.slot_ptr(idx),
+                slot_base: pool.slot_ptr(slot),
                 cap: pool.size,
-                index: FixedBufIndex::new(idx),
+                slot,
                 write_pos: 0,
             });
         }

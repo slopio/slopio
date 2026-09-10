@@ -38,8 +38,8 @@ pub struct WriteFixedSocketZc {
 impl WriteFixedSocketZc {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_ref().expect("buf taken before submit");
-        // `buf_index` flips IORING_RECVSEND_FIXED_BUF: the kernel reads from
-        // the registered region addressed by the index.
+        // buf_index flips IORING_RECVSEND_FIXED_BUF; every slot shares the
+        // slab's region, so ptr/len are what select this slot inside it.
         let entry = opcode::SendZc::new(Fd(self.socket.fd()), buf.ptr(), buf.len() as u32)
             .buf_index(Some(buf.buf_index().get()))
             .build();
