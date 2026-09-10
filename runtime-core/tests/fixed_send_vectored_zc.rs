@@ -95,7 +95,7 @@ fn gather_across_slots_of_one_pool() {
 
         let mut bufs = Vec::new();
         for i in 0..3u32 {
-            let mut b = pool.acquire().await;
+            let mut b = pool.try_acquire().expect("slot free");
             write!(b, "[chunk-{i}]").unwrap();
             bufs.push(b);
         }
@@ -109,9 +109,9 @@ fn gather_across_slots_of_one_pool() {
         );
 
         drop(bufs); // slots return to the pool
-        for _ in 0..4 {
-            let _ = pool.acquire().await;
-        }
+        let all: Vec<_> = (0..4).map(|_| pool.try_acquire().expect("slot free")).collect();
+        assert!(pool.try_acquire().is_none(), "pool handed out a fifth slot");
+        drop(all);
         drop(socket);
     });
 
@@ -131,10 +131,10 @@ fn empty_slot_in_the_middle_is_skipped() {
         let pool = Rc::new(FixedSendBufPool::new(3, 64).unwrap());
         let socket = connect_tcp(addr).await.unwrap();
 
-        let mut head = pool.acquire().await;
+        let mut head = pool.try_acquire().expect("slot free");
         head.write_all(b"head").unwrap();
-        let empty = pool.acquire().await; // never written to
-        let mut tail = pool.acquire().await;
+        let empty = pool.try_acquire().expect("slot free"); // never written to
+        let mut tail = pool.try_acquire().expect("slot free");
         tail.write_all(b"tail").unwrap();
 
         let (result, bufs) = socket_send_vectored_fixed_zc(&socket, vec![head, empty, tail]).await;
@@ -163,7 +163,7 @@ fn send_all_covers_every_slot() {
 
         let mut bufs = Vec::new();
         for i in 0..SLOTS {
-            let mut b = pool.acquire().await;
+            let mut b = pool.try_acquire().expect("slot free");
             b.write_all(&vec![b'a' + i as u8; SIZE as usize]).unwrap();
             bufs.push(b);
         }

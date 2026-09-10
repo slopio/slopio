@@ -29,7 +29,7 @@ fn fixed_send_zc_end_to_end() {
         // resolves only on its zero-copy notification, after which the buffer
         // is dropped and its slot reused.
         for i in 0..6u32 {
-            let mut b = pool.acquire().await;
+            let mut b = pool.try_acquire().expect("slot free");
             write!(b, "zc-{:02} ", i).unwrap();
             let expect_len = b.len();
 
@@ -38,11 +38,11 @@ fn fixed_send_zc_end_to_end() {
             drop(b); // slot returns to the pool
         }
 
-        // All slots came back to the pool.
+        // All slots came back to the pool: three can be held at once.
         assert_eq!(pool.capacity(), 3);
-        for _ in 0..3 {
-            let _ = pool.acquire().await;
-        }
+        let all: Vec<_> = (0..3).map(|_| pool.try_acquire().expect("slot free")).collect();
+        assert!(pool.try_acquire().is_none(), "pool handed out a fourth slot");
+        drop(all);
 
         drop(socket);
     });

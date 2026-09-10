@@ -53,6 +53,5 @@ pub use crate::io_driver::operations::sockets::udp::UdpMultiRecv;
 // ── Buffers ──
 
 pub use crate::io_driver::{
-    BorrowedBuffer, BufRingSet, BufRingSpec, FixedBufAcquire, FixedSendBufPool, PooledBuf,
-    SLAB_BUF_INDEX,
+    BorrowedBuffer, BufRingSet, BufRingSpec, FixedSendBufPool, PooledBuf, SLAB_BUF_INDEX,
 };
