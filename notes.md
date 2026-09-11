@@ -17,11 +17,10 @@
   custom collectors drop down to `init_trace_sink::<C>()` + `TRACING_SINK.set`
   and bypass the convenience entry points.
 
-TCP hot path allocations, measured by `runtime-core/tests/alloc_hotpath.rs`
-(counting global allocator, thread-local counters so only the runtime thread
-is measured; `--release --ignored --nocapture`). Steady-state echo on an
-established connection is 0 alloc / 0 B per round-trip and the test asserts
-it. What is left costs per connection or per timeout:
+TCP hot path allocations, measured 2026-09-11 with a counting global
+allocator on the runtime thread only (harness not kept). Steady-state echo on
+an established connection is 0 alloc / 0 B per round-trip. What is left costs
+per connection or per timeout:
 
 - two `MultiOpQueue` allocations per multishot op: 336 B each
   (`VecDeque::with_capacity(QUEUE_SIZE + 10)` × 8 B/event), one in `MultiRecv`
@@ -42,9 +41,8 @@ it. What is left costs per connection or per timeout:
   not `timeouts in flight`. A read+write `timeout(5s, ..)` per request at
   100k req/s is ~1M dead slots ≈ 40 MB (32 B slab entry + 8 B bucket entry),
   with the per-slot bucket `SmallVec`s well past their 8 inline entries.
-  Shown by `async_timers/tests/cancelled_slot_retention.rs`; the wheel as
-  built is written up in `async_timers/DESIGN.md`. Shows up in the
-  echo-under-timeout phase as 18 reallocs / 327 KB over 2000 round-trips —
+  The wheel as built is written up in `async_timers/DESIGN.md`. Shows up in
+  the echo-under-timeout phase as 18 reallocs / 327 KB over 2000 round-trips —
   growth to the plateau, not a per-op cost.
   Fix, if that profile matters: sweep `Cancelled` entries without waiting for
   the bucket, or document that timeouts should be short and re-armed.

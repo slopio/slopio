@@ -145,7 +145,9 @@ still names it — the sweep would then wake or destroy the wrong timer. The
   not `timeouts in flight`: at 100k req/s with a read and a write
   `timeout(5s, ..)` per request, ~1M dead entries ≈ 40 MB (32 B slab entry plus
   8 B bucket entry), with the per-slot `SmallVec`s well past their 8 inline
-  entries. Demonstrated by `async_timers/tests/cancelled_slot_retention.rs`.
+  entries. A timer cancelled immediately is still counted by `active_timers`
+  until its bucket is swept: 1000 cancelled 5 s timeouts are all still there
+  after a second, and gone after six.
 - **Invariant 5 costs wakeups.** `next_deadline` can name a slot that holds
   only tombstones, so the event loop wakes for a bucket with no live timer.
 - **`cascade`'s `mem::take`** drops a spilled `SmallVec` buffer on every sweep
@@ -156,5 +158,4 @@ still names it — the sweep would then wake or destroy the wrong timer. The
   paragraph alongside any replacement.
 
 Measured numbers for the runtime side of this — the allocation cost of the
-`timeout()` idiom on the TCP hot path — are in `runtime-core/tests/alloc_hotpath.rs`,
-and the open items are listed in `notes.md`.
+`timeout()` idiom on the TCP hot path — and the open items are in `notes.md`.
