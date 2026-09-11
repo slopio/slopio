@@ -1,9 +1,15 @@
 use std::collections::VecDeque;
 use std::collections::vec_deque::Drain;
-use std::task::{Poll, Waker};
+use std::task::Waker;
 use std::time::Duration;
 
-use crate::{DurationTooLong, MS_TICK};
+mod active_field;
+
+use active_field::ActiveField;
+
+// The tick the driver counts in. Deadlines are whole ticks of it, and a store's
+// duration must be one too.
+const MS_TICK: u64 = 10;
 
 /// Names one armed timer in the store that handed it out. The duration is part
 /// of the type, so a token cannot be replayed against a store of another one.
@@ -93,6 +99,23 @@ impl<const MILLIS: u64> Deadlines<MILLIS> {
             self.swept += 1;
         }
     }
+
+    // Deadline of the entry `i` places behind the oldest. Slots hold counts, not
+    // entries, so the answer is where the running total first passes `i` — a
+    // step or two in from `swept` whenever a tick armed more than a handful.
+    fn at_index(&self, i: u32) -> Option<u64> {
+        if i >= self.len {
+            return None;
+        }
+        let mut seen = 0;
+        for at in self.swept..self.swept + Self::SLOTS {
+            seen += self.counts[Self::slot(at)];
+            if seen > i {
+                return Some(at);
+            }
+        }
+        None
+    }
 }
 
 struct Wakers {
@@ -127,110 +150,6 @@ impl Wakers {
     }
 }
 
-struct CancelField {
-    words: VecDeque<u64>,
-    head_bit: usize,
-    len: usize,
-}
-
-impl CancelField {
-    fn new() -> Self {
-        Self {
-            words: VecDeque::new(),
-            head_bit: 0,
-            len: 0,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn push(&mut self) {
-        let p = self.head_bit + self.len;
-        if p == self.words.len() * 64 {
-            self.words.push_back(0);
-        }
-        self.len += 1;
-    }
-
-    fn cancel(&mut self, i: usize) {
-        assert!(i < self.len, "index {i} past the end of {}", self.len);
-        let p = self.head_bit + i;
-        self.words[p >> 6] |= 1 << (p & 63);
-    }
-
-    fn is_cancelled(&self, i: usize) -> bool {
-        assert!(i < self.len, "index {i} past the end of {}", self.len);
-        let p = self.head_bit + i;
-        self.words[p >> 6] & (1 << (p & 63)) != 0
-    }
-
-    fn pop_n(&mut self, n: usize) {
-        let n = n.min(self.len);
-        self.head_bit += n;
-        self.len -= n;
-        while self.head_bit >= 64 {
-            self.words.pop_front();
-            self.head_bit -= 64;
-        }
-    }
-
-    fn live(&self, n: usize) -> impl Iterator<Item = usize> + '_ {
-        let n = n.min(self.len);
-        let start = self.head_bit;
-        let end = start + n;
-        let first = start >> 6;
-        let words = if n == 0 {
-            first..first
-        } else {
-            first..((end - 1) >> 6) + 1
-        };
-        words
-            .flat_map(move |widx| {
-                let from_bit = if widx == first { start & 63 } else { 0 };
-                let mut word = (!self.words[widx] >> from_bit) << from_bit;
-                let word_end = (widx + 1) * 64;
-                if end < word_end {
-                    word &= (1u64 << (end - widx * 64)) - 1;
-                }
-                std::iter::from_fn(move || {
-                    (word != 0).then(|| {
-                        let bit = word.trailing_zeros() as usize;
-                        word &= word - 1;
-                        widx * 64 + bit
-                    })
-                })
-            })
-            .map(move |phys| phys - start)
-    }
-
-    fn first_live(&self) -> Option<usize> {
-        let start = self.head_bit;
-        let end = self.head_bit + self.len;
-        let mut p = start;
-        while p < end {
-            let widx = p >> 6;
-            let bit = p & 63;
-            let mut word = (!self.words[widx] >> bit) << bit;
-            let word_end = (widx + 1) * 64;
-            if end < word_end {
-                let top = end - widx * 64;
-                word &= (1u64 << top) - 1;
-            }
-            if word != 0 {
-                return Some(widx * 64 + word.trailing_zeros() as usize - start);
-            }
-            p = word_end;
-        }
-        None
-    }
-}
-
 /// A timer store where every timer runs for `MILLIS`.
 ///
 /// One duration per store is what makes the three queues FIFOs: arming later
@@ -239,7 +158,7 @@ impl CancelField {
 pub struct Timers<const MILLIS: u64> {
     deadlines: Deadlines<MILLIS>,
     wakers: Wakers,
-    cancels: CancelField,
+    active: ActiveField,
     popped: u64,
 }
 
@@ -260,7 +179,7 @@ impl<const MILLIS: u64> Timers<MILLIS> {
         Self {
             deadlines: Deadlines::new(),
             wakers: Wakers::new(),
-            cancels: CancelField::new(),
+            active: ActiveField::new(),
             popped: 0,
         }
     }
@@ -273,16 +192,16 @@ impl<const MILLIS: u64> Timers<MILLIS> {
         let token = self.pushed();
         self.deadlines.push(now + Self::DURATION_TICKS);
         self.wakers.push(waker);
-        self.cancels.push();
-        debug_assert_eq!(self.wakers.len(), self.cancels.len());
+        self.active.push();
+        debug_assert_eq!(self.wakers.len(), self.active.len());
         token
     }
 
     fn drop_front(&mut self, n: usize) {
         self.wakers.pop_n(n);
-        self.cancels.pop_n(n);
+        self.active.pop_n(n);
         self.popped += n as u64;
-        debug_assert_eq!(self.wakers.len(), self.cancels.len());
+        debug_assert_eq!(self.wakers.len(), self.active.len());
     }
 
     fn pop_n(&mut self, n: usize) {
@@ -300,9 +219,9 @@ impl<const MILLIS: u64> Timers<MILLIS> {
         let Some(i) = self.index_of(token) else {
             return;
         };
-        self.cancels.cancel(i);
+        self.active.cancel(i);
         if i == 0 {
-            let n = self.cancels.first_live().unwrap_or(self.cancels.len());
+            let n = self.active.first().unwrap_or(self.active.len());
             self.pop_n(n);
         }
     }
@@ -313,14 +232,25 @@ impl<const MILLIS: u64> Timers<MILLIS> {
             return;
         }
         let wakers = &self.wakers;
-        for i in self.cancels.live(n) {
+        for i in self.active.iter(n) {
             wakers.get(i).wake_by_ref();
         }
         self.drop_front(n);
     }
 
-    pub fn next_deadline(&self) -> Option<Duration> {
-        todo!()
+    /// Time from `now` until [`tick`](Self::tick) has something to do, or None
+    /// if nothing armed is still waiting.
+    ///
+    /// Exact rather than a bound: a cancelled entry keeps its place in the
+    /// queues until the clock reaches it, so the answer is read off the first
+    /// entry still active, not off the oldest deadline held.
+    pub fn next_deadline(&self, now: u64) -> Option<Duration> {
+        let i = self.active.first()?;
+        let at = self.deadlines.at_index(i as u32)?;
+        // Firing wants the clock strictly past `at`, so never under one tick —
+        // a zero wait would spin the loop.
+        let ticks = at.saturating_sub(now) + 1;
+        Some(Duration::from_millis(ticks * MS_TICK))
     }
 }
 
@@ -558,333 +488,6 @@ mod tests {
         assert!(w.pop().is_some());
     }
 
-    fn model_of(f: &CancelField) -> Vec<bool> {
-        (0..f.len()).map(|i| f.is_cancelled(i)).collect()
-    }
-
-    fn first_live_of(model: &[bool]) -> Option<usize> {
-        model.iter().position(|cancelled| !cancelled)
-    }
-
-    #[test]
-    fn cancel_field_starts_empty() {
-        let f = CancelField::new();
-        assert_eq!(f.len(), 0);
-        assert!(f.is_empty());
-        assert_eq!(f.first_live(), None);
-    }
-
-    #[test]
-    fn pushed_slots_are_live() {
-        let mut f = CancelField::new();
-        f.push();
-        f.push();
-        assert_eq!(model_of(&f), [false, false]);
-        assert_eq!(f.first_live(), Some(0));
-    }
-
-    #[test]
-    fn cancel_marks_only_its_own_slot() {
-        let mut f = CancelField::new();
-        for _ in 0..5 {
-            f.push();
-        }
-        f.cancel(2);
-        assert_eq!(model_of(&f), [false, false, true, false, false]);
-        assert_eq!(f.first_live(), Some(0));
-    }
-
-    #[test]
-    fn first_live_skips_a_cancelled_prefix() {
-        let mut f = CancelField::new();
-        for _ in 0..5 {
-            f.push();
-        }
-        f.cancel(0);
-        f.cancel(1);
-        f.cancel(2);
-        assert_eq!(f.first_live(), Some(3));
-    }
-
-    #[test]
-    fn first_live_is_none_when_everything_is_cancelled() {
-        let mut f = CancelField::new();
-        for _ in 0..70 {
-            f.push();
-        }
-        for i in 0..70 {
-            f.cancel(i);
-        }
-        assert_eq!(f.first_live(), None);
-    }
-
-    fn live_in(f: &CancelField, n: usize) -> Vec<usize> {
-        f.live(n).collect()
-    }
-
-    #[test]
-    fn live_lists_the_uncancelled_in_order() {
-        let mut f = CancelField::new();
-        for _ in 0..6 {
-            f.push();
-        }
-        f.cancel(1);
-        f.cancel(4);
-        assert_eq!(live_in(&f, 6), [0, 2, 3, 5]);
-    }
-
-    #[test]
-    fn live_stops_at_n() {
-        let mut f = CancelField::new();
-        for _ in 0..6 {
-            f.push();
-        }
-        f.cancel(1);
-        assert_eq!(live_in(&f, 3), [0, 2]);
-        assert_eq!(live_in(&f, 0), []);
-    }
-
-    #[test]
-    fn live_clamps_n_to_the_length() {
-        let mut f = CancelField::new();
-        f.push();
-        f.push();
-        assert_eq!(live_in(&f, 100), [0, 1]);
-    }
-
-    #[test]
-    fn live_yields_nothing_when_all_are_cancelled() {
-        let mut f = CancelField::new();
-        for _ in 0..130 {
-            f.push();
-        }
-        for i in 0..130 {
-            f.cancel(i);
-        }
-        assert_eq!(live_in(&f, 130), []);
-    }
-
-    #[test]
-    fn live_crosses_words_and_a_moving_head() {
-        let mut f = CancelField::new();
-        let mut model: Vec<bool> = Vec::new();
-        for round in 0..30 {
-            for k in 0..37 {
-                f.push();
-                model.push(false);
-                if (round + k) % 3 == 0 {
-                    let last = model.len() - 1;
-                    f.cancel(last);
-                    model[last] = true;
-                }
-            }
-            let expected: Vec<usize> = model
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| !**c)
-                .map(|(i, _)| i)
-                .collect();
-            assert_eq!(live_in(&f, model.len()), expected, "round {round}");
-
-            let half = model.len() / 2;
-            assert_eq!(
-                live_in(&f, half),
-                expected_upto(&expected, half),
-                "round {round}"
-            );
-
-            f.pop_n(19);
-            model.drain(..19);
-        }
-    }
-
-    fn expected_upto(all: &[usize], n: usize) -> Vec<usize> {
-        all.iter().copied().take_while(|i| *i < n).collect()
-    }
-
-    #[test]
-    fn live_agrees_with_the_model() {
-        let mut rng = 0xdead_beef_cafe_f00du64;
-        let mut next = move || {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng
-        };
-
-        let mut f = CancelField::new();
-        let mut model: Vec<bool> = Vec::new();
-
-        for step in 0..2_000 {
-            match next() % 6 {
-                0..=3 => {
-                    for _ in 0..1 + next() % 30 {
-                        f.push();
-                        model.push(false);
-                    }
-                }
-                4 if !model.is_empty() => {
-                    let i = (next() as usize) % model.len();
-                    f.cancel(i);
-                    model[i] = true;
-                }
-                _ => {
-                    let n = (next() as usize) % (model.len() + 1);
-                    f.pop_n(n);
-                    model.drain(..n);
-                }
-            }
-
-            let n = if model.is_empty() {
-                0
-            } else {
-                (next() as usize) % (model.len() + 1)
-            };
-            let expected: Vec<usize> = model[..n]
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| !**c)
-                .map(|(i, _)| i)
-                .collect();
-
-            let live: Vec<usize> = f.live(n).collect();
-            assert_eq!(live, expected, "step {step}");
-        }
-    }
-
-    #[test]
-    fn pop_n_shifts_the_indices_down() {
-        let mut f = CancelField::new();
-        for _ in 0..5 {
-            f.push();
-        }
-        f.cancel(3);
-        f.pop_n(2);
-        assert_eq!(model_of(&f), [false, true, false]);
-        assert_eq!(f.first_live(), Some(0));
-    }
-
-    #[test]
-    fn pop_n_past_the_end_empties_it() {
-        let mut f = CancelField::new();
-        f.push();
-        f.push();
-        f.pop_n(10);
-        assert!(f.is_empty());
-        assert_eq!(f.first_live(), None);
-    }
-
-    #[test]
-    fn a_word_is_released_once_fully_consumed() {
-        let mut f = CancelField::new();
-        for _ in 0..200 {
-            f.push();
-        }
-        assert_eq!(f.words.len(), 4);
-        f.pop_n(128);
-        assert_eq!(f.words.len(), 2);
-        assert_eq!(f.len(), 72);
-    }
-
-    #[test]
-    fn a_slot_reached_after_a_word_boundary_is_live() {
-        let mut f = CancelField::new();
-        for _ in 0..64 {
-            f.push();
-        }
-        for i in 0..64 {
-            f.cancel(i);
-        }
-        f.pop_n(64);
-        for _ in 0..64 {
-            f.push();
-        }
-        assert_eq!(
-            model_of(&f),
-            [false; 64],
-            "a fresh slot must never inherit a bit"
-        );
-        assert_eq!(f.first_live(), Some(0));
-    }
-
-    #[test]
-    fn crossing_word_boundaries_keeps_indices_aligned() {
-        let mut f = CancelField::new();
-        let mut model: Vec<bool> = Vec::new();
-
-        for round in 0..40 {
-            for _ in 0..37 {
-                f.push();
-                model.push(false);
-            }
-            let target = round % 37;
-            f.cancel(target);
-            model[target] = true;
-
-            assert_eq!(model_of(&f), model, "round {round} after cancel");
-            assert_eq!(f.first_live(), first_live_of(&model), "round {round}");
-
-            f.pop_n(19);
-            model.drain(..19);
-            assert_eq!(model_of(&f), model, "round {round} after pop");
-            assert_eq!(f.first_live(), first_live_of(&model), "round {round}");
-        }
-    }
-
-    #[test]
-    fn stays_consistent_with_a_reference_model() {
-        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move || {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng
-        };
-
-        let mut f = CancelField::new();
-        let mut model: Vec<bool> = Vec::new();
-        let mut max_len = 0;
-
-        for step in 0..20_000 {
-            match next() % 10 {
-                0..=5 => {
-                    let n = 1 + next() % 40;
-                    for _ in 0..n {
-                        f.push();
-                        model.push(false);
-                    }
-                }
-                6..=7 if !model.is_empty() => {
-                    let i = (next() as usize) % model.len();
-                    f.cancel(i);
-                    model[i] = true;
-                }
-                _ => {
-                    let n = (next() as usize) % (model.len() + 1);
-                    f.pop_n(n);
-                    model.drain(..n);
-                }
-            }
-
-            assert_eq!(f.len(), model.len(), "step {step}");
-            assert_eq!(f.is_empty(), model.is_empty(), "step {step}");
-            assert_eq!(model_of(&f), model, "step {step}");
-            assert_eq!(f.first_live(), first_live_of(&model), "step {step}");
-            assert!(
-                f.words.len() <= (f.head_bit + f.len()) / 64 + 1,
-                "step {step}: {} words held for {} bits",
-                f.words.len(),
-                f.len(),
-            );
-            max_len = max_len.max(model.len());
-        }
-
-        assert!(
-            max_len > 500,
-            "the run stayed too small to cross word boundaries: {max_len}",
-        );
-    }
-
     fn total_of<const M: u64>(d: &Deadlines<M>) -> u32 {
         d.len
     }
@@ -896,8 +499,8 @@ mod tests {
 
         assert_eq!(total_of(&t.deadlines), 1);
         assert_eq!(t.wakers.len(), 1);
-        assert_eq!(t.cancels.len(), 1);
-        assert!(!t.cancels.is_cancelled(0));
+        assert_eq!(t.active.len(), 1);
+        assert!(t.active.is_active(0));
     }
 
     #[test]
@@ -907,7 +510,7 @@ mod tests {
             t.push(waker(), 0);
             assert_eq!(total_of(&t.deadlines) as usize, n);
             assert_eq!(t.wakers.len(), n);
-            assert_eq!(t.cancels.len(), n);
+            assert_eq!(t.active.len(), n);
         }
     }
 
@@ -930,7 +533,7 @@ mod tests {
 
         assert_eq!(groups(&t.deadlines), [(500, 2), (501, 1)]);
         assert_eq!(t.wakers.len(), 3);
-        assert_eq!(t.cancels.len(), 3);
+        assert_eq!(t.active.len(), 3);
     }
 
     #[test]
@@ -1003,7 +606,7 @@ mod tests {
 
         assert_eq!(total_of(&t.deadlines), 27);
         assert_eq!(t.wakers.len(), 27);
-        assert_eq!(t.cancels.len(), 27);
+        assert_eq!(t.active.len(), 27);
     }
 
     #[test]
@@ -1016,7 +619,7 @@ mod tests {
 
         assert_eq!(total_of(&t.deadlines), 0);
         assert_eq!(t.wakers.len(), 0);
-        assert_eq!(t.cancels.len(), 0);
+        assert_eq!(t.active.len(), 0);
         assert_eq!(t.popped, 5);
     }
 
@@ -1049,7 +652,7 @@ mod tests {
             }
 
             assert_eq!(t.wakers.len(), live.len(), "step {step}");
-            assert_eq!(t.cancels.len(), live.len(), "step {step}");
+            assert_eq!(t.active.len(), live.len(), "step {step}");
             assert_eq!(total_of(&t.deadlines) as usize, live.len(), "step {step}");
             for (i, &token) in live.iter().enumerate() {
                 assert_eq!(t.index_of(token), Some(i), "step {step}, token {token:?}");
@@ -1144,7 +747,7 @@ mod tests {
         t.tick(501);
         assert_eq!(*log.lock().unwrap(), [0]);
         assert_eq!(t.wakers.len(), 0);
-        assert_eq!(t.cancels.len(), 0);
+        assert_eq!(t.active.len(), 0);
         assert_eq!(total_of(&t.deadlines), 0);
         assert_eq!(t.popped, 1);
     }
@@ -1156,7 +759,7 @@ mod tests {
         t.push(recording_waker(&log, 0), 0);
         t.push(recording_waker(&log, 1), 0);
         t.push(recording_waker(&log, 2), 0);
-        t.cancels.cancel(1);
+        t.active.cancel(1);
 
         t.tick(501);
         assert_eq!(*log.lock().unwrap(), [0, 2]);
@@ -1196,7 +799,7 @@ mod tests {
         t.tick(600);
         assert_eq!(*log.lock().unwrap(), [0, 1, 2, 3, 4]);
         assert_eq!(t.wakers.len(), 0);
-        assert_eq!(t.cancels.len(), 0);
+        assert_eq!(t.active.len(), 0);
         assert_eq!(total_of(&t.deadlines), 0);
     }
 
@@ -1230,7 +833,7 @@ mod tests {
             t.push(recording_waker(&log, i), 0);
         }
         for i in 0..70 {
-            t.cancels.cancel(i);
+            t.active.cancel(i);
         }
 
         t.tick(501);
@@ -1262,7 +865,7 @@ mod tests {
             t.cancel(*token);
         }
         assert_eq!(t.wakers.len(), 0);
-        assert_eq!(t.cancels.len(), 0);
+        assert_eq!(t.active.len(), 0);
         assert_eq!(total_of(&t.deadlines), 0);
     }
 
@@ -1287,132 +890,115 @@ mod tests {
         assert_eq!(t.wakers.len(), 0);
     }
 
+    fn ticks_of(d: Duration) -> u64 {
+        d.as_millis() as u64 / MS_TICK
+    }
+
     #[test]
-    #[ignore]
-    fn cancel_field_cost() {
-        use std::hint::black_box;
-        use std::time::Instant;
+    fn nothing_armed_has_no_deadline() {
+        let t = Timers::<D>::new();
+        assert_eq!(t.next_deadline(0), None);
+    }
 
-        const N: usize = 2_000_000;
+    #[test]
+    fn the_deadline_counts_down_as_the_clock_moves() {
+        let mut t = Timers::<D>::new();
+        t.push(waker(), 0);
 
-        let mut f = CancelField::new();
-        let t = Instant::now();
-        for _ in 0..N {
-            f.push();
-        }
-        let push = t.elapsed().as_nanos() as f64 / N as f64;
+        assert_eq!(ticks_of(t.next_deadline(0).unwrap()), TICKS + 1);
+        assert_eq!(ticks_of(t.next_deadline(100).unwrap()), TICKS - 100 + 1);
+    }
 
-        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move || {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng
-        };
-        let idx: Vec<usize> = (0..N).map(|_| next() as usize % N).collect();
+    /// The contract the event loop leans on: the tick `next_deadline` names is
+    /// the first one that fires, and the one before it fires nothing.
+    #[test]
+    fn next_deadline_names_the_tick_that_fires() {
+        let log: Log = Arc::default();
+        let mut t = Timers::<D>::new();
+        t.push(recording_waker(&log, 0), 40);
 
-        let t = Instant::now();
-        for &i in &idx {
-            f.cancel(i);
-        }
-        let cancel = t.elapsed().as_nanos() as f64 / N as f64;
+        let target = 40 + ticks_of(t.next_deadline(40).unwrap());
 
-        let t = Instant::now();
-        let mut acc = 0usize;
-        for &i in &idx {
-            acc += black_box(f.is_cancelled(i)) as usize;
-        }
-        let test = t.elapsed().as_nanos() as f64 / N as f64;
-        black_box(acc);
+        t.tick(target - 1);
+        assert!(log.lock().unwrap().is_empty(), "a tick too early");
+        t.tick(target);
+        assert_eq!(*log.lock().unwrap(), [0]);
+    }
 
-        println!(
-            "push {push:.2} ns   cancel {cancel:.2} ns   is_cancelled {test:.2} ns  ({} of {N} set)",
-            acc,
+    #[test]
+    fn a_deadline_the_clock_has_reached_is_still_a_tick_away() {
+        let mut t = Timers::<D>::new();
+        t.push(waker(), 0);
+
+        let wait = t.next_deadline(TICKS).unwrap();
+        assert_eq!(wait, Duration::from_millis(MS_TICK));
+        assert!(wait > Duration::ZERO, "a zero wait would spin the loop");
+        assert_eq!(
+            t.next_deadline(9_999).unwrap(),
+            Duration::from_millis(MS_TICK)
         );
+    }
 
-        for prefix in [64usize, 1_000, 10_000, 100_000] {
-            let mut f = CancelField::new();
-            for _ in 0..prefix + 1 {
-                f.push();
-            }
-            for i in 0..prefix {
-                f.cancel(i);
-            }
-            const REPS: usize = 20_000;
-            let t = Instant::now();
-            for _ in 0..REPS {
-                black_box(f.first_live());
-            }
-            let per = t.elapsed().as_nanos() as f64 / REPS as f64;
-            println!(
-                "first_live over {prefix:>7} cancelled: {per:>9.1} ns  ({:.3} ns/entry)",
-                per / prefix as f64,
-            );
-        }
+    /// `tick` drops the entries it fired without looking at what it uncovers,
+    /// so the head is routinely a cancelled entry. Answering from it would wake
+    /// the loop early, for a timer that will never fire.
+    #[test]
+    fn a_cancelled_head_is_skipped() {
+        let mut t = Timers::<D>::new();
+        let early = t.push(waker(), 0);
+        let later = t.push(waker(), 10);
+        t.push(waker(), 40);
 
-        let mut f = CancelField::new();
-        for _ in 0..N {
-            f.push();
-        }
-        let t = Instant::now();
-        let mut popped = 0;
-        while !f.is_empty() {
-            f.pop_n(37);
-            popped += 1;
-        }
-        println!(
-            "pop_n(37) {:.2} ns/call over {popped} calls",
-            t.elapsed().as_nanos() as f64 / popped as f64,
+        assert_eq!(ticks_of(t.next_deadline(0).unwrap()), TICKS + 1);
+
+        // Cancelling at the head reclaims it, so the answer moves on by itself.
+        t.cancel(early);
+        assert_eq!(ticks_of(t.next_deadline(0).unwrap()), TICKS + 10 + 1);
+
+        // Cancelling away from the head leaves the entry in place; the answer
+        // must step over it anyway.
+        t.cancel(later);
+        assert_eq!(
+            ticks_of(t.next_deadline(0).unwrap()),
+            TICKS + 40 + 1,
+            "the dead entry is still in the queues",
         );
     }
 
     #[test]
-    #[ignore]
-    fn fire_batch_cost() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        const BATCH: usize = 100_000;
-        const REPS: usize = 200;
-
-        println!("{:>4}  {:>12} {:>12}", "%", "live()", "bit by bit");
-
-        for cancelled_pct in [0usize, 50, 90, 95, 99, 100] {
-            let mut f = CancelField::new();
-            for _ in 0..BATCH {
-                f.push();
-            }
-            let mut rng = 0x2545_f491_4f6c_dd1du64;
-            for i in 0..BATCH {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                if (rng % 100) < cancelled_pct as u64 {
-                    f.cancel(i);
-                }
-            }
-
-            let mut acc = 0usize;
-
-            let t = Instant::now();
-            for _ in 0..REPS {
-                acc += f.live(BATCH).sum::<usize>();
-            }
-            let batched = t.elapsed().as_nanos() as f64 / REPS as f64;
-
-            let t = Instant::now();
-            for _ in 0..REPS {
-                for i in 0..BATCH {
-                    if !f.is_cancelled(i) {
-                        acc += i;
-                    }
-                }
-            }
-            let one_by_one = t.elapsed().as_nanos() as f64 / REPS as f64;
-
-            black_box(acc);
-            println!("{cancelled_pct:>3}%  {batched:>9.0} ns {one_by_one:>9.0} ns");
+    fn a_fully_cancelled_queue_has_no_deadline() {
+        let mut t = Timers::<D>::new();
+        for i in 0..70 {
+            t.push(waker(), i);
         }
+        // Straight at the field, so the head reclaim never runs and the queues
+        // keep all seventy dead entries.
+        for i in 0..70 {
+            t.active.cancel(i);
+        }
+        assert_eq!(t.wakers.len(), 70);
+        assert_eq!(t.next_deadline(0), None);
+    }
+
+    #[test]
+    fn the_deadline_follows_the_survivors_across_a_fire() {
+        let log: Log = Arc::default();
+        let mut t = Timers::<D>::new();
+        t.push(recording_waker(&log, 0), 0);
+        let dead = t.push(recording_waker(&log, 1), 5);
+        t.push(recording_waker(&log, 2), 20);
+        t.cancel(dead);
+
+        t.tick(TICKS + 1);
+        assert_eq!(*log.lock().unwrap(), [0], "the first one fired");
+        assert_eq!(t.wakers.len(), 2, "the cancelled entry is still held");
+        // Armed at 20, so due at TICKS + 20 and fired at TICKS + 21 — twenty
+        // ticks from the TICKS + 1 we are standing on.
+        assert_eq!(
+            ticks_of(t.next_deadline(TICKS + 1).unwrap()),
+            20,
+            "answered from entry 2, over the cancelled entry 1",
+        );
     }
 
     #[test]
