@@ -6,6 +6,9 @@ use std::{
 };
 
 mod slab;
+mod timers;
+
+pub use timers::Timers;
 
 // Hierarchical wheel: ms → s → min → h. Every level's period is a whole
 // number of the level below, so a slot cascades exactly when its window opens.
