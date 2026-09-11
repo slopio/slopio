@@ -57,8 +57,9 @@ impl ClockSource {
 // A duration the runtime keeps a dedicated store for. One number, not two: the
 // constant that routes and the type parameter that sizes the store must agree,
 // or a sleep lands in a store dimensioned for something else.
-const FIXED_5S_MS: u64 = 5_000;
-const FIXED_5S: Duration = Duration::from_millis(FIXED_5S_MS);
+pub const FIXED_5S_MS: u64 = 5_000;
+/// The one duration served exactly, outside the wheel.
+pub const FIXED_5S: Duration = Duration::from_millis(FIXED_5S_MS);
 
 pub struct TimeDriver {
     /// Any duration up to `MAX_DURATION`, at 10ms resolution.
