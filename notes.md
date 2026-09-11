@@ -34,18 +34,23 @@ per connection or per timeout:
   `SmallVec`) since it is not generic over the size. Tradeoff: inline in the
   multishot slab means the memory is no longer returned when a connection
   closes, it stays sized to the peak.
-- a cancelled timer keeps its slab slot until its bucket fires or cascades:
-  `TimerStorage::drop` writes `Cancelled` but leaves the id parked in the
-  bucket. Intentional (removing it early would let the slab reuse an id the
-  bucket still names), but the live set is then `rate × timeout duration`,
-  not `timeouts in flight`. A read+write `timeout(5s, ..)` per request at
-  100k req/s is ~1M dead slots ≈ 40 MB (32 B slab entry + 8 B bucket entry),
-  with the per-slot bucket `SmallVec`s well past their 8 inline entries.
-  The wheel as built is written up in `async_timers/DESIGN.md`. Shows up in
-  the echo-under-timeout phase as 18 reallocs / 327 KB over 2000 round-trips —
-  growth to the plateau, not a per-op cost.
-  Fix, if that profile matters: sweep `Cancelled` entries without waiting for
-  the bucket, or document that timeouts should be short and re-armed.
+- a cancelled timer keeps its slot until the clock reaches its deadline, in
+  both stores: the wheel's `TimerStorage::drop` writes `Cancelled` but leaves
+  the id parked in its bucket, and `Timers::cancel` only clears a bit unless
+  the entry is at the head. Intentional in the wheel (removing it early would
+  let the slab reuse an id the bucket still names), but the live set is then
+  `rate × timeout duration`, not `timeouts in flight`. A read+write
+  `timeout(5s, ..)` per request at 100k req/s is ~1M dead slots ≈ 40 MB
+  (32 B slab entry + 8 B bucket entry), with the per-slot bucket `SmallVec`s
+  well past their 8 inline entries. Both stores are written up in
+  `async_timers/DESIGN.md`. Shows up in the echo-under-timeout phase as 18
+  reallocs / 327 KB over 2000 round-trips — growth to the plateau, not a
+  per-op cost.
+  Now bounded by the duration itself (1 s in the wheel, 5 s in the fixed
+  store) rather than by an arbitrary timeout, so the worst case is far
+  smaller than it was — but the shape is unchanged.
+  Fix, if that profile matters: sweep dead entries without waiting for the
+  clock, or document that timeouts should be short and re-armed.
 - `socket_send_vectored` allocates a `Vec<libc::iovec>` per call (16 B per
   chunk) on top of the caller's `Vec<B>` — the only send path that allocates
   on the hot path. `send_vectored_fixed_zc` does the same `Vec::with_capacity`.

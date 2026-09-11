@@ -55,7 +55,7 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 - [Ways of doing I/O](docs/io-model.md). Owned buffers, provided rings, multishot, registered and zero-copy, and why there is no single interface.
 - [Streams and backpressure](docs/streams.md). How multishot accept and receive pause a fast peer and resume on their own.
 - [Cancelling I/O](docs/cancellation.md). What dropping a future guarantees and what it does not.
-- [Time and the timing wheel](docs/time.md). Sleeps, timeouts, resolution, and why reading the clock is free.
+- [Time and timers](docs/time.md). Sleeps, timeouts, which durations are served, resolution, and why reading the clock is free.
 - [Messaging between workers](docs/messaging.md). Raw, typed, shared and request/reply messages over `MSG_RING`.
 - [Telemetry](docs/telemetry.md). Spans, events, propagation and export, all behind features.
 - [Deterministic simulation testing](docs/deterministic-testing.md). Running the runtime against a scripted kernel.
@@ -68,7 +68,7 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 | `runtime` | The facade to depend on: entry points, buffer ring declarations, telemetry wiring, global allocator. |
 | `runtime-core` | The runtime itself: tasks, I/O driver, timers, channels, tracing, simulator. |
 | `runtime-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
-| `async_timers` | The hierarchical timing wheel. |
+| `async_timers` | The two timer stores: a one-second timing wheel, and the fixed-duration deadline queues. |
 | `io_uring_rb` | Provided buffer ring memory management. |
 | `runtime_ebpf_balancer` | Optional eBPF program steering QUIC connections to the right core under `SO_REUSEPORT`. |
 

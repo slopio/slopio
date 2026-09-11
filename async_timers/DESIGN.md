@@ -1,103 +1,68 @@
-# The hierarchical timing wheel, as built
+# The two timer stores, as built
 
-A record of how `async_timers` works as of b817464 (2026-09-11), written down
-so a replacement can be compared against it. Internals only — the user-facing
-description of timers lives in `docs/time.md`.
+A record of how `async_timers` works as of ac2f0ee (2026-09-11). Internals
+only — the user-facing description of timers lives in `docs/time.md`.
 
-## Shape
+The crate holds two stores that share no code, not even a constant. Each is
+built for one shape of workload, and `runtime-core` routes a sleep to whichever
+one can hold it.
+
+```
+src/wheel/{mod,slab}.rs          arbitrary durations, up to 1 s
+src/timers/{mod,active_field}.rs Timers<MILLIS>, one fixed duration per store
+```
+
+Both count in **ticks of 10 ms**. Neither reads a clock: the caller supplies
+the tick, which is what lets a simulation drive them from a clock it controls.
+`TimeDriver` owns the conversion and drives the fixed stores off
+`TimeWheel::ticks()`, so everything armed and everything fired reads one clock.
+
+## The wheel — `src/wheel/`
+
+One ring, no hierarchy, no cascade.
 
 ```
 TimeWheel
-├─ ticks: u64            monotonic count of 10 ms ticks since creation;
-│                        every level index derives from it
-├─ storage: TimerStorage the data — slab::Slab<Timer>, one slot per timer,
-│                        the slot index is the TimerId handed to the caller
-├─ buckets: BucketLevels the ordering — 4 levels of SmallVec<[TimerId; 8]>,
-│                        plus one occupancy bitset per level
+├─ ticks: u64            monotonic count of 10 ms ticks since creation
+├─ storage: TimerStorage slab::Slab<Timer>, the slot index is the id handed out
+├─ buckets: [SmallVec<[TimerId; 8]>; 101]
+├─ occupied: Bitset(u128)
 ├─ last_tick: Instant
 └─ last_tick_wall: SystemTime
 ```
 
-A bucket holds **bare slab indices**. Everything awkward about the design
-follows from that one fact.
+**101 slots, not 100.** The window is `MAX_DURATION` = 1 s = 100 ticks, and a
+deadline exactly that far out must not land on the slot the clock is standing
+on — that slot has already fired this tick, so the timer would go off
+immediately instead of a second later. One spare slot separates the two ends of
+the window. This is the same `+1` the deadline ring below uses, for the same
+reason, and it is why a 1 s timer had to live at the seconds level back when
+there was one.
 
-## Levels
-
-```
-              resolution   slots   window     current index
-  ms_level       10 ms      100      1 s      ticks % 100
-  s_level         1 s        60     60 s      (ticks / 100) % 60
-  m_level         1 min      60     60 min    (ticks / 6 000) % 60
-  h_level         1 h        25     25 h      (ticks / 360 000) % 25
-
-  ms_occupied: Bitset<u128>   s_occupied: Bitset<u64>
-  m_occupied:  Bitset<u64>    h_occupied: Bitset<u32>
-```
-
-`H_BUCKETS` is 25, not 24: a deadline up to 24 h out can land 24 hour-slots
-ahead of `ticks`. `init_timer` rejects durations of 24 h or more with
-`DurationTooLong`.
-
-Each level's period is a whole multiple of the level below, so a slot cascades
-exactly when its window opens. `TICKS_PER_S = 100`, `TICKS_PER_M = 6 000`,
-`TICKS_PER_H = 360 000`.
-
-The bitsets exist so `next_deadline` can find the next occupied slot without
-walking 245 buckets. `next_set(from, len)` rotates the word by `from` and takes
-`trailing_zeros`.
-
-## Placement
-
-`init_timer` rounds the duration down to whole ticks
-(`deadline = ticks + total_ms / MS_TICK`), inserts into the slab, then calls
-`place`. `place` walks down and stops at the **finest level whose window still
-contains the deadline**:
-
-```
-  deadline - now < 100                → ms_level[deadline % 100]           (< 1 s)
-  deadline/100  - now/100  < 60       → s_level[(deadline / 100) % 60]     (< 1 min)
-  deadline/6000 - now/6000 < 60       → m_level[(deadline / 6000) % 60]    (< 1 h)
-  otherwise                           → h_level[(deadline / 360000) % 25]
-```
-
-A timer is therefore not placed once. It **descends** level by level as its
-deadline approaches, re-placed by `cascade` each time its current slot opens.
-
-## A tick
+A tick is the whole of the work:
 
 ```
 process_single_tick():
-
-  1. fire the current ms slot     ms_level[ticks % 100] → storage.wake(id) for each
+  1. fire buckets[ticks % 101] → storage.wake(id) for each
   2. ticks += 1
-  3. if ticks % 100     == 0  →  cascade s_level[s_idx]     ─┐ coarse before fine:
-     if ticks % 6 000   == 0  →  cascade m_level[m_idx]      │ a cascaded timer may
-     if ticks % 360 000 == 0  →  cascade h_level[h_idx]     ─┘ land in a finer slot
-                                                               opening on this tick
 ```
 
-`cascade` takes the bucket with `mem::take`, reads each timer's deadline back
-from the slab and re-`place`s it against the now-current `ticks`.
+`place` is one line — `buckets[deadline % 101]` — because `init_timer` has
+already rejected anything the ring cannot hold. It compares `Duration`s rather
+than milliseconds: `as_millis() as u64` truncates a large enough duration into
+a small one that would otherwise be accepted.
 
 `tick_at` advances by **whole ticks only**, keeping the sub-tick remainder in
 `last_tick`. Resetting `last_tick` to `now` would discard up to `MS_TICK` per
 call, and a busy event loop calling faster than once per 10 ms would never
 accumulate a full tick.
 
-Worked example — a 5 s timer armed at `ticks = 0`, deadline `500`:
+`next_deadline` finds the next occupied slot by rotating the bitset and taking
+`trailing_zeros`. It answers the distance to the slot, which is **one tick
+short** of when that slot fires — a lower bound, so the loop wakes once early
+and re-sleeps. Never late.
 
-```
-  t=0     place: 500-0 = 500 >= 100, but 5-0 = 5 < 60   → s_level[5]
-          ......... sits in one slot for 5 s, no per-tick work
-  t=499   tick: fires ms_level[99], ticks → 500, 500 % 100 == 0
-          cascade s_level[5] → re-place: 500-500 = 0 < 100 → ms_level[0]
-  t=500   tick: fires ms_level[0] → wake()              ← exact to the tick
-```
-
-Hence the documented behaviour: exact to a tick from about a second upward,
-10 ms floor below that.
-
-## Timer lifecycle
+### Timer lifecycle
 
 ```
    init_timer ─→ Waiting ──── bucket fires ────→ Done ──── poll() ────→ slot freed
@@ -106,56 +71,100 @@ Hence the documented behaviour: exact to a tick from about a second upward,
                     ▼                             │  frees it too)
                 Cancelled ───────────────────────┘
                     │
-                    └─ slot RETAINED until its bucket is swept
-                       (wake() on a fire, or deadline() on a cascade)
+                    └─ slot RETAINED until its bucket fires (wake())
 ```
-
-`TimerStorage` operations:
 
 | call | `Waiting` | `Done` | `Cancelled` |
 |---|---|---|---|
 | `drop(id)` | → `Cancelled`, slot kept | remove | no-op |
 | `poll(id, waker)` | refresh waker if `!will_wake`, `Pending` | remove, `Ready` | `Ready`, slot kept |
 | `wake(id)` (fire) | `wake_by_ref`, → `Done` | unreachable | remove |
-| `deadline(id)` (cascade) | `Some(deadline)` | unreachable | remove, `None` |
 
-## Why `Cancelled` cannot free its slot
+A bucket names a timer by **bare slab index**. Freeing the slot on cancel would
+let the slab hand that index to a new timer while the old bucket entry still
+names it, and the sweep would wake or destroy the wrong one. The `Cancelled`
+tombstone is the price of a bucket that stores a bare index.
 
-The bucket names the timer by slab index alone. Freeing the slot on cancel
-would let the slab hand that index to a new timer while the old bucket entry
-still names it — the sweep would then wake or destroy the wrong timer. The
-`Cancelled` tombstone is the price of a bucket that stores a bare index.
+Without a cascade, nothing reads a timer's deadline back after placement, so
+the slab no longer stores one — `Waiting(Waker)`, not `Waiting(Waker, u64)`.
+
+## The fixed-duration store — `src/timers/`
+
+`Timers<const MILLIS: u64>`: every timer in one store runs for the same
+duration. That single fact is what makes all three of its queues FIFOs —
+arming later can only end later, so deadlines are non-decreasing by
+construction and nothing is ever sorted or searched.
+
+```
+Timers<MILLIS>
+├─ deadlines: Deadlines<MILLIS>  counting ring, MILLIS/10 + 1 slots of u32
+├─ wakers:    VecDeque<Waker>
+├─ active:    ActiveField        one bit per entry, cleared on cancel
+└─ popped:    u64                entries retired, the base for token → index
+```
+
+A `Token<MILLIS>` is the absolute position of an entry in the arm sequence;
+`index_of` is `token - popped`, and a token that falls below `popped` has
+fired or been cancelled. The duration is in the token's type, so a token
+cannot be replayed against a store of another duration.
+
+`Deadlines` is a **counting ring**: one `u32` per tick, indexed by
+`at % SLOTS`, holding how many timers are due on that tick. Live deadlines
+never span more than one duration, so `MILLIS/10 + 1` slots hold them all
+without wrapping onto a live one — hence the `debug_assert` and the clamp in
+`push`, which is the one precondition this structure has and the wheel does
+not. It replaced a run-length-encoded `VecDeque<{at, count}>` (through
+19faecf): the deque's footprint tracked the number of distinct occupied ticks
+and grew with traffic, the ring's is fixed at construction and allocates once.
+The trade is that sweeping costs a slot per tick elapsed, empty or not, rather
+than a step per distinct deadline — a win while timers are armed densely,
+which is what this store is for.
+
+`next_deadline` is **exact**, not a bound: it reads the first entry still
+active, stepping over cancelled ones, and `tick` fires what is strictly behind
+the clock, so the answer is `at - now + 1`.
+
+Cancelling clears the entry's bit. If the entry is at the head, the whole dead
+prefix behind it is reclaimed at once; otherwise it stays in place, costing its
+slot until the clock reaches it.
 
 ## Invariants
 
-1. A slab slot is released only once no bucket names it. This is the one that
-   forces the tombstone.
-2. Each level's period is a whole multiple of the level below.
-3. Within a tick, coarse levels cascade before fine ones.
-4. `last_tick` advances by whole ticks only.
-5. An occupancy bit is set on insert and cleared only when the bucket fires or
-   cascades. A bucket holding nothing but tombstones therefore keeps its bit
-   set.
+1. **Wheel.** A slab slot is released only once no bucket names it. This is the
+   one that forces the tombstone.
+2. **Wheel.** `last_tick` advances by whole ticks only.
+3. **Wheel.** An occupancy bit is set on insert and cleared only when the bucket
+   fires. A bucket holding nothing but tombstones therefore keeps its bit set,
+   and `next_deadline` can name it — a wakeup for no live timer.
+4. **Fixed store.** Every timer in a store has the same duration, so deadlines
+   are non-decreasing and the live window never exceeds `SLOTS`.
+5. **Fixed store.** `push` and `tick` are driven by the same clock. Arming from
+   a clock that has run ahead of the one that sweeps overruns the window; the
+   clamp turns that into an early fire rather than a wrap onto a live slot.
+6. **Both.** A cancelled timer keeps its place until the clock reaches its
+   deadline. The live set is `arm rate × duration`, not `timers in flight`.
 
 ## Known costs
 
-- **Cancelled timers are retained for the full timeout duration.** A guard
-  timeout cancelled microseconds after being armed sits in its coarse bucket
-  until that bucket's slot comes up. The live set is `rate × timeout duration`,
-  not `timeouts in flight`: at 100k req/s with a read and a write
-  `timeout(5s, ..)` per request, ~1M dead entries ≈ 40 MB (32 B slab entry plus
-  8 B bucket entry), with the per-slot `SmallVec`s well past their 8 inline
-  entries. A timer cancelled immediately is still counted by `active_timers`
-  until its bucket is swept: 1000 cancelled 5 s timeouts are all still there
-  after a second, and gone after six.
-- **Invariant 5 costs wakeups.** `next_deadline` can name a slot that holds
-  only tombstones, so the event loop wakes for a bucket with no live timer.
-- **`cascade`'s `mem::take`** drops a spilled `SmallVec` buffer on every sweep
-  and reallocates it the next time the slot fills.
-- **`docs/time.md` describes the retention as lazy freeing that absorbs a burst
-  of dropped timers without a spike.** True as far as it goes, but it does not
-  say that the footprint scales with the timeout duration; revisit that
-  paragraph alongside any replacement.
+- **Cancelled timers are retained for the full duration**, in both stores. A
+  guard timeout cancelled microseconds after being armed still occupies memory
+  until its deadline comes up. Now bounded by the duration itself: at most 1 s
+  in the wheel, 5 s in the `Timers<5_000>` store — where before a 24 h timer
+  could hold a slot for a day.
+- **Invariant 3 costs wakeups.** The wheel's `next_deadline` can name a slot
+  holding only tombstones. The fixed store does not have this problem: it steps
+  over cancelled entries.
+- **The wheel's `next_deadline` is a tick short**, so the loop wakes once per
+  deadline for nothing before the real one.
+- **`Timers::new` allocates its ring up front** — `MILLIS/10 + 1` × 4 bytes,
+  about 2 KB for a 5 s store — per worker thread, whether or not anything is
+  ever armed in it.
+
+## Not covered
+
+`Sleep` panics on any duration that is neither ≤ 1 s nor exactly 5 s. The
+`against_the_wheel` benchmark in `src/timers/mod.rs` is `#[ignore]`d and stale:
+it arms the wheel at 5 s, which the wheel now refuses.
 
 Measured numbers for the runtime side of this — the allocation cost of the
 `timeout()` idiom on the TCP hot path — and the open items are in `notes.md`.

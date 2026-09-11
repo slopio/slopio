@@ -52,7 +52,7 @@ By default a completion lands as soon as the runtime next waits on the ring, in 
 
 ## Virtual time
 
-Build the ring with `.virtual_time()` and the timing wheel reads the same virtual clock as the simulated ring. A sleep is a jump: a test that sleeps for an hour finishes in microseconds, and timers and completions fire in an order fully determined by the script. Without `.virtual_time()` the simulator sleeps for real on the monotonic clock, which is still deterministic but slow.
+Build the ring with `.virtual_time()` and the timer stores read the same virtual clock as the simulated ring. A sleep is a jump: a test that sleeps for five seconds finishes in microseconds, and timers and completions fire in an order fully determined by the script. Without `.virtual_time()` the simulator sleeps for real on the monotonic clock, which is still deterministic but slow.
 
 ## What it is good for
 
