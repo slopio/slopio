@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 
 use io_uring::{opcode, types::Fd};
 
-use super::send_vectored::IOV_MAX;
+use super::send_vectored::{VectoredMsg, send_all_with};
 use super::send_vectored_zc::ZC_DEFAULT_MSG_FLAGS;
 use crate::io_driver::{
     IO_DRIVER, PooledBuf, SLAB_BUF_INDEX,
@@ -24,13 +24,6 @@ const _: () = assert!(
     SLAB_BUF_INDEX.get() == 0,
     "SendMsgZc cannot set buf_index; the slab must be registered as region 0"
 );
-
-/// Boxed: `msghdr.msg_iov` points at the Vec's heap and the msghdr itself must not move.
-struct VectoredZcState {
-    msghdr: libc::msghdr,
-    #[allow(dead_code)]
-    iovecs: Vec<libc::iovec>,
-}
 
 /// Zero-copy gather send from pre-registered buffers: one submission for every
 /// chunk, no per-request page pinning. All chunks must come from the same
@@ -62,37 +55,13 @@ fn submit_from(
     offset: usize,
     msg_flags: u32,
 ) -> WriteVectoredFixedSocketZc {
-    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(
-        bufs.len().saturating_sub(first).min(IOV_MAX),
-    );
-    for (i, b) in bufs.iter().enumerate().skip(first) {
-        if iovecs.len() == IOV_MAX {
-            break;
-        }
-        let skip = if i == first { offset } else { 0 };
-        let len = b.len() - skip;
-        // A zero-length segment fails the whole request with EFAULT.
-        if len == 0 {
-            continue;
-        }
-        iovecs.push(libc::iovec {
-            iov_base: unsafe { (b.ptr() as *mut u8).add(skip) } as *mut _,
-            iov_len: len,
-        });
-    }
-
-    let mut state = Box::new(VectoredZcState {
-        msghdr: unsafe { std::mem::zeroed() },
-        iovecs,
-    });
-    state.msghdr.msg_iov = state.iovecs.as_mut_ptr();
-    state.msghdr.msg_iovlen = state.iovecs.len() as _;
+    let msg = VectoredMsg::new(&bufs, first, offset);
 
     WriteVectoredFixedSocketZc {
         socket: socket.share(),
         id: None,
         bufs: Some(bufs),
-        state: Some(state),
+        msg: Some(msg),
         msg_flags,
     }
 }
@@ -101,15 +70,15 @@ pub struct WriteVectoredFixedSocketZc {
     socket: OpSocket,
     id: Option<OneshotToken>,
     bufs: Option<Vec<PooledBuf>>,
-    state: Option<Box<VectoredZcState>>,
+    msg: Option<Box<VectoredMsg>>,
     msg_flags: u32,
 }
 
 impl WriteVectoredFixedSocketZc {
     fn register_to_driver(&mut self) {
-        let state = self.state.as_ref().expect("state taken before submit");
+        let msg = self.msg.as_ref().expect("msg taken before submit");
         // buf_index stays 0 (zeroed SQE) — the slab's region, see the const assert.
-        let entry = opcode::SendMsgZc::new(Fd(self.socket.fd()), &state.msghdr)
+        let entry = opcode::SendMsgZc::new(Fd(self.socket.fd()), &msg.msghdr)
             .ioprio(IORING_RECVSEND_FIXED_BUF)
             .flags(self.msg_flags)
             .build();
@@ -146,8 +115,8 @@ impl Drop for WriteVectoredFixedSocketZc {
     fn drop(&mut self) {
         if let Some(token) = self.id {
             // Kernel reads the iovec array and the slots; hold both to the final CQE.
-            let state = self.state.take().expect("state taken");
-            let keep: Box<dyn Any> = Box::new((self.bufs.take(), state));
+            let msg = self.msg.take().expect("msg taken");
+            let keep: Box<dyn Any> = Box::new((self.bufs.take(), msg));
             let parked = Some(self.socket.park());
             IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep), parked));
         }
@@ -158,46 +127,10 @@ impl Drop for WriteVectoredFixedSocketZc {
 /// writes and over the `IOV_MAX` chunk limit. Returns the slots to the caller.
 pub async fn send_vectored_fixed_all_zc(
     socket: &SocketWrapper,
-    mut bufs: Vec<PooledBuf>,
+    bufs: Vec<PooledBuf>,
 ) -> (io::Result<()>, Vec<PooledBuf>) {
-    let total: usize = bufs.iter().map(|b| b.len()).sum();
-    if total == 0 {
-        return (Ok(()), bufs);
-    }
-
-    let mut sent = 0usize;
-    let mut first = 0usize;
-    let mut offset = 0usize;
-
-    while sent < total {
-        let (result, back) = submit_from(socket, bufs, first, offset, ZC_DEFAULT_MSG_FLAGS).await;
-        bufs = back;
-        match result {
-            Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), bufs),
-            Ok(n) => {
-                sent += n;
-                if sent >= total {
-                    break;
-                }
-                let mut rem = n;
-                while rem > 0 {
-                    let avail = bufs[first].len() - offset;
-                    if rem >= avail {
-                        rem -= avail;
-                        first += 1;
-                        offset = 0;
-                    } else {
-                        offset += rem;
-                        rem = 0;
-                    }
-                }
-                while first < bufs.len() && bufs[first].len() == offset {
-                    first += 1;
-                    offset = 0;
-                }
-            }
-            Err(e) => return (Err(e), bufs),
-        }
-    }
-    (Ok(()), bufs)
+    send_all_with(socket, bufs, |s, b, first, offset| {
+        submit_from(s, b, first, offset, ZC_DEFAULT_MSG_FLAGS)
+    })
+    .await
 }

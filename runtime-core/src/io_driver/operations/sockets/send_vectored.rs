@@ -9,32 +9,99 @@ use std::task::{Context, Poll};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, Slice, sockets::{OpSocket, SocketWrapper}},
+    operations::{IoBuf, OneshotToken, sockets::{OpSocket, SocketWrapper}},
 };
 
 /// Kernel cap on iovecs per submission.
 pub(super) const IOV_MAX: usize = libc::UIO_MAXIOV as usize;
 
-/// Cancellation-safe vectored send: takes ownership of every chunk, returns
-/// the chunk list on completion. If the future is dropped mid-flight, both
-/// the chunks AND the kernel-visible iovec array are moved into the driver's
-/// keepalive slot so the kernel can finish reading them after the cancel CQE.
+/// Default `msg_flags` for the gather sends. Without `MSG_WAITALL` a short
+/// send comes back to the `_all` loop for a fresh submission instead of being
+/// retried inside the kernel.
+pub const DEFAULT_MSG_FLAGS: u32 = libc::MSG_WAITALL as u32;
+
+/// A `msghdr` and the iovec array it points at. Boxed and never moved after
+/// construction: the kernel reads both until the op's terminal CQE, so on
+/// cancellation the whole box goes to keepalive as one piece.
+pub(super) struct VectoredMsg {
+    pub(super) msghdr: libc::msghdr,
+    /// Read by the kernel through `msghdr.msg_iov`, never by us.
+    #[allow(dead_code)]
+    iovecs: Vec<libc::iovec>,
+}
+
+impl VectoredMsg {
+    /// Covers `bufs[first..]`, skipping `offset` bytes of `bufs[first]`.
+    pub(super) fn new<B: IoBuf>(bufs: &[B], first: usize, offset: usize) -> Box<Self> {
+        let mut msg = Box::new(VectoredMsg {
+            msghdr: unsafe { std::mem::zeroed() },
+            iovecs: build_iovecs(bufs, first, offset),
+        });
+        msg.msghdr.msg_iov = msg.iovecs.as_mut_ptr();
+        msg.msghdr.msg_iovlen = msg.iovecs.len() as _;
+        msg
+    }
+}
+
+/// The iovec array for `bufs[first..]`, skipping `offset` bytes of
+/// `bufs[first]` and stopping at `IOV_MAX` entries. Empty chunks are dropped:
+/// a zero-length segment fails a whole `SENDMSG` with `EFAULT`.
+fn build_iovecs<B: IoBuf>(bufs: &[B], first: usize, offset: usize) -> Vec<libc::iovec> {
+    let mut iovecs = Vec::with_capacity(bufs.len().saturating_sub(first).min(IOV_MAX));
+    for (i, b) in bufs.iter().enumerate().skip(first) {
+        if iovecs.len() == IOV_MAX {
+            break;
+        }
+        let skip = if i == first { offset } else { 0 };
+        let len = b.bytes_init() - skip;
+        if len == 0 {
+            continue;
+        }
+        iovecs.push(libc::iovec {
+            iov_base: unsafe { (b.stable_ptr() as *mut u8).add(skip) } as *mut _,
+            iov_len: len,
+        });
+    }
+    iovecs
+}
+
+/// Cancellation-safe vectored send (`IORING_OP_SENDMSG`): takes ownership of
+/// every chunk, returns the chunk list on completion. A short send is retried
+/// inside the kernel — see [`DEFAULT_MSG_FLAGS`]. If the future is dropped
+/// mid-flight, both the chunks AND the kernel-visible `msghdr` are moved into
+/// the driver's keepalive slot so the kernel can finish reading them after the
+/// cancel CQE.
 pub fn socket_send_vectored<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> WriteVectoredSocket<B> {
-    let iovecs = bufs
-        .iter()
-        .map(|b| libc::iovec {
-            iov_base: b.stable_ptr() as *mut _,
-            iov_len: b.bytes_init(),
-        })
-        .collect();
+    submit_from(socket, bufs, 0, 0, DEFAULT_MSG_FLAGS)
+}
+
+/// As above with explicit `msg_flags`. `0` restores short-write behaviour.
+pub fn socket_send_vectored_with_flags<B: IoBuf>(
+    socket: &SocketWrapper,
+    bufs: Vec<B>,
+    msg_flags: u32,
+) -> WriteVectoredSocket<B> {
+    submit_from(socket, bufs, 0, 0, msg_flags)
+}
+
+/// Covers `bufs[first..]`, skipping `offset` bytes of `bufs[first]`.
+pub(super) fn submit_from<B: IoBuf>(
+    socket: &SocketWrapper,
+    bufs: Vec<B>,
+    first: usize,
+    offset: usize,
+    msg_flags: u32,
+) -> WriteVectoredSocket<B> {
+    let msg = VectoredMsg::new(&bufs, first, offset);
     WriteVectoredSocket {
         socket: socket.share(),
         id: None,
         bufs: Some(bufs),
-        iovecs,
+        msg: Some(msg),
+        msg_flags,
     }
 }
 
@@ -42,20 +109,16 @@ pub struct WriteVectoredSocket<B: IoBuf> {
     socket: OpSocket,
     id: Option<OneshotToken>,
     bufs: Option<Vec<B>>,
-    /// Built once at construction. The Vec's heap allocation is what the
-    /// kernel reads as the iovec array — its pointer stays stable across
-    /// moves of `self`, but it must outlive any in-flight kernel read.
-    iovecs: Vec<libc::iovec>,
+    msg: Option<Box<VectoredMsg>>,
+    msg_flags: u32,
 }
 
 impl<B: IoBuf> WriteVectoredSocket<B> {
     fn register_to_driver(&mut self) {
-        let entry = opcode::Writev::new(
-            Fd(self.socket.fd()),
-            self.iovecs.as_ptr(),
-            self.iovecs.len() as u32,
-        )
-        .build();
+        let msg = self.msg.as_ref().expect("msg taken before submit");
+        let entry = opcode::SendMsg::new(Fd(self.socket.fd()), &msg.msghdr)
+            .flags(self.msg_flags)
+            .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
@@ -88,21 +151,19 @@ impl<B: IoBuf> Future for WriteVectoredSocket<B> {
 impl<B: IoBuf> Drop for WriteVectoredSocket<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            // Two layers of memory the kernel reads:
-            //   - the iovec array (`self.iovecs`)
-            //   - each iovec's `iov_base`, which points into a B
-            // Both must outlive any in-flight read. Move both into keepalive.
-            //
-            // When B's data lives forever (`NEEDS_KEEPALIVE = false`, e.g.
-            // `&'static [u8]`), only the iovec array itself needs keeping
-            // alive — the const-evaluated branch saves moving the Vec<B>.
-            let keep: Option<Box<dyn Any>> = if B::NEEDS_KEEPALIVE {
-                self.bufs.take().map(|bufs| {
-                    Box::new((bufs, std::mem::take(&mut self.iovecs))) as Box<dyn Any>
-                })
+            // Three layers of memory the kernel reads: the `msghdr`, the iovec
+            // array it names, and each iovec's `iov_base` pointing into a B.
+            // The first two travel together in the box; the chunks only need
+            // keeping when B's data does not live forever (`NEEDS_KEEPALIVE`,
+            // e.g. `&'static [u8]` lives in .rodata) — the const-evaluated
+            // branch saves moving the Vec<B>.
+            let msg = self.msg.take().expect("msg taken");
+            let keep: Box<dyn Any> = if B::NEEDS_KEEPALIVE {
+                Box::new((self.bufs.take(), msg))
             } else {
-                Some(Box::new(std::mem::take(&mut self.iovecs)))
+                Box::new(msg)
             };
+            let keep = Some(keep);
             let parked = Some(self.socket.park());
             IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
@@ -115,75 +176,75 @@ pub async fn send_vectored_all<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> (std::io::Result<()>, Vec<B>) {
-    send_all_with(socket, bufs, socket_send_vectored).await
+    send_all_with(socket, bufs, |s, b, first, offset| {
+        submit_from(s, b, first, offset, DEFAULT_MSG_FLAGS)
+    })
+    .await
 }
 
-/// The `_all` loop shared by the copying and zero-copy gather sends. Each
-/// iteration submits at most `IOV_MAX` chunks from the first unsent one on.
+/// The `_all` loop shared by the gather sends. Each iteration submits at most
+/// `IOV_MAX` chunks from the first unsent byte on. The caller's `Vec` is
+/// handed straight to each submission and back: the unsent frontier is two
+/// integers, never a re-split chunk list.
 pub(super) async fn send_all_with<B, S, Fut>(
     socket: &SocketWrapper,
-    bufs: Vec<B>,
+    mut bufs: Vec<B>,
     submit: S,
 ) -> (std::io::Result<()>, Vec<B>)
 where
     B: IoBuf,
-    S: Fn(&SocketWrapper, Vec<Slice<B>>) -> Fut,
-    Fut: Future<Output = (std::io::Result<usize>, Vec<Slice<B>>)>,
+    S: Fn(&SocketWrapper, Vec<B>, usize, usize) -> Fut,
+    Fut: Future<Output = (std::io::Result<usize>, Vec<B>)>,
 {
     let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
     if total == 0 {
         return (Ok(()), bufs);
     }
 
-    let mut chunks: Vec<Slice<B>> = bufs.into_iter().map(|b| b.slice(..)).collect();
     let mut sent = 0usize;
     let mut first = 0usize;
+    let mut offset = 0usize;
 
     while sent < total {
-        let mut window = chunks.split_off(first);
-        let tail = window.split_off(window.len().min(IOV_MAX));
-        let (result, window) = submit(socket, window).await;
-        chunks.extend(window);
-        chunks.extend(tail);
+        let (result, back) = submit(socket, bufs, first, offset).await;
+        bufs = back;
         match result {
-            Ok(0) => {
-                return (
-                    Err(std::io::ErrorKind::WriteZero.into()),
-                    unwrap_chunks(chunks),
-                );
-            }
+            Ok(0) => return (Err(std::io::ErrorKind::WriteZero.into()), bufs),
             Ok(n) => {
                 sent += n;
                 if sent >= total {
                     break;
                 }
-                first = advance_chunks(&mut chunks, first, n);
+                (first, offset) = advance(&bufs, first, offset, n);
             }
-            Err(e) => return (Err(e), unwrap_chunks(chunks)),
+            Err(e) => return (Err(e), bufs),
         }
     }
-    (Ok(()), unwrap_chunks(chunks))
+    (Ok(()), bufs)
 }
 
-fn unwrap_chunks<B: IoBuf>(chunks: Vec<Slice<B>>) -> Vec<B> {
-    chunks.into_iter().map(|s| s.into_inner()).collect()
-}
-
-/// Consume `n` bytes from `chunks[first..]` in place; returns the new first
-/// chunk with bytes left to send.
-fn advance_chunks<B: IoBuf>(chunks: &mut [Slice<B>], mut first: usize, mut n: usize) -> usize {
+/// Consume `n` bytes from `bufs[first..]` starting at `offset`; returns the
+/// first chunk with bytes left to send and how far into it the next send starts.
+pub(super) fn advance<B: IoBuf>(
+    bufs: &[B],
+    mut first: usize,
+    mut offset: usize,
+    mut n: usize,
+) -> (usize, usize) {
     while n > 0 {
-        let len = chunks[first].len();
-        if n >= len {
-            n -= len;
+        let avail = bufs[first].bytes_init() - offset;
+        if n >= avail {
+            n -= avail;
             first += 1;
+            offset = 0;
         } else {
-            chunks[first].advance(n);
+            offset += n;
             n = 0;
         }
     }
-    while first < chunks.len() && chunks[first].is_empty() {
+    while first < bufs.len() && bufs[first].bytes_init() == offset {
         first += 1;
+        offset = 0;
     }
-    first
+    (first, offset)
 }

@@ -4,22 +4,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use super::send_vectored::send_all_with;
+use super::send_vectored::{VectoredMsg, send_all_with};
+pub use super::send_vectored::DEFAULT_MSG_FLAGS as ZC_DEFAULT_MSG_FLAGS;
 use crate::io_driver::{
     IO_DRIVER,
     operations::{IoBuf, OneshotToken, sockets::{OpSocket, SocketWrapper}},
 };
-
-/// Boxed: `msghdr.msg_iov` points at the Vec's heap and the msghdr itself must not move.
-struct VectoredZcState {
-    msghdr: libc::msghdr,
-    #[allow(dead_code)]
-    iovecs: Vec<libc::iovec>,
-}
-
-/// Default `msg_flags` for the zero-copy sends. Without `MSG_WAITALL` a short
-/// send makes the `_all` loop wait for one notification per round trip.
-pub const ZC_DEFAULT_MSG_FLAGS: u32 = libc::MSG_WAITALL as u32;
 
 /// Zero-copy gather send (`IORING_OP_SENDMSG_ZC`): every chunk goes out in
 /// one submission straight from user memory; resolves on the kernel's
@@ -37,24 +27,23 @@ pub fn socket_send_vectored_zc_with_flags<B: IoBuf>(
     bufs: Vec<B>,
     msg_flags: u32,
 ) -> WriteVectoredSocketZc<B> {
-    let iovecs: Vec<libc::iovec> = bufs
-        .iter()
-        .map(|b| libc::iovec {
-            iov_base: b.stable_ptr() as *mut _,
-            iov_len: b.bytes_init(),
-        })
-        .collect();
-    let mut state = Box::new(VectoredZcState {
-        msghdr: unsafe { std::mem::zeroed() },
-        iovecs,
-    });
-    state.msghdr.msg_iov = state.iovecs.as_mut_ptr();
-    state.msghdr.msg_iovlen = state.iovecs.len() as _;
+    submit_from(socket, bufs, 0, 0, msg_flags)
+}
+
+/// Covers `bufs[first..]`, skipping `offset` bytes of `bufs[first]`.
+fn submit_from<B: IoBuf>(
+    socket: &SocketWrapper,
+    bufs: Vec<B>,
+    first: usize,
+    offset: usize,
+    msg_flags: u32,
+) -> WriteVectoredSocketZc<B> {
+    let msg = VectoredMsg::new(&bufs, first, offset);
     WriteVectoredSocketZc {
         socket: socket.share(),
         id: None,
         bufs: Some(bufs),
-        state: Some(state),
+        msg: Some(msg),
         msg_flags,
     }
 }
@@ -63,14 +52,14 @@ pub struct WriteVectoredSocketZc<B: IoBuf> {
     socket: OpSocket,
     id: Option<OneshotToken>,
     bufs: Option<Vec<B>>,
-    state: Option<Box<VectoredZcState>>,
+    msg: Option<Box<VectoredMsg>>,
     msg_flags: u32,
 }
 
 impl<B: IoBuf> WriteVectoredSocketZc<B> {
     fn register_to_driver(&mut self) {
-        let state = self.state.as_ref().expect("state taken before submit");
-        let entry = opcode::SendMsgZc::new(Fd(self.socket.fd()), &state.msghdr)
+        let msg = self.msg.as_ref().expect("msg taken before submit");
+        let entry = opcode::SendMsgZc::new(Fd(self.socket.fd()), &msg.msghdr)
             .flags(self.msg_flags)
             .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
@@ -106,11 +95,11 @@ impl<B: IoBuf> Drop for WriteVectoredSocketZc<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
             // msghdr + iovecs are always kernel-read; chunks only when not `'static`.
-            let state = self.state.take().expect("state taken");
+            let msg = self.msg.take().expect("msg taken");
             let keep: Box<dyn Any> = if B::NEEDS_KEEPALIVE {
-                Box::new((self.bufs.take(), state))
+                Box::new((self.bufs.take(), msg))
             } else {
-                Box::new(state)
+                Box::new(msg)
             };
             let parked = Some(self.socket.park());
             IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep), parked));
@@ -124,5 +113,8 @@ pub async fn send_vectored_all_zc<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> (std::io::Result<()>, Vec<B>) {
-    send_all_with(socket, bufs, socket_send_vectored_zc).await
+    send_all_with(socket, bufs, |s, b, first, offset| {
+        submit_from(s, b, first, offset, ZC_DEFAULT_MSG_FLAGS)
+    })
+    .await
 }
