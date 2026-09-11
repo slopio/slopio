@@ -8,7 +8,7 @@ use std::{
 mod slab;
 mod timers;
 
-pub use timers::Timers;
+pub use timers::{Timers, Token};
 
 // Hierarchical wheel: ms → s → min → h. Every level's period is a whole
 // number of the level below, so a slot cascades exactly when its window opens.
@@ -144,6 +144,12 @@ impl TimeWheel {
     /// not yet polled, or cancelled but not yet swept by their bucket.
     pub fn active_timers(&self) -> usize {
         self.storage.len()
+    }
+
+    /// Whole ticks processed since creation. The reference clock for anything
+    /// else the driver advances alongside the wheel.
+    pub fn ticks(&self) -> u64 {
+        self.ticks
     }
 
     #[inline]
