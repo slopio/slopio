@@ -54,29 +54,55 @@ impl ClockSource {
     }
 }
 
+// A duration the runtime keeps a dedicated store for. One number, not two: the
+// constant that routes and the type parameter that sizes the store must agree,
+// or a sleep lands in a store dimensioned for something else.
+const FIXED_5S_MS: u64 = 5_000;
+const FIXED_5S: Duration = Duration::from_millis(FIXED_5S_MS);
+
 pub struct TimeDriver {
-    inner: UnsafeCell<async_timers::TimeWheel>,
+    /// Any duration up to `MAX_DURATION`, at 10ms resolution.
+    wheel: UnsafeCell<async_timers::TimeWheel>,
+    /// [`FIXED_5S`] only. One duration per store is what keeps its queues
+    /// FIFO — arming later can only end later, so nothing is ever sorted.
+    fixed_5s: UnsafeCell<async_timers::Timers<FIXED_5S_MS>>,
     clock: ClockSource,
 }
 
 impl Default for TimeDriver {
     fn default() -> Self {
         Self {
-            inner: UnsafeCell::default(),
+            wheel: UnsafeCell::default(),
+            fixed_5s: UnsafeCell::default(),
             clock: ClockSource::System,
         }
     }
 }
 
+/// Which store a [`Sleep`] is parked in, and under what name there. The wheel
+/// hands out slab ids and the fixed stores hand out tokens; the two are not
+/// interchangeable, so the store is part of what a `Sleep` remembers.
+#[derive(Clone, Copy)]
+enum Armed {
+    Wheel(usize),
+    Fixed5s(async_timers::Token<FIXED_5S_MS>),
+}
+
 pub struct Sleep {
-    id: Option<usize>,
     duration: Duration,
+    armed: Option<Armed>,
 }
 
 impl Sleep {
-    ///can be 10ms late
+    /// Sleeps for `duration`, up to 10ms late.
+    ///
+    /// Two shapes are served: anything up to one second, and 5s exactly.
+    /// Anything else panics on the first poll — no store can hold it.
     pub fn during(duration: Duration) -> Self {
-        Self { duration, id: None }
+        Self {
+            duration,
+            armed: None,
+        }
     }
 }
 
@@ -87,14 +113,14 @@ impl Future for Sleep {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        if let Some(id) = self.id {
-            let result = TIME_DRIVER.with(|d| d.poll(id, cx.waker()));
+        if let Some(armed) = self.armed {
+            let result = TIME_DRIVER.with(|d| d.poll(armed, cx.waker()));
             if result.is_ready() {
-                self.id = None;
+                self.armed = None;
             }
             result
         } else {
-            self.id = TIME_DRIVER.with(|d| d.register(self.duration, cx.waker()));
+            self.armed = Some(TIME_DRIVER.with(|d| d.arm(self.duration, cx.waker())));
             std::task::Poll::Pending
         }
     }
@@ -102,51 +128,90 @@ impl Future for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            TIME_DRIVER.with(|d| d.drop(id));
+        if let Some(armed) = self.armed {
+            TIME_DRIVER.with(|d| d.cancel(armed));
         }
     }
 }
 
 impl TimeDriver {
     pub fn now(&self) -> SystemTime {
-        let this = unsafe { &mut *self.inner.get() };
-        this.now()
+        let wheel = unsafe { &*self.wheel.get() };
+        wheel.now()
     }
 
-    /// Drive the wheel with whichever clock this runtime was built on.
+    /// Drive every store with whichever clock this runtime was built on.
+    ///
+    /// The wheel owns the tick counter and the fixed stores are driven off it,
+    /// so everything armed and everything fired reads the same clock — which is
+    /// what the deadline rings assume.
     pub fn tick(&self) {
-        let this = unsafe { &mut *self.inner.get() };
-        this.tick_at(self.clock.now(), self.clock.now_wall());
+        let wheel = unsafe { &mut *self.wheel.get() };
+        wheel.tick_at(self.clock.now(), self.clock.now_wall());
+        let now = wheel.ticks();
+
+        let fixed_5s = unsafe { &mut *self.fixed_5s.get() };
+        fixed_5s.tick(now);
     }
 
     /// A driver on a clock a simulation advances rather than the OS.
     #[cfg(feature = "simulation")]
     pub fn simulated(clock: Rc<VirtualClock>) -> Self {
         Self {
-            inner: UnsafeCell::default(),
+            wheel: UnsafeCell::default(),
+            fixed_5s: UnsafeCell::default(),
             clock: ClockSource::Virtual(clock),
         }
     }
-    fn register(&self, duration: Duration, waker: &Waker) -> Option<usize> {
-        let this = unsafe { &mut *self.inner.get() };
-        this.init_timer(duration, waker).ok()
-    }
-    fn drop(&self, id: usize) {
-        let this = unsafe { &mut *self.inner.get() };
-        this.drop(id);
+
+    /// Pick the store that can hold `duration` and arm it there.
+    ///
+    /// Fixed durations are matched before the wheel's range, not after: a fixed
+    /// value that happens to fit the wheel must still go to its own store.
+    fn arm(&self, duration: Duration, waker: &Waker) -> Armed {
+        match duration {
+            FIXED_5S => {
+                // Armed off the wheel's tick counter, which is also what
+                // `tick` drives this store with.
+                let now = unsafe { &*self.wheel.get() }.ticks();
+                let fixed_5s = unsafe { &mut *self.fixed_5s.get() };
+                Armed::Fixed5s(fixed_5s.push(waker.clone(), now))
+            }
+            d if d <= async_timers::MAX_DURATION => {
+                let wheel = unsafe { &mut *self.wheel.get() };
+                let id = wheel.init_timer(d, waker).expect("within MAX_DURATION");
+                Armed::Wheel(id)
+            }
+            d => unimplemented!(
+                "no timer store holds {d:?}: a sleep is up to {:?}, or {FIXED_5S:?} exactly",
+                async_timers::MAX_DURATION,
+            ),
+        }
     }
 
-    fn poll(&self, id: usize, waker: &Waker) -> std::task::Poll<()> {
-        let this = unsafe { &mut *self.inner.get() };
-        this.poll(id, waker)
+    fn cancel(&self, armed: Armed) {
+        match armed {
+            Armed::Wheel(id) => unsafe { &mut *self.wheel.get() }.drop(id),
+            Armed::Fixed5s(token) => unsafe { &mut *self.fixed_5s.get() }.cancel(token),
+        }
     }
 
+    fn poll(&self, armed: Armed, waker: &Waker) -> std::task::Poll<()> {
+        match armed {
+            Armed::Wheel(id) => unsafe { &mut *self.wheel.get() }.poll(id, waker),
+            Armed::Fixed5s(token) => unsafe { &mut *self.fixed_5s.get() }.poll(token, waker),
+        }
+    }
+
+    /// The soonest any store has something to do, or None if nothing is armed.
+    /// This is what the event loop blocks on when it runs out of work.
     pub fn next_deadline(&self) -> Option<Duration> {
-        let this = unsafe { &mut *self.inner.get() };
-        match this.next_deadline() {
-            Some(Duration::ZERO) => Some(Duration::ZERO),
-            other => other,
+        let wheel = unsafe { &*self.wheel.get() };
+        let fixed_5s = unsafe { &*self.fixed_5s.get() };
+
+        match (wheel.next_deadline(), fixed_5s.next_deadline(wheel.ticks())) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 }

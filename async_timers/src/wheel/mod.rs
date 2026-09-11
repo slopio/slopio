@@ -7,20 +7,16 @@ use std::{
 
 mod slab;
 
-// Hierarchical wheel: ms → s → min → h. Every level's period is a whole
-// number of the level below, so a slot cascades exactly when its window opens.
+// One ring of 10ms slots covering a second, the longest timer the wheel takes.
+// Nothing cascades: a deadline always lands in the only level there is.
 const MS_TICK: u64 = 10;
-const MS_BUCKETS: usize = 100;
-const S_BUCKETS: usize = 60;
-const M_BUCKETS: usize = 60;
-// 25, not 24: a deadline up to 24h out can land 24 hour-slots ahead of `ticks`.
-const H_BUCKETS: usize = 25;
-const MAX_DURATION_HOURS: u64 = 24;
+const MAX_TICKS: u64 = 100;
+/// The longest timer [`TimeWheel::init_timer`] accepts, inclusive.
+pub const MAX_DURATION: Duration = Duration::from_millis(MAX_TICKS * MS_TICK);
+// One slot per tick of the window, plus one: a deadline a full second out must
+// not alias the slot the clock is standing on, which has already fired.
+const BUCKETS: usize = MAX_TICKS as usize + 1;
 const SMALLVEC_SIZE: usize = 8;
-
-const TICKS_PER_S: u64 = MS_BUCKETS as u64;
-const TICKS_PER_M: u64 = TICKS_PER_S * S_BUCKETS as u64;
-const TICKS_PER_H: u64 = TICKS_PER_M * M_BUCKETS as u64;
 
 type TimerId = usize;
 type Bucket = SmallVec<[TimerId; SMALLVEC_SIZE]>;
@@ -30,69 +26,40 @@ pub struct DurationTooLong;
 
 pub struct TimeWheel {
     storage: TimerStorage,
-    buckets: BucketLevels,
+    buckets: [Bucket; BUCKETS],
+    occupied: Bitset,
     last_tick: Instant,
     last_tick_wall: SystemTime,
-    // Whole ticks processed since creation; every level index derives from it.
+    // Whole ticks processed since creation; the slot index derives from it.
     ticks: u64,
 }
 
-struct Bitset<T>(T);
+struct Bitset(u128);
 
-macro_rules! impl_bitset {
-    ($($t:ty),*) => {$(
-        impl Bitset<$t> {
-            #[inline]
-            fn set(&mut self, idx: usize) {
-                self.0 |= 1 << idx;
-            }
+impl Bitset {
+    // Only the low BUCKETS bits are live; the rest stay zero.
+    const MASK: u128 = (1 << BUCKETS) - 1;
 
-            #[inline]
-            fn clear(&mut self, idx: usize) {
-                self.0 &= !(1 << idx);
-            }
+    #[inline]
+    fn set(&mut self, idx: usize) {
+        self.0 |= 1 << idx;
+    }
 
-            #[inline]
-            fn is_set(&self, idx: usize) -> bool {
-                (self.0 & (1 << idx)) != 0
-            }
+    #[inline]
+    fn clear(&mut self, idx: usize) {
+        self.0 &= !(1 << idx);
+    }
 
-            // Distance from `from` to the next set bit on a ring of `len` bits.
-            #[inline]
-            fn next_set(&self, from: usize, len: usize) -> Option<usize> {
-                let mask: $t = (1 << len) - 1;
-                let rotated = ((self.0 >> from) | (self.0 << (len - from))) & mask;
-                (rotated != 0).then(|| rotated.trailing_zeros() as usize)
-            }
-        }
-    )*};
-}
+    #[inline]
+    fn is_set(&self, idx: usize) -> bool {
+        (self.0 & (1 << idx)) != 0
+    }
 
-impl_bitset!(u32, u64, u128);
-
-struct BucketLevels {
-    ms_level: [Bucket; MS_BUCKETS],
-    s_level: [Bucket; S_BUCKETS],
-    m_level: [Bucket; M_BUCKETS],
-    h_level: [Bucket; H_BUCKETS],
-    ms_occupied: Bitset<u128>,
-    s_occupied: Bitset<u64>,
-    m_occupied: Bitset<u64>,
-    h_occupied: Bitset<u32>,
-}
-
-impl BucketLevels {
-    fn new() -> Self {
-        Self {
-            ms_level: std::array::from_fn(|_| SmallVec::new()),
-            s_level: std::array::from_fn(|_| SmallVec::new()),
-            m_level: std::array::from_fn(|_| SmallVec::new()),
-            h_level: std::array::from_fn(|_| SmallVec::new()),
-            ms_occupied: Bitset(0),
-            s_occupied: Bitset(0),
-            m_occupied: Bitset(0),
-            h_occupied: Bitset(0),
-        }
+    // Distance from `from` to the next set bit, wrapping around the ring.
+    #[inline]
+    fn next_set(&self, from: usize) -> Option<usize> {
+        let rotated = ((self.0 >> from) | (self.0 << (BUCKETS - from))) & Self::MASK;
+        (rotated != 0).then(|| rotated.trailing_zeros() as usize)
     }
 }
 
@@ -101,7 +68,8 @@ impl TimeWheel {
     pub fn new() -> Self {
         Self {
             storage: TimerStorage::default(),
-            buckets: BucketLevels::new(),
+            buckets: std::array::from_fn(|_| SmallVec::new()),
+            occupied: Bitset(0),
             last_tick: Instant::now(),
             last_tick_wall: SystemTime::now(),
             ticks: 0,
@@ -150,115 +118,50 @@ impl TimeWheel {
     }
 
     #[inline]
-    fn ms_idx(&self) -> usize {
-        (self.ticks % TICKS_PER_S) as usize
-    }
-
-    #[inline]
-    fn s_idx(&self) -> usize {
-        ((self.ticks / TICKS_PER_S) % S_BUCKETS as u64) as usize
-    }
-
-    #[inline]
-    fn m_idx(&self) -> usize {
-        ((self.ticks / TICKS_PER_M) % M_BUCKETS as u64) as usize
-    }
-
-    #[inline]
-    fn h_idx(&self) -> usize {
-        ((self.ticks / TICKS_PER_H) % H_BUCKETS as u64) as usize
+    fn idx(&self) -> usize {
+        (self.ticks % BUCKETS as u64) as usize
     }
 
     fn process_single_tick(&mut self) {
-        let idx = self.ms_idx();
-        if self.buckets.ms_occupied.is_set(idx) {
-            self.buckets.ms_occupied.clear(idx);
-            for timer_id in self.buckets.ms_level[idx].drain(..) {
+        let idx = self.idx();
+        if self.occupied.is_set(idx) {
+            self.occupied.clear(idx);
+            for timer_id in self.buckets[idx].drain(..) {
                 self.storage.wake(timer_id);
             }
         }
-
         self.ticks += 1;
-
-        // Coarse levels first: a cascaded timer may land in a finer slot that
-        // is itself opening on this same tick.
-        if self.ticks.is_multiple_of(TICKS_PER_S) {
-            if self.ticks.is_multiple_of(TICKS_PER_M) {
-                if self.ticks.is_multiple_of(TICKS_PER_H) {
-                    let idx = self.h_idx();
-                    if self.buckets.h_occupied.is_set(idx) {
-                        self.buckets.h_occupied.clear(idx);
-                        let bucket = std::mem::take(&mut self.buckets.h_level[idx]);
-                        self.cascade(bucket);
-                    }
-                }
-                let idx = self.m_idx();
-                if self.buckets.m_occupied.is_set(idx) {
-                    self.buckets.m_occupied.clear(idx);
-                    let bucket = std::mem::take(&mut self.buckets.m_level[idx]);
-                    self.cascade(bucket);
-                }
-            }
-            let idx = self.s_idx();
-            if self.buckets.s_occupied.is_set(idx) {
-                self.buckets.s_occupied.clear(idx);
-                let bucket = std::mem::take(&mut self.buckets.s_level[idx]);
-                self.cascade(bucket);
-            }
-        }
     }
 
-    // Re-place each timer by its remaining time; cancelled ids are freed here.
-    fn cascade(&mut self, bucket: Bucket) {
-        for timer_id in bucket {
-            if let Some(deadline) = self.storage.deadline(timer_id) {
-                self.place(timer_id, deadline);
-            }
-        }
-    }
-
-    // Finest level whose window still contains `deadline`; the current slot of
-    // a coarser level has already cascaded, so it is never targeted.
+    // A deadline is at most MAX_TICKS out, so its slot is always free: the ring
+    // is one longer than the window it holds.
     fn place(&mut self, timer_id: TimerId, deadline: u64) {
-        let now = self.ticks;
-        let deadline = deadline.max(now);
-        let b = &mut self.buckets;
-
-        if deadline - now < TICKS_PER_S {
-            let idx = (deadline % TICKS_PER_S) as usize;
-            b.ms_occupied.set(idx);
-            b.ms_level[idx].push(timer_id);
-        } else if deadline / TICKS_PER_S - now / TICKS_PER_S < S_BUCKETS as u64 {
-            let idx = ((deadline / TICKS_PER_S) % S_BUCKETS as u64) as usize;
-            b.s_occupied.set(idx);
-            b.s_level[idx].push(timer_id);
-        } else if deadline / TICKS_PER_M - now / TICKS_PER_M < M_BUCKETS as u64 {
-            let idx = ((deadline / TICKS_PER_M) % M_BUCKETS as u64) as usize;
-            b.m_occupied.set(idx);
-            b.m_level[idx].push(timer_id);
-        } else {
-            let idx = ((deadline / TICKS_PER_H) % H_BUCKETS as u64) as usize;
-            b.h_occupied.set(idx);
-            b.h_level[idx].push(timer_id);
-        }
+        let idx = (deadline % BUCKETS as u64) as usize;
+        self.occupied.set(idx);
+        self.buckets[idx].push(timer_id);
     }
 
     pub fn poll(&mut self, id: usize, waker: &Waker) -> std::task::Poll<()> {
         self.storage.poll(id, waker)
     }
 
+    /// Arm a timer, rounded down to the enclosing 10ms tick.
+    ///
+    /// Anything past [`MAX_DURATION`] is rejected rather than truncated: the
+    /// ring holds exactly one second and has nowhere to put it.
     pub fn init_timer(
         &mut self,
         duration: Duration,
         waker: &Waker,
     ) -> Result<usize, DurationTooLong> {
-        let total_ms = duration.as_millis() as u64;
-        if total_ms >= MAX_DURATION_HOURS * 3_600_000 {
+        // Compared as a Duration, not in milliseconds: `as_millis() as u64`
+        // truncates a large enough duration into a small one that would pass.
+        if duration > MAX_DURATION {
             return Err(DurationTooLong);
         }
 
-        let deadline = self.ticks + total_ms / MS_TICK;
-        let timer_id = self.storage.create(waker, deadline);
+        let deadline = self.ticks + duration.as_millis() as u64 / MS_TICK;
+        let timer_id = self.storage.create(waker);
         self.place(timer_id, deadline);
         Ok(timer_id)
     }
@@ -271,29 +174,12 @@ impl TimeWheel {
         self.last_tick_wall
     }
 
-    // Ticks until the slot `i` ahead on a level of period `period` opens.
-    #[inline]
-    fn ticks_until(&self, i: usize, period: u64) -> u64 {
-        (i as u64 * period).saturating_sub(self.ticks % period)
-    }
-
-    /// Lower bound on the time until the next timer fires, or None if no
-    /// timers are registered. Exact for the ms level; for coarser levels it is
-    /// when the slot cascades, which never overshoots the earliest deadline.
+    /// Time until the next occupied slot opens, or None if no timers are
+    /// registered. Exact, up to the 10ms tick: with a single level there is
+    /// nothing to cascade, so the slot that opens is the one that fires.
     pub fn next_deadline(&self) -> Option<Duration> {
-        let b = &self.buckets;
-        let ticks = if let Some(i) = b.ms_occupied.next_set(self.ms_idx(), MS_BUCKETS) {
-            i as u64
-        } else if let Some(i) = b.s_occupied.next_set(self.s_idx(), S_BUCKETS) {
-            self.ticks_until(i, TICKS_PER_S)
-        } else if let Some(i) = b.m_occupied.next_set(self.m_idx(), M_BUCKETS) {
-            self.ticks_until(i, TICKS_PER_M)
-        } else if let Some(i) = b.h_occupied.next_set(self.h_idx(), H_BUCKETS) {
-            self.ticks_until(i, TICKS_PER_H)
-        } else {
-            return None;
-        };
-        Some(Duration::from_millis(ticks * MS_TICK))
+        let i = self.occupied.next_set(self.idx())?;
+        Some(Duration::from_millis(i as u64 * MS_TICK))
     }
 }
 

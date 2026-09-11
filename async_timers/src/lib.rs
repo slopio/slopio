@@ -4,4 +4,4 @@ mod timers;
 mod wheel;
 
 pub use timers::{Timers, Token};
-pub use wheel::{DurationTooLong, TimeWheel};
+pub use wheel::{DurationTooLong, MAX_DURATION, TimeWheel};

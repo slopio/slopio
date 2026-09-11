@@ -1,6 +1,6 @@
 mod common;
 
-use async_timers::{DurationTooLong, TimeWheel};
+use async_timers::{DurationTooLong, MAX_DURATION, TimeWheel};
 use common::make_waker;
 use std::task::Poll;
 use std::thread::sleep;
@@ -35,7 +35,7 @@ fn test_duration_too_long_rejected() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
-    let result = wheel.init_timer(Duration::from_hours(24), &waker);
+    let result = wheel.init_timer(MAX_DURATION + Duration::from_millis(1), &waker);
     assert_eq!(result, Err(DurationTooLong));
 }
 
@@ -44,9 +44,20 @@ fn test_duration_at_limit() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
-    // Just under 24 hours should work
-    let result = wheel.init_timer(Duration::from_hours(24) - Duration::from_millis(1), &waker);
-    assert!(result.is_ok());
+    // One second exactly is the last duration the ring can hold.
+    assert_eq!(MAX_DURATION, Duration::from_secs(1));
+    assert!(wheel.init_timer(MAX_DURATION, &waker).is_ok());
+}
+
+/// A duration whose millisecond count overflows `u64` must be rejected, not
+/// truncated into a small one that the ring would happily accept.
+#[test]
+fn test_absurd_duration_rejected() {
+    let mut wheel = TimeWheel::new();
+    let (_, waker) = make_waker();
+
+    let result = wheel.init_timer(Duration::from_secs(u64::MAX), &waker);
+    assert_eq!(result, Err(DurationTooLong));
 }
 
 #[test]
@@ -100,19 +111,16 @@ fn test_timer_fires_at_ms_boundary() {
 }
 
 #[test]
-fn test_timer_fires_at_second_level() {
+fn test_timer_fires_well_into_the_ring() {
     let mut wheel = TimeWheel::new();
     let (counter, waker) = make_waker();
 
-    // 300ms should be in the second-level bucket (ms threshold is 200ms)
     let id = wheel
         .init_timer(Duration::from_millis(300), &waker)
         .unwrap();
 
-    // Verify it's not in ms level by checking deadline is calculated correctly
-    assert!(wheel.next_deadline().unwrap() >= Duration::from_millis(200));
+    assert_eq!(wheel.next_deadline(), Some(Duration::from_millis(300)));
 
-    // Process ticks until timer fires
     sleep(Duration::from_millis(350));
     wheel.tick();
 
@@ -127,31 +135,18 @@ fn test_timer_at_one_second() {
 
     let id = wheel.init_timer(Duration::from_secs(1), &waker).unwrap();
 
-    // Verify timer is placed in second-level bucket (deadline >= 200ms threshold)
-    let deadline = wheel.next_deadline().unwrap();
-    assert!(
-        deadline >= Duration::from_millis(200),
-        "1s timer should be in second-level bucket"
+    // The whole point of the 101st slot: a deadline a full second out must
+    // land clear of the slot the clock stands on, not alias it.
+    assert_eq!(
+        wheel.next_deadline(),
+        Some(Duration::from_secs(1)),
+        "a 1s timer must not read as due now"
     );
 
-    // Should fire after 1 second total
     sleep(Duration::from_millis(1100));
     wheel.tick();
     assert_eq!(counter.count(), 1);
     assert_eq!(wheel.poll(id, &waker), Poll::Ready(()));
-}
-
-#[test]
-fn test_timer_registered_at_hour_level() {
-    let mut wheel = TimeWheel::new();
-    let (_, waker) = make_waker();
-
-    // 2 hours should be in the hour-level bucket
-    let _id = wheel.init_timer(Duration::from_secs(7200), &waker).unwrap();
-
-    // Verify it's in hour level (deadline should be large)
-    let deadline = wheel.next_deadline().unwrap();
-    assert!(deadline >= Duration::from_secs(60));
 }
 
 #[test]
@@ -206,32 +201,30 @@ fn test_multiple_timers_different_buckets() {
 }
 
 #[test]
-fn test_multiple_timers_different_levels() {
+fn test_timers_far_apart_in_the_ring() {
     let mut wheel = TimeWheel::new();
-    let (counter_ms, waker_ms) = make_waker();
-    let (counter_s, waker_s) = make_waker();
+    let (counter_near, waker_near) = make_waker();
+    let (counter_far, waker_far) = make_waker();
 
-    let id_ms = wheel
-        .init_timer(Duration::from_millis(50), &waker_ms)
+    let id_near = wheel
+        .init_timer(Duration::from_millis(50), &waker_near)
         .unwrap();
-    let id_s = wheel
-        .init_timer(Duration::from_millis(300), &waker_s)
+    let id_far = wheel
+        .init_timer(Duration::from_millis(300), &waker_far)
         .unwrap();
 
-    // MS level timer should fire first
     sleep(Duration::from_millis(60));
     wheel.tick();
 
-    assert_eq!(counter_ms.count(), 1);
-    assert_eq!(counter_s.count(), 0);
-    assert_eq!(wheel.poll(id_ms, &waker_ms), Poll::Ready(()));
+    assert_eq!(counter_near.count(), 1);
+    assert_eq!(counter_far.count(), 0);
+    assert_eq!(wheel.poll(id_near, &waker_near), Poll::Ready(()));
 
-    // S level timer should fire after cascade
     sleep(Duration::from_millis(300));
     wheel.tick();
 
-    assert_eq!(counter_s.count(), 1);
-    assert_eq!(wheel.poll(id_s, &waker_s), Poll::Ready(()));
+    assert_eq!(counter_far.count(), 1);
+    assert_eq!(wheel.poll(id_far, &waker_far), Poll::Ready(()));
 }
 
 #[test]
@@ -463,11 +456,10 @@ fn test_rapid_ticks() {
 }
 
 #[test]
-fn test_cascade_from_seconds_to_ms() {
+fn test_timer_past_the_first_hundred_ms() {
     let mut wheel = TimeWheel::new();
     let (counter, waker) = make_waker();
 
-    // Timer in second-level bucket
     let id = wheel
         .init_timer(Duration::from_millis(150), &waker)
         .unwrap();
@@ -594,126 +586,51 @@ fn test_next_deadline_zero_duration_timer() {
 }
 
 #[test]
-fn test_next_deadline_timer_in_second_level() {
+fn test_next_deadline_is_exact() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
-    // 300ms is in the second-level bucket (ms threshold is 200ms)
     wheel
         .init_timer(Duration::from_millis(300), &waker)
         .unwrap();
 
-    let deadline = wheel.next_deadline().unwrap();
-    // Should be at least 200ms (the full ms level needs to pass first)
-    assert!(
-        deadline >= Duration::from_millis(200),
-        "Second-level timer deadline should be >= 200ms, got {:?}",
-        deadline
-    );
+    // One level means nothing cascades, so the slot that opens is the slot
+    // that fires — the answer is the deadline itself, not a lower bound.
+    assert_eq!(wheel.next_deadline(), Some(Duration::from_millis(300)));
 }
 
 #[test]
-fn test_next_deadline_timer_in_hour_level() {
+fn test_next_deadline_returns_the_soonest_of_many() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
-    // 2 hours is in the hour-level bucket
-    wheel.init_timer(Duration::from_secs(7200), &waker).unwrap();
-
-    let deadline = wheel.next_deadline().unwrap();
-    // Should be at least 60 seconds (full ms + s levels need to cascade)
-    assert!(
-        deadline >= Duration::from_secs(60),
-        "Hour-level timer deadline should be >= 60s, got {:?}",
-        deadline
-    );
-}
-
-#[test]
-fn test_next_deadline_prefers_ms_over_s_level() {
-    let mut wheel = TimeWheel::new();
-    let (_, waker) = make_waker();
-
-    // First add a second-level timer
     wheel
         .init_timer(Duration::from_millis(200), &waker)
         .unwrap();
-
-    // Then add a ms-level timer
     wheel.init_timer(Duration::from_millis(30), &waker).unwrap();
+    wheel.init_timer(Duration::from_secs(1), &waker).unwrap();
 
-    let deadline = wheel.next_deadline().unwrap();
-    // Should return the ms-level timer (sooner)
-    assert!(
-        deadline <= Duration::from_millis(40),
-        "Should return ms-level timer deadline, got {:?}",
-        deadline
-    );
+    assert_eq!(wheel.next_deadline(), Some(Duration::from_millis(30)));
 }
 
 #[test]
-fn test_next_deadline_prefers_s_over_h_level() {
+fn test_next_deadline_moves_on_once_the_first_fired() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
-    // First add an hour-level timer
-    wheel.init_timer(Duration::from_secs(7200), &waker).unwrap();
-
-    // Then add a second-level timer
-    wheel
-        .init_timer(Duration::from_millis(500), &waker)
-        .unwrap();
-
-    let deadline = wheel.next_deadline().unwrap();
-    // Should return the second-level timer (sooner than hour-level)
-    assert!(
-        deadline < Duration::from_secs(60),
-        "Should return s-level timer deadline, got {:?}",
-        deadline
-    );
-}
-
-#[test]
-fn test_next_deadline_all_three_levels() {
-    let mut wheel = TimeWheel::new();
-    let (_, waker) = make_waker();
-
-    // Add timers at all three levels
-    wheel.init_timer(Duration::from_secs(7200), &waker).unwrap(); // hour level
-    wheel
-        .init_timer(Duration::from_millis(500), &waker)
-        .unwrap(); // second level
-    wheel.init_timer(Duration::from_millis(50), &waker).unwrap(); // ms level
-
-    let deadline = wheel.next_deadline().unwrap();
-    // Should return the ms-level timer
-    assert!(
-        deadline <= Duration::from_millis(60),
-        "Should return ms-level timer deadline, got {:?}",
-        deadline
-    );
-}
-
-#[test]
-fn test_next_deadline_after_ms_level_cleared() {
-    let mut wheel = TimeWheel::new();
-    let (_, waker) = make_waker();
-
-    // Add timer at ms level and s level
     wheel.init_timer(Duration::from_millis(50), &waker).unwrap();
     wheel
         .init_timer(Duration::from_millis(500), &waker)
         .unwrap();
 
-    // Fire the ms-level timer
     sleep(Duration::from_millis(60));
     wheel.tick();
 
-    // Now next_deadline should point to the s-level timer
     let deadline = wheel.next_deadline();
+    assert!(deadline.is_some(), "the 500ms timer is still waiting");
     assert!(
-        deadline.is_some(),
-        "Should have deadline from s-level timer"
+        deadline.unwrap() <= Duration::from_millis(500),
+        "got {deadline:?}"
     );
 }
 
@@ -882,77 +799,76 @@ fn assert_fires_at(duration: Duration) {
 }
 
 #[test]
-fn test_timer_one_and_a_half_seconds_keeps_sub_second_remainder() {
-    assert_fires_at(Duration::from_millis(1_500));
+fn test_timer_at_a_single_tick() {
+    assert_fires_at(Duration::from_millis(10));
 }
 
 #[test]
-fn test_timer_crossing_minute_level() {
-    assert_fires_at(Duration::from_secs(61));
+fn test_timer_mid_ring_keeps_its_sub_tick_remainder() {
+    assert_fires_at(Duration::from_millis(455));
 }
 
 #[test]
-fn test_timer_crossing_minute_level_with_remainder() {
-    assert_fires_at(Duration::from_millis(90_250));
+fn test_timer_at_the_full_window() {
+    assert_fires_at(MAX_DURATION);
 }
 
+/// Armed from a clock that is already part-way round the ring, so the deadline
+/// wraps past slot 0. The modulo has to carry it, not fold it back onto a slot
+/// that has already fired.
 #[test]
-fn test_timer_crossing_hour_level() {
-    assert_fires_at(Duration::from_secs(2 * 3600 + 3));
-}
-
-#[test]
-fn test_timer_just_under_max_duration() {
-    assert_fires_at(Duration::from_hours(24) - Duration::from_millis(10));
-}
-
-#[test]
-fn test_timer_inserted_mid_second_fires_at_its_own_deadline() {
+fn test_timer_inserted_mid_ring_wraps_to_its_own_slot() {
     let mut wheel = TimeWheel::new();
     let mut clock = Clock::new();
     let (counter, waker) = make_waker();
 
     let idle = Duration::from_millis(370);
     clock.advance(&mut wheel, idle);
-    wheel.init_timer(Duration::from_millis(1_500), &waker).unwrap();
-
-    let fired_at = clock.run_until_fired(&mut wheel, &counter, Duration::from_secs(3));
-    assert_fired_within_tick(fired_at, idle + Duration::from_millis(1_500));
-}
-
-#[test]
-fn test_far_timer_inserted_late_in_its_hour() {
-    let mut wheel = TimeWheel::new();
-    let mut clock = Clock::new();
-    let (counter, waker) = make_waker();
-
-    // Insert 1s before the wheel's hour boundary; the deadline sits 24
-    // hour-slots ahead, the aliasing case that needs the 25th slot.
-    let idle = Duration::from_secs(3599);
-    clock.advance(&mut wheel, idle);
-    let duration = Duration::from_hours(24) - Duration::from_millis(10);
+    let duration = Duration::from_millis(750);
     wheel.init_timer(duration, &waker).unwrap();
 
-    let fired_at = clock.run_until_fired(&mut wheel, &counter, idle + duration + Duration::from_secs(1));
+    let fired_at = clock.run_until_fired(&mut wheel, &counter, Duration::from_secs(3));
     assert_fired_within_tick(fired_at, idle + duration);
 }
 
+/// The aliasing case the 101st slot exists for: a full-window timer armed at an
+/// arbitrary point in the ring must not land on the slot the clock stands on.
 #[test]
-fn test_cancelled_timer_freed_on_cascade() {
+fn test_full_window_timer_never_aliases_the_current_slot() {
+    // Every slot of the ring, so the wrap past slot 0 is covered too.
+    let ring = MAX_DURATION.as_millis() as u64 / 10 + 1;
+    for offset in 0..ring {
+        let mut wheel = TimeWheel::new();
+        let mut clock = Clock::new();
+        let (counter, waker) = make_waker();
+
+        clock.advance(&mut wheel, Duration::from_millis(offset * 10));
+        wheel.init_timer(MAX_DURATION, &waker).unwrap();
+
+        // An aliased deadline would land on the current slot and fire on the
+        // very next tick instead of a second from now.
+        clock.advance(&mut wheel, MAX_DURATION);
+        assert_eq!(counter.count(), 0, "fired early at offset {offset}");
+
+        clock.advance(&mut wheel, Duration::from_millis(10));
+        assert_eq!(counter.count(), 1, "never fired at offset {offset}");
+    }
+}
+
+#[test]
+fn test_cancelled_timer_freed_when_its_bucket_fires() {
     let mut wheel = TimeWheel::new();
     let mut clock = Clock::new();
     let (_, waker) = make_waker();
 
-    let id = wheel.init_timer(Duration::from_secs(5), &waker).unwrap();
+    let id = wheel.init_timer(Duration::from_millis(500), &waker).unwrap();
     wheel.drop(id);
-    assert_eq!(wheel.active_timers(), 1);
+    assert_eq!(
+        wheel.active_timers(),
+        1,
+        "the bucket still references the id"
+    );
 
-    // The seconds slot cascades at t=5s; the cancelled id must be released then.
-    clock.advance(&mut wheel, Duration::from_millis(5_010));
+    clock.advance(&mut wheel, Duration::from_millis(510));
     assert_eq!(wheel.active_timers(), 0);
-}
-
-#[test]
-fn test_timer_at_ten_seconds_fires_on_time() {
-    assert_fires_at(Duration::from_secs(10));
 }

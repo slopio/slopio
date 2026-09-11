@@ -42,7 +42,7 @@ fn test_process_finishes_before_timeout() {
     main_thread(async {
         let proc = Process::new("sleep", &["1"]).unwrap();
 
-        match select(proc.wait(), Sleep::during(Duration::from_secs(10))).await {
+        match select(proc.wait(), Sleep::during(Duration::from_secs(5))).await {
             SelectResult::First(result) => {
                 let code = unwrap_finished(result.unwrap()).into_result().unwrap();
                 assert_eq!(code, 0);
@@ -155,8 +155,8 @@ fn test_stop_notification() {
             unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
         });
 
-        // race: stop notification vs 10s safety timeout
-        match select(wait_stopped, Sleep::during(Duration::from_secs(10))).await {
+        // race: stop notification vs 5s safety timeout
+        match select(wait_stopped, Sleep::during(Duration::from_secs(5))).await {
             SelectResult::First(result) => {
                 let status = result.unwrap();
                 match status.code {

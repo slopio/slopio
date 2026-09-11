@@ -4,6 +4,71 @@ use runtime::main_thread;
 use runtime::runtime::spawn;
 use runtime::runtime::time::Sleep;
 
+/// 5s is the one duration routed to a dedicated fixed-duration store instead
+/// of the wheel, so it arms, fires and cancels through a different path.
+#[test]
+fn test_sleep_five_seconds_uses_the_fixed_store() {
+    let start = Instant::now();
+    main_thread(async {
+        Sleep::during(Duration::from_secs(5)).await;
+    });
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(4_990),
+        "Sleep finished too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(5_400),
+        "Sleep took too long: {elapsed:?}"
+    );
+}
+
+/// The fixed store's queues are FIFO, which only holds because every timer in
+/// it runs for the same duration. Two armed at different ticks must come back
+/// in the order they went in, spaced by the gap between their arms.
+#[test]
+fn test_concurrent_five_second_sleeps() {
+    main_thread(async {
+        let first = spawn(async { Instant::now() });
+        let a = spawn(async {
+            Sleep::during(Duration::from_secs(5)).await;
+            Instant::now()
+        });
+        first.await;
+        Sleep::during(Duration::from_millis(200)).await;
+        let b = spawn(async {
+            Sleep::during(Duration::from_secs(5)).await;
+            Instant::now()
+        });
+
+        let (ta, tb) = (a.await, b.await);
+        assert!(ta < tb, "the one armed first must fire first");
+        let gap = tb - ta;
+        assert!(
+            gap >= Duration::from_millis(180) && gap < Duration::from_millis(320),
+            "expected the 200ms arming gap to survive, got {gap:?}"
+        );
+    });
+}
+
+/// Dropping a 5s sleep must release its entry in the fixed store rather than
+/// leave a waker behind that fires into a dead task.
+#[test]
+fn test_five_second_sleep_drop_cancellation() {
+    let start = Instant::now();
+    main_thread(async {
+        let _slow = Sleep::during(Duration::from_secs(5));
+        Sleep::during(Duration::from_millis(50)).await;
+    });
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the dropped 5s sleep held the loop open: {elapsed:?}"
+    );
+}
+
 #[test]
 fn test_sleep_basic() {
     let start = Instant::now();
@@ -195,13 +260,13 @@ fn test_sleep_drop_cancellation() {
         });
 
         // This will be dropped when we return early
-        let _slow = Sleep::during(Duration::from_secs(10));
+        let _slow = Sleep::during(Duration::from_secs(5));
 
         quick.await
     });
     let elapsed = start.elapsed();
 
-    // Should complete around 50ms, not wait for the 10s timer
+    // Should complete around 50ms, not wait for the 5s timer
     assert!(
         elapsed < Duration::from_millis(200),
         "Dropped sleep should not block: {:?}",

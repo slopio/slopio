@@ -225,7 +225,7 @@ fn a_timer_fires_without_any_time_actually_passing() {
 
     let started = Instant::now();
     RuntimeInner::simulated(fake).block_on::<(), _>(
-        async move { Sleep::during(Duration::from_secs(30)).await },
+        async move { Sleep::during(Duration::from_secs(5)).await },
         None,
         |run| run(),
     );
@@ -233,11 +233,11 @@ fn a_timer_fires_without_any_time_actually_passing() {
 
     assert!(
         wall < Duration::from_secs(1),
-        "a 30s sleep took {wall:?} of real time",
+        "a 5s sleep took {wall:?} of real time",
     );
-    // And it was not skipped: simulated time really moved thirty seconds.
+    // And it was not skipped: simulated time really moved five seconds.
     assert!(
-        clock.elapsed() >= Duration::from_secs(30),
+        clock.elapsed() >= Duration::from_secs(5),
         "the sleep resolved after only {:?} of simulated time",
         clock.elapsed(),
     );
@@ -251,7 +251,8 @@ async fn never_reached(duration: Duration) {
 
 #[test]
 fn select_resolves_on_whichever_sleep_is_shorter() {
-    let long = Duration::from_secs(3600);
+    // `long` only has to outlive `short` and never win.
+    let long = Duration::from_secs(5);
     let short = Duration::from_millis(100);
 
     // Both orders, so "always the second arm" cannot pass either.
@@ -288,7 +289,7 @@ fn work_continues_normally_after_a_select() {
     RuntimeInner::simulated(fake).block_on::<(), _>(
         async move {
             select(
-                never_reached(Duration::from_secs(3600)),
+                never_reached(Duration::from_secs(5)),
                 Sleep::during(Duration::from_millis(100)),
             )
             .await;

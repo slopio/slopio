@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::collections::vec_deque::Drain;
-use std::task::Waker;
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 mod active_field;
@@ -141,6 +141,13 @@ impl Wakers {
         &self.inner[i]
     }
 
+    fn replace(&mut self, i: usize, waker: &Waker) {
+        let held = &mut self.inner[i];
+        if !held.will_wake(waker) {
+            *held = waker.clone();
+        }
+    }
+
     fn pop(&mut self) -> Option<Waker> {
         self.inner.pop_front()
     }
@@ -162,7 +169,6 @@ pub struct Timers<const MILLIS: u64> {
     popped: u64,
 }
 
-#[allow(unused_variables)]
 impl<const MILLIS: u64> Timers<MILLIS> {
     const DURATION_TICKS: u64 = MILLIS / MS_TICK;
 
@@ -188,7 +194,12 @@ impl<const MILLIS: u64> Timers<MILLIS> {
         Token(self.popped + self.wakers.len() as u64)
     }
 
-    fn push(&mut self, waker: Waker, now: u64) -> Token<MILLIS> {
+    /// Arm a timer for `MILLIS`, starting from the tick `now`.
+    ///
+    /// `now` must come from the same clock that drives [`tick`](Self::tick):
+    /// the deadline ring holds exactly one duration and has nowhere to put an
+    /// entry armed from a clock that has run ahead of it.
+    pub fn push(&mut self, waker: Waker, now: u64) -> Token<MILLIS> {
         let token = self.pushed();
         self.deadlines.push(now + Self::DURATION_TICKS);
         self.wakers.push(waker);
@@ -215,7 +226,9 @@ impl<const MILLIS: u64> Timers<MILLIS> {
         (i < self.wakers.len()).then_some(i)
     }
 
-    fn cancel(&mut self, token: Token<MILLIS>) {
+    /// Drop an armed timer without firing it. A token that already fired, or
+    /// that was already cancelled, is a no-op.
+    pub fn cancel(&mut self, token: Token<MILLIS>) {
         let Some(i) = self.index_of(token) else {
             return;
         };
@@ -223,6 +236,18 @@ impl<const MILLIS: u64> Timers<MILLIS> {
         if i == 0 {
             let n = self.active.first().unwrap_or(self.active.len());
             self.pop_n(n);
+        }
+    }
+
+    /// `Ready` once the timer has fired — that is, once its entry has left the
+    /// queues. A still-armed timer refreshes its waker and stays `Pending`.
+    pub fn poll(&mut self, token: Token<MILLIS>, waker: &Waker) -> Poll<()> {
+        match self.index_of(token) {
+            Some(i) => {
+                self.wakers.replace(i, waker);
+                Poll::Pending
+            }
+            None => Poll::Ready(()),
         }
     }
 

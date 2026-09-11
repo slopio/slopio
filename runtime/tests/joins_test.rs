@@ -50,15 +50,15 @@ fn join3_sleep_runs_concurrently() {
     let result = main_thread(async {
         join3(
             async {
-                Sleep::during(Duration::from_secs(1)).await;
+                Sleep::during(Duration::from_millis(300)).await;
                 10
             },
             async {
-                Sleep::during(Duration::from_secs(2)).await;
+                Sleep::during(Duration::from_millis(600)).await;
                 20
             },
             async {
-                Sleep::during(Duration::from_secs(1)).await;
+                Sleep::during(Duration::from_millis(300)).await;
                 30
             },
         )
@@ -68,11 +68,12 @@ fn join3_sleep_runs_concurrently() {
 
     assert_eq!(result, (10, 20, 30));
     assert!(
-        elapsed >= Duration::from_millis(900),
+        elapsed >= Duration::from_millis(550),
         "join3 children must actually suspend on their timers: {elapsed:?}"
     );
+    // Sequential would be 1.2s; overlapping is bounded by the longest child.
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_millis(1_000),
         "join3 children should overlap, not run sequentially: {elapsed:?}"
     );
 }

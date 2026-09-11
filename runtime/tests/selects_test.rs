@@ -28,15 +28,16 @@ fn select3_skips_pending() {
 
 // The winner is the 1s sleep in the SECOND slot, so passing proves select3
 // resolves on whichever future is ready first — not merely the first in
-// declaration order. The losers are 7s/9s: select3 returns on the winner
-// without ever waiting for them.
+// declaration order. The losers are 5s: select3 returns on the winner without
+// ever waiting for them, and drops them, which also exercises cancellation in
+// the fixed-duration store they land in.
 #[test]
 fn select3_ready_future_wins_regardless_of_slot() {
     let start = Instant::now();
     let result = main_thread(async {
         select3(
             async {
-                Sleep::during(Duration::from_secs(7)).await;
+                Sleep::during(Duration::from_secs(5)).await;
                 1
             },
             async {
@@ -44,7 +45,7 @@ fn select3_ready_future_wins_regardless_of_slot() {
                 2
             },
             async {
-                Sleep::during(Duration::from_secs(9)).await;
+                Sleep::during(Duration::from_secs(5)).await;
                 3
             },
         )
@@ -61,7 +62,7 @@ fn select3_ready_future_wins_regardless_of_slot() {
         "select3 should not resolve before its winner fires: {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(5),
-        "select3 should return on the winner, not wait for the 7s/9s losers: {elapsed:?}"
+        elapsed < Duration::from_secs(3),
+        "select3 should return on the winner, not wait for the 5s losers: {elapsed:?}"
     );
 }
