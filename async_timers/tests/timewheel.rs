@@ -44,8 +44,8 @@ fn test_duration_at_limit() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
-    // One second exactly is the last duration the ring can hold.
-    assert_eq!(MAX_DURATION, Duration::from_secs(1));
+    // One minute exactly is the last duration the seconds level can hold.
+    assert_eq!(MAX_DURATION, Duration::from_secs(60));
     assert!(wheel.init_timer(MAX_DURATION, &waker).is_ok());
 }
 
@@ -135,8 +135,8 @@ fn test_timer_at_one_second() {
 
     let id = wheel.init_timer(Duration::from_secs(1), &waker).unwrap();
 
-    // The whole point of the 101st slot: a deadline a full second out must
-    // land clear of the slot the clock stands on, not alias it.
+    // A second out is the first deadline the ms level cannot hold: it waits at
+    // the seconds level, and `next_deadline` answers with its cascade.
     assert_eq!(
         wheel.next_deadline(),
         Some(Duration::from_secs(1)),
@@ -594,7 +594,7 @@ fn test_next_deadline_is_exact() {
         .init_timer(Duration::from_millis(300), &waker)
         .unwrap();
 
-    // One level means nothing cascades, so the slot that opens is the slot
+    // Nothing cascades below a second, so the ms slot that opens is the slot
     // that fires — the answer is the deadline itself, not a lower bound.
     assert_eq!(wheel.next_deadline(), Some(Duration::from_millis(300)));
 }
@@ -831,28 +831,136 @@ fn test_timer_inserted_mid_ring_wraps_to_its_own_slot() {
     assert_fired_within_tick(fired_at, idle + duration);
 }
 
-/// The aliasing case the 101st slot exists for: a full-window timer armed at an
-/// arbitrary point in the ring must not land on the slot the clock stands on.
+/// The aliasing case the 61st seconds slot exists for: a full-window timer
+/// armed at an arbitrary second must not land on the slot the clock stands on,
+/// which has already cascaded.
 #[test]
 fn test_full_window_timer_never_aliases_the_current_slot() {
-    // Every slot of the ring, so the wrap past slot 0 is covered too.
-    let ring = MAX_DURATION.as_millis() as u64 / 10 + 1;
-    for offset in 0..ring {
+    // Every slot of the seconds ring, so the wrap past slot 0 is covered too,
+    // each from a second boundary and from part-way into a second.
+    let seconds_ring = MAX_DURATION.as_secs() + 1;
+    for offset in 0..seconds_ring {
+        for skew in [Duration::ZERO, Duration::from_millis(370)] {
+            let mut wheel = TimeWheel::new();
+            let mut clock = Clock::new();
+            let (counter, waker) = make_waker();
+
+            clock.advance(&mut wheel, Duration::from_secs(offset) + skew);
+            wheel.init_timer(MAX_DURATION, &waker).unwrap();
+
+            // An aliased deadline would land on a slot that cascades at the
+            // next second, firing a minute early.
+            clock.advance(&mut wheel, MAX_DURATION);
+            assert_eq!(counter.count(), 0, "fired early at {offset}s + {skew:?}");
+
+            clock.advance(&mut wheel, Duration::from_millis(10));
+            assert_eq!(counter.count(), 1, "never fired at {offset}s + {skew:?}");
+        }
+    }
+}
+
+/// Every duration the wheel takes, armed together, must fire on exactly the
+/// tick its deadline names: the two levels have to agree on where a deadline
+/// lives, and the cascade has to carry it down without rounding.
+#[test]
+fn test_every_duration_fires_on_the_tick_its_deadline_names() {
+    let max_ticks = MAX_DURATION.as_millis() as usize / 10;
+
+    // Arming at, just before and just after a second boundary: where the ms
+    // level hands over to the seconds level and where a cascade lands.
+    for skew in [0, 37, 99, 100] {
         let mut wheel = TimeWheel::new();
         let mut clock = Clock::new();
-        let (counter, waker) = make_waker();
+        clock.advance(&mut wheel, Duration::from_millis(skew * 10));
 
-        clock.advance(&mut wheel, Duration::from_millis(offset * 10));
-        wheel.init_timer(MAX_DURATION, &waker).unwrap();
+        let wakers: Vec<_> = (0..=max_ticks).map(|_| make_waker()).collect();
+        for (ticks, (_, waker)) in wakers.iter().enumerate() {
+            wheel
+                .init_timer(Duration::from_millis(ticks as u64 * 10), waker)
+                .unwrap();
+        }
 
-        // An aliased deadline would land on the current slot and fire on the
-        // very next tick instead of a second from now.
-        clock.advance(&mut wheel, MAX_DURATION);
-        assert_eq!(counter.count(), 0, "fired early at offset {offset}");
+        // A deadline `n` ticks out fires as the wheel passes tick `n`, which is
+        // the (n+1)th tick of the clock.
+        for elapsed in 0..=max_ticks + 1 {
+            if let Some((counter, _)) = wakers.get(elapsed) {
+                assert_eq!(
+                    counter.count(),
+                    0,
+                    "{elapsed} ticks fired early (skew {skew})"
+                );
+            }
+            if elapsed > 0 {
+                let (counter, _) = &wakers[elapsed - 1];
+                assert_eq!(
+                    counter.count(),
+                    1,
+                    "{} ticks did not fire on its tick (skew {skew})",
+                    elapsed - 1
+                );
+            }
+            clock.advance(&mut wheel, Duration::from_millis(10));
+        }
 
-        clock.advance(&mut wheel, Duration::from_millis(10));
-        assert_eq!(counter.count(), 1, "never fired at offset {offset}");
+        for (ticks, (counter, _)) in wakers.iter().enumerate() {
+            assert_eq!(
+                counter.count(),
+                1,
+                "{ticks} ticks fired {} times (skew {skew})",
+                counter.count()
+            );
+        }
     }
+}
+
+/// A deadline that outruns the ms level waits a whole seconds slot, then
+/// cascades into the ms slot its remainder names — not the slot the second
+/// opens on.
+#[test]
+fn test_timer_cascades_with_its_sub_second_remainder() {
+    assert_fires_at(Duration::from_millis(1_500));
+}
+
+#[test]
+fn test_timer_crossing_several_seconds() {
+    assert_fires_at(Duration::from_secs(10));
+}
+
+/// Armed part-way into a second, so the cascade has to carry a remainder that
+/// does not align with the boundary it cascades on.
+#[test]
+fn test_timer_inserted_mid_second_fires_at_its_own_deadline() {
+    let mut wheel = TimeWheel::new();
+    let mut clock = Clock::new();
+    let (counter, waker) = make_waker();
+
+    let idle = Duration::from_millis(370);
+    clock.advance(&mut wheel, idle);
+    let duration = Duration::from_millis(1_500);
+    wheel.init_timer(duration, &waker).unwrap();
+
+    let fired_at = clock.run_until_fired(&mut wheel, &counter, Duration::from_secs(3));
+    assert_fired_within_tick(fired_at, idle + duration);
+}
+
+#[test]
+fn test_cancelled_timer_freed_on_cascade() {
+    let mut wheel = TimeWheel::new();
+    let mut clock = Clock::new();
+    let (_, waker) = make_waker();
+
+    let id = wheel.init_timer(Duration::from_secs(5), &waker).unwrap();
+    wheel.drop(id);
+    assert_eq!(
+        wheel.active_timers(),
+        1,
+        "the bucket still references the id"
+    );
+
+    // The seconds slot cascades at t=5s; the cancelled id is released there,
+    // without ever reaching the ms level.
+    clock.advance(&mut wheel, Duration::from_millis(5_000));
+    assert_eq!(wheel.active_timers(), 0);
 }
 
 #[test]

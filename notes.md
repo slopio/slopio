@@ -46,9 +46,11 @@ per connection or per timeout:
   `async_timers/DESIGN.md`. Shows up in the echo-under-timeout phase as 18
   reallocs / 327 KB over 2000 round-trips — growth to the plateau, not a
   per-op cost.
-  Now bounded by the duration itself (1 s in the wheel, 5 s in the fixed
-  store) rather than by an arbitrary timeout, so the worst case is far
-  smaller than it was — but the shape is unchanged.
+  Bounded by the duration itself (1 min in the wheel, 5 s in the fixed
+  store) rather than by an arbitrary timeout — but the shape is unchanged. The
+  1M-dead-slot figure above is the fixed store's case, which is where the
+  high-rate timeouts are meant to live; the wheel's minute-long reach is for
+  the occasional long sleep, not for a timeout per request.
   Fix, if that profile matters: sweep dead entries without waiting for the
   clock, or document that timeouts should be short and re-armed.
 - `socket_send_vectored` allocates a `Vec<libc::iovec>` per call (16 B per

@@ -68,7 +68,7 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 | `runtime` | The facade to depend on: entry points, buffer ring declarations, telemetry wiring, global allocator. |
 | `runtime-core` | The runtime itself: tasks, I/O driver, timers, channels, tracing, simulator. |
 | `runtime-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
-| `async_timers` | The two timer stores: a one-second timing wheel, and the fixed-duration deadline queues. |
+| `async_timers` | The two timer stores: a one-minute timing wheel, and the fixed-duration deadline queues. |
 | `io_uring_rb` | Provided buffer ring memory management. |
 | `runtime_ebpf_balancer` | Optional eBPF program steering QUIC connections to the right core under `SO_REUSEPORT`. |
 

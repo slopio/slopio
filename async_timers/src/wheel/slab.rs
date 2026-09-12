@@ -6,14 +6,15 @@ pub struct TimerStorage {
 }
 
 enum Timer {
-    Waiting(Waker),
+    // Deadline in wheel ticks; read back when the timer cascades.
+    Waiting(Waker, u64),
     Done,
     Cancelled,
 }
 
 impl TimerStorage {
-    pub(crate) fn create(&mut self, waker: &Waker) -> usize {
-        self.inner.insert(Timer::Waiting(waker.clone()))
+    pub(crate) fn create(&mut self, waker: &Waker, deadline: u64) -> usize {
+        self.inner.insert(Timer::Waiting(waker.clone(), deadline))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -36,7 +37,7 @@ impl TimerStorage {
     pub(crate) fn poll(&mut self, id: usize, waker: &Waker) -> std::task::Poll<()> {
         let timer = self.inner.get_mut(id).unwrap();
         match timer {
-            Timer::Waiting(r_waker) => {
+            Timer::Waiting(r_waker, _) => {
                 if !r_waker.will_wake(waker) {
                     *r_waker = waker.clone();
                 }
@@ -50,8 +51,9 @@ impl TimerStorage {
                 std::task::Poll::Ready(())
             }
             // Cancelled ids are still parked in a bucket; the slot is freed
-            // when the bucket fires (`wake`). Removing it here would let the
-            // slab reuse the id while the bucket still references it.
+            // when the bucket fires (`wake`) or cascades (`deadline`).
+            // Removing it here would let the slab reuse the id while the
+            // bucket still references it.
             Timer::Cancelled => std::task::Poll::Ready(()),
         }
     }
@@ -59,7 +61,7 @@ impl TimerStorage {
     pub(crate) fn wake(&mut self, id: usize) {
         let timer = self.inner.get_mut(id).unwrap();
         match timer {
-            Timer::Waiting(waker) => {
+            Timer::Waiting(waker, _) => {
                 waker.wake_by_ref();
                 *timer = Timer::Done;
                 return;
@@ -68,5 +70,18 @@ impl TimerStorage {
             Timer::Cancelled => {}
         }
         self.inner.remove(id);
+    }
+
+    // Deadline of a waiting timer leaving its bucket; a cancelled one is freed
+    // instead since no bucket references it any more.
+    pub(crate) fn deadline(&mut self, id: usize) -> Option<u64> {
+        match self.inner.get(id).unwrap() {
+            Timer::Waiting(_, deadline) => Some(*deadline),
+            Timer::Done => unreachable!(),
+            Timer::Cancelled => {
+                self.inner.remove(id);
+                None
+            }
+        }
     }
 }

@@ -128,6 +128,27 @@ fn test_sleep_accuracy_1_second() {
     );
 }
 
+/// Past a second the wheel parks the timer at its seconds level, so the sleep
+/// only lands on time if the loop wakes for the cascade and the cascade carries
+/// the sub-second remainder down with it.
+#[test]
+fn test_sleep_accuracy_past_the_ms_level() {
+    let start = Instant::now();
+    main_thread(async {
+        Sleep::during(Duration::from_millis(1_500)).await;
+    });
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(1_499),
+        "Sleep finished too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1_900),
+        "Sleep took too long: {elapsed:?}"
+    );
+}
+
 #[test]
 fn test_multiple_sequential_sleeps() {
     let start = Instant::now();
