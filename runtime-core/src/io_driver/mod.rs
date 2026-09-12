@@ -249,8 +249,12 @@ impl MultiOpState {
             };
         }
     }
+    /// The kernel op is over, by our pause-cancel or on its own; resubmit re-arms it.
     fn transition_to_paused(&mut self) {
         if let MultiOpState::TringToPause {
+            waker, fd, queue, ..
+        }
+        | MultiOpState::Sent {
             waker, fd, queue, ..
         } = self
         {
@@ -940,9 +944,23 @@ impl IODriver {
             MultiOpState::Sent {
                 queue: provision,
                 waker: existant_waker,
+                last_cqe,
                 ..
+            } => {
+                if provision.has_content() {
+                    std::mem::swap(poller_queue, provision);
+                    MultiPollResult::Ready
+                } else if *last_cqe {
+                    // Ended on its own (EOF, error) and fully drained: no CQE will
+                    // ever wake this waker, so the consumer must re-arm or stop.
+                    multishot_op.transition_to_paused();
+                    MultiPollResult::NeedsResubmit
+                } else {
+                    *existant_waker = waker.clone();
+                    MultiPollResult::Pending
+                }
             }
-            | MultiOpState::TringToPause {
+            MultiOpState::TringToPause {
                 waker: existant_waker,
                 queue: provision,
                 ..

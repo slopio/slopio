@@ -84,3 +84,7 @@ required-features = ["simulation"]
 [[test]]
 name = "kill_drop"
 required-features = ["simulation"]
+
+[[test]]
+name = "multishot_rearm"
+required-features = ["simulation"]

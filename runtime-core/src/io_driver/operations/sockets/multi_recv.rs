@@ -31,6 +31,8 @@ pub struct MultiRecv<
     /// `Some` until `into_inner` moves the socket handle out.
     socket: Option<O>,
     reads: MultiOpQueue,
+    /// EOF was yielded: every later poll answers `None` without re-arming.
+    ended: bool,
     _spec: PhantomData<S>,
 }
 
@@ -78,6 +80,7 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
             id: None,
             socket: Some(socket),
             reads: MultiOpQueue::new(QUEUE_SIZE),
+            ended: false,
             _spec: PhantomData,
         };
         multi_recv.register_to_driver();
@@ -141,7 +144,10 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
         while let Some(completion_event) = self.reads.pop() {
             match self.try_parse(completion_event) {
                 Ok(buf) => return Poll::Ready(Some(Ok(buf))),
-                Err(CompletionError::Eof { .. }) => return Poll::Ready(None),
+                Err(CompletionError::Eof { .. }) => {
+                    self.ended = true;
+                    return Poll::Ready(None);
+                }
                 Err(e) if e.can_continue() => continue,
                 Err(e) => return Poll::Ready(Some(Err(e))),
             }
@@ -154,6 +160,9 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream for MultiRe
     type Item = Result<BorrowedBuffer<S>, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
         if let Poll::Ready(result) = self.try_drain_one() {
             return Poll::Ready(result);
         }
@@ -167,11 +176,10 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream for MultiRe
                 match self.try_drain_one() {
                     Poll::Ready(result) => Poll::Ready(result),
                     Poll::Pending => {
-                        // Queue had only skippable errors, check if we need resubmit
+                        // Only skippable errors came out; the op may be over.
                         if let MultiPollResult::NeedsResubmit =
                             IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.reads))
                         {
-
                             let entry = self.to_entry();
                             IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
                         }
@@ -180,7 +188,6 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream for MultiRe
                 }
             }
             MultiPollResult::NeedsResubmit => {
-
                 let entry = self.to_entry();
                 IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
                 Poll::Pending
