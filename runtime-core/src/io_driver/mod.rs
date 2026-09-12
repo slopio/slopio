@@ -1085,37 +1085,34 @@ impl IODriver {
         keepalive: Option<Box<dyn std::any::Any>>,
         parked_fd: Option<ParkedFd>,
     ) {
-        // Only transition to Cancelled (and stash the keepalive) if the cancel
-        // SQE was actually submitted. For ops already in `Ended` state,
-        // `send_singleop_cancel_event` reaps the slab entry directly and
-        // returns false — the keepalive then drops at end-of-scope.
-        if self.send_singleop_cancel_event(token) {
-            let slab = unsafe { &mut *self.slab.get() };
-            *slab.get_mut(token).unwrap() = SingleOpState::Cancelled {
-                bgid,
-                keepalive: keepalive.map(CancelKeepalive),
-                parked_fd,
-            };
+        let slab = unsafe { &mut *self.slab.get() };
+        // The CQE beat the drop: nothing to cancel, but a buffer it delivered must go back.
+        if let Some(SingleOpState::Ended(meta)) = slab.get_mut(token) {
+            let meta = *meta;
+            slab.remove(token);
+            if let (Some(bgid), Some(bid)) = (bgid, io_uring::cqueue::buffer_select(meta.flags))
+                && meta.result > 0
+            {
+                self.recycle_by_bgid(bgid, bid);
+            }
+            return;
         }
+        self.send_singleop_cancel_event(token);
+        *slab.get_mut(token).unwrap() = SingleOpState::Cancelled {
+            bgid,
+            keepalive: keepalive.map(CancelKeepalive),
+            parked_fd,
+        };
     }
 
-    /// Submit an async cancel SQE for `token`, returning `true` if a cancel
-    /// was actually needed. If the op is already in `Ended` state (CQE arrived
-    /// before this cancel call), the slab entry is reaped directly and `false`
-    /// is returned — no cancel SQE is sent.
-    fn send_singleop_cancel_event(&self, token: OneshotToken) -> bool {
-        let slab = unsafe { &mut *self.slab.get() };
-        if matches!(slab.get_mut(token), Some(SingleOpState::Ended(_))) {
-            slab.remove(token);
-            return false;
-        }
+    /// Submit an async cancel SQE for `token`.
+    fn send_singleop_cancel_event(&self, token: OneshotToken) {
         let raw = token.raw();
         let ring_inner = unsafe { &mut *self.ring.get() };
         let cancel_op = opcode::AsyncCancel::new(raw)
             .build()
             .user_data(UserData::cancel_echo(raw).into_bits());
         ring_inner.add(&cancel_op);
-        true
     }
 
     /// Queue a fire-and-forget close for `fd`, flushed at the next submit.
