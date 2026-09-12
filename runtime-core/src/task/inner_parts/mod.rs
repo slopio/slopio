@@ -16,6 +16,8 @@ pub struct Metadata {
     /// Set by `Handle::kill`; the next scheduler pop drops the task instead of polling it.
     killed: Cell<bool>,
     pub(crate) queued: Cell<bool>,
+    /// Live wakers pointing here, plus one while the scheduler polls.
+    wakers: Cell<u32>,
     vtable: &'static Vtable,
     #[cfg(feature = "tracing")]
     pub(crate) tracing: TaskTelemetry,

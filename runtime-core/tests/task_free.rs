@@ -1,5 +1,5 @@
 //! When a task's allocation is freed: only once its future is gone, its
-//! handle is gone, and it is no longer in the run queue.
+//! handle is gone, it is no longer in the run queue, and no waker points at it.
 //!
 //! Each `yield_now` from the root future is one scheduler pass. The simulated
 //! ring panics if the root yields while no task is queued, so every test

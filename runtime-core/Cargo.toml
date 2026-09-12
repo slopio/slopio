@@ -72,3 +72,15 @@ required-features = ["simulation"]
 [[test]]
 name = "channels_vec"
 required-features = ["simulation"]
+
+[[test]]
+name = "kill"
+required-features = ["simulation"]
+
+[[test]]
+name = "task_free"
+required-features = ["simulation"]
+
+[[test]]
+name = "kill_drop"
+required-features = ["simulation"]

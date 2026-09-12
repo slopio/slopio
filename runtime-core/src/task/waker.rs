@@ -5,6 +5,7 @@ use std::{
 
 use crate::task::inner_parts::{Metadata, typed_task::TypedTask};
 
+/// A waker over `header`. Counts nothing: the caller owns the ref it stands for.
 pub(super) fn raw_waker<T>(header: *const Metadata) -> RawWaker
 where
     T: Future,
@@ -19,34 +20,35 @@ where
     RawWaker::new(ptr, vtable)
 }
 
+fn task<T: Future>(ptr: *const ()) -> TypedTask<T> {
+    TypedTask::<T>::from_raw(unsafe { NonNull::new_unchecked(ptr as *mut Metadata) })
+}
+
 unsafe fn clone_waker<T>(ptr: *const ()) -> RawWaker
 where
     T: Future,
 {
-    let header = ptr as *const Metadata;
-    raw_waker::<T>(header)
+    task::<T>(ptr).retain();
+    raw_waker::<T>(ptr as *const Metadata)
 }
 
-unsafe fn drop_waker<T>(_ptr: *const ())
+unsafe fn drop_waker<T>(ptr: *const ())
 where
     T: Future,
 {
+    task::<T>(ptr).release();
 }
 
 unsafe fn wake_by_val<T>(ptr: *const ())
 where
     T: Future,
 {
-    let ptr = unsafe { NonNull::new_unchecked(ptr as *mut Metadata) };
-    let typed_task = TypedTask::<T>::from_raw(ptr);
-    typed_task.wake_by_val()
+    task::<T>(ptr).wake_by_val();
 }
 
 unsafe fn wake_by_ref<T>(ptr: *const ())
 where
     T: Future,
 {
-    let ptr = unsafe { NonNull::new_unchecked(ptr as *mut Metadata) };
-    let typed_task = TypedTask::<T>::from_raw(ptr);
-    typed_task.wake_by_ref();
+    task::<T>(ptr).wake_by_ref();
 }

@@ -136,14 +136,12 @@ fn kill_after_a_fixed_5s_timer_fired_holds_a_stale_token() {
     });
 }
 
-/// A receiver shared with the killed task keeps that task's waker after the
-/// task is freed; the next send wakes freed memory.
-///
-/// Passes natively, since the freed header still reads as plausible bytes;
-/// Miri names the use-after-free at `TypedTask::wake_by_ref`.
+/// A receiver shared with the killed task keeps that task's waker past the
+/// reap. The waker holds the box alive; the send consumes it and the
+/// scheduler frees the box on the pass after. Miri checks both halves: no
+/// use-after-free on the send, no leak at exit.
 #[test]
-#[ignore = "documents a known use-after-free; Miri fails it by design"]
-fn kill_then_send_on_a_shared_receiver_wakes_a_freed_task() {
+fn kill_then_send_on_a_shared_receiver_frees_the_task() {
     on_runtime(async {
         let (send, recv) = unbounded_channel::<()>();
         let recv = Rc::new(recv);
@@ -156,9 +154,10 @@ fn kill_then_send_on_a_shared_receiver_wakes_a_freed_task() {
         // Task polled once: its waker is now parked in the channel.
         yield_now().await;
         handle.kill();
-        // Reaped and freed; the channel still holds the waker. Only Miri can
-        // see the send touch freed memory: natively it reads garbage quietly.
+        // Reaped; the channel's waker is the last ref to the box.
         yield_now().await;
         send.send(());
+        // The send queued the reaped task; this pass pops and frees it.
+        yield_now().await;
     });
 }

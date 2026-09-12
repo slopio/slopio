@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    mem::ManuallyDrop,
     pin::{self},
     ptr::NonNull,
     task::{Context, Waker},
@@ -38,41 +39,36 @@ impl<F: Future> TypedTask<F> {
         inner.data.state.take()
     }
 
-    /// The handle is gone: free now if nothing will poll us again, else at the next pop.
-    pub fn detach(mut self) {
-        let inner = unsafe { self.inner.as_mut() };
-        inner.header.detached_mode.set(true);
-        if !matches!(inner.data.state, State::Running(_)) && !inner.header.queued.get() {
-            self.free();
-        }
+    /// The handle is gone: free now if nothing else can reach us.
+    pub fn detach(self) {
+        let header = unsafe { &(*self.inner.as_ptr()).header };
+        header.detached_mode.set(true);
+        self.free_if_unreachable();
     }
 
     pub fn poll(mut self) {
         let inner = unsafe { self.inner.as_mut() };
         inner.header.queued.set(false);
+        // One ref for the whole poll: nothing can free the task under us.
+        inner.header.wakers.set(inner.header.wakers.get() + 1);
         if inner.header.killed.get() {
             Self::reap(inner);
         } else if let State::Running(future) = &mut inner.data.state {
             let pinned = unsafe { pin::Pin::new_unchecked(future) };
             let raw_waker = crate::task::waker::raw_waker::<F>(self.inner.as_ptr() as *const _);
-            let waker = unsafe { Waker::from_raw(raw_waker) };
+            // Never dropped: its ref is the one taken above.
+            let waker = ManuallyDrop::new(unsafe { Waker::from_raw(raw_waker) });
             let mut ctx = Context::from_waker(&waker);
-            match pinned.poll(&mut ctx) {
-                std::task::Poll::Ready(r) => {
-                    inner.data.state = State::Finished(r);
-                    if !inner.header.detached_mode.get()
-                        && let Some(waker) = &inner.waker.waker
-                    {
-                        waker.wake_by_ref();
-                    }
+            if let std::task::Poll::Ready(r) = pinned.poll(&mut ctx) {
+                inner.data.state = State::Finished(r);
+                if !inner.header.detached_mode.get()
+                    && let Some(waker) = &inner.waker.waker
+                {
+                    waker.wake_by_ref();
                 }
-                std::task::Poll::Pending => return,
             }
         }
-        // No future left: free once the handle is gone, unless drop glue re-queued us.
-        if inner.header.detached_mode.get() && !inner.header.queued.get() {
-            self.free();
-        }
+        self.release();
     }
 
     /// Kill path: drops the future, or an output nobody will collect.
@@ -84,6 +80,7 @@ impl<F: Future> TypedTask<F> {
 
     pub fn wake_by_val(self) {
         self.wake_by_ref();
+        self.release();
     }
 
     pub fn wake_by_ref(&self) {
@@ -97,6 +94,31 @@ impl<F: Future> TypedTask<F> {
         TASK_LIST.with(|ctx| {
             ctx.push(erased);
         });
+    }
+
+    /// One more waker points here.
+    pub(crate) fn retain(&self) {
+        let header = unsafe { &(*self.inner.as_ptr()).header };
+        header.wakers.set(header.wakers.get() + 1);
+    }
+
+    /// One waker fewer; frees the task once nothing can reach it.
+    pub(crate) fn release(self) {
+        let header = unsafe { &(*self.inner.as_ptr()).header };
+        header.wakers.set(header.wakers.get() - 1);
+        self.free_if_unreachable();
+    }
+
+    /// Header first: `state` is read only when no poll is in progress.
+    fn free_if_unreachable(self) {
+        let header = unsafe { &(*self.inner.as_ptr()).header };
+        if header.wakers.get() != 0 || header.queued.get() || !header.detached_mode.get() {
+            return;
+        }
+        let inner = unsafe { self.inner.as_ref() };
+        if !matches!(inner.data.state, State::Running(_)) {
+            self.free();
+        }
     }
 
     fn free(self) {
@@ -119,6 +141,7 @@ impl<F: Future> TypedTask<F> {
                 detached_mode: Cell::new(false),
                 killed: Cell::new(false),
                 queued: Cell::new(true),
+                wakers: Cell::new(0),
                 vtable: table::<F>(),
                 #[cfg(feature = "tracing")]
                 tracing: match current_trace_id() {
