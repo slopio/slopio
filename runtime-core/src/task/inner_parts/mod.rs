@@ -11,6 +11,9 @@ use crate::tracing::TaskTelemetry;
 pub(crate) mod type_agnostic_task;
 pub(crate) mod typed_task;
 
+/// A task no live-task list holds.
+pub(crate) const UNLISTED: u32 = u32::MAX;
+
 pub struct Metadata {
     detached_mode: Cell<bool>,
     /// Set by `Handle::kill`; the next scheduler pop drops the task instead of polling it.
@@ -18,6 +21,8 @@ pub struct Metadata {
     pub(crate) queued: Cell<bool>,
     /// Live wakers pointing here, plus one while the scheduler polls.
     wakers: Cell<u32>,
+    /// Slot in the runtime's live-task list, or `UNLISTED`.
+    live: Cell<u32>,
     vtable: &'static Vtable,
     #[cfg(feature = "tracing")]
     pub(crate) tracing: TaskTelemetry,

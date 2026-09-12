@@ -252,25 +252,11 @@ fn a_stream_dropped_mid_batch_gives_the_ring_its_buffers_back() {
     assert_eq!(held, 2, "the ring should have both buffers back");
 }
 
-/// A runtime that ends with a task still parked leaks that task.
-///
-/// Passes on its own terms — `block_on` returns, nothing hangs — but under
-/// Miri it reports two leaks: the `TypedTask` box and the buffer the parked
-/// read owns. A parked task is kept alive by the waker the driver holds, not
-/// by the `TaskList`, so consuming the runtime never reclaims it.
-///
-/// Ignored rather than deleted because the fix is a design decision and not an
-/// oversight: tearing down a task whose op is in flight means cancelling and
-/// draining first, which is exactly what the per-future keepalive does and
-/// what no one does for a whole task at shutdown. Freeing it outright would
-/// trade this leak for the use-after-free the keepalive exists to prevent.
-///
-/// ```text
-/// cargo test --features simulation --test cancellation -- --ignored
-/// ```
+/// A runtime that ends with a task still parked reaps it: the read is
+/// cancelled, the cancel is waited for, and the box and buffer go with it.
+/// Under Miri the leak check at exit is what proves the last part.
 #[test]
-#[ignore = "documents a known shutdown leak; Miri fails it by design"]
-fn a_task_still_parked_on_a_read_leaks_it() {
+fn a_task_still_parked_on_a_read_is_reaped_at_shutdown() {
     let (fake, handle) = simulated();
     let socket = simulated_socket().expect("a socket");
 
@@ -282,9 +268,7 @@ fn a_task_still_parked_on_a_read_leaks_it() {
                 result
             });
 
-            // The spawned task is still on the ring when this returns, so the
-            // runtime tears down around an op in flight and a buffer the ring
-            // still points into.
+            // The spawned task is still on the ring when this returns.
             Sleep::during(Duration::from_millis(1)).await;
             true
         },
@@ -293,5 +277,10 @@ fn a_task_still_parked_on_a_read_leaks_it() {
     );
 
     assert!(done);
-    let _ = handle.inflight();
+    assert!(
+        handle.inflight().is_empty(),
+        "shutdown left {:?} in flight",
+        handle.inflight(),
+    );
+    assert_eq!(handle.parked(), 0);
 }

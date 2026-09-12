@@ -1,7 +1,7 @@
 use std::{ptr::NonNull, task::Waker};
 
 use crate::runtime::TASK_LIST;
-use crate::task::inner_parts::Metadata;
+use crate::task::inner_parts::{Metadata, UNLISTED};
 #[cfg(feature = "tracing")]
 use crate::tracing::swap_current_task_tracing;
 
@@ -36,14 +36,27 @@ impl TypeAgnosticTask {
     /// Marks the task killed and queues it; the scheduler drops and frees it on the next pop.
     #[cold]
     pub fn kill(self) {
+        self.header().detached_mode.set(true);
+        self.abort();
+    }
+
+    /// Marks the task killed and queues it; the box stays until its handle is dropped.
+    pub(crate) fn abort(self) {
         let header = self.header();
         header.killed.set(true);
-        header.detached_mode.set(true);
         if header.queued.get() {
             return;
         }
         header.queued.set(true);
         TASK_LIST.with(|ctx| ctx.push(self));
+    }
+
+    pub(crate) fn set_live(&self, index: u32) {
+        self.header().live.set(index);
+    }
+
+    pub(crate) fn unlist(&self) {
+        self.header().live.set(UNLISTED);
     }
 
     pub fn poll(self) {
