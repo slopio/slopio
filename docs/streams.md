@@ -2,6 +2,16 @@
 
 Accept and receive have streaming forms: `MultiAccept` for incoming connections, `MultiRecv` for bytes on a TCP socket, `UdpMultiRecv` for datagrams. Each is a `Stream` you consume with `next().await`, backed by a single multishot submission that the kernel keeps completing on its own. You never resubmit anything, and you never see the mechanism below.
 
+## Choosing what a listener listens on
+
+`MultiAccept::new(port)` listens on `0.0.0.0:port`, IPv4 only. To pick the address yourself, use `MultiAccept::bind(addr)` with any `SocketAddr`.
+
+A listener bound to a v6 address serves IPv6 only, whatever the host's `bindv6only` setting: peers arrive as real `SocketAddr::V6`, and the same port stays free for a separate v4 listener. Bind two listeners if you want to serve both families.
+
+If you would rather have one socket for both, `MultiAccept::bind_dual_stack(port)` listens on `[::]:port` and accepts v4 clients too — but their `peer_addr()` is then a v4-mapped address such as `::ffff:127.0.0.1`, so compare addresses with `to_canonical()` rather than against an `Ipv4Addr`.
+
+Binding to port 0 lets the kernel pick a free port; `local_addr()` tells you which one. Each of these has a `*_with_queue_size` form when you also want to set the queue depth described below.
+
 ## What happens when the consumer is slower than the producer
 
 A stream has a bounded queue of completions, whose depth you choose at construction and which defaults to 32. Results land in that queue as the kernel produces them, and your task pulls from it as it polls.

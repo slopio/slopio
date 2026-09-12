@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::IntoRawFd,
     pin::Pin,
     task::{Context, Poll},
@@ -58,15 +58,47 @@ impl TryFrom<MultishotCompletionEvent> for SocketWrapper {
 }
 
 impl MultiAccept<DEFAULT_QUEUE_SIZE> {
+    /// Listen on `0.0.0.0:port`.
     pub fn new(port: u16) -> std::io::Result<Self> {
         Self::with_queue_size(port)
+    }
+
+    /// Listen on `addr`. A v6 address serves v6 only: bind a second listener
+    /// for v4, or use [`MultiAccept::bind_dual_stack`].
+    pub fn bind(addr: SocketAddr) -> std::io::Result<Self> {
+        Self::bind_with_queue_size(addr)
+    }
+
+    /// Listen on `[::]:port` for both families; v4 peers report a v4-mapped
+    /// address such as `::ffff:127.0.0.1`.
+    pub fn bind_dual_stack(port: u16) -> std::io::Result<Self> {
+        Self::bind_dual_stack_with_queue_size(port)
     }
 }
 
 impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
     pub fn with_queue_size(port: u16) -> std::io::Result<Self> {
-        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-        let socket = S::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        Self::bind_inner(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)), true)
+    }
+
+    pub fn bind_with_queue_size(addr: SocketAddr) -> std::io::Result<Self> {
+        Self::bind_inner(addr, true)
+    }
+
+    pub fn bind_dual_stack_with_queue_size(port: u16) -> std::io::Result<Self> {
+        Self::bind_inner(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)), false)
+    }
+
+    fn bind_inner(addr: SocketAddr, only_v6: bool) -> std::io::Result<Self> {
+        let domain = match addr {
+            SocketAddr::V4(_) => Domain::IPV4,
+            SocketAddr::V6(_) => Domain::IPV6,
+        };
+        let socket = S::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        // Set before bind, or the kernel keeps its `bindv6only` default.
+        if addr.is_ipv6() {
+            socket.set_only_v6(only_v6)?;
+        }
         socket.set_reuse_port(true)?;
         socket.set_nonblocking(true)?;
         socket.bind(&addr.into())?;
@@ -85,6 +117,11 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
 
     pub fn socket(&self) -> &SocketWrapper {
         &self.socket
+    }
+
+    /// The bound address, including the kernel-chosen port when bound to 0.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
     }
 
     pub fn set_backlog(&self, backlog: i32) -> std::io::Result<()> {
