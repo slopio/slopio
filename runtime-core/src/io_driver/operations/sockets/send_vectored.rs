@@ -15,9 +15,14 @@ use crate::io_driver::{
 /// Kernel cap on iovecs per submission.
 pub(super) const IOV_MAX: usize = libc::UIO_MAXIOV as usize;
 
-/// Default `msg_flags` for the gather sends. Without `MSG_WAITALL` a short
-/// send comes back to the `_all` loop for a fresh submission instead of being
-/// retried inside the kernel.
+/// What a socket's `msg_flags` start at, for every send that does not pass its
+/// own. Without `MSG_WAITALL` a short send comes back to the `_all` loop for a
+/// fresh submission instead of being retried inside the kernel.
+///
+/// Not valid on a kTLS socket: `tls_sw_sendmsg` rejects every flag outside
+/// `MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL | MSG_CMSG_COMPAT | MSG_SPLICE_PAGES
+/// | MSG_EOR` with `EOPNOTSUPP`. Those sockets take
+/// [`set_default_msg_flags(0)`](SocketWrapper::set_default_msg_flags).
 pub const DEFAULT_MSG_FLAGS: u32 = libc::MSG_WAITALL as u32;
 
 /// A `msghdr` and the iovec array it points at. Boxed and never moved after
@@ -66,19 +71,21 @@ fn build_iovecs<B: IoBuf>(bufs: &[B], first: usize, offset: usize) -> Vec<libc::
 }
 
 /// Cancellation-safe vectored send (`IORING_OP_SENDMSG`): takes ownership of
-/// every chunk, returns the chunk list on completion. A short send is retried
-/// inside the kernel — see [`DEFAULT_MSG_FLAGS`]. If the future is dropped
-/// mid-flight, both the chunks AND the kernel-visible `msghdr` are moved into
-/// the driver's keepalive slot so the kernel can finish reading them after the
-/// cancel CQE.
+/// every chunk, returns the chunk list on completion. Sends under the socket's
+/// [`default_msg_flags`](SocketWrapper::default_msg_flags), so a short send is
+/// retried inside the kernel unless that default was changed. If the future is
+/// dropped mid-flight, both the chunks AND the kernel-visible `msghdr` are
+/// moved into the driver's keepalive slot so the kernel can finish reading them
+/// after the cancel CQE.
 pub fn socket_send_vectored<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> WriteVectoredSocket<B> {
-    submit_from(socket, bufs, 0, 0, DEFAULT_MSG_FLAGS)
+    submit_from(socket, bufs, 0, 0, socket.default_msg_flags())
 }
 
-/// As above with explicit `msg_flags`. `0` restores short-write behaviour.
+/// As above, overriding the socket's default `msg_flags`. `0` restores
+/// short-write behaviour.
 pub fn socket_send_vectored_with_flags<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
@@ -176,8 +183,19 @@ pub async fn send_vectored_all<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> (std::io::Result<()>, Vec<B>) {
-    send_all_with(socket, bufs, |s, b, first, offset| {
-        submit_from(s, b, first, offset, DEFAULT_MSG_FLAGS)
+    send_vectored_all_with_flags(socket, bufs, socket.default_msg_flags()).await
+}
+
+/// As [`send_vectored_all`], overriding the socket's default `msg_flags` for
+/// this call only. `0` costs at most extra submissions on a short send — this
+/// loop retries either way.
+pub async fn send_vectored_all_with_flags<B: IoBuf>(
+    socket: &SocketWrapper,
+    bufs: Vec<B>,
+    msg_flags: u32,
+) -> (std::io::Result<()>, Vec<B>) {
+    send_all_with(socket, bufs, move |s, b, first, offset| {
+        submit_from(s, b, first, offset, msg_flags)
     })
     .await
 }

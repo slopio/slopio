@@ -7,7 +7,6 @@ use std::task::{Context, Poll};
 use io_uring::{opcode, types::Fd};
 
 use super::send_vectored::{VectoredMsg, send_all_with};
-use super::send_vectored_zc::ZC_DEFAULT_MSG_FLAGS;
 use crate::io_driver::{
     IO_DRIVER, PooledBuf, SLAB_BUF_INDEX,
     operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
@@ -35,10 +34,11 @@ pub fn socket_send_vectored_fixed_zc(
     socket: &SocketWrapper,
     bufs: Vec<PooledBuf>,
 ) -> WriteVectoredFixedSocketZc {
-    submit_from(socket, bufs, 0, 0, ZC_DEFAULT_MSG_FLAGS)
+    submit_from(socket, bufs, 0, 0, socket.default_msg_flags())
 }
 
-/// As above with explicit `msg_flags`. `0` restores short-write behaviour.
+/// As above, overriding the socket's default `msg_flags`. `0` restores
+/// short-write behaviour.
 pub fn socket_send_vectored_fixed_zc_with_flags(
     socket: &SocketWrapper,
     bufs: Vec<PooledBuf>,
@@ -129,8 +129,9 @@ pub async fn send_vectored_fixed_all_zc(
     socket: &SocketWrapper,
     bufs: Vec<PooledBuf>,
 ) -> (io::Result<()>, Vec<PooledBuf>) {
-    send_all_with(socket, bufs, |s, b, first, offset| {
-        submit_from(s, b, first, offset, ZC_DEFAULT_MSG_FLAGS)
+    let msg_flags = socket.default_msg_flags();
+    send_all_with(socket, bufs, move |s, b, first, offset| {
+        submit_from(s, b, first, offset, msg_flags)
     })
     .await
 }

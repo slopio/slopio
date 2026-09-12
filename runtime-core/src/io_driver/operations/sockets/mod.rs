@@ -1,4 +1,5 @@
 use libc::c_int;
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::io_driver::ParkedFd;
@@ -41,6 +42,9 @@ pub mod udp;
 #[derive(Debug)]
 pub(crate) struct SocketInner {
     fd: i32,
+    /// `msg_flags` for the sends on this socket that do not pass their own.
+    /// See [`SocketWrapper::set_default_msg_flags`].
+    msg_flags: Cell<u32>,
 }
 
 impl SocketInner {
@@ -84,7 +88,10 @@ impl std::os::fd::FromRawFd for SocketWrapper {
 impl SocketWrapper {
     pub(crate) fn from_fd(fd: i32) -> Self {
         Self {
-            inner: Rc::new(SocketInner { fd }),
+            inner: Rc::new(SocketInner {
+                fd,
+                msg_flags: Cell::new(send_vectored::DEFAULT_MSG_FLAGS),
+            }),
         }
     }
 
@@ -119,6 +126,25 @@ impl SocketWrapper {
 
     pub fn fd(&self) -> i32 {
         self.inner.fd
+    }
+
+    /// The `msg_flags` every send on this socket uses unless it passes its own.
+    /// Starts at [`DEFAULT_MSG_FLAGS`](send_vectored::DEFAULT_MSG_FLAGS).
+    ///
+    /// Read it to extend rather than replace what the socket was configured
+    /// with: `socket.default_msg_flags() | MSG_MORE`.
+    pub fn default_msg_flags(&self) -> u32 {
+        self.inner.msg_flags.get()
+    }
+
+    /// Set that default. Not a `setsockopt` — it is carried per send, and is
+    /// shared by both halves of an `into_split`.
+    ///
+    /// Set `0` after attaching the TLS ULP: `tls_sw_sendmsg` rejects
+    /// `MSG_WAITALL` (and every other flag outside its allowed set) with
+    /// `EOPNOTSUPP`, which would fail every send on the socket.
+    pub fn set_default_msg_flags(&self, flags: u32) {
+        self.inner.msg_flags.set(flags);
     }
 
     pub fn vectored_write<B: IoBuf>(&self, bufs: Vec<B>) -> WriteVectoredSocket<B> {

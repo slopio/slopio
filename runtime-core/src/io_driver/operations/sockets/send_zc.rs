@@ -7,7 +7,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use super::send_vectored_zc::ZC_DEFAULT_MSG_FLAGS;
 use crate::io_driver::{
     IO_DRIVER,
     operations::{IoBuf, OneshotToken, sockets::{OpSocket, SocketWrapper}},
@@ -28,10 +27,11 @@ use crate::io_driver::{
 /// may transparently fall back to a copy (a single CQE, no notification),
 /// which this future handles like an ordinary send.
 pub fn socket_send_zc<B: IoBuf>(socket: &SocketWrapper, buf: B) -> WriteSocketZc<B> {
-    socket_send_zc_with_flags(socket, buf, ZC_DEFAULT_MSG_FLAGS)
+    socket_send_zc_with_flags(socket, buf, socket.default_msg_flags())
 }
 
-/// As above with explicit `msg_flags`. `0` restores short-write behaviour.
+/// As above, overriding the socket's default `msg_flags`. `0` restores
+/// short-write behaviour.
 pub fn socket_send_zc_with_flags<B: IoBuf>(
     socket: &SocketWrapper,
     buf: B,

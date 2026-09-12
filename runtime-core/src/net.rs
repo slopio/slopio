@@ -24,8 +24,8 @@ pub use crate::io_driver::operations::sockets::send_fixed_zc::{
     WriteFixedSocketZc, socket_write_fixed_zc,
 };
 pub use crate::io_driver::operations::sockets::send_vectored::{
-    DEFAULT_MSG_FLAGS, WriteVectoredSocket, send_vectored_all, socket_send_vectored,
-    socket_send_vectored_with_flags,
+    DEFAULT_MSG_FLAGS, WriteVectoredSocket, send_vectored_all, send_vectored_all_with_flags,
+    socket_send_vectored, socket_send_vectored_with_flags,
 };
 pub use crate::io_driver::operations::sockets::send_vectored_fixed_zc::{
     WriteVectoredFixedSocketZc, send_vectored_fixed_all_zc, socket_send_vectored_fixed_zc,

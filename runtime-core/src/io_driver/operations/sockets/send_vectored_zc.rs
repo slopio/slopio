@@ -18,10 +18,11 @@ pub fn socket_send_vectored_zc<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> WriteVectoredSocketZc<B> {
-    socket_send_vectored_zc_with_flags(socket, bufs, ZC_DEFAULT_MSG_FLAGS)
+    socket_send_vectored_zc_with_flags(socket, bufs, socket.default_msg_flags())
 }
 
-/// As above with explicit `msg_flags`. `0` restores short-write behaviour.
+/// As above, overriding the socket's default `msg_flags`. `0` restores
+/// short-write behaviour.
 pub fn socket_send_vectored_zc_with_flags<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
@@ -113,8 +114,9 @@ pub async fn send_vectored_all_zc<B: IoBuf>(
     socket: &SocketWrapper,
     bufs: Vec<B>,
 ) -> (std::io::Result<()>, Vec<B>) {
-    send_all_with(socket, bufs, |s, b, first, offset| {
-        submit_from(s, b, first, offset, ZC_DEFAULT_MSG_FLAGS)
+    let msg_flags = socket.default_msg_flags();
+    send_all_with(socket, bufs, move |s, b, first, offset| {
+        submit_from(s, b, first, offset, msg_flags)
     })
     .await
 }
