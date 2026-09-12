@@ -368,6 +368,7 @@ pub unsafe fn request_msg_from_peer<Req: Send + 'static, Rep>(
     });
     RecvMsgReply {
         slot,
+        resolved: false,
         _marker: std::marker::PhantomData,
     }
 }
@@ -414,6 +415,7 @@ pub fn reply_msg_to_peer<Rep: Send + 'static>(request_header: &Header, payload: 
 /// never taken is freed immediately on drop.
 pub struct RecvMsgReply<Rep: 'static> {
     slot: u32,
+    resolved: bool,
     _marker: std::marker::PhantomData<fn() -> Rep>,
 }
 
@@ -424,16 +426,24 @@ impl<Rep: 'static> std::future::Future for RecvMsgReply<Rep> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> std::task::Poll<Arc<Message<Rep>>> {
-        crate::io_driver::IO_DRIVER
-            .with(|d| d.poll_reply_slot(self.slot, cx.waker()))
-            // SAFETY: forwarded from `request_msg_from_peer`'s contract — the
-            // peer replies with a `Message<Rep>`.
-            .map(|erased| unsafe { erased.into_typed::<Rep>() })
+        let this = self.get_mut();
+        let polled = crate::io_driver::IO_DRIVER.with(|d| d.poll_reply_slot(this.slot, cx.waker()));
+        if polled.is_ready() {
+            // `poll_reply_slot` removed the slot on the way out; remember it,
+            // so `drop` does not reach for an index the slab may have reused.
+            this.resolved = true;
+        }
+        // SAFETY: forwarded from `request_msg_from_peer`'s contract — the
+        // peer replies with a `Message<Rep>`.
+        polled.map(|erased| unsafe { erased.into_typed::<Rep>() })
     }
 }
 
 impl<Rep: 'static> Drop for RecvMsgReply<Rep> {
     fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
         // Don't free the slot outright — a reply may still be racing toward it.
         // Hand `abandon_reply_slot` the type-recovering glue for `Rep`: if a
         // reply was already delivered but never polled, it is freed now; if none
