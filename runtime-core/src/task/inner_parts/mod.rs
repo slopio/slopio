@@ -13,6 +13,8 @@ pub(crate) mod typed_task;
 
 pub struct Metadata {
     detached_mode: Cell<bool>,
+    /// Set by `Handle::kill`; the next scheduler pop drops the task instead of polling it.
+    killed: Cell<bool>,
     pub(crate) queued: Cell<bool>,
     vtable: &'static Vtable,
     #[cfg(feature = "tracing")]

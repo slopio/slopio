@@ -38,66 +38,68 @@ impl<F: Future> TypedTask<F> {
         inner.data.state.take()
     }
 
+    /// The handle is gone: free now if nothing will poll us again, else at the next pop.
     pub fn detach(mut self) {
         let inner = unsafe { self.inner.as_mut() };
-        inner.header.detached_mode.replace(true);
+        inner.header.detached_mode.set(true);
+        if !matches!(inner.data.state, State::Running(_)) && !inner.header.queued.get() {
+            self.free();
+        }
     }
 
     pub fn poll(mut self) {
         let inner = unsafe { self.inner.as_mut() };
         inner.header.queued.set(false);
-        let state = &mut inner.data.state;
-        match state {
-            State::Running(future) => {
-                let pinned = unsafe { pin::Pin::new_unchecked(future) };
-                let raw_waker = crate::task::waker::raw_waker::<F>(self.inner.as_ptr() as *const _);
-                let waker = unsafe { Waker::from_raw(raw_waker) };
-                let mut ctx = Context::from_waker(&waker);
-                match pinned.poll(&mut ctx) {
-                    std::task::Poll::Ready(r) => {
-                        *state = State::Finished(r);
-                        let registered_waker = &inner.waker.waker;
-                        if !inner.header.detached_mode.get() {
-                            if let Some(waker) = registered_waker {
-                                waker.wake_by_ref();
-                            }
-                        } else {
-                            self.free();
-                        }
+        if inner.header.killed.get() {
+            Self::reap(inner);
+        } else if let State::Running(future) = &mut inner.data.state {
+            let pinned = unsafe { pin::Pin::new_unchecked(future) };
+            let raw_waker = crate::task::waker::raw_waker::<F>(self.inner.as_ptr() as *const _);
+            let waker = unsafe { Waker::from_raw(raw_waker) };
+            let mut ctx = Context::from_waker(&waker);
+            match pinned.poll(&mut ctx) {
+                std::task::Poll::Ready(r) => {
+                    inner.data.state = State::Finished(r);
+                    if !inner.header.detached_mode.get()
+                        && let Some(waker) = &inner.waker.waker
+                    {
+                        waker.wake_by_ref();
                     }
-                    std::task::Poll::Pending => {}
                 }
+                std::task::Poll::Pending => return,
             }
-            State::Finished(_) => {}
-            State::Ended => {}
+        }
+        // No future left: free once the handle is gone, unless drop glue re-queued us.
+        if inner.header.detached_mode.get() && !inner.header.queued.get() {
+            self.free();
         }
     }
 
-    pub fn wake_by_val(mut self) {
-        let inner = unsafe { self.inner.as_mut() };
-        if inner.header.queued.get() {
-            return;
-        }
-        inner.header.queued.set(true);
-        let erased = self.erase_type();
-        TASK_LIST.with(|ctx| {
-            ctx.push(erased);
-        });
+    /// Kill path: drops the future, or an output nobody will collect.
+    #[cold]
+    #[inline(never)]
+    fn reap(inner: &mut TypedTaskInner<F>) {
+        inner.data.state = State::Ended;
+    }
+
+    pub fn wake_by_val(self) {
+        self.wake_by_ref();
     }
 
     pub fn wake_by_ref(&self) {
-        let inner = unsafe { &*self.inner.as_ptr() };
-        if inner.header.queued.get() {
+        // Header only: the future's bytes may be under a protected `&mut` mid-poll.
+        let header = unsafe { &(*self.inner.as_ptr()).header };
+        if header.queued.get() {
             return;
         }
-        inner.header.queued.set(true);
+        header.queued.set(true);
         let erased = self.erase_type();
         TASK_LIST.with(|ctx| {
             ctx.push(erased);
         });
     }
 
-    pub fn free(self) {
+    fn free(self) {
         drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
     }
 
@@ -115,6 +117,7 @@ impl<F: Future> TypedTask<F> {
         let ptr = Box::into_raw(Box::new(TypedTaskInner::<F> {
             header: Metadata {
                 detached_mode: Cell::new(false),
+                killed: Cell::new(false),
                 queued: Cell::new(true),
                 vtable: table::<F>(),
                 #[cfg(feature = "tracing")]
@@ -137,7 +140,6 @@ impl<F: Future> TypedTask<F> {
 #[derive(Debug)]
 pub struct Vtable {
     pub poll: unsafe fn(NonNull<Metadata>),
-    pub free: unsafe fn(NonNull<Metadata>),
     pub get_output: unsafe fn(NonNull<Metadata>, *mut (), &Waker),
     pub detach: unsafe fn(NonNull<Metadata>),
 }
@@ -145,7 +147,6 @@ pub struct Vtable {
 fn table<F: Future>() -> &'static Vtable {
     &Vtable {
         poll: poll::<F>,
-        free: free::<F>,
         get_output: get_output::<F>,
         detach: detach::<F>,
     }
@@ -159,11 +160,6 @@ unsafe fn poll<F: Future>(ptr: NonNull<Metadata>) {
 unsafe fn detach<F: Future>(ptr: NonNull<Metadata>) {
     let typed_task = TypedTask::<F>::from_raw(ptr);
     typed_task.detach();
-}
-
-unsafe fn free<F: Future>(ptr: NonNull<Metadata>) {
-    let typed_task = TypedTask::<F>::from_raw(ptr);
-    typed_task.free();
 }
 
 unsafe fn get_output<F: Future>(ptr: NonNull<Metadata>, dest: *mut (), waker: &Waker) {

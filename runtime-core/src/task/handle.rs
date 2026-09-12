@@ -18,6 +18,18 @@ impl<T> From<TypeAgnosticTask> for Handle<T> {
     }
 }
 
+impl<T> Handle<T> {
+    /// Kills the task: its future is dropped by the scheduler on the next pass,
+    /// running cancellation for anything it had in flight. An output already
+    /// produced but not yet awaited is dropped too.
+    #[cold]
+    pub fn kill(mut self) {
+        if let Some(task) = self.task.take() {
+            task.kill();
+        }
+    }
+}
+
 impl<T> Drop for Handle<T> {
     fn drop(&mut self) {
         if let Some(task) = self.task {
@@ -41,7 +53,7 @@ impl<T> Future for Handle<T> {
         }
         if ret.is_ready() {
             if let Some(task) = self.task.take() {
-                task.free();
+                task.detach();
             }
         }
         ret
