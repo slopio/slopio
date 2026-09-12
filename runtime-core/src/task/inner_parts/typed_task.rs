@@ -10,7 +10,7 @@ use std::{
 use crate::tracing::{TaskTelemetry, current_trace_id};
 use crate::{
     runtime::TASK_LIST,
-    task::inner_parts::{Data, Metadata, State, UNLISTED, type_agnostic_task::TypeAgnosticTask},
+    task::inner_parts::{Data, Metadata, State, type_agnostic_task::TypeAgnosticTask},
 };
 
 #[repr(C)]
@@ -122,15 +122,6 @@ impl<F: Future> TypedTask<F> {
     }
 
     fn free(self) {
-        // The list is gone once `block_on` returned; a handle dropped later lands here.
-        let live = unsafe { &(*self.inner.as_ptr()).header }.live.get();
-        if live != UNLISTED {
-            TASK_LIST.try_with(|list| {
-                if let Some(list) = list {
-                    list.unregister(live);
-                }
-            });
-        }
         drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
     }
 
@@ -151,7 +142,6 @@ impl<F: Future> TypedTask<F> {
                 killed: Cell::new(false),
                 queued: Cell::new(true),
                 wakers: Cell::new(0),
-                live: Cell::new(UNLISTED),
                 vtable: table::<F>(),
                 #[cfg(feature = "tracing")]
                 tracing: match current_trace_id() {

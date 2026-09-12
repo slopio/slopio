@@ -447,9 +447,6 @@ impl IODriver {
                         slab.remove_raw(index);
                     }
                     SingleProcessResult::Shutdown => {
-                        // One read per runtime: the slot is done, and shutdown's
-                        // cancel sweep must not wait on it.
-                        slab.remove_raw(index);
                         self.shutting_down.replace(true);
                     }
                     SingleProcessResult::InvalidState(_msg) => {}
@@ -1134,52 +1131,6 @@ impl IODriver {
             .build()
             .user_data(UserData::cancel_echo(raw).into_bits());
         ring_inner.add(&cancel_op);
-    }
-
-    /// Shutdown: cancel the runtime's own eventfd reads, keeping their boxes
-    /// until the kernel confirms.
-    pub(crate) fn cancel_signal_ops(&self) {
-        let slab = unsafe { &mut *self.slab.get() };
-        let mut to_cancel = Vec::new();
-        for (index, entry) in slab.0.iter_mut() {
-            let SingleOpState::Signal(_) = entry else {
-                continue;
-            };
-            let SingleOpState::Signal(buf) = std::mem::replace(entry, SingleOpState::Init) else {
-                unreachable!("matched Signal")
-            };
-            *entry = SingleOpState::Cancelled {
-                bgid: None,
-                keepalive: Some(CancelKeepalive(buf)),
-                parked_fd: None,
-            };
-            to_cancel.push(index as u64);
-        }
-        for index in to_cancel {
-            self.send_singleop_cancel_event(OneshotToken(index));
-        }
-    }
-
-    /// Cancelled ops whose terminal CQE has not landed yet.
-    pub(crate) fn pending_cancels(&self) -> usize {
-        let slab = unsafe { &*self.slab.get() };
-        let multishot = unsafe { &*self.multishot_slab.get() };
-        slab.0
-            .iter()
-            .filter(|(_, e)| matches!(e, SingleOpState::Cancelled { .. }))
-            .count()
-            + multishot
-                .0
-                .iter()
-                .filter(|(_, e)| {
-                    matches!(
-                        e,
-                        MultiOpState::Cancelled { .. }
-                            | MultiOpState::AcceptCancelled { .. }
-                            | MultiOpState::TringToPause { .. }
-                    )
-                })
-                .count()
     }
 
     /// Queue a fire-and-forget close for `fd`, flushed at the next submit.

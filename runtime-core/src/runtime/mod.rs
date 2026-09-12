@@ -163,7 +163,13 @@ impl RuntimeInner {
                                 let pinned = pinned_f.as_mut();
                                 match pinned.poll(&mut context) {
                                     std::task::Poll::Ready(output) => {
-                                        self.drain();
+                                        // Flush any ops submitted during this
+                                        // final poll (e.g. a MSG_RING to a peer)
+                                        // before returning — otherwise they sit
+                                        // unsubmitted in the SQ and are lost.
+                                        if self.io_driver.has_pending_sqes() {
+                                            self.io_driver.submit();
+                                        }
                                         return output;
                                     }
                                     std::task::Poll::Pending => {}
@@ -195,38 +201,6 @@ impl RuntimeInner {
                 })
             })
         })
-    }
-}
-
-impl RuntimeInner {
-    /// The root is done: reap every task, cancel what they had in flight, and
-    /// wait for the kernel to let go of it before the ring is torn down.
-    fn drain(&self) {
-        self.io_driver.cancel_signal_ops();
-        loop {
-            // Drop glue may spawn; every pass kills whatever is live, then
-            // reaps one generation so a self-waking newcomer cannot spin it.
-            self.tasks.abort_all();
-            for _ in 0..self.tasks.len() {
-                let Some(task) = self.tasks.pop() else {
-                    break;
-                };
-                task.poll();
-            }
-            if !self.tasks.is_empty() {
-                continue;
-            }
-            if self.io_driver.pending_cancels() == 0 {
-                break;
-            }
-            self.io_driver.submit_and_wait();
-            self.io_driver.process_completion_queue();
-        }
-        // Deferred closes, and any MSG_RING the root sent on its way out.
-        if self.io_driver.has_pending_sqes() {
-            self.io_driver.submit();
-        }
-        self.tasks.unlist_all();
     }
 }
 
@@ -593,7 +567,6 @@ impl std::future::Future for RecvFromPeer {
 pub fn spawn<F: Future + 'static>(f: F) -> Handle<F::Output> {
     let (task, handle) = new_task(f);
     TASK_LIST.with(|ctx| {
-        ctx.register(task);
         ctx.push(task);
     });
     handle
@@ -602,45 +575,12 @@ pub fn spawn<F: Future + 'static>(f: F) -> Handle<F::Output> {
 #[derive(Default)]
 pub struct TaskList {
     tasks: UnsafeCell<VecDeque<TypeAgnosticTask>>,
-    /// Every task not yet freed, so shutdown can reach the parked ones.
-    live: UnsafeCell<Vec<TypeAgnosticTask>>,
 }
 
 impl TaskList {
     pub(crate) fn push(&self, task: TypeAgnosticTask) {
         let tasks_list = unsafe { &mut *self.tasks.get() };
         tasks_list.push_back(task);
-    }
-
-    fn register(&self, task: TypeAgnosticTask) {
-        let live = unsafe { &mut *self.live.get() };
-        task.set_live(live.len().try_into().expect("live tasks exceed u32"));
-        live.push(task);
-    }
-
-    /// Frees slot `index`; the last task moves into it.
-    pub(crate) fn unregister(&self, index: u32) {
-        let live = unsafe { &mut *self.live.get() };
-        live.swap_remove(index as usize);
-        if let Some(moved) = live.get(index as usize) {
-            moved.set_live(index);
-        }
-    }
-
-    /// Queues every live task for reaping. Idempotent.
-    fn abort_all(&self) {
-        let live = unsafe { &*self.live.get() };
-        for task in live {
-            task.abort();
-        }
-    }
-
-    /// Drops the list: a task freed after this skips the unregister.
-    fn unlist_all(&self) {
-        let live = unsafe { &mut *self.live.get() };
-        for task in live.drain(..) {
-            task.unlist();
-        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
