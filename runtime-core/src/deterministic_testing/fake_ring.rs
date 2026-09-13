@@ -137,7 +137,12 @@ fn ends_multishot(sqe: &Sqe, result: i32) -> bool {
 }
 
 /// What a scenario entry would have to name to answer this op.
-fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
+///
+/// Public because a test holding an [`Sqe`] from [`FakeRingHandle::inflight`]
+/// otherwise has a `pub` opcode byte it cannot interpret. Going through the
+/// simulator's own classification is also what keeps a test's idea of "this is
+/// a read" from drifting away from the one [`arm`] dispatches on.
+pub fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
     match sqe.opcode {
         OP_RECV | OP_READ | OP_RECVMSG => Some(Trigger::Read(sqe.fd)),
         OP_ACCEPT => Some(Trigger::Accept(sqe.fd)),

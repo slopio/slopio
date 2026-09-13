@@ -24,9 +24,11 @@ pub mod sqe;
 pub mod timeline;
 pub mod virtual_clock;
 
-pub use fake_ring::{Completion, FakeRing, FakeRingBuilder, FakeRingHandle, SIMULATED_RING_FD};
+pub use fake_ring::{
+    Completion, FakeRing, FakeRingBuilder, FakeRingHandle, SIMULATED_RING_FD, trigger_for,
+};
 pub use fds::{FdKind, mint, simulated_socket};
-pub use scenario::{AcceptEvent, ConnectEvent, Delay, ReadEvent, Scripted, WriteEvent};
+pub use scenario::{AcceptEvent, ConnectEvent, Delay, ReadEvent, Scripted, Trigger, WriteEvent};
 pub use sqe::{IOSQE_BUFFER_SELECT, Sqe};
 pub use timeline::Outcome;
 pub use virtual_clock::VirtualClock;
