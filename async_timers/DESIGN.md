@@ -42,9 +42,10 @@ two ends of the window — the same `+1` the deadline ring below uses, for the
 same reason.
 
 **100 ms slots, not 101.** The ms level only ever holds deadlines strictly
-under a second out, so its 100 slots never alias: the slot the clock stands on
-is reachable only by a deadline of *now*, which means the next tick, which is
-what a deadline of now should mean.
+under a second out — at most 99 ticks, one short of the ring — so its 100 slots
+never alias. The slot the clock stands on is reachable, by any duration under
+two ticks, and that is correct: it is drained by the next tick, which is the
+soonest the wheel can fire at all.
 
 A tick fires one ms slot, and cascades one seconds slot per second:
 
@@ -74,12 +75,25 @@ call, and a busy event loop calling faster than once per 10 ms would never
 accumulate a full tick.
 
 `next_deadline` finds the next occupied slot by rotating the bitset and taking
-`trailing_zeros`, ms level first. It answers the distance to the slot, which is
-**one tick short** of when that slot fires — a lower bound, so the loop wakes
-once early and re-sleeps. Never late. A seconds slot answers with the distance
-to its *cascade*, which is earlier still: the loop wakes at the second
-boundary, the cascade moves the timer down to the ms level, and the next answer
-is exact.
+`trailing_zeros`, ms level first, and answers the distance to the slot **plus
+one tick** — a slot `i` ahead is drained by the i+1-th tick, because a tick
+fires the slot it stands on before stepping off it. Answering `i` instead sent
+the loop back to sleep a tick short of every firing, where it found nothing to
+run and fell to the event loop's fixed 10 ms re-sleep: a wait rounded up to the
+next tick, twice, for one timer. A seconds slot answers with the distance to
+its *cascade*, which is earlier: the loop wakes at the second boundary, the
+cascade moves the timer down to the ms level, and the next answer is exact.
+
+**A duration of `n` ticks is served by the n-th tick**, and `init_timer` picks
+its slot one short to say so. The slot is drained by the tick that reaches it,
+so naming the n-th slot would be served by the n+1-th tick — the duration plus
+however much of the current tick had already gone when the timer was armed.
+Neither the duration itself nor a tick past it is reachable: that would need to
+know how far into the current tick we are, and the wheel is the only clock in
+the runtime, so nobody can tell it. The choice is which side to miss on, and
+the near side wins — under a load that arms timers right after a tick, which is
+when the event loop polls, the remainder is a few microseconds and a wait comes
+back on time instead of a tick late.
 
 ### Timer lifecycle
 

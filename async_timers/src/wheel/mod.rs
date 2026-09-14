@@ -209,6 +209,13 @@ impl TimeWheel {
     ///
     /// Anything past [`MAX_DURATION`] is rejected rather than truncated: the
     /// seconds level reaches exactly one minute and has nowhere to put it.
+    ///
+    /// A slot is drained by the tick that *reaches* it, so a deadline `n` ticks
+    /// out is served by the n+1-th tick from here — the duration plus whatever
+    /// is left of the current tick. The slot is picked one short to cancel
+    /// that, which trades a wait of up to a tick too long for one up to a tick
+    /// too short. Neither is reachable without knowing how far into the current
+    /// tick we are, and the wheel is the only clock: nobody can tell it.
     pub fn init_timer(
         &mut self,
         duration: Duration,
@@ -220,7 +227,10 @@ impl TimeWheel {
             return Err(DurationTooLong);
         }
 
-        let deadline = self.ticks + duration.as_millis() as u64 / MS_TICK;
+        // Saturating, and `place` clamps to the current slot in turn: under one
+        // tick asks for the slot behind us, which is the one about to drain.
+        let ticks = (duration.as_millis() as u64 / MS_TICK).saturating_sub(1);
+        let deadline = self.ticks + ticks;
         let timer_id = self.storage.create(waker, deadline);
         self.place(timer_id, deadline);
         Ok(timer_id)
@@ -243,6 +253,10 @@ impl TimeWheel {
     /// Lower bound on the time until the next timer fires, or None if no timers
     /// are registered. Exact for the ms level; a seconds slot answers with when
     /// it cascades, which is never past the earliest deadline it holds.
+    ///
+    /// The `+ 1` is the same offset [`init_timer`](Self::init_timer) takes off:
+    /// a slot `i` ahead is drained by the i+1-th tick, so answering `i` sends
+    /// the loop back to sleep one tick short of the firing, every time.
     pub fn next_deadline(&self) -> Option<Duration> {
         let b = &self.buckets;
         let ticks = if let Some(i) = b.ms_occupied.next_set(self.ms_idx(), MS_BUCKETS) {
@@ -252,7 +266,7 @@ impl TimeWheel {
         } else {
             return None;
         };
-        Some(Duration::from_millis(ticks * MS_TICK))
+        Some(Duration::from_millis((ticks + 1) * MS_TICK))
     }
 }
 

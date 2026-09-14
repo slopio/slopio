@@ -178,9 +178,10 @@ fn test_multiple_timers_different_buckets() {
     let (counter1, waker1) = make_waker();
     let (counter2, waker2) = make_waker();
 
-    let id1 = wheel.init_timer(Duration::from_millis(5), &waker1).unwrap();
+    // A tick apart: anything under 10ms shares the first tick with 10ms itself.
+    let id1 = wheel.init_timer(Duration::from_millis(10), &waker1).unwrap();
     let id2 = wheel
-        .init_timer(Duration::from_millis(15), &waker2)
+        .init_timer(Duration::from_millis(20), &waker2)
         .unwrap();
 
     // First timer should fire first
@@ -576,12 +577,13 @@ fn test_next_deadline_zero_duration_timer() {
     // Zero duration timer goes into current bucket
     wheel.init_timer(Duration::ZERO, &waker).unwrap();
 
-    // Timer at current bucket (offset 0) should fire immediately
+    // The current slot is drained by the next tick, not by this one, so the
+    // answer is a tick away. Zero would spin the event loop.
     let deadline = wheel.next_deadline();
     assert_eq!(
         deadline,
-        Some(Duration::ZERO),
-        "Zero-offset timer should return Duration::ZERO"
+        Some(Duration::from_millis(10)),
+        "a timer in the current slot fires on the next tick"
     );
 }
 
@@ -850,7 +852,7 @@ fn test_full_window_timer_never_aliases_the_current_slot() {
 
             // An aliased deadline would land on a slot that cascades at the
             // next second, firing a minute early.
-            clock.advance(&mut wheel, MAX_DURATION);
+            clock.advance(&mut wheel, MAX_DURATION - Duration::from_millis(10));
             assert_eq!(counter.count(), 0, "fired early at {offset}s + {skew:?}");
 
             clock.advance(&mut wheel, Duration::from_millis(10));
@@ -880,23 +882,31 @@ fn test_every_duration_fires_on_the_tick_its_deadline_names() {
                 .unwrap();
         }
 
-        // A deadline `n` ticks out fires as the wheel passes tick `n`, which is
-        // the (n+1)th tick of the clock.
+        // An `n` tick duration is served by the n-th tick of the clock, and
+        // anything under one tick by the first — so 0 and 1 fire together.
         for elapsed in 0..=max_ticks + 1 {
-            if let Some((counter, _)) = wakers.get(elapsed) {
+            if let Some((counter, _)) = wakers.get(elapsed + 1) {
                 assert_eq!(
                     counter.count(),
                     0,
-                    "{elapsed} ticks fired early (skew {skew})"
+                    "{} ticks fired early (skew {skew})",
+                    elapsed + 1
                 );
             }
-            if elapsed > 0 {
-                let (counter, _) = &wakers[elapsed - 1];
+            if (1..=max_ticks).contains(&elapsed) {
+                let (counter, _) = &wakers[elapsed];
                 assert_eq!(
                     counter.count(),
                     1,
-                    "{} ticks did not fire on its tick (skew {skew})",
-                    elapsed - 1
+                    "{elapsed} ticks did not fire on its tick (skew {skew})"
+                );
+            }
+            if elapsed == 1 {
+                let (counter, _) = &wakers[0];
+                assert_eq!(
+                    counter.count(),
+                    1,
+                    "a sub-tick duration did not fire on the first tick (skew {skew})"
                 );
             }
             clock.advance(&mut wheel, Duration::from_millis(10));
