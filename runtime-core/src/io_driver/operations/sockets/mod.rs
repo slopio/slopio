@@ -3,9 +3,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::io_driver::ParkedFd;
+use crate::io_driver::sys;
 use std::io;
-use std::mem::MaybeUninit;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use self::send_control_record::{socket_send_control_record, WriteControlRecord};
@@ -58,9 +58,7 @@ impl Drop for SocketInner {
         // otherwise (socket dropped outside the driver scope).
         crate::io_driver::IO_DRIVER.try_with(|driver| match driver {
             Some(d) => d.close_fd(fd),
-            None => unsafe {
-                libc::close(fd);
-            },
+            None => crate::io_driver::sys::close(fd),
         });
     }
 }
@@ -227,37 +225,22 @@ impl SocketWrapper {
 
     /// Local end of the connection (`getsockname`). One syscall per call.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        getname(|sa, len| unsafe { libc::getsockname(self.fd(), sa, len) })
+        sys::local_addr(self.fd())
     }
 
     /// Remote end of the connection (`getpeername`). One syscall per call.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        getname(|sa, len| unsafe { libc::getpeername(self.fd(), sa, len) })
+        sys::peer_addr(self.fd())
     }
 
     fn set_opt<T>(&self, level: c_int, name: c_int, value: &T) -> io::Result<()> {
-        let ret = unsafe {
-            libc::setsockopt(
-                self.fd(),
-                level,
-                name,
-                value as *const T as *const libc::c_void,
-                std::mem::size_of::<T>() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        sys::setsockopt(self.fd(), level, name, value)
     }
 }
 
 impl SocketWrapper {
     pub fn sync_shutdown(self) {
-        unsafe {
-            libc::shutdown(self.fd(), libc::SHUT_RDWR);
-        }
+        let _ = sys::shutdown(self.fd(), libc::SHUT_RDWR);
         // self is dropped here; the fd closes once no operation holds a ref
     }
 }
@@ -277,46 +260,5 @@ impl OpSocket {
     /// touch the socket afterwards.
     pub(crate) fn park(&mut self) -> ParkedFd {
         ParkedFd::Socket(self.0.take().expect("parked twice"))
-    }
-}
-
-fn getname(
-    syscall: impl FnOnce(*mut libc::sockaddr, *mut libc::socklen_t) -> c_int,
-) -> io::Result<SocketAddr> {
-    let mut storage: MaybeUninit<libc::sockaddr_storage> = MaybeUninit::uninit();
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let ret = syscall(
-        storage.as_mut_ptr() as *mut libc::sockaddr,
-        &mut len,
-    );
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let storage = unsafe { storage.assume_init() };
-    match storage.ss_family as c_int {
-        libc::AF_INET => {
-            let sin: libc::sockaddr_in =
-                unsafe { *(&storage as *const _ as *const libc::sockaddr_in) };
-            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-            Ok(SocketAddr::V4(SocketAddrV4::new(
-                ip,
-                u16::from_be(sin.sin_port),
-            )))
-        }
-        libc::AF_INET6 => {
-            let sin6: libc::sockaddr_in6 =
-                unsafe { *(&storage as *const _ as *const libc::sockaddr_in6) };
-            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-            Ok(SocketAddr::V6(SocketAddrV6::new(
-                ip,
-                u16::from_be(sin6.sin6_port),
-                sin6.sin6_flowinfo,
-                sin6.sin6_scope_id,
-            )))
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported address family",
-        )),
     }
 }

@@ -35,6 +35,7 @@ mod fixed_buf_pool;
 mod message;
 pub mod operations;
 mod sending_buffers;
+pub(crate) mod sys;
 mod user_data;
 
 pub(crate) use user_data::{
@@ -82,7 +83,7 @@ pub struct IODriver {
 impl Drop for IODriver {
     fn drop(&mut self) {
         for fd in self.pending_closes.get_mut().drain(..) {
-            unsafe { libc::close(fd) };
+            sys::close(fd);
         }
     }
 }
@@ -387,6 +388,11 @@ impl IODriver {
     #[cfg(feature = "simulation")]
     pub fn simulated(fake: FakeRing) -> Self {
         Self::around(Ring::simulated(fake))
+    }
+
+    #[cfg(feature = "simulation")]
+    pub(crate) fn is_simulated(&self) -> bool {
+        matches!(unsafe { &*self.ring.get() }.inner, RingBackend::Fake(_))
     }
 
     pub fn shutdown(&self) -> bool {
@@ -1138,22 +1144,13 @@ impl IODriver {
         unsafe { (*self.pending_closes.get()).push(fd) };
     }
 
-    /// Turn queued closes into `IORING_OP_CLOSE` SQEs with ignored CQEs. The
-    /// simulator closes synchronously — its fds are real, and close is
-    /// bookkeeping rather than scriptable IO.
+    /// Turn queued closes into `IORING_OP_CLOSE` SQEs with ignored CQEs.
     fn flush_pending_closes(&self) {
         let fds = unsafe { &mut *self.pending_closes.get() };
         if fds.is_empty() {
             return;
         }
         let ring = unsafe { &mut *self.ring.get() };
-        #[cfg(feature = "simulation")]
-        if matches!(ring.inner, RingBackend::Fake(_)) {
-            for fd in fds.drain(..) {
-                unsafe { libc::close(fd) };
-            }
-            return;
-        }
         for fd in fds.drain(..) {
             let entry = opcode::Close::new(io_uring::types::Fd(fd))
                 .build()
@@ -1285,9 +1282,7 @@ impl IODriver {
         };
         while let Some(event) = queue.pop() {
             if event.result > 0 {
-                unsafe {
-                    libc::close(event.result);
-                }
+                sys::close(event.result);
             }
         }
     }

@@ -11,8 +11,9 @@
 //! untouched — it reads the same clock, and the simulation makes the time it
 //! believes in actually pass.
 //!
-//! Nothing simulator-shaped lives in [`io_driver`](crate::io_driver); the one
-//! place they meet is its `RingBackend` enum.
+//! Nothing simulator-shaped lives in [`io_driver`](crate::io_driver); they meet
+//! at its `RingBackend` enum, and at its `sys` module for the syscalls made
+//! outside the ring on a descriptor from [`fds`].
 //!
 //! [`Timeline`]: timeline::Timeline
 
@@ -27,7 +28,7 @@ pub mod virtual_clock;
 pub use fake_ring::{
     Completion, FakeRing, FakeRingBuilder, FakeRingHandle, SIMULATED_RING_FD, trigger_for,
 };
-pub use fds::{FdKind, mint, simulated_socket};
+pub use fds::{FIRST_SIMULATED_FD, FdKind, is_open, is_simulated, mint, simulated_socket};
 pub use scenario::{AcceptEvent, ConnectEvent, Delay, ReadEvent, Scripted, Trigger, WriteEvent};
 pub use sqe::{IOSQE_BUFFER_SELECT, Sqe};
 pub use timeline::Outcome;

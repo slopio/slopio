@@ -10,6 +10,7 @@ use runtime_streams::Stream;
 use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
+    sys,
     DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     UserData,
     operations::{IoOP, MultishotToken, sockets::SocketWrapper},
@@ -90,20 +91,25 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
     }
 
     fn bind_inner(addr: SocketAddr, only_v6: bool) -> std::io::Result<Self> {
-        let domain = match addr {
-            SocketAddr::V4(_) => Domain::IPV4,
-            SocketAddr::V6(_) => Domain::IPV6,
+        let fd = match sys::simulated_bound_socket(addr) {
+            Some(fd) => fd,
+            None => {
+                let domain = match addr {
+                    SocketAddr::V4(_) => Domain::IPV4,
+                    SocketAddr::V6(_) => Domain::IPV6,
+                };
+                let socket = S::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+                // Set before bind, or the kernel keeps its `bindv6only` default.
+                if addr.is_ipv6() {
+                    socket.set_only_v6(only_v6)?;
+                }
+                socket.set_reuse_port(true)?;
+                socket.set_nonblocking(true)?;
+                socket.bind(&addr.into())?;
+                socket.listen(1024)?;
+                socket.into_raw_fd()
+            }
         };
-        let socket = S::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        // Set before bind, or the kernel keeps its `bindv6only` default.
-        if addr.is_ipv6() {
-            socket.set_only_v6(only_v6)?;
-        }
-        socket.set_reuse_port(true)?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&addr.into())?;
-        socket.listen(1024)?;
-        let fd = socket.into_raw_fd();
 
         let mut multi_accept = Self {
             id: None,
@@ -125,12 +131,7 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
     }
 
     pub fn set_backlog(&self, backlog: i32) -> std::io::Result<()> {
-        let ret = unsafe { libc::listen(self.socket.fd(), backlog) };
-        if ret < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        sys::listen(self.socket.fd(), backlog)
     }
 }
 
@@ -148,9 +149,7 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
     fn close_pending_fds(&mut self) {
         while let Some(event) = self.sockets.pop() {
             if event.result > 0 {
-                unsafe {
-                    libc::close(event.result);
-                }
+                sys::close(event.result);
             }
         }
     }

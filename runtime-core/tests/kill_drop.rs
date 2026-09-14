@@ -34,8 +34,8 @@ runtime_core::define_buf_ring!(KillRing, bgid = 7, buffer_size = 64, ring_size =
 #[test]
 fn kill_after_a_managed_recv_completed_gives_the_buffer_back() {
     let (fake, handle) = FakeRing::builder().virtual_time().build();
-    let victim = simulated_socket().expect("a socket");
-    let probe = simulated_socket().expect("a socket");
+    let victim = simulated_socket();
+    let probe = simulated_socket();
 
     handle.on_read(victim.fd(), ReadEvent::data(b"a"));
     handle.on_read(probe.fd(), ReadEvent::data(b"c"));

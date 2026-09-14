@@ -31,15 +31,20 @@ impl UdpSocket {
     }
 
     pub fn bind_addr(addr: SocketAddr) -> std::io::Result<Self> {
-        let domain = match addr {
-            SocketAddr::V4(_) => Domain::IPV4,
-            SocketAddr::V6(_) => Domain::IPV6,
+        let fd = match crate::io_driver::sys::simulated_bound_socket(addr) {
+            Some(fd) => fd,
+            None => {
+                let domain = match addr {
+                    SocketAddr::V4(_) => Domain::IPV4,
+                    SocketAddr::V6(_) => Domain::IPV6,
+                };
+                let socket = S::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+                socket.set_reuse_port(true)?;
+                socket.set_nonblocking(true)?;
+                socket.bind(&addr.into())?;
+                socket.into_raw_fd()
+            }
         };
-        let socket = S::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_reuse_port(true)?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&addr.into())?;
-        let fd = socket.into_raw_fd();
 
         Ok(Self {
             socket: SocketWrapper::from_fd(fd),

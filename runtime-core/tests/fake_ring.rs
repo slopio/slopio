@@ -8,13 +8,13 @@
 //! delayed completes in submission order.
 
 use std::os::fd::FromRawFd;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use io_uring::types::Timespec;
 use io_uring::{cqueue, opcode, types::Fd};
 use runtime_core::deterministic_testing::{
-    AcceptEvent, FakeRing, FakeRingHandle, FdKind, IOSQE_BUFFER_SELECT, ReadEvent, WriteEvent,
-    mint, simulated_socket,
+    AcceptEvent, FIRST_SIMULATED_FD, FakeRing, FakeRingHandle, FdKind, IOSQE_BUFFER_SELECT,
+    ReadEvent, WriteEvent, is_open, mint, simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::SocketWrapper;
 use runtime_core::io_driver::{BufRingSpec, RingHandle};
@@ -31,12 +31,12 @@ fn recv_multi(fd: i32, bgid: u16, user_data: u64) -> io_uring::squeue::Entry {
         .user_data(user_data)
 }
 
-/// A convenient unit for scripted delays. Comfortably above the ~50µs floor on
-/// the sleep, so a pinned order is never in doubt.
+/// A convenient unit for scripted delays.
 const STEP: Duration = Duration::from_millis(1);
 
+/// On virtual time: a delay is a jump, so no test sleeps and none can race the clock.
 fn ring() -> (FakeRing, FakeRingHandle) {
-    FakeRing::builder().build()
+    FakeRing::builder().virtual_time().build()
 }
 
 fn send(fd: i32, buf: &[u8], user_data: u64) -> io_uring::squeue::Entry {
@@ -122,10 +122,7 @@ fn a_multishot_accept_consumes_scripted_connections_then_parks() {
     // not come — which is what a test asserting "exactly two" wants.
     assert_eq!(handle.scenario_remaining(), 0);
     assert_eq!(handle.parked(), 1);
-
-    for fd in fds {
-        assert_eq!(unsafe { libc::close(fd) }, 0);
-    }
+    assert!(fds.iter().all(|&fd| is_open(fd)));
 }
 
 #[test]
@@ -135,7 +132,7 @@ fn an_accept_can_hand_back_a_descriptor_the_test_made() {
     // Created up front, so the test knows the number and can script what the
     // accepted connection does. Raw rather than a `SocketWrapper`: ownership
     // passes to whoever receives the completion, and two owners close it twice.
-    let conn = mint(FdKind::Socket).expect("a socket");
+    let conn = mint(FdKind::Socket);
 
     handle.on_accept(3, AcceptEvent::On(conn));
     handle.on_read(conn, ReadEvent::data(b"GET / HTTP/1.1\r\n"));
@@ -165,8 +162,6 @@ fn an_accept_can_hand_back_a_descriptor_the_test_made() {
     assert_eq!(handle.scenario_remaining(), 0);
     // The simulator minted nothing here: the descriptor was the test's.
     assert!(handle.opened_fds().is_empty());
-
-    assert_eq!(unsafe { libc::close(conn) }, 0);
 }
 
 #[test]
@@ -213,7 +208,6 @@ fn a_scripted_error_ends_a_multishot_accept() {
     ring.submit_and_wait();
     let first = ring.pop_completion().expect("a connection");
     assert!(cqueue::more(first.flags));
-    let fd = first.result;
 
     ring.submit_and_wait();
     let last = ring.pop_completion().expect("the error");
@@ -223,8 +217,7 @@ fn a_scripted_error_ends_a_multishot_accept() {
         "an error ends a multishot accept"
     );
     assert!(handle.inflight().is_empty());
-
-    assert_eq!(unsafe { libc::close(fd) }, 0);
+    assert!(is_open(first.result));
 }
 
 #[test]
@@ -297,8 +290,7 @@ fn a_scripted_delay_needs_no_grid_and_has_no_ceiling() {
 
 #[test]
 fn cancelling_a_read_gives_its_scripted_data_back() {
-    // Virtual time so the long pin below costs nothing.
-    let (mut ring, handle) = FakeRing::builder().virtual_time().build();
+    let (mut ring, handle) = ring();
     let mut buf = [0u8; 32];
 
     // Pinned far out, so the cancel is certain to land first.
@@ -380,7 +372,7 @@ fn different_seeds_can_draw_a_different_order() {
 fn nothing_draws_unless_a_range_asked_for_it() {
     // Two seeds, no range anywhere: the order is the scenario's, not chance's.
     let order = |seed: u64| {
-        let (mut ring, _handle) = FakeRing::builder().seed(seed).build();
+        let (mut ring, _handle) = FakeRing::builder().seed(seed).virtual_time().build();
         for i in 0..8 {
             ring.add(&send(3, b"x", i));
         }
@@ -492,7 +484,7 @@ fn only_the_completion_that_ends_a_batch_drops_f_more() {
 
 #[test]
 fn cancelling_mid_batch_gives_the_whole_batch_back() {
-    let (mut ring, handle) = FakeRing::builder().virtual_time().build();
+    let (mut ring, handle) = ring();
     TestRing::init(RingHandle::Simulated(&handle));
 
     handle.on_multishot_read(
@@ -592,7 +584,7 @@ fn a_stream_still_owed_counts_as_remaining() {
 
 #[test]
 fn cancelling_a_multishot_gives_its_whole_stream_back() {
-    let (mut ring, handle) = FakeRing::builder().virtual_time().build();
+    let (mut ring, handle) = ring();
     TestRing::init(RingHandle::Simulated(&handle));
 
     handle.on_multishot_read(
@@ -867,6 +859,7 @@ fn the_wakeup_timer_is_not_an_io_op() {
 #[test]
 fn the_wakeup_timer_bounds_a_wait_that_would_otherwise_be_longer() {
     let (mut ring, handle) = ring();
+    let clock = handle.clock().expect("built with virtual_time");
     let mut buf = [0u8; 8];
 
     // A read the scenario put an hour out, against a 5ms timer.
@@ -876,13 +869,12 @@ fn the_wakeup_timer_bounds_a_wait_that_would_otherwise_be_longer() {
     let ts = Timespec::new().nsec(5_000_000);
     ring.add(&opcode::Timeout::new(&ts).count(1).build().user_data(0xFFFF));
 
-    let started = Instant::now();
     ring.submit_and_wait();
-    let waited = started.elapsed();
 
-    assert!(
-        waited < Duration::from_secs(1),
-        "waited {waited:?} — the timer did not bound the wait",
+    assert_eq!(
+        clock.elapsed(),
+        Duration::from_millis(5),
+        "the timer did not bound the wait",
     );
     let completion = ring.pop_completion().expect("the timer fired");
     assert_eq!(completion.user_data, 0xFFFF);
@@ -923,33 +915,22 @@ fn open_at(path: &std::ffi::CStr, user_data: u64) -> io_uring::squeue::Entry {
 }
 
 #[test]
-fn openat_completes_with_a_descriptor_that_really_works() {
+fn openat_mints_a_file_descriptor() {
     let (mut ring, handle) = ring();
 
     ring.add(&open_at(c"/nonexistent", 3));
     ring.submit_and_wait();
 
     let fd = ring.pop_completion().expect("the open completed").result;
-    assert!(fd >= 0, "open returned {fd}");
+    assert!(fd >= FIRST_SIMULATED_FD, "open returned {fd}");
     assert_eq!(handle.opened_fds(), vec![fd]);
+    assert!(is_open(fd));
 
-    // The point of minting a real descriptor: it can be written, read back and
-    // closed. A made-up integer would fail here — or worse, succeed against
-    // some unrelated fd of the test process.
-    let msg = b"round trip";
-    let written = unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
-    assert_eq!(written, msg.len() as isize);
-
-    let mut back = [0u8; 16];
-    let read = unsafe { libc::pread(fd, back.as_mut_ptr().cast(), msg.len(), 0) };
-    assert_eq!(read, msg.len() as isize);
-    assert_eq!(&back[..msg.len()], msg);
-
-    assert_eq!(
-        unsafe { libc::close(fd) },
-        0,
-        "the descriptor did not close"
-    );
+    // A file, so the socket calls the runtime makes on it are refused.
+    // SAFETY: the fake ring's open minted this fd and nothing else owns it.
+    let not_a_socket = unsafe { SocketWrapper::from_raw_fd(fd) };
+    let err = not_a_socket.set_nodelay(true).expect_err("a file takes no TCP option");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTSOCK));
 }
 
 #[test]
@@ -977,10 +958,6 @@ fn each_open_mints_a_distinct_descriptor() {
     let mut reported = handle.opened_fds();
     reported.sort_unstable();
     assert_eq!(reported, distinct);
-
-    for fd in opened {
-        assert_eq!(unsafe { libc::close(fd) }, 0);
-    }
 }
 
 #[test]
@@ -1008,24 +985,24 @@ fn accept_mints_a_socket_the_runtime_can_actually_use() {
     );
     assert_eq!(handle.opened_fds(), vec![fd]);
 
-    // These are the syscalls the runtime makes outside the ring, and they are
-    // exactly what a memfd or an AF_UNIX pair would have failed.
+    // The syscalls the runtime makes outside the ring, answered by the simulator.
     // SAFETY: the fake ring's accept opened this fd and nothing else owns it.
     let socket = unsafe { SocketWrapper::from_raw_fd(fd) };
     socket.set_nodelay(true).expect("TCP_NODELAY");
     socket.set_quickack(true).expect("TCP_QUICKACK");
     socket.set_reuseaddr(true).expect("SO_REUSEADDR");
     socket.local_addr().expect("getsockname");
-    // Truthfully unconnected, and the kernel says so.
-    assert!(socket.peer_addr().is_err(), "peer_addr should be ENOTCONN");
+    let err = socket.peer_addr().expect_err("unconnected");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN));
 
-    // Dropping the wrapper closes it, which is only correct because it is real.
+    // Dropped outside any runtime, so it closes on the spot.
     drop(socket);
+    assert!(!is_open(fd), "the wrapper's drop closed it");
 }
 
 #[test]
 fn simulated_socket_takes_every_option_the_runtime_sets() {
-    let socket = simulated_socket().expect("a real unconnected TCP socket");
+    let socket = simulated_socket();
 
     socket.set_nodelay(true).expect("TCP_NODELAY");
     socket.set_keepalive(true).expect("SO_KEEPALIVE");
@@ -1036,6 +1013,30 @@ fn simulated_socket_takes_every_option_the_runtime_sets() {
     socket.set_defer_accept(1).expect("TCP_DEFER_ACCEPT");
     socket.set_quickack(true).expect("TCP_QUICKACK");
     socket.local_addr().expect("getsockname");
+}
+
+#[test]
+#[should_panic(expected = "which is closed")]
+fn an_op_on_a_closed_simulated_descriptor_is_refused() {
+    let (mut ring, _handle) = ring();
+    let fd = mint(FdKind::Socket);
+    // SAFETY: minted just above and owned by nothing else.
+    drop(unsafe { SocketWrapper::from_raw_fd(fd) });
+
+    let mut buf = [0u8; 8];
+    ring.add(&recv(fd, &mut buf, 1));
+    ring.submit();
+}
+
+#[test]
+fn a_close_sqe_closes_at_submit() {
+    let (mut ring, _handle) = ring();
+    let fd = mint(FdKind::Socket);
+
+    ring.add(&opcode::Close::new(Fd(fd)).build().user_data(1));
+    ring.submit();
+    assert!(!is_open(fd));
+    assert_eq!(ring.pop_completion().expect("posted at submit").result, 0);
 }
 
 // ------------------------------------------------------------- multishot
@@ -1073,10 +1074,6 @@ fn a_multishot_accept_stays_in_flight_across_connections() {
         3,
         "connections reused a descriptor: {fds:?}"
     );
-
-    for fd in fds {
-        assert_eq!(unsafe { libc::close(fd) }, 0);
-    }
 }
 
 #[test]

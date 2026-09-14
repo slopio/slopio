@@ -1,6 +1,6 @@
 use std::{
     fs::Metadata,
-    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
+    os::fd::{FromRawFd, IntoRawFd},
 };
 pub mod open;
 pub mod read;
@@ -17,8 +17,7 @@ pub struct OpenedFile {
 
 impl Drop for OpenedFile {
     fn drop(&mut self) {
-        let fd = unsafe { OwnedFd::from_raw_fd(self.fd) };
-        drop(fd);
+        crate::io_driver::sys::close(self.fd);
     }
 }
 

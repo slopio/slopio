@@ -16,7 +16,7 @@ runtime_core::define_buf_ring!(OneBuf, bgid = 8, buffer_size = 64, ring_size = 1
 #[test]
 fn a_transient_error_re_arms_the_stream() {
     let (fake, handle) = FakeRing::builder().virtual_time().build();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     // The first op dies on EINTR; the re-armed one delivers.
     handle.on_multishot_read(socket.fd(), [ReadEvent::Error(libc::EINTR)]);
@@ -40,7 +40,7 @@ fn a_transient_error_re_arms_the_stream() {
 #[test]
 fn a_dry_ring_reports_once_then_re_arms_when_a_buffer_returns() {
     let (fake, handle) = FakeRing::builder().virtual_time().build();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     // "b" lands while "a" is still held: ENOBUFS, which ends the op.
     handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"a"), ReadEvent::data(b"b")]);
@@ -74,7 +74,7 @@ fn a_dry_ring_reports_once_then_re_arms_when_a_buffer_returns() {
 #[test]
 fn eof_stays_eof_without_re_arming() {
     let (fake, handle) = FakeRing::builder().virtual_time().build();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"a"), ReadEvent::Eof]);
 

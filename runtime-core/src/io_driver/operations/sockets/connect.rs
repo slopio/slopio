@@ -54,18 +54,11 @@ impl ConnectTcp {
     }
 
     fn submit(&mut self) -> io::Result<()> {
-        let af = match self.addr {
-            SocketAddr::V4(_) => libc::AF_INET,
-            SocketAddr::V6(_) => libc::AF_INET6,
-        };
-        let mut ty = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+        let mut ty = libc::SOCK_CLOEXEC;
         if self.nonblocking {
             ty |= libc::SOCK_NONBLOCK;
         }
-        let fd = unsafe { libc::socket(af, ty, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = crate::io_driver::sys::tcp_socket(&self.addr, ty)?;
         let socket = SocketWrapper::from_fd(fd);
         if self.nodelay {
             socket.set_nodelay(true)?;

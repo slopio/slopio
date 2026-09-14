@@ -71,9 +71,7 @@ impl OwnedWriteHalf {
     /// Send FIN (`shutdown(SHUT_WR)`) and consume this half. The read half
     /// keeps receiving and the fd stays open until it drops too.
     pub fn sync_shutdown(self) {
-        unsafe {
-            libc::shutdown(self.socket.fd(), libc::SHUT_WR);
-        }
+        let _ = crate::io_driver::sys::shutdown(self.socket.fd(), libc::SHUT_WR);
     }
 
     pub fn reunite(self, read: OwnedReadHalf) -> Result<SocketWrapper, ReuniteError> {

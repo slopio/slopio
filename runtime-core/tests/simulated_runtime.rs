@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use runtime_core::deterministic_testing::{
-    FakeRing, FakeRingHandle, ReadEvent, WriteEvent, simulated_socket,
+    FakeRing, FakeRingHandle, ReadEvent, WriteEvent, is_open, simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
 use runtime_core::io_driver::operations::sockets::recv::{socket_peek, socket_recv};
@@ -33,7 +33,7 @@ fn simulated() -> (FakeRing, FakeRingHandle) {
 #[test]
 fn a_send_completes_through_the_whole_driver() {
     let (fake, _handle) = simulated();
-    let socket = simulated_socket().expect("a real unconnected socket");
+    let socket = simulated_socket();
 
     let (result, _buf) = RuntimeInner::simulated(fake).block_on::<(), _>(
         async move { socket_send(&socket, b"hello").await },
@@ -48,9 +48,33 @@ fn a_send_completes_through_the_whole_driver() {
 }
 
 #[test]
+fn a_dropped_socket_closes_through_the_ring_after_its_cancelled_read() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    handle.on_read(fd, ReadEvent::data(b"late").after(Duration::from_secs(10)));
+
+    RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            // The cancelled read parks its ref, so dropping the wrapper does not close yet.
+            select(socket_recv(&socket, vec![0u8; 8]), Sleep::during(Duration::from_millis(1))).await;
+            drop(socket);
+            assert!(is_open(fd), "closed while the cancelled read was still in flight");
+
+            for _ in 0..3 {
+                Sleep::during(Duration::from_millis(1)).await;
+            }
+            assert!(!is_open(fd), "the cancel's CQE should have released the last ref");
+        },
+        None,
+        |run| run(),
+    );
+}
+
+#[test]
 fn a_scripted_write_reports_and_records_what_it_accepted() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a real unconnected socket");
+    let socket = simulated_socket();
     let fd = socket.fd();
 
     handle.on_write(fd, WriteEvent::Short(3));
@@ -79,7 +103,7 @@ fn a_scripted_write_reports_and_records_what_it_accepted() {
 #[test]
 fn a_vectored_send_is_recorded_as_one_write() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a real unconnected socket");
+    let socket = simulated_socket();
     let fd = socket.fd();
     let head = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
     let body = b"hello".to_vec();
@@ -101,7 +125,7 @@ fn a_vectored_send_is_recorded_as_one_write() {
 #[test]
 fn a_zero_copy_vectored_send_is_recorded_as_one_write() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a real unconnected socket");
+    let socket = simulated_socket();
     let fd = socket.fd();
     let head = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
     let body = b"hello".to_vec();
@@ -122,7 +146,7 @@ fn a_zero_copy_vectored_send_is_recorded_as_one_write() {
 #[test]
 fn a_scripted_read_reaches_the_awaiting_task() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a real unconnected socket");
+    let socket = simulated_socket();
 
     handle.on_read(socket.fd(), ReadEvent::data(b"hello"));
 
@@ -140,7 +164,7 @@ fn a_scripted_read_reaches_the_awaiting_task() {
 #[test]
 fn a_peek_leaves_the_scripted_read_for_the_next_recv() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a real unconnected socket");
+    let socket = simulated_socket();
 
     // One delivery scripted; two peeks and a recv all see it, then EOF.
     handle.on_read(
@@ -194,7 +218,7 @@ fn concurrent_sends_all_complete() {
         async move {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
-                    let socket = simulated_socket().expect("a socket");
+                    let socket = simulated_socket();
                     spawn(async move {
                         let (result, _) = socket_send(&socket, b"xyz").await;
                         result.expect("the send succeeded")
@@ -305,7 +329,7 @@ fn work_continues_normally_after_a_select() {
 #[test]
 fn a_managed_recv_hands_a_borrowed_buffer_to_the_task() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
     handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"hello")]);
 
     let got = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
@@ -326,7 +350,7 @@ fn a_managed_recv_hands_a_borrowed_buffer_to_the_task() {
 #[test]
 fn a_ring_of_two_serves_more_reads_than_it_has_buffers() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     // One op's whole life, declared as one thing.
     handle.on_multishot_read(
@@ -370,7 +394,7 @@ fn holding_every_buffer_drains_the_ring() {
     // its buffers instead of dropping them. If recycling were not what makes
     // that one pass, this one would pass too.
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     handle.on_multishot_read(
         socket.fd(),
@@ -410,7 +434,7 @@ fn holding_every_buffer_drains_the_ring() {
 #[test]
 fn a_timed_out_read_leaves_its_data_for_the_next_one() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     // Arrives long after the timeout below, so the first read never sees it.
     handle.on_read(
@@ -454,7 +478,7 @@ fn a_timed_out_read_leaves_its_data_for_the_next_one() {
 /// two landed in one drain.
 fn second_completion_was_already_there(batched: bool) -> bool {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     if batched {
         handle.on_multishot_read(
@@ -500,7 +524,7 @@ fn separate_batches_let_the_program_run_in_between() {
 #[test]
 fn a_whole_batch_is_drained_in_one_pass() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     handle.on_multishot_read(
         socket.fd(),
@@ -545,7 +569,7 @@ fn a_whole_batch_is_drained_in_one_pass() {
 #[test]
 fn a_ring_buffer_is_sent_back_as_is() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
     let fd = socket.fd();
     handle.on_multishot_read(fd, [ReadEvent::data(b"hello")]);
 
@@ -572,7 +596,7 @@ fn a_sent_ring_buffer_returns_to_the_ring_once_the_send_completes() {
     // only possible if a buffer handed to a send comes back to the ring after
     // the send completes, rather than being lost to it.
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
     let fd = socket.fd();
     handle.on_multishot_read(
         fd,

@@ -82,6 +82,7 @@ const OP_WRITEV: u8 = opcode::Writev::CODE;
 const OP_WRITE_FIXED: u8 = opcode::WriteFixed::CODE;
 const OP_OPENAT: u8 = opcode::OpenAt::CODE;
 const OP_ASYNC_CANCEL: u8 = opcode::AsyncCancel::CODE;
+const OP_CLOSE: u8 = opcode::Close::CODE;
 
 enum Class {
     /// The kernel finishes these alone: sends, writes, opens, cancels. A
@@ -324,12 +325,7 @@ fn complete_outcome(
         }
         Outcome::NewFd(kind) => Completion {
             user_data: sqe.user_data,
-            result: match fds::mint(kind) {
-                Ok(fd) => fd,
-                // Report exhaustion the way the kernel would, rather than
-                // panicking inside what is meant to be a completion.
-                Err(e) => -e.raw_os_error().unwrap_or(libc::ENFILE),
-            },
+            result: fds::mint(kind),
             flags: 0,
         },
         Outcome::Data(bytes) if sqe.uses_buffer_select() => {
@@ -627,8 +623,7 @@ impl FakeRingHandle {
     }
 
     /// Schedule a parked `ACCEPT`, as though a connection arrived. It completes
-    /// with a real, unconnected TCP socket the runtime can set options on and
-    /// close like any other.
+    /// with a simulated, unconnected TCP socket.
     pub fn accept(&self, user_data: u64) {
         self.schedule_parked(user_data, Outcome::NewFd(FdKind::Socket));
     }
@@ -775,9 +770,8 @@ impl FakeRingHandle {
         }
     }
 
-    /// Descriptors the simulator minted and handed to the runtime, oldest
-    /// first. They are real and owned by whatever received them, so a test can
-    /// check that each was closed — an fd still open at the end is a leak.
+    /// Descriptors this ring minted and handed to the runtime, oldest first.
+    /// Pair with [`fds::is_open`] to check each was closed.
     pub fn opened_fds(&self) -> Vec<RawFd> {
         self.0.borrow().opened.clone()
     }
@@ -890,6 +884,28 @@ impl FakeRing {
         for sqe in staged.drain(..) {
             let seq = state.next_seq;
             state.next_seq += 1;
+
+            // A simulated fd is checked on every op naming it: the driver must
+            // never submit on a closed one.
+            assert!(
+                !fds::is_simulated(sqe.fd) || fds::is_open(sqe.fd),
+                "user_data {:#x} (opcode {}) names simulated fd {}, which is closed",
+                sqe.user_data,
+                sqe.opcode,
+                sqe.fd,
+            );
+            // The kernel runs a close inline at submit and posts its CQE there.
+            if sqe.opcode == OP_CLOSE {
+                if fds::is_simulated(sqe.fd) {
+                    fds::close(sqe.fd).expect("checked open just above");
+                }
+                state.cq.push_back(Completion {
+                    user_data: sqe.user_data,
+                    result: 0,
+                    flags: 0,
+                });
+                continue;
+            }
             let outcome = default_outcome(&sqe);
 
             match classify(&sqe) {

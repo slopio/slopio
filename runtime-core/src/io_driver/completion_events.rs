@@ -270,9 +270,7 @@ pub(crate) fn process_multi(
             // Any positive result is a freshly-accepted fd we'll never hand
             // to the user — close it.
             if event.result > 0 {
-                unsafe {
-                    libc::close(event.result);
-                }
+                crate::io_driver::sys::close(event.result);
             }
             if *last_cqe {
                 MultiProcessResult::AcceptCancelComplete

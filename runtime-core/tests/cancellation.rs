@@ -47,7 +47,7 @@ async fn settle() {
 #[test]
 fn a_read_dropped_in_flight_leaves_nothing_behind() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     // Far enough out that the read is certainly still in flight when dropped.
     handle.on_read(
@@ -78,7 +78,7 @@ fn a_read_dropped_in_flight_leaves_nothing_behind() {
 #[test]
 fn a_dropped_read_hands_its_delivery_back_to_the_scenario() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     handle.on_read(
         socket.fd(),
@@ -112,7 +112,7 @@ fn a_dropped_read_hands_its_delivery_back_to_the_scenario() {
 #[test]
 fn a_send_dropped_in_flight_outlives_its_own_future() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     RuntimeInner::simulated(fake).block_on::<(), _>(
         async move {
@@ -141,7 +141,7 @@ fn a_send_dropped_in_flight_outlives_its_own_future() {
 #[test]
 fn a_zero_copy_gather_send_dropped_in_flight_outlives_its_own_future() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     RuntimeInner::simulated(fake).block_on::<(), _>(
         async move {
@@ -168,7 +168,7 @@ fn a_zero_copy_gather_send_dropped_in_flight_outlives_its_own_future() {
 #[test]
 fn a_multishot_dropped_in_flight_is_cancelled() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     handle.on_multishot_read(
         socket.fd(),
@@ -207,7 +207,7 @@ fn a_stream_dropped_mid_batch_gives_the_ring_its_buffers_back() {
     // That buffer comes back through the cancel path, which is a different
     // path from the one a delivered buffer takes.
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     handle.on_multishot_read(
         socket.fd(),
@@ -272,7 +272,7 @@ fn a_stream_dropped_mid_batch_gives_the_ring_its_buffers_back() {
 #[ignore = "documents a known shutdown leak; Miri fails it by design"]
 fn a_task_still_parked_on_a_read_leaks_it() {
     let (fake, handle) = simulated();
-    let socket = simulated_socket().expect("a socket");
+    let socket = simulated_socket();
 
     // Nothing scripted: this read parks and never completes.
     let done = RuntimeInner::simulated(fake).block_on::<(), _>(
