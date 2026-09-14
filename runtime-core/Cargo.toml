@@ -35,7 +35,6 @@ io_uring_rb = { path = "../io_uring_rb" }
 runtime_ebpf_balancer = { path = "../runtime_ebpf_balancer", optional = true }
 async_timers = { path = "../async_timers" }
 runtime-streams = { path = "../runtime-streams" }
-mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 pin-project = "1.1.10"
 slab = "0.4.11"
 socket2 = { version = "0.6.1", features = ["all"] }

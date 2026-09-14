@@ -15,6 +15,9 @@ ebpf_balancer         = ["runtime-core/ebpf_balancer"]
 runtime-core = { path = "../runtime-core" }
 runtime-h2 = { package = "popple-h2", git = "ssh://git@github.com/saucisoupe/popple-h2", optional = true }
 libc = "0.2.178"
+
+# Miri cannot call into mimalloc's C; it runs on its own allocator instead.
+[target.'cfg(not(miri))'.dependencies]
 mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
 
 [dev-dependencies]

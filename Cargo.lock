@@ -462,7 +462,6 @@ dependencies = [
  "io-uring",
  "io_uring_rb 0.1.0",
  "libc",
- "mimalloc",
  "pin-project",
  "rand 0.8.6",
  "runtime-streams 0.1.0",
