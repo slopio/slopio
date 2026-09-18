@@ -45,19 +45,7 @@ pub enum CompletionError {
     Other(i32),
 }
 
-/// What a failed completion says about the op that produced it. The kernel
-/// ended the multishot either way; this is whether re-arming it is worth
-/// anything, and when.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Continuation {
-    /// Re-arm now: the failure was transient in itself.
-    Continue,
-    /// Re-arm once the condition clears. Nothing here knows when that is —
-    /// the stream hands the error to its consumer and stays armable.
-    ContinueLater,
-    /// The op is over; a re-arm would fail the same way.
-    NotContinue,
-}
+pub use crate::io_driver::operations::Continuation;
 
 #[allow(unreachable_patterns)]
 impl CompletionError {

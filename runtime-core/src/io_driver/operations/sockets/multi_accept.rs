@@ -13,7 +13,7 @@ use crate::io_driver::{
     sys,
     DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     UserData,
-    operations::{IoOP, MultishotToken, sockets::SocketWrapper},
+    operations::{Continuation, IoOP, MultishotToken, sockets::SocketWrapper},
 };
 
 pub struct MultiAccept<const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
@@ -29,6 +29,7 @@ pub enum AcceptError {
     Other(i32),
 }
 
+#[allow(unreachable_patterns)]
 impl AcceptError {
     fn from_result(result: i32) -> Self {
         if result == -libc::ECANCELED {
@@ -38,9 +39,25 @@ impl AcceptError {
         }
     }
 
-    /// Returns true if this error is recoverable and we should continue accepting.
-    pub fn can_continue(&self) -> bool {
-        matches!(self, AcceptError::Cancelled)
+    pub fn continuation(&self) -> Continuation {
+        match self {
+            // Pausing works by cancelling, so this is the driver's own
+            // backpressure coming back to be re-armed.
+            Self::Cancelled => Continuation::Continue,
+            // `Other` holds a positive errno here, unlike `CompletionError`.
+            Self::Other(code) => match *code {
+                // ECONNABORTED: the peer left before we took the connection.
+                libc::EINTR | libc::EAGAIN | libc::EWOULDBLOCK | libc::ECONNABORTED => {
+                    Continuation::Continue
+                }
+                // Out of descriptors or memory. Another holder has to release
+                // one; re-arming on the spot only burns the worker that would.
+                libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM => {
+                    Continuation::ContinueLater
+                }
+                _ => Continuation::NotContinue,
+            },
+        }
     }
 }
 
@@ -163,8 +180,14 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
         while let Some(event) = self.sockets.pop() {
             match event.try_into() {
                 Ok(socket) => return Poll::Ready(Some(socket)),
-                Err(e) if e.can_continue() => continue,
-                Err(_) => return Poll::Ready(None),
+                Err(e) => match e.continuation() {
+                    Continuation::Continue => continue,
+                    // `Item` is a bare socket, so a `ContinueLater` has nowhere
+                    // to be reported and ends the listener like a fatal one.
+                    Continuation::ContinueLater | Continuation::NotContinue => {
+                        return Poll::Ready(None);
+                    }
+                },
             }
         }
         Poll::Pending

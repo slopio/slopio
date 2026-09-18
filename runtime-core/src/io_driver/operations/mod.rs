@@ -8,6 +8,20 @@ pub mod sockets;
 pub use fixed_buf::FixedBufIndex;
 pub use io_traits::{IoBuf, IoBufMut, Slice};
 
+/// What a failed completion says about the multishot op that produced it. The
+/// kernel ended the op either way; this is whether re-arming it is worth
+/// anything, and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Continuation {
+    /// Re-arm now: the failure was transient in itself.
+    Continue,
+    /// Re-arm once the condition clears. Nothing here knows when that is —
+    /// the exhausted resource is refilled by another holder, not by polling.
+    ContinueLater,
+    /// The op is over; a re-arm would fail the same way.
+    NotContinue,
+}
+
 /// A token for a single-shot io_uring operation.
 #[derive(Debug, Clone, Copy)]
 pub struct OneshotToken(pub(crate) u64);
