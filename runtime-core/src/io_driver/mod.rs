@@ -462,7 +462,7 @@ impl IODriver {
                     }
                 }
             }
-            Event::SendBuffer(_) => {
+            Event::SendBuffer => {
                 // Fire-and-forget: the slot goes back whether the send landed or not.
                 self.sending_buffers.release(index);
             }

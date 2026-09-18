@@ -45,15 +45,37 @@ pub enum CompletionError {
     Other(i32),
 }
 
+/// What a failed completion says about the op that produced it. The kernel
+/// ended the multishot either way; this is whether re-arming it is worth
+/// anything, and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Continuation {
+    /// Re-arm now: the failure was transient in itself.
+    Continue,
+    /// Re-arm once the condition clears. Nothing here knows when that is —
+    /// the stream hands the error to its consumer and stays armable.
+    ContinueLater,
+    /// The op is over; a re-arm would fail the same way.
+    NotContinue,
+}
+
 #[allow(unreachable_patterns)]
 impl CompletionError {
-    pub fn can_continue(&self) -> bool {
+    pub fn continuation(&self) -> Continuation {
         match self {
-            Self::Eof { .. } => false,
-            Self::ConnectionReset => false,
-            Self::BrokenPipe => false,
-            Self::Cancelled => true, // Cancellation is recoverable - we'll resubmit
-            Self::Other(code) => matches!(-code, libc::EINTR | libc::EAGAIN | libc::EWOULDBLOCK),
+            Self::Eof { .. } => Continuation::NotContinue,
+            Self::ConnectionReset => Continuation::NotContinue,
+            Self::BrokenPipe => Continuation::NotContinue,
+            // Pausing works by cancelling, so this is the driver's own
+            // backpressure coming back to be re-armed.
+            Self::Cancelled => Continuation::Continue,
+            Self::Other(code) => match -code {
+                libc::EINTR | libc::EAGAIN | libc::EWOULDBLOCK => Continuation::Continue,
+                // The ring was empty. It refills only when another holder
+                // recycles, which no poll of this stream can bring about.
+                libc::ENOBUFS => Continuation::ContinueLater,
+                _ => Continuation::NotContinue,
+            },
         }
     }
 
@@ -148,8 +170,17 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
                     self.ended = true;
                     return Poll::Ready(None);
                 }
-                Err(e) if e.can_continue() => continue,
-                Err(e) => return Poll::Ready(Some(Err(e))),
+                Err(e) => match e.continuation() {
+                    Continuation::Continue => continue,
+                    // Armable still: the next poll re-arms, so the consumer
+                    // decides when to come back rather than spinning here.
+                    Continuation::ContinueLater => return Poll::Ready(Some(Err(e))),
+                    // Reported once, then the stream is over.
+                    Continuation::NotContinue => {
+                        self.ended = true;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
             }
         }
         Poll::Pending

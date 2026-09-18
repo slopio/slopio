@@ -1,8 +1,9 @@
 //! A multishot recv the kernel ended on its own: EOF, or an error.
 //!
-//! An error CQE without `IORING_CQE_F_MORE` ends the op in the kernel. The
-//! stream must then re-arm on the next poll rather than wait for a CQE that
-//! will never come, and EOF must stay EOF without re-arming anything.
+//! An error CQE without `IORING_CQE_F_MORE` ends the op in the kernel. What
+//! the stream owes its consumer next is the error's `Continuation`: re-arm on
+//! the next poll rather than wait for a CQE that will never come, stay armable
+//! but say so, or end — and EOF stays EOF without re-arming anything.
 
 use runtime_core::deterministic_testing::{FakeRing, ReadEvent, simulated_socket};
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
@@ -98,4 +99,36 @@ fn eof_stays_eof_without_re_arming() {
     // Nothing was re-armed: an unscripted read would be parked here.
     assert_eq!(handle.parked(), 0);
     assert!(handle.inflight().is_empty());
+}
+
+#[test]
+fn a_fatal_error_is_reported_once_and_ends_the_stream() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+
+    handle.on_multishot_read(socket.fd(), [ReadEvent::Error(libc::ECONNRESET)]);
+    // Scripted but unreachable: a re-arm would pick this up, and must not.
+    handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"never"), ReadEvent::Eof]);
+
+    let (reset, ends) = RuntimeInner::simulated(fake).block_on::<ReArmRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ReArmRing>::new(socket);
+            let reset = matches!(
+                recv.next().await,
+                Some(Err(CompletionError::ConnectionReset))
+            );
+            let mut ends = 0;
+            for _ in 0..3 {
+                if recv.next().await.is_none() {
+                    ends += 1;
+                }
+            }
+            (reset, ends)
+        },
+        None,
+        |run| run(),
+    );
+
+    assert!(reset);
+    assert_eq!(ends, 3, "the error is not repeated, and nothing re-arms");
 }

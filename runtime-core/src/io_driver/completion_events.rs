@@ -17,7 +17,8 @@ pub(crate) struct CQEData {
 pub(crate) enum Event {
     SingleShot(CQEData),
     MultiShot(CQEData),
-    SendBuffer(i32),
+    /// Fire-and-forget: the slot goes back either way, so no result is carried.
+    SendBuffer,
     /// MSG_RING delivered by another worker. Carries no slab entry: `payload`
     /// is the 62-bit `user_data` field and `data` the CQE `res`.
     PeerMessage { payload: u64, data: i32 },
@@ -71,7 +72,7 @@ impl CompletionEvent {
                 let ud = UserData::from_bits(raw);
                 let data = CQEData { result, flags };
                 let event = match ud.io_kind() {
-                    IO_SEND_BUFFER => Event::SendBuffer(data.result),
+                    IO_SEND_BUFFER => Event::SendBuffer,
                     IO_REPLY_SIGNAL => Event::ReplySignal { status: data.result },
                     kind /* IO_MULTI or IO_SINGLE */ => {
                         // EBADF means an SQE named a closed fd: fd ownership is broken.
