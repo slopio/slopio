@@ -1509,15 +1509,64 @@ pub enum RingHandle<'a> {
 }
 
 impl Ring {
+    /// Queue one SQE, submitting first if there is no room for it.
+    ///
+    /// The submission queue is a fixed 4096 entries, and [`block_on`] polls
+    /// every runnable task before it flushes — the pass budget is
+    /// `tasks.len()`. So the SQEs one pass produces are bounded by how many
+    /// tasks are runnable and by nothing else, while the queue that has to hold
+    /// them is not. Past 4096, `push` returns `PushError`, which this used to
+    /// unwrap: a panic on a worker thread, and since `thread_per_core_with`
+    /// unwraps the join, one full queue took the whole process down.
+    ///
+    /// Measured with ~10 000 IO-issuing tasks per worker, where it fired on
+    /// roughly one run in eight — it needs enough of them to wake in the *same*
+    /// pass, which is why it is intermittent rather than a hard ceiling.
+    /// Anything that wakes tasks in bulk, a timer store handing back a whole
+    /// bucket at once for instance, makes it likelier.
+    ///
+    /// [`block_on`]: crate::runtime::RuntimeInner::block_on
+    ///
+    /// Submitting mid-pass is the price, and it is the right one: a syscall on
+    /// the rare full queue against a process that dies on it. Nothing else has
+    /// to change, because the kernel consumes the whole queue on a successful
+    /// `submit`, so the retry cannot find it full again.
     pub(crate) fn add(&mut self, entry: &squeue::Entry) {
         match &mut self.inner {
-            RingBackend::Uring(ring) => unsafe {
-                ring.submission().push(entry).unwrap();
-            },
+            RingBackend::Uring(ring) => {
+                // SAFETY: the caller's contract for `add` is the caller's
+                // contract for `push` — the entry's buffers outlive the op.
+                if unsafe { ring.submission().push(entry) }.is_err() {
+                    // The borrow above ends here, which `submit` needs.
+                    Self::submit_uring(ring);
+                    // The queue was drained by the submit, so this cannot be
+                    // the full-queue error again.
+                    unsafe { ring.submission().push(entry) }
+                        .expect("submission queue drained by the submit above");
+                    // Everything queued went with it; only this entry is new.
+                    self.pending = 0;
+                }
+            }
             #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.add(entry),
         }
         self.pending += 1;
+    }
+
+    /// `submit` with the one error that is not a failure folded away, so the
+    /// full-queue path and [`IODriver::submit`] agree on what `EINTR` means.
+    fn submit_uring(ring: &mut IoUring) {
+        loop {
+            match ring.submit() {
+                Ok(_) => return,
+                // Interrupted before the kernel took anything: nothing was
+                // consumed, so there is still no room and retrying is the only
+                // way out. `IODriver::submit` can return here and let the next
+                // pass flush; this one cannot.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("io_uring submit failed while making room: {e:?}"),
+            }
+        }
     }
 
     fn handle(&self) -> RingHandle<'_> {
@@ -1526,5 +1575,37 @@ impl Ring {
             #[cfg(feature = "simulation")]
             RingBackend::Fake(fake) => RingHandle::Simulated(fake.handle()),
         }
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    /// Pushing past the submission queue's capacity flushes and carries on.
+    ///
+    /// It used to unwrap the `PushError` instead, which is a panic on a worker
+    /// thread and so the death of the process. A scheduler pass polls every
+    /// runnable task before flushing, so any workload with more IO-issuing
+    /// tasks awake at once than the queue is deep reaches this.
+    #[test]
+    fn a_full_submission_queue_is_flushed_rather_than_unwrapped() {
+        let mut ring = Ring::default();
+
+        // Nops: no fd, no buffer, so nothing has to outlive the call and the
+        // `add` safety contract is trivially met.
+        let nop = opcode::Nop::new().build();
+        for _ in 0..5_000 {
+            ring.add(&nop);
+        }
+
+        // The flush reset the count, so what is left is only what was queued
+        // after it — the point being that this is bounded by the queue rather
+        // than by how many times `add` was called.
+        assert!(
+            ring.pending < 4096,
+            "the mid-pass flush should have reset the count, not let it grow: {}",
+            ring.pending
+        );
     }
 }
