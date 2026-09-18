@@ -100,12 +100,9 @@ impl Collector for OtlpCollector {
         let body = std::mem::take(&mut self.encode_buf.buf);
 
         let conn = self.conn.as_mut().unwrap();
-        match conn.grpc_unary(OTLP_GRPC_PATH, body).await {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("OtlpCollector: grpc export failed: {e:?}");
-                self.conn = None;
-            }
+        // Export failure drops the connection; the next batch reconnects.
+        if conn.grpc_unary(OTLP_GRPC_PATH, body).await.is_err() {
+            self.conn = None;
         }
     }
 }

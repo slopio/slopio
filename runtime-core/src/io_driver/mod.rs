@@ -462,13 +462,8 @@ impl IODriver {
                     }
                 }
             }
-            Event::SendBuffer(result) => {
-                if result < 0 {
-                    eprintln!(
-                        "sendmsg failed: {}",
-                        std::io::Error::from_raw_os_error(-result)
-                    );
-                }
+            Event::SendBuffer(_) => {
+                // Fire-and-forget: the slot goes back whether the send landed or not.
                 self.sending_buffers.release(index);
             }
             Event::PeerMessage { payload, data } => {
