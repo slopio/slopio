@@ -914,6 +914,12 @@ impl IODriver {
             .count(1)
             .build()
             .user_data(UserData::ignored_only().into_bits());
+        // The simulated ring is handed the duration rather than left to read it
+        // back out of the sqe: in one process that is an integer-to-pointer
+        // round trip with no exposed provenance, which Miri rejects. A real
+        // ring reads the timespec across a syscall boundary and is unaffected.
+        #[cfg(feature = "simulation")]
+        ring_inner.note_wakeup_timeout(duration);
         ring_inner.add(&entry);
     }
 
@@ -1526,6 +1532,15 @@ impl Ring {
     /// the rare full queue against a process that dies on it. Nothing else has
     /// to change, because the kernel consumes the whole queue on a successful
     /// `submit`, so the retry cannot find it full again.
+    /// Passes the next timeout's duration to the simulated ring, which cannot
+    /// soundly read it from the sqe. A no-op on a real one.
+    #[cfg(feature = "simulation")]
+    fn note_wakeup_timeout(&mut self, duration: Duration) {
+        if let RingBackend::Fake(ring) = &mut self.inner {
+            ring.note_wakeup_timeout(duration);
+        }
+    }
+
     pub(crate) fn add(&mut self, entry: &squeue::Entry) {
         match &mut self.inner {
             RingBackend::Uring(ring) => {

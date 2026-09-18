@@ -415,21 +415,7 @@ fn complete_outcome(
 
 /// `io_uring::types::Timespec` is `repr(transparent)` over this but exposes no
 /// accessors, so reading a `TIMEOUT`'s duration means restating the layout.
-#[repr(C)]
-struct KernelTimespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
 
-fn timeout_duration(sqe: &Sqe) -> Nanos {
-    if sqe.addr == 0 {
-        return 0;
-    }
-    // SAFETY: a `TIMEOUT` sqe points at a `Timespec` the submitter keeps alive
-    // while the op is in flight — the contract the kernel itself reads it under.
-    let ts = unsafe { &*(sqe.addr as *const KernelTimespec) };
-    (ts.tv_sec.max(0) as Nanos) * 1_000_000_000 + ts.tv_nsec.max(0) as Nanos
-}
 
 struct Wakeup {
     deadline: Nanos,
@@ -542,6 +528,21 @@ struct FakeRingState {
     /// Registered buffer rings, by group id.
     buf_rings: Vec<(u16, BufRingTake)>,
     pace: Pace,
+    /// How long the next `TIMEOUT` sqe is for, handed over by the driver.
+    ///
+    /// A real ring reads that from the `Timespec` the sqe points at, and this
+    /// used to do the same — which is sound across a syscall boundary and is
+    /// undefined behaviour inside one process. The sqe carries the timespec as
+    /// an integer, so reading it back is an integer-to-pointer round trip whose
+    /// provenance was never exposed; and it could not be exposed usefully,
+    /// because every path from `push_wakeup_timeout` to `submit` takes
+    /// `&mut Ring`, which invalidates any shared tag on the field the timespec
+    /// lives in. Miri says so at the first armed timer.
+    ///
+    /// Taking the value instead costs the simulation nothing: one producer
+    /// arms these and one consumer reads them, and the address was only ever
+    /// standing in for a boundary that is not there.
+    wakeup_nanos: Nanos,
 }
 
 /// A test's handle on a [`FakeRing`]: what the runtime submitted, and what
@@ -839,6 +840,7 @@ impl FakeRingBuilder {
             written: HashMap::new(),
             buf_rings: Vec::new(),
             pace,
+                    wakeup_nanos: 0,
         })));
         (FakeRing(handle.clone()), handle)
     }
@@ -846,6 +848,18 @@ impl FakeRingBuilder {
 
 /// The ring itself. Held by the driver; driven through [`FakeRingHandle`].
 pub struct FakeRing(FakeRingHandle);
+
+impl FakeRing {
+    /// The duration the next `TIMEOUT` sqe is for.
+    ///
+    /// Told rather than read: see `FakeRingState::wakeup_nanos`. Called by
+    /// `push_wakeup_timeout` immediately before the sqe it describes, and only
+    /// one wakeup is ever armed at a time, so a single slot is enough.
+    pub fn note_wakeup_timeout(&self, duration: std::time::Duration) {
+        self.0.0.borrow_mut().wakeup_nanos = duration.as_nanos() as Nanos;
+    }
+}
+
 
 enum Wait {
     /// Sleep to the next op's due time, then complete everything due.
@@ -910,7 +924,7 @@ impl FakeRing {
 
             match classify(&sqe) {
                 Class::Wakeup => {
-                    let deadline = now + timeout_duration(&sqe);
+                    let deadline = now + state.wakeup_nanos;
                     state.wakeup = Some(Wakeup {
                         deadline,
                         user_data: sqe.user_data,
