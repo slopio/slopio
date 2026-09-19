@@ -339,6 +339,8 @@ impl Default for Ring {
             .setup_coop_taskrun()
             .setup_single_issuer()
             .setup_defer_taskrun()
+            // Lets `has_deferred_completions` see task work without a syscall.
+            .setup_taskrun_flag()
             .build(4096)
             .unwrap();
 
@@ -1021,6 +1023,18 @@ impl IODriver {
             slab.remove(token);
         }
         res
+    }
+
+    /// Completions the kernel holds back until the next enter, or already in the CQ.
+    pub(crate) fn has_deferred_completions(&self) -> bool {
+        let ring = unsafe { &mut *self.ring.get() };
+        match &mut ring.inner {
+            RingBackend::Uring(ring) => {
+                ring.submission().taskrun() || !ring.completion().is_empty()
+            }
+            #[cfg(feature = "simulation")]
+            RingBackend::Fake(_) => false,
+        }
     }
 
     pub(crate) fn has_pending_sqes(&self) -> bool {

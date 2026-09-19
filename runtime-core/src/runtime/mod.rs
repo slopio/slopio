@@ -153,9 +153,12 @@ impl RuntimeInner {
                                     budget -= 1;
                                 }
 
-                                // Only flush if tasks actually submitted IO operations.
-                                // Avoids a syscall on pure task/channel workloads.
-                                if self.io_driver.has_pending_sqes() {
+                                // Only enter if tasks submitted IO or the kernel holds
+                                // completions back. Avoids a syscall on pure
+                                // task/channel workloads.
+                                if self.io_driver.has_pending_sqes()
+                                    || self.io_driver.has_deferred_completions()
+                                {
                                     self.io_driver.submit();
                                     self.io_driver.process_completion_queue();
                                 }
