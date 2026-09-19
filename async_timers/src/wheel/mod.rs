@@ -259,12 +259,18 @@ impl TimeWheel {
     /// the loop back to sleep one tick short of the firing, every time.
     pub fn next_deadline(&self) -> Option<Duration> {
         let b = &self.buckets;
-        let ticks = if let Some(i) = b.ms_occupied.next_set(self.ms_idx(), MS_BUCKETS) {
-            i as u64
-        } else if let Some(i) = b.s_occupied.next_set(self.s_idx(), S_BUCKETS) {
-            self.ticks_until(i, TICKS_PER_S)
-        } else {
-            return None;
+        let ms = b
+            .ms_occupied
+            .next_set(self.ms_idx(), MS_BUCKETS)
+            .map(|i| i as u64);
+        let s = b
+            .s_occupied
+            .next_set(self.s_idx(), S_BUCKETS)
+            .map(|i| self.ticks_until(i, TICKS_PER_S));
+        // Both: a seconds slot can cascade into an ms slot ahead of the occupied one.
+        let ticks = match (ms, s) {
+            (Some(ms), Some(s)) => ms.min(s),
+            (ms, s) => ms.or(s)?,
         };
         Some(Duration::from_millis((ticks + 1) * MS_TICK))
     }

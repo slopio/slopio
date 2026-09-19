@@ -990,3 +990,27 @@ fn test_cancelled_timer_freed_when_its_bucket_fires() {
     clock.advance(&mut wheel, Duration::from_millis(510));
     assert_eq!(wheel.active_timers(), 0);
 }
+
+/// An occupied ms slot must not hide a seconds slot that cascades ahead of it.
+#[test]
+fn test_next_deadline_sees_both_levels() {
+    let mut wheel = TimeWheel::new();
+    let (counter, waker) = make_waker();
+    let mut clock = Clock::new();
+    clock.advance(&mut wheel, Duration::ZERO);
+
+    wheel.init_timer(Duration::from_millis(1050), &waker).unwrap();
+    clock.advance(&mut wheel, Duration::from_millis(500));
+    wheel.init_timer(Duration::from_millis(1000), &waker).unwrap();
+
+    // Sleep exactly what the wheel asks for, as the runtime does.
+    while counter.count() == 0 {
+        let wait = wheel.next_deadline().unwrap();
+        clock.advance(&mut wheel, wait);
+    }
+    assert!(
+        clock.elapsed <= Duration::from_millis(1070),
+        "the 1050ms timer fired at {:?}",
+        clock.elapsed
+    );
+}
