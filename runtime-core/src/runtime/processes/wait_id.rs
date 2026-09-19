@@ -120,7 +120,8 @@ pub struct WaitProcess {
     id_type: IdType,
     options: WaitFlags,
     token: Option<OneshotToken>,
-    siginfo: Box<libc::siginfo_t>,
+    /// `Some` until a cancel hands it to the driver as keepalive.
+    siginfo: Option<Box<libc::siginfo_t>>,
 }
 
 impl WaitProcess {
@@ -144,7 +145,7 @@ impl WaitProcess {
             id_type,
             options,
             token: None,
-            siginfo: Box::new(unsafe { std::mem::zeroed() }),
+            siginfo: Some(Box::new(unsafe { std::mem::zeroed() })),
         }
     }
 
@@ -154,7 +155,7 @@ impl WaitProcess {
             self.id as libc::id_t,
             self.options.bits(),
         )
-        .infop(self.siginfo.as_ref() as *const libc::siginfo_t)
+        .infop(&**self.siginfo.as_ref().expect("siginfo present") as *const libc::siginfo_t)
         .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.token = Some(token);
@@ -179,7 +180,7 @@ impl Future for WaitProcess {
                 self.token = None;
                 std::task::Poll::Ready(match io_result.result {
                     0.. => {
-                        let info = &*self.siginfo;
+                        let info = &**self.siginfo.as_ref().expect("siginfo present");
                         let pid = unsafe { info.si_pid() } as u32;
                         let status = unsafe { info.si_status() };
                         let code = match info.si_code {
@@ -203,7 +204,9 @@ impl Future for WaitProcess {
 impl Drop for WaitProcess {
     fn drop(&mut self) {
         if let Some(token) = self.token {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
+            // The kernel writes the siginfo until the cancelled op's CQE.
+            let keep = self.siginfo.take().map(|b| b as Box<dyn std::any::Any>);
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, None))
         }
     }
 }
