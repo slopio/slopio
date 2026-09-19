@@ -9,7 +9,10 @@ use std::task::{Context, Poll};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, sockets::{OpSocket, SocketWrapper}},
+    operations::{
+        IoBuf, OneshotToken,
+        sockets::{OpSocket, SocketWrapper},
+    },
 };
 
 /// Cancellation-safe send: takes ownership of the buffer, returns it on
@@ -33,8 +36,12 @@ pub struct WriteSocket<B: IoBuf> {
 impl<B: IoBuf> WriteSocket<B> {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_ref().expect("buf taken before submit");
-        let entry =
-            opcode::Send::new(Fd(self.socket.fd()), buf.stable_ptr(), buf.bytes_init() as u32).build();
+        let entry = opcode::Send::new(
+            Fd(self.socket.fd()),
+            buf.stable_ptr(),
+            buf.bytes_init() as u32,
+        )
+        .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
