@@ -296,7 +296,7 @@ impl MultiOpState {
                 };
             }
             MultiOpState::TringToPause { .. } => unreachable!("already"),
-            MultiOpState::Paused { .. } => todo!(),
+            MultiOpState::Paused { .. } => unreachable!("paused ops get no CQE"),
             MultiOpState::Cancelled { .. } => {}
             MultiOpState::AcceptCancelled { .. } => {}
         }
@@ -437,7 +437,8 @@ impl IODriver {
                             slab.remove_raw(index);
                         }
                     }
-                    MultiProcessResult::InvalidState(_msg) => {}
+                    // A multishot slot only gets CQEs while the kernel owes it some.
+                    MultiProcessResult::InvalidState(msg) => panic!("multishot slot {index}: {msg}"),
                 }
             }
             Event::SingleShot(cqe_data) => {
@@ -963,7 +964,7 @@ impl IODriver {
                     multishot_op.transition_to_paused();
                     MultiPollResult::NeedsResubmit
                 } else {
-                    *existant_waker = waker.clone();
+                    existant_waker.clone_from(waker);
                     MultiPollResult::Pending
                 }
             }
@@ -976,7 +977,7 @@ impl IODriver {
                     std::mem::swap(poller_queue, provision);
                     MultiPollResult::Ready
                 } else {
-                    *existant_waker = waker.clone();
+                    existant_waker.clone_from(waker);
                     MultiPollResult::Pending
                 }
             }

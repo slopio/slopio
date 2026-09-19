@@ -433,3 +433,41 @@ fn cqe_before_first_poll_is_not_lost() {
     assert_eq!(got, Ok(Some(Some(b"hello".to_vec()))));
     drop(client);
 }
+
+/// A queue handed over by a pause must be delivered before re-arming.
+#[test]
+fn paused_queue_is_delivered_without_more_traffic() {
+    let (cv1, cv2) = Cv::new();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        main_thread_with::<Small, _>(async move {
+            let mut multiaccept = MultiAccept::new(9195).unwrap();
+            cv1.notify();
+            let socket = multiaccept.next().await.unwrap();
+            let mut multirecv = MultiRecv::<Small, _, 2>::with_queue_size(socket);
+            let mut total = 0usize;
+            let mut first = true;
+            while let Some(Ok(data)) = multirecv.next().await {
+                total += data.as_ref().len();
+                if first {
+                    // Busy elsewhere while the queue overflows and the op pauses.
+                    first = false;
+                    runtime::runtime::time::Sleep::during(Duration::from_millis(1000)).await;
+                }
+                if total == 8 { break; }
+            }
+            done_tx.send(total).unwrap();
+        })
+    });
+    cv2.wait();
+    let mut client = TcpStream::connect("localhost:9195").unwrap();
+    client.set_nodelay(true).unwrap();
+    for i in 0..4u8 {
+        client.write_all(&[i, i]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The peer now waits for a reply: nothing further will wake the consumer.
+    let got = done_rx.recv_timeout(Duration::from_secs(5));
+    assert_eq!(got, Ok(8), "consumer never saw all 8 bytes");
+    drop(client);
+}

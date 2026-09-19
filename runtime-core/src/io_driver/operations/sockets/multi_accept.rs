@@ -226,28 +226,32 @@ impl<const QUEUE_SIZE: usize> Stream for MultiAccept<QUEUE_SIZE> {
         let waker = cx.waker();
         let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.sockets)) {
-            MultiPollResult::Pending => Poll::Pending,
-            MultiPollResult::Ready => {
-                let drained = self.try_drain_one();
-                // If shutting down and nothing left, we're done.
-                if shutting_down && matches!(drained, Poll::Pending) {
-                    return Poll::Ready(None);
+        loop {
+            match IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.sockets)) {
+                MultiPollResult::Pending => return Poll::Pending,
+                MultiPollResult::Ready => {
+                    if let Poll::Ready(result) = self.try_drain_one() {
+                        return Poll::Ready(result);
+                    }
+                    // If shutting down and nothing left, we're done.
+                    if shutting_down {
+                        return Poll::Ready(None);
+                    }
+                    // Only skippable errors came out: ask again, the op may be over.
                 }
-                drained
-            }
-            MultiPollResult::NeedsResubmit => {
-                // Drain any remaining sockets queued before the pause.
-                if let Poll::Ready(result) = self.try_drain_one() {
-                    return Poll::Ready(result);
+                MultiPollResult::NeedsResubmit => {
+                    // Drain any remaining sockets queued before the pause.
+                    if let Poll::Ready(result) = self.try_drain_one() {
+                        return Poll::Ready(result);
+                    }
+                    // During shutdown, don't resubmit — the stream is done.
+                    if shutting_down {
+                        return Poll::Ready(None);
+                    }
+                    let entry = self.to_entry();
+                    IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
+                    return Poll::Pending;
                 }
-                // During shutdown, don't resubmit — the stream is done.
-                if shutting_down {
-                    return Poll::Ready(None);
-                }
-                let entry = self.to_entry();
-                IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
-                Poll::Pending
             }
         }
     }

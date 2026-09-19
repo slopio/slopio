@@ -195,27 +195,24 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream for MultiRe
         let waker = cx.waker();
         let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.reads)) {
-            MultiPollResult::Pending => Poll::Pending,
-            MultiPollResult::Ready => {
-                match self.try_drain_one() {
-                    Poll::Ready(result) => Poll::Ready(result),
-                    Poll::Pending => {
-                        // Only skippable errors came out; the op may be over.
-                        if let MultiPollResult::NeedsResubmit =
-                            IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.reads))
-                        {
-                            let entry = self.to_entry();
-                            IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
-                        }
-                        Poll::Pending
+        loop {
+            match IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.reads)) {
+                MultiPollResult::Pending => return Poll::Pending,
+                // Only skippable errors came out: ask again, the op may be over.
+                MultiPollResult::Ready => {
+                    if let Poll::Ready(result) = self.try_drain_one() {
+                        return Poll::Ready(result);
                     }
                 }
-            }
-            MultiPollResult::NeedsResubmit => {
-                let entry = self.to_entry();
-                IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
-                Poll::Pending
+                MultiPollResult::NeedsResubmit => {
+                    // The paused queue came with the swap, and nothing will wake us for it.
+                    if let Poll::Ready(result) = self.try_drain_one() {
+                        return Poll::Ready(result);
+                    }
+                    let entry = self.to_entry();
+                    IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
+                    return Poll::Pending;
+                }
             }
         }
     }

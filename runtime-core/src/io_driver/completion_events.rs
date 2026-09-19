@@ -245,7 +245,7 @@ pub(crate) fn process_multi(
                 *last_cqe = true;
             }
             let paused = *last_cqe;
-            queue.push(event);
+            let inserted = queue.push(event);
 
             // Whether the final CQE is our pause-cancel's -ECANCELED or the
             // op terminating on its own (EOF/error), no further CQE is
@@ -254,6 +254,10 @@ pub(crate) fn process_multi(
                 multi_op.transition_to_paused();
                 multi_op.wake();
                 MultiProcessResult::FullyPaused
+            } else if matches!(inserted, super::QueueInsertEvent::WasEmpty) {
+                // The consumer drained everything mid-pause and is parked on this queue.
+                multi_op.wake();
+                MultiProcessResult::WakeConsumer
             } else {
                 MultiProcessResult::Queued
             }
