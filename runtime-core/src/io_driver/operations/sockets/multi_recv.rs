@@ -86,15 +86,20 @@ impl<S: BufRingSpec, O: SocketOwner> MultiRecv<S, O, DEFAULT_QUEUE_SIZE> {
 
 impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QUEUE_SIZE> {
     pub fn with_queue_size(socket: O) -> Self {
-        let mut multi_recv = Self {
+        Self {
             id: None,
             socket: Some(socket),
             reads: MultiOpQueue::new(QUEUE_SIZE),
             ended: false,
             _spec: PhantomData,
-        };
-        multi_recv.register_to_driver();
-        multi_recv
+        }
+    }
+
+    // Armed by the first poll, which also leaves `Init`: no CQE can land in between.
+    fn ensure_registered(&mut self) {
+        if self.id.is_none() {
+            self.register_to_driver();
+        }
     }
 
     /// The socket this stream reads from — the write half of the connection,
@@ -186,6 +191,7 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream for MultiRe
             return Poll::Ready(result);
         }
 
+        self.ensure_registered();
         let waker = cx.waker();
         let token = self.id.unwrap();
 

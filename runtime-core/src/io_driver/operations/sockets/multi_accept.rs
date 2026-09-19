@@ -128,14 +128,19 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
             }
         };
 
-        let mut multi_accept = Self {
+        Ok(Self {
             id: None,
             socket: SocketWrapper::from_fd(fd),
             sockets: MultiOpQueue::new(QUEUE_SIZE),
             cancel_sent: false,
-        };
-        multi_accept.register_to_driver();
-        Ok(multi_accept)
+        })
+    }
+
+    // Armed by the first poll, which also leaves `Init`: no CQE can land in between.
+    fn ensure_registered(&mut self) {
+        if self.id.is_none() {
+            self.register_to_driver();
+        }
     }
 
     pub fn socket(&self) -> &SocketWrapper {
@@ -199,6 +204,12 @@ impl<const QUEUE_SIZE: usize> Stream for MultiAccept<QUEUE_SIZE> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let shutting_down = IO_DRIVER.with(|d| d.shutdown());
+
+        // Never armed: nothing to cancel, nothing queued.
+        if shutting_down && self.id.is_none() {
+            return Poll::Ready(None);
+        }
+        self.ensure_registered();
 
         // On shutdown, ask io_uring to cancel the multishot accept (once).
         if shutting_down && !self.cancel_sent {

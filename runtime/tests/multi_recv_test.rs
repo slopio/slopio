@@ -407,3 +407,29 @@ fn test_multishot_slab_entry_reaped_after_eof() {
         "dropping a MultiRecv after EOF leaked a multishot slab entry"
     );
 }
+
+/// Data arriving between construction and the first poll must still come out.
+#[test]
+fn cqe_before_first_poll_is_not_lost() {
+    let (cv1, cv2) = Cv::new();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        main_thread_with::<Small, _>(async move {
+            let mut multiaccept = MultiAccept::new(9197).unwrap();
+            cv1.notify();
+            let socket = multiaccept.next().await.unwrap();
+            let mut multirecv = MultiRecv::<Small>::new(socket);
+            // Any await between construction and the first poll.
+            runtime::runtime::time::Sleep::during(Duration::from_millis(400)).await;
+            let got = multirecv.next().await.map(|r| r.map(|b| b.as_ref().to_vec()).ok());
+            done_tx.send(got).unwrap();
+        })
+    });
+    cv2.wait();
+    let mut client = TcpStream::connect("localhost:9197").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    client.write_all(b"hello").unwrap();
+    let got = done_rx.recv_timeout(Duration::from_secs(3));
+    assert_eq!(got, Ok(Some(Some(b"hello".to_vec()))));
+    drop(client);
+}
