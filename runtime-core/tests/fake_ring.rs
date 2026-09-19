@@ -866,6 +866,8 @@ fn the_wakeup_timer_bounds_a_wait_that_would_otherwise_be_longer() {
     handle.on_read(11, ReadEvent::data(b"x").after(Duration::from_secs(3600)));
     ring.add(&recv(11, &mut buf, 1));
 
+    // The simulator is told the duration rather than reading the timespec.
+    ring.note_wakeup_timeout(Duration::from_millis(5));
     let ts = Timespec::new().nsec(5_000_000);
     ring.add(&opcode::Timeout::new(&ts).count(1).build().user_data(0xFFFF));
 
