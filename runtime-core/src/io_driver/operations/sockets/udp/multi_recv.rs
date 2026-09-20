@@ -122,6 +122,9 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
 
     fn try_parse(&self, event: MultishotCompletionEvent) -> Result<UdpDatagram<S>, ()> {
         if event.result <= 0 {
+            if let Some(bid) = buffer_select(event.flags) {
+                S::recycle_bid(bid);
+            }
             return Err(());
         }
 
@@ -179,10 +182,9 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> Drop for UdpMultiRecv<S, QUEUE_SIZ
 impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
     fn recycle_pending_buffers(&mut self) {
         while let Some(event) = self.reads.pop() {
-            if event.result > 0 {
-                if let Some(buffer_id) = buffer_select(event.flags) {
-                    S::recycle_bid(buffer_id);
-                }
+            // The flag alone says a buffer was consumed, whatever the result.
+            if let Some(buffer_id) = buffer_select(event.flags) {
+                S::recycle_bid(buffer_id);
             }
         }
     }
@@ -229,7 +231,8 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for UdpMultiRecv<S, QUEUE_S
 impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for UdpMultiRecv<S, QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket().fd(), QUEUE_SIZE));
+        let token = IO_DRIVER
+            .with(|d| d.push_buffered_multishot_op(entry, self.socket().fd(), QUEUE_SIZE, S::BGID));
         self.id = Some(token);
     }
 

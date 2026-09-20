@@ -22,8 +22,8 @@ use runtime_core::io_driver::{BufRingSpec, RingHandle};
 // Real provided-buffer rings: anonymous mappings and a buffer pool, exactly as
 // production builds them. Only the kernel registration is skipped, so the
 // simulator has to consume them itself.
-runtime_core::define_buf_ring!(TestRing, bgid = 9, buffer_size = 64, ring_size = 4);
-runtime_core::define_buf_ring!(TinyRing, bgid = 10, buffer_size = 16, ring_size = 2);
+runtime_core::define_buf_ring!(TestRing, bgid = 0, buffer_size = 64, ring_size = 4);
+runtime_core::define_buf_ring!(TinyRing, bgid = 1, buffer_size = 16, ring_size = 2);
 
 fn recv_multi(fd: i32, bgid: u16, user_data: u64) -> io_uring::squeue::Entry {
     opcode::RecvMulti::new(Fd(fd), bgid)
@@ -172,7 +172,7 @@ fn a_scripted_eof_ends_a_multishot_recv() {
     // One op's whole life: a chunk, then the peer closes.
     handle.on_multishot_read(11, [ReadEvent::Bytes(32), ReadEvent::Eof]);
 
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.submit();
 
     ring.submit_and_wait();
@@ -437,7 +437,7 @@ fn a_batch_lands_in_one_drain() {
             vec![ReadEvent::data(b"c")],                        // alone
         ],
     );
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
 
     // Not cosmetic: two in one drain is one round of task polling, two in
     // separate drains is two, with the program progressing in between.
@@ -459,7 +459,7 @@ fn an_ungrouped_stream_is_one_completion_per_drain() {
             ReadEvent::data(b"c"),
         ],
     );
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
 
     assert_eq!(drains(&mut ring, 3), vec![1, 1, 1]);
 }
@@ -470,7 +470,7 @@ fn only_the_completion_that_ends_a_batch_drops_f_more() {
     TestRing::init(RingHandle::Simulated(&handle));
 
     handle.on_multishot_read(11, [vec![ReadEvent::data(b"a"), ReadEvent::Eof]]);
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.submit_and_wait();
 
     let first = ring.pop_completion().expect("the chunk");
@@ -494,7 +494,7 @@ fn cancelling_mid_batch_gives_the_whole_batch_back() {
             ReadEvent::data(b"b").into(),
         ]],
     );
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.submit();
     assert_eq!(handle.scenario_remaining(), 2);
 
@@ -517,7 +517,7 @@ fn two_readers_of_one_descriptor_do_not_share_a_stream() {
     handle.on_multishot_read(11, [ReadEvent::data(b"stream one"), ReadEvent::Eof]);
     handle.on_read(11, ReadEvent::data(b"the single read"));
 
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.add(&recv(11, &mut solo, 8));
     ring.submit_and_wait();
 
@@ -539,7 +539,7 @@ fn a_single_completion_declared_for_a_multishot_is_refused() {
     TestRing::init(RingHandle::Simulated(&handle));
 
     handle.on_read(11, ReadEvent::data(b"hello"));
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.submit();
 }
 
@@ -569,7 +569,7 @@ fn a_stream_still_owed_counts_as_remaining() {
     );
     assert_eq!(handle.scenario_remaining(), 3);
 
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.submit_and_wait();
     ring.pop_completion().expect("the first chunk");
 
@@ -595,7 +595,7 @@ fn cancelling_a_multishot_gives_its_whole_stream_back() {
         ],
     );
 
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.submit();
     assert_eq!(handle.scenario_remaining(), 2, "both still owed");
 
@@ -1244,7 +1244,7 @@ fn a_delivery_larger_than_a_provided_buffer_is_refused() {
 
     // TinyRing hands out sixteen-byte buffers.
     handle.on_multishot_read(11, [ReadEvent::data(vec![b'x'; 100])]);
-    ring.add(&recv_multi(11, 10, 7));
+    ring.add(&recv_multi(11, 1, 7));
     ring.submit_and_wait();
 }
 
@@ -1262,12 +1262,14 @@ fn a_payload_split_across_a_batch_fills_successive_buffers() {
             ReadEvent::data(&payload[16..]),
         ]],
     );
-    ring.add(&recv_multi(11, 10, 7));
+    ring.add(&recv_multi(11, 1, 7));
     ring.submit_and_wait();
 
     let mut got = Vec::new();
     while let Some(completion) = ring.pop_completion() {
         let bid = cqueue::buffer_select(completion.flags).expect("F_BUFFER");
+        // No driver here to account the consumption.
+        TinyRing::note_consumed();
         let len = completion.result as usize;
         got.extend_from_slice(TinyRing::make_buffer(bid, len).as_ref());
     }
@@ -1281,7 +1283,7 @@ fn a_managed_recv_lands_in_a_provided_buffer() {
     TestRing::init(RingHandle::Simulated(&handle));
 
     handle.on_multishot_read(11, [ReadEvent::data(b"hello")]);
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.submit_and_wait();
 
     let completion = ring.pop_completion().expect("the recv completed");
@@ -1290,6 +1292,8 @@ fn a_managed_recv_lands_in_a_provided_buffer() {
     // The buffer the data went to is named in the CQE flags, which is how the
     // driver finds it.
     let bid = cqueue::buffer_select(completion.flags).expect("F_BUFFER was set");
+    // No driver here to account the consumption.
+    TestRing::note_consumed();
     let buffer = TestRing::make_buffer(bid, 5);
     assert_eq!(
         buffer.as_ref(),
@@ -1307,12 +1311,14 @@ fn recycling_hands_the_same_buffer_back_out() {
     let mut seen = Vec::new();
     for token in 0..4u64 {
         handle.on_multishot_read(11, [ReadEvent::data(b"x")]);
-        ring.add(&recv_multi(11, 10, token));
+        ring.add(&recv_multi(11, 1, token));
         ring.submit_and_wait();
 
         let completion = ring.pop_completion().expect("a completion");
         let bid = cqueue::buffer_select(completion.flags).expect("F_BUFFER");
         seen.push(bid);
+        // No driver here to account the consumption.
+        TinyRing::note_consumed();
         // Dropping recycles it, which is plain userspace memory traffic — the
         // same code production runs.
         drop(TinyRing::make_buffer(bid, 1));
@@ -1335,7 +1341,7 @@ fn a_leaked_buffer_drains_the_ring() {
     // Two buffers, taken and never given back.
     for token in 0..2u64 {
         handle.on_multishot_read(11, [ReadEvent::data(b"x")]);
-        ring.add(&recv_multi(11, 10, token));
+        ring.add(&recv_multi(11, 1, token));
         ring.submit_and_wait();
 
         let completion = ring.pop_completion().expect("a completion");
@@ -1346,7 +1352,7 @@ fn a_leaked_buffer_drains_the_ring() {
     // The ring is dry, and a real one says exactly this. Today a leaked
     // BorrowedBuffer is invisible; here it fails a read.
     handle.on_multishot_read(11, [ReadEvent::data(b"x")]);
-    ring.add(&recv_multi(11, 10, 99));
+    ring.add(&recv_multi(11, 1, 99));
     ring.submit_and_wait();
 
     let completion = ring.pop_completion().expect("a completion");
@@ -1361,7 +1367,7 @@ fn an_unregistered_buffer_group_is_refused() {
 
     // Group 9 exists as a type, but nothing installed it on this thread.
     handle.on_multishot_read(11, [ReadEvent::data(b"hello")]);
-    ring.add(&recv_multi(11, 9, 7));
+    ring.add(&recv_multi(11, 0, 7));
     ring.submit_and_wait();
 }
 

@@ -21,12 +21,13 @@ fn test_recv_with_buffer_ring() {
     let random_bytes_clone = random_bytes.clone();
 
     const BUFFER_SIZE: u32 = 1024;
-    const SIZE: u16 = 1024;
+    const SIZE: u16 = 64;
+    const POOL: u32 = 256;
     const BGID: u16 = 0;
 
     let mut ring = io_uring::IoUring::new(64).unwrap();
 
-    let br = RingBuffer::<BUFFER_SIZE, SIZE>::new(&ring, 0, BGID).unwrap();
+    let br = RingBuffer::<BUFFER_SIZE, SIZE, POOL>::new(&ring, 0, BGID).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -57,6 +58,7 @@ fn test_recv_with_buffer_ring() {
             }
             need_resubmit = false;
         }
+        br.refill();
         ring.submit_and_wait(1).unwrap();
 
         // Collect CQEs first to avoid borrow issues
@@ -65,14 +67,16 @@ fn test_recv_with_buffer_ring() {
             .map(|cqe| (cqe.result(), cqe.flags()))
             .collect();
 
+        let mut held = Vec::new();
         for (bytes_read, flags) in cqes {
             match bytes_read {
                 n if n > 0 => {
                     let buffer_id = (flags >> 16) as u16;
                     let buf_more = (flags & 0x08) != 0; // IORING_CQE_F_BUF_MORE
+                    br.note_consumed();
                     let buffer = br.get_buffer(buffer_id, n as _).unwrap();
                     received.extend(buffer.as_ref());
-                    br.recycle_buffer(&buffer);
+                    held.push(buffer);
                     if !buf_more {
                         need_resubmit = true;
                     }
@@ -84,6 +88,13 @@ fn test_recv_with_buffer_ring() {
                 e => panic!("{}", e),
             }
         }
+        // Refill before releasing, so the held buffers find the ring full and
+        // rotate through the reserve.
+        br.refill();
+        for buffer in held {
+            br.recycle_buffer(&buffer);
+        }
+        assert_eq!(br.in_flight(), 0);
         ring.submit().unwrap();
     }
 

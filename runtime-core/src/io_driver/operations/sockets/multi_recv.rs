@@ -123,6 +123,9 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
         event: MultishotCompletionEvent,
     ) -> Result<BorrowedBuffer<S>, CompletionError> {
         if event.result <= 0 {
+            if let Some(bid) = buffer_select(event.flags) {
+                S::recycle_bid(bid);
+            }
             return Err(CompletionError::from_code(event.result, event.flags));
         }
         let len = event.result as usize;
@@ -143,10 +146,9 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Drop for MultiRecv
 impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QUEUE_SIZE> {
     fn recycle_pending_buffers(&mut self) {
         while let Some(event) = self.reads.pop() {
-            if event.result > 0 {
-                if let Some(buffer_id) = buffer_select(event.flags) {
-                    S::recycle_bid(buffer_id);
-                }
+            // The flag alone says a buffer was consumed, whatever the result.
+            if let Some(buffer_id) = buffer_select(event.flags) {
+                S::recycle_bid(buffer_id);
             }
         }
     }
@@ -221,7 +223,8 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream for MultiRe
 impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> IoOP for MultiRecv<S, O, QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER.with(|d| d.push_multishot_op(entry, self.socket().fd(), QUEUE_SIZE));
+        let token = IO_DRIVER
+            .with(|d| d.push_buffered_multishot_op(entry, self.socket().fd(), QUEUE_SIZE, S::BGID));
         self.id = Some(token);
     }
 

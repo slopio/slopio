@@ -11,7 +11,7 @@
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
-use crate::io_driver::{IODriver, RingHandle};
+use crate::io_driver::{BufRingHooks, IODriver, RingHandle};
 
 /// Hands out the next buffer of one group, as `(bid, pointer, capacity)`.
 ///
@@ -25,11 +25,11 @@ pub type BufRingTake = fn() -> Option<(u16, NonNull<u8>, u32)>;
 /// The branch lives here rather than in [`define_buf_ring!`] because the macro
 /// expands into the caller's crate, where a `cfg` on *this* crate's features
 /// would mean nothing. `take` is ignored unless the ring is simulated.
-pub fn install_buf_ring<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
+pub fn install_buf_ring<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32>(
     ring: RingHandle<'_>,
     bgid: u16,
     take: BufRingTake,
-) -> std::io::Result<io_uring_rb::RingBuffer<BUFFER_SIZE, RING_SIZE>> {
+) -> std::io::Result<io_uring_rb::RingBuffer<BUFFER_SIZE, RING_SIZE, POOL_SIZE>> {
     let _ = take;
     match ring {
         RingHandle::Uring(ring) => io_uring_rb::RingBuffer::new(ring, 0, bgid),
@@ -55,8 +55,11 @@ pub trait BufRingSpec: 'static + Sized {
     const BGID: u16;
     /// Size of each buffer in the ring, in bytes.
     const BUFFER_SIZE: u32;
-    /// Number of buffers in the ring.
+    /// Number of buffers the kernel can see at once.
     const RING_SIZE: u16;
+    /// Number of buffers in all; those past `RING_SIZE` wait in a reserve and
+    /// enter the ring as it empties.
+    const POOL_SIZE: u32;
 
     /// Build the underlying `RingBuffer` and stash it in this spec's
     /// per-thread cell. Called once per worker thread at runtime startup.
@@ -70,6 +73,30 @@ pub trait BufRingSpec: 'static + Sized {
     /// Recycle buffer `bid` back to this spec's ring, without holding a
     /// `BorrowedBuffer`. Used by cancel-cleanup paths and by `Drop`.
     fn recycle_bid(bid: u16);
+
+    /// Account one buffer consumed by the kernel. Called by the driver, once
+    /// per completion that carries a buffer.
+    #[doc(hidden)]
+    fn note_consumed();
+
+    /// Move reserve buffers into the ring's free entries. Called by the driver
+    /// before it submits.
+    #[doc(hidden)]
+    fn refill();
+
+    /// Where this ring's buffers are right now, on the current thread.
+    fn usage() -> BufRingUsage;
+}
+
+/// A snapshot of where a ring's buffers are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufRingUsage {
+    /// Available to the kernel.
+    pub in_kernel: usize,
+    /// Free, waiting for room in the ring.
+    pub reserved: usize,
+    /// Handed out and not given back yet.
+    pub in_flight: usize,
 }
 
 /// A buffer borrowed from a registered provided-buffer ring `S`.
@@ -155,11 +182,17 @@ pub trait BufRingSet {
     /// Initialize every ring in this set against `ring` on the current thread.
     fn init_all(ring: RingHandle<'_>);
 
-    /// Register a `(bgid, recycle_fn)` entry for every ring in this set into
-    /// `driver`'s cancel-fallback table. The driver uses this when a cancel
-    /// completion delivers a buffer the type-erased cancel path needs to
-    /// recycle.
+    /// Tell `driver` about every ring in this set: it accounts their
+    /// consumption, refills them, and recycles on the type-erased cancel path.
     fn register_fallbacks(driver: &IODriver);
+}
+
+fn hooks<S: BufRingSpec>() -> BufRingHooks {
+    BufRingHooks {
+        consumed: S::note_consumed,
+        refill: S::refill,
+        recycle: S::recycle_bid,
+    }
 }
 
 impl BufRingSet for () {
@@ -172,7 +205,7 @@ impl<A: BufRingSpec> BufRingSet for A {
         A::init(ring);
     }
     fn register_fallbacks(driver: &IODriver) {
-        driver.register_recycler(A::BGID, A::recycle_bid);
+        driver.register_buf_ring(A::BGID, hooks::<A>());
     }
 }
 
@@ -183,7 +216,7 @@ macro_rules! impl_buf_ring_set_tuple {
                 $( <$t as BufRingSpec>::init(ring); )+
             }
             fn register_fallbacks(driver: &IODriver) {
-                $( driver.register_recycler(<$t as BufRingSpec>::BGID, <$t as BufRingSpec>::recycle_bid); )+
+                $( driver.register_buf_ring(<$t as BufRingSpec>::BGID, hooks::<$t>()); )+
             }
         }
     };
@@ -219,8 +252,12 @@ impl_buf_ring_set_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
 /// });
 /// ```
 ///
-/// `bgid` must be unique across every spec installed in the same runtime.
-/// `buffer_size` and `ring_size` must both be powers of two.
+/// `bgid` must be below 4 and unique across every spec installed in the same
+/// runtime. `buffer_size` and `ring_size` must both be powers of two.
+///
+/// `pool_size` is optional: it reserves more buffers than the ring shows the
+/// kernel at once, and the extra ones enter the ring as it empties. Defaults to
+/// `ring_size`.
 #[macro_export]
 macro_rules! define_buf_ring {
     (
@@ -229,23 +266,57 @@ macro_rules! define_buf_ring {
         buffer_size = $bsize:literal,
         ring_size = $rsize:literal $(,)?
     ) => {
+        $crate::define_buf_ring!(
+            $vis $name,
+            bgid = $bgid,
+            buffer_size = $bsize,
+            ring_size = $rsize,
+            pool_size = $rsize,
+        );
+    };
+    (
+        $vis:vis $name:ident,
+        bgid = $bgid:literal,
+        buffer_size = $bsize:literal,
+        ring_size = $rsize:literal,
+        pool_size = $psize:literal $(,)?
+    ) => {
         $vis struct $name;
+
+        const _: () = {
+            // The ring rides in two bits of every op's user_data.
+            assert!($bgid < 4, "bgid must be below 4");
+            assert!($psize >= $rsize, "pool_size must be at least ring_size");
+            assert!($psize <= 1 << 16, "pool_size must fit 16-bit buffer ids");
+        };
 
         const _: () = {
             ::std::thread_local! {
                 static RING: ::std::cell::OnceCell<
-                    $crate::__private::RingBuffer<$bsize, $rsize>
+                    $crate::__private::RingBuffer<$bsize, $rsize, $psize>
                 > = const { ::std::cell::OnceCell::new() };
+            }
+
+            fn with_ring<R>(
+                f: impl FnOnce(&$crate::__private::RingBuffer<$bsize, $rsize, $psize>) -> R,
+            ) -> R {
+                RING.with(|cell| {
+                    f(cell.get().expect(concat!(
+                        "buf ring `", stringify!($name),
+                        "` not initialized on this thread",
+                    )))
+                })
             }
 
             impl $crate::io_driver::BufRingSpec for $name {
                 const BGID: u16 = $bgid;
                 const BUFFER_SIZE: u32 = $bsize;
                 const RING_SIZE: u16 = $rsize;
+                const POOL_SIZE: u32 = $psize;
 
                 fn init(ring: $crate::io_driver::RingHandle<'_>) {
                     RING.with(|cell| {
-                        let rb = $crate::io_driver::install_buf_ring::<$bsize, $rsize>(
+                        let rb = $crate::io_driver::install_buf_ring::<$bsize, $rsize, $psize>(
                             ring,
                             $bgid,
                             || {
@@ -269,11 +340,7 @@ macro_rules! define_buf_ring {
                     bid: u16,
                     len: usize,
                 ) -> $crate::io_driver::BorrowedBuffer<Self> {
-                    RING.with(|cell| {
-                        let rb = cell.get().expect(concat!(
-                            "buf ring `", stringify!($name),
-                            "` not initialized on this thread",
-                        ));
+                    with_ring(|rb| {
                         let ptr = rb.ptr_for_bid(bid).expect("invalid bid");
                         unsafe {
                             $crate::io_driver::BorrowedBuffer::from_raw_parts(
@@ -284,13 +351,25 @@ macro_rules! define_buf_ring {
                 }
 
                 fn recycle_bid(bid: u16) {
-                    RING.with(|cell| {
-                        let rb = cell.get().expect(concat!(
-                            "buf ring `", stringify!($name),
-                            "` not initialized on this thread",
-                        ));
-                        rb.recycle_bid(bid);
+                    with_ring(|rb| rb.recycle_bid(bid));
+                }
+
+                fn note_consumed() {
+                    with_ring(|rb| rb.note_consumed());
+                }
+
+                fn refill() {
+                    with_ring(|rb| {
+                        rb.refill();
                     });
+                }
+
+                fn usage() -> $crate::io_driver::BufRingUsage {
+                    with_ring(|rb| $crate::io_driver::BufRingUsage {
+                        in_kernel: rb.in_kernel() as usize,
+                        reserved: rb.reserved(),
+                        in_flight: rb.in_flight(),
+                    })
                 }
             }
         };

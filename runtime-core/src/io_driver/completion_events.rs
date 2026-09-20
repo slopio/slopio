@@ -34,6 +34,8 @@ pub(crate) enum Event {
 #[derive(Debug)]
 pub(crate) struct CompletionEvent {
     pub slab_index: usize,
+    /// Buffer ring of the op; meaningful only with `F_BUFFER` in the flags.
+    pub ring: u8,
     pub event: Event,
 }
 
@@ -52,6 +54,7 @@ impl CompletionEvent {
                 let payload = PeerUserData::from_bits(raw).payload();
                 Some(CompletionEvent {
                     slab_index: 0,
+                    ring: 0,
                     event: Event::PeerMessage {
                         payload,
                         data: result,
@@ -65,6 +68,7 @@ impl CompletionEvent {
                 let erased = unsafe { ErasedMessage::from_raw(ptr) };
                 Some(CompletionEvent {
                     slab_index: 0,
+                    ring: 0,
                     event: Event::TypedMessage(erased),
                 })
             }
@@ -90,6 +94,7 @@ impl CompletionEvent {
                 };
                 Some(CompletionEvent {
                     slab_index: ud.index() as usize,
+                    ring: ud.ring(),
                     event,
                 })
             }
@@ -181,7 +186,6 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
                 SingleProcessResult::CancelComplete
             } else {
                 if let Some(id) = buffer_select(data.flags)
-                    && data.result > 0
                     && let Some(bgid) = bgid
                 {
                     SingleProcessResult::CancelledRecycling {
@@ -292,11 +296,7 @@ pub(crate) fn process_multi(
             }
 
             // Recycle buffer if the kernel consumed one
-            let recycle = if event.result > 0 {
-                buffer_select(event.flags).map(|buffer_id| (buffer_id, *bgid))
-            } else {
-                None
-            };
+            let recycle = buffer_select(event.flags).map(|buffer_id| (buffer_id, *bgid));
 
             if *last_cqe {
                 if let Some((buffer_id, bgid)) = recycle {
@@ -312,4 +312,3 @@ pub(crate) fn process_multi(
         }
     }
 }
-

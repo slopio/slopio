@@ -10,9 +10,9 @@ use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, 
 use runtime_core::runtime::RuntimeInner;
 use runtime_streams::StreamExt;
 
-runtime_core::define_buf_ring!(ReArmRing, bgid = 9, buffer_size = 64, ring_size = 4);
+runtime_core::define_buf_ring!(ReArmRing, bgid = 0, buffer_size = 64, ring_size = 4);
 // One buffer, so holding it runs the ring dry on the very next read.
-runtime_core::define_buf_ring!(OneBuf, bgid = 8, buffer_size = 64, ring_size = 1);
+runtime_core::define_buf_ring!(OneBuf, bgid = 1, buffer_size = 64, ring_size = 1);
 
 #[test]
 fn a_transient_error_re_arms_the_stream() {

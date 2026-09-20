@@ -25,7 +25,7 @@ use runtime_streams::StreamExt;
 
 // Two buffers, so a ring that fails to take one back is a ring that runs dry
 // on the very next read rather than a hundred reads later.
-runtime_core::define_buf_ring!(CancelRing, bgid = 5, buffer_size = 64, ring_size = 2);
+runtime_core::define_buf_ring!(CancelRing, bgid = 1, buffer_size = 64, ring_size = 2);
 
 fn simulated() -> (FakeRing, FakeRingHandle) {
     FakeRing::builder().virtual_time().build()

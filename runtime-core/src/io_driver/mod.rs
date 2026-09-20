@@ -45,11 +45,25 @@ pub(crate) use user_data::{
 
 pub use message::{Endpoint, ErasedMessage, Header, Message};
 
-pub use buf_ring::{BorrowedBuffer, BufRingSet, BufRingSpec, BufRingTake, install_buf_ring};
+pub use buf_ring::{
+    BorrowedBuffer, BufRingSet, BufRingSpec, BufRingTake, BufRingUsage, install_buf_ring,
+};
 pub use fixed_buf_pool::{FixedSendBufPool, PooledBuf, SLAB_BUF_INDEX};
 pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
 pub const DEFAULT_QUEUE_SIZE: usize = 32;
+
+/// How the driver reaches one installed buffer ring, whose storage is a
+/// thread-local keyed by the spec type.
+#[derive(Clone, Copy)]
+pub(crate) struct BufRingHooks {
+    /// A CQE carried one of the ring's buffers.
+    pub consumed: fn(),
+    /// Move reserve buffers into the ring's holes.
+    pub refill: fn(),
+    /// Give a buffer back.
+    pub recycle: fn(u16),
+}
 
 pub struct IODriver {
     ring: UnsafeCell<Ring>,
@@ -57,11 +71,10 @@ pub struct IODriver {
     multishot_slab: Rc<UnsafeCell<MultishotSlab>>,
     sending_buffers: SendingBufferPool,
     shutting_down: Cell<bool>,
-    /// Cancel-path recycler fallbacks, keyed by bgid. The hot path uses
-    /// the typed `S::recycle_bid` instead; this table is only consulted
-    /// when a cancelled completion delivers a buffer at a point where the
-    /// originating spec type has already been erased.
-    recyclers: UnsafeCell<smallvec::SmallVec<[(u16, fn(u16)); 4]>>,
+    /// Installed buffer rings, indexed by bgid — the ring bits of a CQE's
+    /// `user_data`. Consumption is accounted here on every `F_BUFFER` CQE;
+    /// `recycle` is the cancel-path fallback, where the spec type is erased.
+    buf_rings: UnsafeCell<[Option<BufRingHooks>; UserData::MAX_RINGS as usize]>,
     /// Shared, process-wide registry of every worker's ring/event fds. Used
     /// to target MSG_RING at peer rings. `None` under `main_thread`.
     peers: Option<Arc<PeerTable>>,
@@ -373,7 +386,7 @@ impl IODriver {
             multishot_slab: Default::default(),
             sending_buffers: Default::default(),
             shutting_down: Default::default(),
-            recyclers: Default::default(),
+            buf_rings: UnsafeCell::new([None; UserData::MAX_RINGS as usize]),
             peers: Default::default(),
             peer_inbox: Default::default(),
             msg_inbox: Default::default(),
@@ -403,6 +416,13 @@ impl IODriver {
 
     fn process_cqe(&self, completion_event: CompletionEvent) {
         let index = completion_event.slab_index;
+        let ring = completion_event.ring;
+        // The one place a consumed buffer is counted, whatever state the slot is in.
+        if let Event::MultiShot(data) | Event::SingleShot(data) = &completion_event.event
+            && io_uring::cqueue::buffer_select(data.flags).is_some()
+        {
+            (self.buf_ring_hooks(ring as u16).consumed)();
+        }
         match completion_event.event {
             Event::MultiShot(cqe_data) => {
                 let slab = unsafe { &mut *self.multishot_slab.get() };
@@ -414,14 +434,12 @@ impl IODriver {
                         result: cqe_data.result,
                         flags: cqe_data.flags,
                     },
-                    index as u64,
+                    UserData::token(index as u64, ring as u16),
                 ) {
                     MultiProcessResult::Queued => {}
                     MultiProcessResult::WakeConsumer => {}
-                    MultiProcessResult::PauseRequired(clean_index) => {
-                        self.send_multiop_cancel_event(
-                            UserData::multi(clean_index).into_bits(),
-                        );
+                    MultiProcessResult::PauseRequired(token) => {
+                        self.send_multiop_cancel_event(UserData::multi(token).into_bits());
                     }
                     MultiProcessResult::FullyPaused => {}
                     MultiProcessResult::CancelComplete => {
@@ -528,22 +546,32 @@ impl IODriver {
         }
     }
 
-    pub(crate) fn register_recycler(&self, bgid: u16, f: fn(u16)) {
-        let recyclers = unsafe { &mut *self.recyclers.get() };
-        recyclers.push((bgid, f));
+    pub(crate) fn register_buf_ring(&self, bgid: u16, hooks: BufRingHooks) {
+        let rings = unsafe { &mut *self.buf_rings.get() };
+        let slot = &mut rings[bgid as usize];
+        assert!(slot.is_none(), "two buffer rings share bgid {bgid}");
+        *slot = Some(hooks);
+    }
+
+    fn buf_ring_hooks(&self, bgid: u16) -> &BufRingHooks {
+        let rings = unsafe { &*self.buf_rings.get() };
+        rings[bgid as usize]
+            .as_ref()
+            .unwrap_or_else(|| panic!("no buffer ring installed for bgid {bgid}"))
     }
 
     /// Recycle buffer `bid` back to the ring identified by `bgid`. Used by
     /// cancel cleanup, which doesn't carry the spec type through the slab.
     pub(crate) fn recycle_by_bgid(&self, bgid: u16, bid: u16) {
-        let recyclers = unsafe { &*self.recyclers.get() };
-        for &(g, f) in recyclers.iter() {
-            if g == bgid {
-                f(bid);
-                return;
-            }
+        (self.buf_ring_hooks(bgid).recycle)(bid);
+    }
+
+    /// Top every ring up from its reserve, right before the kernel gets to run.
+    fn refill_buf_rings(&self) {
+        let rings = unsafe { &*self.buf_rings.get() };
+        for hooks in rings.iter().flatten() {
+            (hooks.refill)();
         }
-        panic!("no recycler registered for bgid {bgid}");
     }
 
     /// Number of multishot slab entries currently held by the driver.
@@ -555,13 +583,25 @@ impl IODriver {
 
     pub fn push_multishot_op(
         &self,
-        mut entry: squeue::Entry,
+        entry: squeue::Entry,
         fd: i32,
         queue_size: usize,
     ) -> MultishotToken {
+        self.push_buffered_multishot_op(entry, fd, queue_size, 0)
+    }
+
+    /// [`push_multishot_op`](Self::push_multishot_op) for an op that selects
+    /// its buffers from ring `bgid`.
+    pub fn push_buffered_multishot_op(
+        &self,
+        mut entry: squeue::Entry,
+        fd: i32,
+        queue_size: usize,
+        bgid: u16,
+    ) -> MultishotToken {
         let slab = unsafe { &mut *self.multishot_slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let token = slab.insert(MultiOpState::Init { fd, queue_size });
+        let token = slab.insert(MultiOpState::Init { fd, queue_size }, bgid);
         entry.set_user_data(UserData::multi(token.raw()).into_bits());
         ring_inner.add(&entry);
         token
@@ -901,10 +941,15 @@ impl IODriver {
         }
     }
 
-    pub fn push_op(&self, mut entry: squeue::Entry) -> OneshotToken {
+    pub fn push_op(&self, entry: squeue::Entry) -> OneshotToken {
+        self.push_buffered_op(entry, 0)
+    }
+
+    /// [`push_op`](Self::push_op) for an op that selects its buffer from ring `bgid`.
+    pub fn push_buffered_op(&self, mut entry: squeue::Entry, bgid: u16) -> OneshotToken {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
-        let token = slab.insert(SingleOpState::Init);
+        let token = slab.insert(SingleOpState::Init, bgid);
         entry.set_user_data(UserData::single(token.raw()).into_bits());
         ring_inner.add(&entry);
         token
@@ -931,7 +976,7 @@ impl IODriver {
         let ring_inner = unsafe { &mut *self.ring.get() };
         let mut sig_data = Box::new([0u8; 8]);
         let ptr = sig_data.as_mut_ptr();
-        let token = slab.insert(SingleOpState::Signal(sig_data));
+        let token = slab.insert(SingleOpState::Signal(sig_data), 0);
         let mut entry = opcode::Read::new(Fd(fd), ptr, 8).build();
         entry.set_user_data(UserData::single(token.raw()).into_bits());
         ring_inner.add(&entry);
@@ -1043,6 +1088,7 @@ impl IODriver {
     }
 
     pub(crate) fn submit(&self) {
+        self.refill_buf_rings();
         self.flush_pending_closes();
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
@@ -1060,6 +1106,7 @@ impl IODriver {
     }
 
     pub(crate) fn submit_and_wait(&self) {
+        self.refill_buf_rings();
         self.flush_pending_closes();
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
@@ -1130,9 +1177,7 @@ impl IODriver {
         if let Some(SingleOpState::Ended(meta)) = slab.get_mut(token) {
             let meta = *meta;
             slab.remove(token);
-            if let (Some(bgid), Some(bid)) = (bgid, io_uring::cqueue::buffer_select(meta.flags))
-                && meta.result > 0
-            {
+            if let (Some(bgid), Some(bid)) = (bgid, io_uring::cqueue::buffer_select(meta.flags)) {
                 self.recycle_by_bgid(bgid, bid);
             }
             return;
@@ -1311,10 +1356,9 @@ impl IODriver {
             _ => return,
         };
         while let Some(event) = queue.pop() {
-            if event.result > 0 {
-                if let Some(buffer_id) = io_uring::cqueue::buffer_select(event.flags) {
-                    self.recycle_by_bgid(bgid, buffer_id);
-                }
+            // The flag alone says a buffer was consumed, whatever the result.
+            if let Some(buffer_id) = io_uring::cqueue::buffer_select(event.flags) {
+                self.recycle_by_bgid(bgid, buffer_id);
             }
         }
     }
@@ -1422,22 +1466,22 @@ impl Default for OneshotSlab {
 }
 
 impl OneshotSlab {
-    fn insert(&mut self, val: SingleOpState) -> OneshotToken {
-        OneshotToken(self.0.insert(val) as u64)
+    fn insert(&mut self, val: SingleOpState, ring: u16) -> OneshotToken {
+        OneshotToken(UserData::token(self.0.insert(val) as u64, ring))
     }
 
     fn get_mut(&mut self, token: OneshotToken) -> Option<&mut SingleOpState> {
-        self.0.get_mut(token.raw() as usize)
+        self.0.get_mut(token.index())
     }
 
     /// # Safety
     /// The token must refer to an occupied slot.
     unsafe fn get_unchecked_mut(&mut self, token: OneshotToken) -> &mut SingleOpState {
-        unsafe { self.0.get_unchecked_mut(token.raw() as usize) }
+        unsafe { self.0.get_unchecked_mut(token.index()) }
     }
 
     fn remove(&mut self, token: OneshotToken) -> SingleOpState {
-        self.0.remove(token.raw() as usize)
+        self.0.remove(token.index())
     }
 
     /// Access by raw index from a CQE user_data.
@@ -1460,8 +1504,8 @@ impl Default for MultishotSlab {
 }
 
 impl MultishotSlab {
-    fn insert(&mut self, val: MultiOpState) -> MultishotToken {
-        MultishotToken(self.0.insert(val) as u64)
+    fn insert(&mut self, val: MultiOpState, ring: u16) -> MultishotToken {
+        MultishotToken(UserData::token(self.0.insert(val) as u64, ring))
     }
 
     fn len(&self) -> usize {
@@ -1469,17 +1513,17 @@ impl MultishotSlab {
     }
 
     fn get_mut(&mut self, token: MultishotToken) -> Option<&mut MultiOpState> {
-        self.0.get_mut(token.raw() as usize)
+        self.0.get_mut(token.index())
     }
 
     /// # Safety
     /// The token must refer to an occupied slot.
     unsafe fn get_unchecked_mut(&mut self, token: MultishotToken) -> &mut MultiOpState {
-        unsafe { self.0.get_unchecked_mut(token.raw() as usize) }
+        unsafe { self.0.get_unchecked_mut(token.index()) }
     }
 
     fn remove(&mut self, token: MultishotToken) -> MultiOpState {
-        self.0.remove(token.raw() as usize)
+        self.0.remove(token.index())
     }
 
     /// Access by raw index from a CQE user_data.

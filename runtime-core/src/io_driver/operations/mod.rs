@@ -31,16 +31,24 @@ pub struct OneshotToken(pub(crate) u64);
 pub struct MultishotToken(pub(crate) u64);
 
 impl OneshotToken {
-    /// Raw u64 value for io_uring user_data.
+    /// Raw u64 value for io_uring user_data: slab index plus buffer-ring bits.
     pub(crate) fn raw(self) -> u64 {
         self.0
+    }
+
+    pub(crate) fn index(self) -> usize {
+        crate::io_driver::UserData::token_index(self.0)
     }
 }
 
 impl MultishotToken {
-    /// Raw u64 value for io_uring user_data.
+    /// Raw u64 value for io_uring user_data: slab index plus buffer-ring bits.
     pub(crate) fn raw(self) -> u64 {
         self.0
+    }
+
+    pub(crate) fn index(self) -> usize {
+        crate::io_driver::UserData::token_index(self.0)
     }
 }
 

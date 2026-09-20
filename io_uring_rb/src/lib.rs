@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, UnsafeCell},
+    collections::VecDeque,
     marker::PhantomData,
     mem::MaybeUninit,
     sync::atomic::Ordering,
@@ -66,10 +67,26 @@ unsafe fn setup_ring_entry<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
     }
 }
 
-pub struct RingBuffer<const BUFFER_SIZE: u32, const RING_SIZE: u16> {
-    buffer_pool: UnsafeCell<BufferPool<BUFFER_SIZE, RING_SIZE>>,
+/// A provided-buffer ring of `RING_SIZE` entries over a pool of `POOL_SIZE`
+/// buffers.
+///
+/// The kernel only ever sees `RING_SIZE` buffers at once; the rest wait in a
+/// userspace FIFO. A released buffer goes straight into the ring when it has a
+/// hole, into the FIFO otherwise, and [`refill`](Self::refill) tops the ring
+/// up from the FIFO.
+///
+/// The ring's consumption cursor is private to the kernel, so whoever reaps
+/// the completions reports each consumed buffer through
+/// [`note_consumed`](Self::note_consumed). A late report only delays a refill;
+/// a report that never comes leaks a ring entry.
+pub struct RingBuffer<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32> {
+    buffer_pool: UnsafeCell<BufferPool<BUFFER_SIZE, POOL_SIZE>>,
     mapped_ring: UnsafeCell<MmapedRing>,
     id: u16,
+    /// Buffers published and not yet reported consumed: never below what the ring really holds.
+    in_kernel: Cell<u16>,
+    /// Free buffers the ring had no room for, oldest first.
+    reserve: UnsafeCell<VecDeque<BufferId>>,
     /// How many entries have been handed out, for a ring consumed in
     /// userspace.
     ///
@@ -80,7 +97,11 @@ pub struct RingBuffer<const BUFFER_SIZE: u32, const RING_SIZE: u16> {
     consumed: Cell<u16>,
 }
 
-impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_SIZE> {
+impl<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32>
+    RingBuffer<BUFFER_SIZE, RING_SIZE, POOL_SIZE>
+{
+    const RESERVE_CAPACITY: usize = POOL_SIZE as usize - RING_SIZE as usize;
+
     pub fn group_id(&self) -> u16 {
         self.id
     }
@@ -114,13 +135,15 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
     ) -> std::io::Result<Self> {
         assert!(BUFFER_SIZE.is_power_of_two());
         assert!(RING_SIZE.is_power_of_two());
+        assert!(POOL_SIZE >= RING_SIZE as u32, "pool smaller than its ring");
+        assert!(POOL_SIZE <= 1 << 16, "buffer ids are 16 bits");
 
         let mut mmaped_ring: MmapedRing = MmapedRing::build(RING_SIZE as _)?;
         let slice = mmaped_ring.as_slice();
 
         register(slice)?;
 
-        let bp = BufferPool::<BUFFER_SIZE, RING_SIZE>::new()?;
+        let bp = BufferPool::<BUFFER_SIZE, POOL_SIZE>::new()?;
 
         for (bid, slot) in slice.iter_mut().enumerate() {
             let entry = slot.write(unsafe { std::mem::zeroed() });
@@ -137,6 +160,12 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
             buffer_pool: UnsafeCell::new(bp),
             mapped_ring: UnsafeCell::new(mmaped_ring),
             id: buffer_group_id,
+            in_kernel: Cell::new(RING_SIZE),
+            reserve: UnsafeCell::new(
+                (RING_SIZE as u32..POOL_SIZE)
+                    .map(|bid| bid as u16)
+                    .collect(),
+            ),
             consumed: Cell::new(0),
         })
     }
@@ -161,6 +190,12 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
              A buffer was recycled twice, and the second push overwrote an entry that was \
              still live — two operations now share one buffer.",
             self.id,
+        );
+        assert!(
+            outstanding <= self.in_kernel.get(),
+            "buffer group {}: ring holds {outstanding} buffers, accounted {}",
+            self.id,
+            self.in_kernel.get(),
         );
         if outstanding == 0 {
             return None;
@@ -196,41 +231,88 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
         inner.get(bid)
     }
 
-    ///recycles a buffer in the ring, use this only once on a buffer when you are done
-    pub fn recycle_buffer(&self, buffer: &Buffer<BUFFER_SIZE>) {
-        let ring = unsafe { &*self.mapped_ring.get() };
-
-        unsafe {
-            let ring_ptr = ring.inner().as_ptr();
-            let tail = get_tail(ring_ptr);
-            setup_ring_entry::<BUFFER_SIZE, RING_SIZE>(
-                ring_ptr,
-                tail,
-                buffer.ptr.as_ptr() as u64,
-                buffer.bid,
-            );
-            set_tail(ring_ptr, tail.wrapping_add(1));
-        }
+    /// Report one buffer consumed by the kernel: a completion carried its id.
+    pub fn note_consumed(&self) {
+        let in_kernel = self.in_kernel.get();
+        assert!(
+            in_kernel > 0,
+            "buffer group {}: a buffer was consumed from a ring accounted empty",
+            self.id,
+        );
+        self.in_kernel.set(in_kernel - 1);
     }
 
-    /// Recycle by buffer id, without holding a `Buffer` handle. Used by the
-    /// runtime's cancel paths and by typed `BorrowedBuffer<S>`'s drop, which
-    /// only retain the raw bid.
-    pub fn recycle_bid(&self, bid: BufferId) {
-        let inner = unsafe { &*self.buffer_pool.get() };
-        let ptr = inner.get(bid).expect("invalid bid");
-        let ring = unsafe { &*self.mapped_ring.get() };
-
+    /// Top the ring up from the reserve. Returns how many buffers went in.
+    pub fn refill(&self) -> u16 {
+        let reserve = unsafe { &mut *self.reserve.get() };
+        let in_kernel = self.in_kernel.get();
+        let count = ((RING_SIZE - in_kernel) as usize).min(reserve.len()) as u16;
+        if count == 0 {
+            return 0;
+        }
+        let pool = unsafe { &*self.buffer_pool.get() };
+        let ring_ptr = unsafe { &*self.mapped_ring.get() }.inner().as_ptr();
         unsafe {
-            let ring_ptr = ring.inner().as_ptr();
             let tail = get_tail(ring_ptr);
-            setup_ring_entry::<BUFFER_SIZE, RING_SIZE>(
-                ring_ptr,
-                tail,
-                ptr.as_ptr() as u64,
-                bid,
+            for (offset, bid) in reserve.drain(..count as usize).enumerate() {
+                setup_ring_entry::<BUFFER_SIZE, RING_SIZE>(
+                    ring_ptr,
+                    tail.wrapping_add(offset as u16),
+                    pool.ptr_for_bid(bid) as u64,
+                    bid,
+                );
+            }
+            set_tail(ring_ptr, tail.wrapping_add(count));
+        }
+        self.in_kernel.set(in_kernel + count);
+        count
+    }
+
+    /// Buffers published to the kernel and not yet reported consumed.
+    pub fn in_kernel(&self) -> u16 {
+        self.in_kernel.get()
+    }
+
+    /// Free buffers waiting in the reserve.
+    pub fn reserved(&self) -> usize {
+        unsafe { &*self.reserve.get() }.len()
+    }
+
+    /// Buffers neither in the ring nor in the reserve: held by a consumer, or
+    /// consumed and not yet reported.
+    pub fn in_flight(&self) -> usize {
+        POOL_SIZE as usize - self.in_kernel.get() as usize - self.reserved()
+    }
+
+    /// Give a buffer back, once: into the ring if it has a hole, else the reserve.
+    pub fn recycle_buffer(&self, buffer: &Buffer<BUFFER_SIZE>) {
+        self.recycle_bid(buffer.bid);
+    }
+
+    /// [`recycle_buffer`](Self::recycle_buffer) by id, for holders that only kept the bid.
+    pub fn recycle_bid(&self, bid: BufferId) {
+        let pool = unsafe { &*self.buffer_pool.get() };
+        let ptr = pool.get(bid).expect("invalid bid");
+        let in_kernel = self.in_kernel.get();
+
+        if in_kernel == RING_SIZE {
+            let reserve = unsafe { &mut *self.reserve.get() };
+            assert!(
+                reserve.len() < Self::RESERVE_CAPACITY,
+                "buffer group {}: buffer {bid} released with every buffer already free. \
+                 It was recycled twice.",
+                self.id,
             );
+            reserve.push_back(bid);
+            return;
+        }
+
+        let ring_ptr = unsafe { &*self.mapped_ring.get() }.inner().as_ptr();
+        unsafe {
+            let tail = get_tail(ring_ptr);
+            setup_ring_entry::<BUFFER_SIZE, RING_SIZE>(ring_ptr, tail, ptr.as_ptr() as u64, bid);
             set_tail(ring_ptr, tail.wrapping_add(1));
         }
+        self.in_kernel.set(in_kernel + 1);
     }
 }

@@ -24,7 +24,7 @@ use runtime_streams::StreamExt;
 runtime_core::define_buf_ring!(ManagedRing, bgid = 3, buffer_size = 64, ring_size = 2);
 // Room for a whole batch at once: every buffer of a batch is taken before any
 // of them is recycled, so a batch cannot outgrow its ring.
-runtime_core::define_buf_ring!(BigRing, bgid = 4, buffer_size = 64, ring_size = 8);
+runtime_core::define_buf_ring!(BigRing, bgid = 2, buffer_size = 64, ring_size = 8);
 
 fn simulated() -> (FakeRing, FakeRingHandle) {
     FakeRing::builder().virtual_time().build()

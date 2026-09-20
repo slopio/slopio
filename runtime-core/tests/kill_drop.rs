@@ -27,7 +27,7 @@ use runtime_core::runtime::{
     yield_now,
 };
 
-runtime_core::define_buf_ring!(KillRing, bgid = 7, buffer_size = 64, ring_size = 2);
+runtime_core::define_buf_ring!(KillRing, bgid = 0, buffer_size = 64, ring_size = 2);
 
 /// A provided-buffer recv whose completion landed, then was dropped by kill
 /// before the task polled it: the buffer the CQE delivered must come back.

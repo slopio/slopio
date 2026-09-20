@@ -36,12 +36,16 @@ impl<S: BufRingSpec> ManagedRecv<S> {
             .buf_group(S::BGID)
             .build()
             .flags(io_uring::squeue::Flags::BUFFER_SELECT);
-        let token = IO_DRIVER.with(|d| d.push_op(entry));
+        let token = IO_DRIVER.with(|d| d.push_buffered_op(entry, S::BGID));
         self.id = Some(token);
     }
 
     fn parse_completion(&self, event: OpMetadata) -> std::io::Result<BorrowedBuffer<S>> {
         if event.result <= 0 {
+            // The flag alone says a buffer was consumed, whatever the result.
+            if let Some(bid) = buffer_select(event.flags) {
+                S::recycle_bid(bid);
+            }
             return Err(std::io::Error::from_raw_os_error(-event.result));
         }
         let len = event.result as usize;
