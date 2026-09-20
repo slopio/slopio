@@ -33,7 +33,8 @@ pub struct WriteFile<B: IoBuf> {
 impl<B: IoBuf> WriteFile<B> {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_ref().expect("buf taken before submit");
-        let entry = opcode::Write::new(Fd(self.fd), buf.stable_ptr(), buf.bytes_init() as u32).build();
+        let entry =
+            opcode::Write::new(Fd(self.fd), buf.stable_ptr(), buf.bytes_init() as u32).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
@@ -80,10 +81,7 @@ impl<B: IoBuf> Drop for WriteFile<B> {
 /// flushed to the file or an error occurs. Returns the buffer back to the
 /// caller alongside the result. Returns `WriteZero` if the kernel ever
 /// accepts zero bytes (which would otherwise spin forever).
-pub async fn write_all<B: IoBuf>(
-    file: &OpenedFile,
-    buf: B,
-) -> (std::io::Result<()>, B) {
+pub async fn write_all<B: IoBuf>(file: &OpenedFile, buf: B) -> (std::io::Result<()>, B) {
     let total = buf.bytes_init();
     if total == 0 {
         return (Ok(()), buf);

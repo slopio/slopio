@@ -20,20 +20,17 @@ fn join_test() {
 
 #[test]
 fn join3_test() {
-    let result = main_thread(async { join3(async { 1u8 }, async { "two" }, async { 3.0f64 }).await });
+    let result =
+        main_thread(async { join3(async { 1u8 }, async { "two" }, async { 3.0f64 }).await });
     assert_eq!(result, (1u8, "two", 3.0f64));
 }
 
 #[test]
 fn join5_test() {
     let result = main_thread(async {
-        join5(
-            async { 1 },
-            async { 2 },
-            async { 3 },
-            async { 4 },
-            async { 5 },
-        )
+        join5(async { 1 }, async { 2 }, async { 3 }, async { 4 }, async {
+            5
+        })
         .await
     });
     assert_eq!(result, (1, 2, 3, 4, 5));

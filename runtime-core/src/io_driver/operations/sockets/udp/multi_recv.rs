@@ -250,10 +250,7 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for UdpMultiRecv<S, QUEUE_SIZ
             // The kernel may still write into msghdr.msg_name → addr for any
             // in-flight datagram before the cancel completes. Hand the Box
             // to the driver as keepalive so it outlives those accesses.
-            let keep = self
-                .hdr
-                .take()
-                .map(|h| h as Box<dyn std::any::Any>);
+            let keep = self.hdr.take().map(|h| h as Box<dyn std::any::Any>);
             let parked = Some(self.socket().park());
             IO_DRIVER.with(|d| d.cancel_multishot_op_keep(token, S::BGID, keep, parked));
         }

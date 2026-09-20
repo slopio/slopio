@@ -416,7 +416,6 @@ fn complete_outcome(
 /// `io_uring::types::Timespec` is `repr(transparent)` over this but exposes no
 /// accessors, so reading a `TIMEOUT`'s duration means restating the layout.
 
-
 struct Wakeup {
     deadline: Nanos,
     user_data: u64,
@@ -782,7 +781,12 @@ impl FakeRingHandle {
     /// boundaries kept. A short write records only what was accepted; a failed
     /// one records nothing.
     pub fn writes(&self, fd: RawFd) -> Vec<Vec<u8>> {
-        self.0.borrow().written.get(&fd).cloned().unwrap_or_default()
+        self.0
+            .borrow()
+            .written
+            .get(&fd)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -840,7 +844,7 @@ impl FakeRingBuilder {
             written: HashMap::new(),
             buf_rings: Vec::new(),
             pace,
-                    wakeup_nanos: 0,
+            wakeup_nanos: 0,
         })));
         (FakeRing(handle.clone()), handle)
     }
@@ -859,7 +863,6 @@ impl FakeRing {
         self.0.0.borrow_mut().wakeup_nanos = duration.as_nanos() as Nanos;
     }
 }
-
 
 enum Wait {
     /// Sleep to the next op's due time, then complete everything due.

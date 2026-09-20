@@ -4,11 +4,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use super::send_vectored::{VectoredMsg, send_all_with};
 pub use super::send_vectored::DEFAULT_MSG_FLAGS as ZC_DEFAULT_MSG_FLAGS;
+use super::send_vectored::{VectoredMsg, send_all_with};
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, sockets::{OpSocket, SocketWrapper}},
+    operations::{
+        IoBuf, OneshotToken,
+        sockets::{OpSocket, SocketWrapper},
+    },
 };
 
 /// Zero-copy gather send (`IORING_OP_SENDMSG_ZC`): every chunk goes out in

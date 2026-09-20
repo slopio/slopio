@@ -931,7 +931,9 @@ fn openat_mints_a_file_descriptor() {
     // A file, so the socket calls the runtime makes on it are refused.
     // SAFETY: the fake ring's open minted this fd and nothing else owns it.
     let not_a_socket = unsafe { SocketWrapper::from_raw_fd(fd) };
-    let err = not_a_socket.set_nodelay(true).expect_err("a file takes no TCP option");
+    let err = not_a_socket
+        .set_nodelay(true)
+        .expect_err("a file takes no TCP option");
     assert_eq!(err.raw_os_error(), Some(libc::ENOTSOCK));
 }
 
@@ -1530,7 +1532,10 @@ fn a_delayed_write_lands_after_an_undelayed_one() {
     ring.submit_and_wait();
     let first = ring.pop_completion().expect("the read");
     assert_eq!(first.user_data, 8);
-    assert!(ring.pop_completion().is_none(), "the write was not held back");
+    assert!(
+        ring.pop_completion().is_none(),
+        "the write was not held back"
+    );
     assert!(handle.writes(11).is_empty(), "recorded before it completed");
 
     ring.submit_and_wait();

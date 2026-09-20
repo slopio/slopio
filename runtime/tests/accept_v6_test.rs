@@ -6,7 +6,7 @@ use std::{
 
 use runtime::{
     main_thread,
-    net::{socket_recv, socket_send, MultiAccept},
+    net::{MultiAccept, socket_recv, socket_send},
 };
 use runtime_streams::StreamExt;
 

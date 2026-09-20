@@ -216,10 +216,7 @@ impl PooledBuf {
     pub fn remaining_mut(&mut self) -> &mut [u8] {
         let written = self.write_pos as usize;
         unsafe {
-            std::slice::from_raw_parts_mut(
-                self.slot_base.add(written),
-                self.cap as usize - written,
-            )
+            std::slice::from_raw_parts_mut(self.slot_base.add(written), self.cap as usize - written)
         }
     }
 
@@ -286,4 +283,3 @@ impl Drop for PooledBuf {
         unsafe { self.pool.as_ref().release(self.slot) };
     }
 }
-

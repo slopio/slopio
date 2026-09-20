@@ -98,7 +98,11 @@ fn a_receiver_with_nothing_to_take_parks_until_a_send() {
     assert_eq!(counter.count(), 0, "parking is not a wakeup");
 
     tx.send(1u32);
-    assert_eq!(counter.count(), 1, "the send should have woken the receiver");
+    assert_eq!(
+        counter.count(),
+        1,
+        "the send should have woken the receiver"
+    );
     assert_eq!(poll_once(&mut recv, &waker), Poll::Ready(Some(1)));
 }
 
@@ -387,7 +391,10 @@ fn take_empties_the_buffer_without_ending_the_stream() {
     // The sender is still there, so this is a park rather than a `None`.
     assert_eq!(poll_once(&mut rx.recv(), &waker), Poll::Pending);
     tx.push(2);
-    assert_eq!(poll_once(&mut rx.recv(), &waker), Poll::Ready(Some(vec![2])));
+    assert_eq!(
+        poll_once(&mut rx.recv(), &waker),
+        Poll::Ready(Some(vec![2]))
+    );
 }
 
 #[test]

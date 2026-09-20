@@ -112,7 +112,10 @@ fn a_pool_held_whole_runs_dry_then_recovers() {
             }
             match recv.next().await {
                 Some(Err(CompletionError::Other(code))) => assert_eq!(code, -libc::ENOBUFS),
-                other => panic!("expected ENOBUFS, got {:?}", other.map(|r| r.map(|b| b.len()))),
+                other => panic!(
+                    "expected ENOBUFS, got {:?}",
+                    other.map(|r| r.map(|b| b.len()))
+                ),
             }
 
             held.clear();

@@ -62,7 +62,12 @@ fn typed_ping_pong_between_two_workers() {
                 1 => {
                     let ping = unsafe { recv_or_timeout::<Ping>("worker 1") }.await;
                     assert_eq!(ping.payload, Ping { n: 7 });
-                    send_msg_to_peer(0, Pong { n: ping.payload.n + 1 });
+                    send_msg_to_peer(
+                        0,
+                        Pong {
+                            n: ping.payload.n + 1,
+                        },
+                    );
                 }
                 _ => {}
             }

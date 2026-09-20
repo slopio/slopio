@@ -109,7 +109,9 @@ fn gather_across_slots_of_one_pool() {
         );
 
         drop(bufs); // slots return to the pool
-        let all: Vec<_> = (0..4).map(|_| pool.try_acquire().expect("slot free")).collect();
+        let all: Vec<_> = (0..4)
+            .map(|_| pool.try_acquire().expect("slot free"))
+            .collect();
         assert!(pool.try_acquire().is_none(), "pool handed out a fifth slot");
         drop(all);
         drop(socket);

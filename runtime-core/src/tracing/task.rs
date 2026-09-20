@@ -55,15 +55,30 @@ pub const STATIC_MAX_LEVEL: Level = {
         Level::Trace
     } else if cfg!(all(not(debug_assertions), feature = "up_to_off_in_release")) {
         Level::Off
-    } else if cfg!(all(not(debug_assertions), feature = "up_to_error_in_release")) {
+    } else if cfg!(all(
+        not(debug_assertions),
+        feature = "up_to_error_in_release"
+    )) {
         Level::Error
-    } else if cfg!(all(not(debug_assertions), feature = "up_to_warn_in_release")) {
+    } else if cfg!(all(
+        not(debug_assertions),
+        feature = "up_to_warn_in_release"
+    )) {
         Level::Warn
-    } else if cfg!(all(not(debug_assertions), feature = "up_to_info_in_release")) {
+    } else if cfg!(all(
+        not(debug_assertions),
+        feature = "up_to_info_in_release"
+    )) {
         Level::Info
-    } else if cfg!(all(not(debug_assertions), feature = "up_to_debug_in_release")) {
+    } else if cfg!(all(
+        not(debug_assertions),
+        feature = "up_to_debug_in_release"
+    )) {
         Level::Debug
-    } else if cfg!(all(not(debug_assertions), feature = "up_to_trace_in_release")) {
+    } else if cfg!(all(
+        not(debug_assertions),
+        feature = "up_to_trace_in_release"
+    )) {
         Level::Trace
     } else if cfg!(not(debug_assertions)) {
         Level::Warn

@@ -101,7 +101,12 @@ fn unsync_payload_moves_between_workers() {
                     // Interior mutability through a shared reference: sound
                     // precisely because worker 0 kept nothing.
                     msg.payload.n.set(msg.payload.n.get() + 1);
-                    send_msg_to_peer(0, Ack { n: msg.payload.n.get() });
+                    send_msg_to_peer(
+                        0,
+                        Ack {
+                            n: msg.payload.n.get(),
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -133,7 +138,12 @@ fn unsync_payload_crosses_preallocated() {
                 }
                 1 => {
                     let msg = unsafe { recv_or_timeout::<Unsync>("worker 1") }.await;
-                    send_msg_to_peer(0, Ack { n: msg.payload.n.get() });
+                    send_msg_to_peer(
+                        0,
+                        Ack {
+                            n: msg.payload.n.get(),
+                        },
+                    );
                 }
                 _ => {}
             }

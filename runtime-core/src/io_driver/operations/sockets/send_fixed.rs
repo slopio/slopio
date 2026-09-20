@@ -7,7 +7,10 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER, PooledBuf,
-    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
+    operations::{
+        OneshotToken,
+        sockets::{OpSocket, SocketWrapper},
+    },
 };
 
 /// Cancellation-safe send over a pre-registered ("fixed") buffer.
@@ -38,9 +41,13 @@ pub struct WriteFixedSocket {
 impl WriteFixedSocket {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_ref().expect("buf taken before submit");
-        let entry =
-            opcode::WriteFixed::new(Fd(self.socket.fd()), buf.ptr(), buf.len() as u32, buf.buf_index().get())
-                .build();
+        let entry = opcode::WriteFixed::new(
+            Fd(self.socket.fd()),
+            buf.ptr(),
+            buf.len() as u32,
+            buf.buf_index().get(),
+        )
+        .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }

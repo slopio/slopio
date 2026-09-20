@@ -179,7 +179,9 @@ fn test_multiple_timers_different_buckets() {
     let (counter2, waker2) = make_waker();
 
     // A tick apart: anything under 10ms shares the first tick with 10ms itself.
-    let id1 = wheel.init_timer(Duration::from_millis(10), &waker1).unwrap();
+    let id1 = wheel
+        .init_timer(Duration::from_millis(10), &waker1)
+        .unwrap();
     let id2 = wheel
         .init_timer(Duration::from_millis(20), &waker2)
         .unwrap();
@@ -781,7 +783,10 @@ impl Clock {
 // A whole-tick deadline fires on the tick that closes its 10ms window.
 fn assert_fired_within_tick(fired_at: Duration, deadline: Duration) {
     let lo = deadline - Duration::from_millis(deadline.as_millis() as u64 % 10);
-    assert!(fired_at >= lo, "{deadline:?} timer fired early at {fired_at:?}");
+    assert!(
+        fired_at >= lo,
+        "{deadline:?} timer fired early at {fired_at:?}"
+    );
     assert!(
         fired_at <= lo + Duration::from_millis(10),
         "{deadline:?} timer fired late at {fired_at:?}"
@@ -979,7 +984,9 @@ fn test_cancelled_timer_freed_when_its_bucket_fires() {
     let mut clock = Clock::new();
     let (_, waker) = make_waker();
 
-    let id = wheel.init_timer(Duration::from_millis(500), &waker).unwrap();
+    let id = wheel
+        .init_timer(Duration::from_millis(500), &waker)
+        .unwrap();
     wheel.drop(id);
     assert_eq!(
         wheel.active_timers(),
@@ -999,9 +1006,13 @@ fn test_next_deadline_sees_both_levels() {
     let mut clock = Clock::new();
     clock.advance(&mut wheel, Duration::ZERO);
 
-    wheel.init_timer(Duration::from_millis(1050), &waker).unwrap();
+    wheel
+        .init_timer(Duration::from_millis(1050), &waker)
+        .unwrap();
     clock.advance(&mut wheel, Duration::from_millis(500));
-    wheel.init_timer(Duration::from_millis(1000), &waker).unwrap();
+    wheel
+        .init_timer(Duration::from_millis(1000), &waker)
+        .unwrap();
 
     // Sleep exactly what the wheel asks for, as the runtime does.
     while counter.count() == 0 {

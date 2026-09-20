@@ -10,10 +10,10 @@ use runtime_streams::Stream;
 use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::{
-    sys,
     DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult, MultishotCompletionEvent,
     UserData,
     operations::{Continuation, IoOP, MultishotToken, sockets::SocketWrapper},
+    sys,
 };
 
 pub struct MultiAccept<const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {

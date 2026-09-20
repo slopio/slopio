@@ -34,8 +34,8 @@ pub struct ReadFile<B: IoBufMut> {
 impl<B: IoBufMut> ReadFile<B> {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_mut().expect("buf taken before submit");
-        let entry = opcode::Read::new(Fd(self.fd), buf.stable_mut_ptr(), buf.bytes_total() as u32)
-            .build();
+        let entry =
+            opcode::Read::new(Fd(self.fd), buf.stable_mut_ptr(), buf.bytes_total() as u32).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }

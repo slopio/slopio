@@ -9,7 +9,10 @@ use io_uring::{opcode, types::Fd};
 use super::send_vectored::{VectoredMsg, send_all_with};
 use crate::io_driver::{
     IO_DRIVER, PooledBuf, SLAB_BUF_INDEX,
-    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
+    operations::{
+        OneshotToken,
+        sockets::{OpSocket, SocketWrapper},
+    },
 };
 
 const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;

@@ -6,10 +6,10 @@ use libc::cpu_set_t;
 use runtime_core::runtime::eventfd;
 
 // Re-export core
+pub use runtime_core::io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec};
 pub use runtime_core::runtime::{RuntimeInner, spawn, yield_now};
 pub use runtime_core::task::{Handle, new_task};
 pub use runtime_core::{channels, io_driver, net, runtime, task};
-pub use runtime_core::io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec};
 // Re-export the buf-ring declaration macro so downstream crates can do
 // `runtime::define_buf_ring!(...)` without naming `runtime_core`.
 pub use runtime_core::define_buf_ring;
@@ -178,9 +178,7 @@ where
 
     // Shared registry: eventfds filled now, ring fds published by each worker
     // once it has created its ring (barrier sized to num_threads).
-    let peers = std::sync::Arc::new(
-        runtime_core::runtime::peers::PeerTable::new(&fds),
-    );
+    let peers = std::sync::Arc::new(runtime_core::runtime::peers::PeerTable::new(&fds));
 
     let f = std::sync::Arc::new(f);
     let handles = fds
@@ -251,7 +249,9 @@ where
         });
         #[cfg(all(feature = "tracing", not(feature = "otlp")))]
         return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
-            use runtime_core::tracing::{ConsoleCollector, TRACING_SINK, init_trace_sink, set_thread_id};
+            use runtime_core::tracing::{
+                ConsoleCollector, TRACING_SINK, init_trace_sink, set_thread_id,
+            };
             set_thread_id(n);
             let sink = init_trace_sink::<ConsoleCollector>();
             TRACING_SINK.set(&sink, run)

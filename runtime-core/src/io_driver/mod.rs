@@ -458,7 +458,9 @@ impl IODriver {
                         }
                     }
                     // A multishot slot only gets CQEs while the kernel owes it some.
-                    MultiProcessResult::InvalidState(msg) => panic!("multishot slot {index}: {msg}"),
+                    MultiProcessResult::InvalidState(msg) => {
+                        panic!("multishot slot {index}: {msg}")
+                    }
                 }
             }
             Event::SingleShot(cqe_data) => {
@@ -1435,7 +1437,10 @@ enum SingleOpState {
     /// set, so the byte count is known but the kernel may still be reading
     /// the buffer. We stash the result and wait for the `IORING_CQE_F_NOTIF`
     /// notification before waking — only then is the buffer safe to release.
-    Notif { result: i32, waker: Waker },
+    Notif {
+        result: i32,
+        waker: Waker,
+    },
     Ended(OpMetadata),
     Signal(Box<[u8; 8]>),
     /// Slot for a non-terminal op in a link chain. The `u64` is the slab

@@ -9,7 +9,10 @@ use io_uring::{cqueue::buffer_select, opcode, types::Fd};
 
 use crate::io_driver::{
     BorrowedBuffer, BufRingSpec, IO_DRIVER, OpMetadata,
-    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
+    operations::{
+        OneshotToken,
+        sockets::{OpSocket, SocketWrapper},
+    },
 };
 
 pub struct ManagedRecv<S: BufRingSpec> {

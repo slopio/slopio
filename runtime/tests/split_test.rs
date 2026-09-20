@@ -5,7 +5,7 @@ use std::{
 
 use runtime::{
     main_thread_with,
-    net::{send_all, MultiAccept, MultiRecv, OwnedReadHalf, ReuniteError},
+    net::{MultiAccept, MultiRecv, OwnedReadHalf, ReuniteError, send_all},
     spawn,
 };
 use runtime_streams::StreamExt;

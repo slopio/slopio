@@ -9,7 +9,10 @@ use std::task::{Context, Poll};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, sockets::{OpSocket, SocketWrapper}},
+    operations::{
+        IoBuf, OneshotToken,
+        sockets::{OpSocket, SocketWrapper},
+    },
 };
 
 /// Kernel cap on iovecs per submission.

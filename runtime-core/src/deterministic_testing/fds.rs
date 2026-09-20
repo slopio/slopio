@@ -123,7 +123,9 @@ pub(crate) fn check_socket(fd: RawFd) -> io::Result<()> {
 pub(crate) fn local_addr(fd: RawFd) -> io::Result<SocketAddr> {
     TABLE.with_borrow(|t| match t.open.get(&fd) {
         None => Err(io::Error::from_raw_os_error(libc::EBADF)),
-        Some(Open { kind: FdKind::File, .. }) => Err(io::Error::from_raw_os_error(libc::ENOTSOCK)),
+        Some(Open {
+            kind: FdKind::File, ..
+        }) => Err(io::Error::from_raw_os_error(libc::ENOTSOCK)),
         Some(Open { local, .. }) => Ok(*local),
     })
 }

@@ -8,12 +8,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use self::send_control_record::{socket_send_control_record, WriteControlRecord};
-use self::send_vectored::{socket_send_vectored, WriteVectoredSocket};
-use self::send_vectored_fixed_zc::{socket_send_vectored_fixed_zc, WriteVectoredFixedSocketZc};
-use self::send_vectored_zc::{socket_send_vectored_zc, WriteVectoredSocketZc};
+use self::send_control_record::{WriteControlRecord, socket_send_control_record};
+use self::send_vectored::{WriteVectoredSocket, socket_send_vectored};
+use self::send_vectored_fixed_zc::{WriteVectoredFixedSocketZc, socket_send_vectored_fixed_zc};
+use self::send_vectored_zc::{WriteVectoredSocketZc, socket_send_vectored_zc};
+use self::send_zc::{WriteSocketZc, socket_send_zc};
 use crate::io_driver::PooledBuf;
-use self::send_zc::{socket_send_zc, WriteSocketZc};
 use crate::io_driver::operations::IoBuf;
 
 pub mod connect;
@@ -218,7 +218,10 @@ impl SocketWrapper {
                 l_onoff: 1,
                 l_linger: d.as_secs().min(c_int::MAX as u64) as c_int,
             },
-            None => libc::linger { l_onoff: 0, l_linger: 0 },
+            None => libc::linger {
+                l_onoff: 0,
+                l_linger: 0,
+            },
         };
         self.set_opt(libc::SOL_SOCKET, libc::SO_LINGER, &l)
     }

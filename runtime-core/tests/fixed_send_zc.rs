@@ -40,8 +40,13 @@ fn fixed_send_zc_end_to_end() {
 
         // All slots came back to the pool: three can be held at once.
         assert_eq!(pool.capacity(), 3);
-        let all: Vec<_> = (0..3).map(|_| pool.try_acquire().expect("slot free")).collect();
-        assert!(pool.try_acquire().is_none(), "pool handed out a fourth slot");
+        let all: Vec<_> = (0..3)
+            .map(|_| pool.try_acquire().expect("slot free"))
+            .collect();
+        assert!(
+            pool.try_acquire().is_none(),
+            "pool handed out a fourth slot"
+        );
         drop(all);
 
         drop(socket);
@@ -79,7 +84,11 @@ fn zc_send_completes_in_one_submission() {
         // One `socket_send_zc`, not `send_all_zc`: no retry loop to hide a
         // short send.
         let (result, _payload) = socket_send_zc(&socket, payload).await;
-        assert_eq!(result.unwrap(), TOTAL, "short send: MSG_WAITALL not applied");
+        assert_eq!(
+            result.unwrap(),
+            TOTAL,
+            "short send: MSG_WAITALL not applied"
+        );
         drop(socket);
     });
 

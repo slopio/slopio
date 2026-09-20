@@ -7,7 +7,13 @@ use runtime::runtime::retry::{RetryError, retry};
 #[test]
 fn test_retry_succeeds_first_attempt() {
     let result: Result<i32, RetryError<&str>> = main_thread(async {
-        retry(Some(3), Duration::from_millis(10), || async { Ok(42) }, |_| true).await
+        retry(
+            Some(3),
+            Duration::from_millis(10),
+            || async { Ok(42) },
+            |_| true,
+        )
+        .await
     });
     assert_eq!(result, Ok(42));
 }
@@ -22,11 +28,7 @@ fn test_retry_succeeds_after_failures() {
             || async {
                 let n = attempts.get() + 1;
                 attempts.set(n);
-                if n < 3 {
-                    Err("not yet")
-                } else {
-                    Ok(n)
-                }
+                if n < 3 { Err("not yet") } else { Ok(n) }
             },
             |_| true,
         )
@@ -77,11 +79,7 @@ fn test_retry_none_max_retries_until_success() {
             || async {
                 let n = attempts.get() + 1;
                 attempts.set(n);
-                if n < 10 {
-                    Err("not yet")
-                } else {
-                    Ok(n)
-                }
+                if n < 10 { Err("not yet") } else { Ok(n) }
             },
             |_| true,
         )

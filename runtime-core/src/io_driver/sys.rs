@@ -121,10 +121,7 @@ fn getname(
 ) -> io::Result<SocketAddr> {
     let mut storage: MaybeUninit<libc::sockaddr_storage> = MaybeUninit::uninit();
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let ret = syscall(
-        storage.as_mut_ptr() as *mut libc::sockaddr,
-        &mut len,
-    );
+    let ret = syscall(storage.as_mut_ptr() as *mut libc::sockaddr, &mut len);
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }

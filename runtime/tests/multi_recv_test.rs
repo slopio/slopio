@@ -376,8 +376,7 @@ fn test_multishot_slab_entry_reaped_after_eof() {
             let socket = multiaccept.next().await.unwrap();
 
             // Baseline includes the still-live MultiAccept entry.
-            let baseline =
-                runtime::io_driver::IO_DRIVER.with(|d| d.multishot_ops_in_flight());
+            let baseline = runtime::io_driver::IO_DRIVER.with(|d| d.multishot_ops_in_flight());
 
             let mut multi_recv = MultiRecv::<Small>::new(socket);
             let mut received = 0usize;
@@ -421,7 +420,10 @@ fn cqe_before_first_poll_is_not_lost() {
             let mut multirecv = MultiRecv::<Small>::new(socket);
             // Any await between construction and the first poll.
             runtime::runtime::time::Sleep::during(Duration::from_millis(400)).await;
-            let got = multirecv.next().await.map(|r| r.map(|b| b.as_ref().to_vec()).ok());
+            let got = multirecv
+                .next()
+                .await
+                .map(|r| r.map(|b| b.as_ref().to_vec()).ok());
             done_tx.send(got).unwrap();
         })
     });
@@ -454,7 +456,9 @@ fn paused_queue_is_delivered_without_more_traffic() {
                     first = false;
                     runtime::runtime::time::Sleep::during(Duration::from_millis(1000)).await;
                 }
-                if total == 8 { break; }
+                if total == 8 {
+                    break;
+                }
             }
             done_tx.send(total).unwrap();
         })

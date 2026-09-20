@@ -95,25 +95,35 @@ macro_rules! new_trace_with_parent {
 
 #[macro_export]
 macro_rules! error_span {
-    ($name:expr) => { $crate::span!($crate::tracing::Level::Error, $name) };
+    ($name:expr) => {
+        $crate::span!($crate::tracing::Level::Error, $name)
+    };
 }
 
 #[macro_export]
 macro_rules! warn_span {
-    ($name:expr) => { $crate::span!($crate::tracing::Level::Warn, $name) };
+    ($name:expr) => {
+        $crate::span!($crate::tracing::Level::Warn, $name)
+    };
 }
 
 #[macro_export]
 macro_rules! info_span {
-    ($name:expr) => { $crate::span!($crate::tracing::Level::Info, $name) };
+    ($name:expr) => {
+        $crate::span!($crate::tracing::Level::Info, $name)
+    };
 }
 
 #[macro_export]
 macro_rules! debug_span {
-    ($name:expr) => { $crate::span!($crate::tracing::Level::Debug, $name) };
+    ($name:expr) => {
+        $crate::span!($crate::tracing::Level::Debug, $name)
+    };
 }
 
 #[macro_export]
 macro_rules! trace_span {
-    ($name:expr) => { $crate::span!($crate::tracing::Level::Trace, $name) };
+    ($name:expr) => {
+        $crate::span!($crate::tracing::Level::Trace, $name)
+    };
 }

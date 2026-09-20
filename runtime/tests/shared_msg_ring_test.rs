@@ -22,7 +22,7 @@ use std::time::Duration;
 use runtime::io_driver::Message;
 use runtime::runtime::select::{SelectResult, select};
 use runtime::runtime::time::Sleep;
-use runtime::runtime::{recv_msg_from_peer, send_shared_to_peer, send_msg_to_peer};
+use runtime::runtime::{recv_msg_from_peer, send_msg_to_peer, send_shared_to_peer};
 use runtime::thread_per_core;
 
 const TIMEOUT: Duration = Duration::from_secs(5);

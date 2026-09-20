@@ -6,7 +6,10 @@ use std::task::{Context, Poll};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
+    operations::{
+        OneshotToken,
+        sockets::{OpSocket, SocketWrapper},
+    },
 };
 
 const SOL_TLS: libc::c_int = 282;

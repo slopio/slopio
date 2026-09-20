@@ -14,8 +14,8 @@ use std::{
 use socket2::{Domain, Protocol, Socket as S, Type};
 
 use crate::io_driver::ParkedFd;
-use crate::io_driver::operations::{IoBuf, IoBufMut};
 use crate::io_driver::operations::sockets::SocketWrapper;
+use crate::io_driver::operations::{IoBuf, IoBufMut};
 
 pub struct UdpSocket {
     socket: SocketWrapper,

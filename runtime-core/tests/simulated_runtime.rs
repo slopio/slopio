@@ -57,14 +57,24 @@ fn a_dropped_socket_closes_through_the_ring_after_its_cancelled_read() {
     RuntimeInner::simulated(fake).block_on::<(), _>(
         async move {
             // The cancelled read parks its ref, so dropping the wrapper does not close yet.
-            select(socket_recv(&socket, vec![0u8; 8]), Sleep::during(Duration::from_millis(1))).await;
+            select(
+                socket_recv(&socket, vec![0u8; 8]),
+                Sleep::during(Duration::from_millis(1)),
+            )
+            .await;
             drop(socket);
-            assert!(is_open(fd), "closed while the cancelled read was still in flight");
+            assert!(
+                is_open(fd),
+                "closed while the cancelled read was still in flight"
+            );
 
             for _ in 0..3 {
                 Sleep::during(Duration::from_millis(1)).await;
             }
-            assert!(!is_open(fd), "the cancel's CQE should have released the last ref");
+            assert!(
+                !is_open(fd),
+                "the cancel's CQE should have released the last ref"
+            );
         },
         None,
         |run| run(),

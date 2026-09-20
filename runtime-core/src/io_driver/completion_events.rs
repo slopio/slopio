@@ -21,14 +21,19 @@ pub(crate) enum Event {
     SendBuffer,
     /// MSG_RING delivered by another worker. Carries no slab entry: `payload`
     /// is the 62-bit `user_data` field and `data` the CQE `res`.
-    PeerMessage { payload: u64, data: i32 },
+    PeerMessage {
+        payload: u64,
+        data: i32,
+    },
     /// A heap-allocated, type-erased message delivered by another worker. The
     /// 62-bit `user_data` was a thin pointer; we own the allocation now.
     TypedMessage(ErasedMessage),
     /// A pointer-free reply-slot wakeup from another worker: the peer answered
     /// a request by naming our slot rather than sending it a payload. The slot
     /// index rides in `slab_index`; `status` is the CQE `res`.
-    ReplySignal { status: i32 },
+    ReplySignal {
+        status: i32,
+    },
 }
 
 #[derive(Debug)]
@@ -115,7 +120,10 @@ pub(crate) enum SingleProcessResult {
     /// CQE for a non-terminal link in a chain — slab entry should be reaped.
     LinkCompleted,
     Shutdown,
-    CancelledRecycling { id: u16, bgid: u16 },
+    CancelledRecycling {
+        id: u16,
+        bgid: u16,
+    },
     InvalidState(&'static str),
 }
 
@@ -188,10 +196,7 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
                 if let Some(id) = buffer_select(data.flags)
                     && let Some(bgid) = bgid
                 {
-                    SingleProcessResult::CancelledRecycling {
-                        id,
-                        bgid: *bgid,
-                    }
+                    SingleProcessResult::CancelledRecycling { id, bgid: *bgid }
                 } else {
                     //no buffers were taken from the ring or there was an error
                     SingleProcessResult::CancelComplete
@@ -288,9 +293,7 @@ pub(crate) fn process_multi(
             }
         }
 
-        MultiOpState::Cancelled {
-            bgid, last_cqe, ..
-        } => {
+        MultiOpState::Cancelled { bgid, last_cqe, .. } => {
             if !cqueue::more(event.flags) {
                 *last_cqe = true;
             }

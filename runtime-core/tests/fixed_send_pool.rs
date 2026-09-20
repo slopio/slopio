@@ -33,7 +33,11 @@ fn fixed_send_pool_end_to_end() {
         // every slot; the slot pointer is what identifies one.
         let round_one = send_round(&pool, &socket, 0).await;
         let set_one: HashSet<*const u8> = round_one.iter().copied().collect();
-        assert_eq!(set_one.len(), 3, "round 1 slots not distinct: {round_one:?}");
+        assert_eq!(
+            set_one.len(),
+            3,
+            "round 1 slots not distinct: {round_one:?}"
+        );
 
         // --- 2. Recycling: a second round draws from the same slot set ---
         let round_two = send_round(&pool, &socket, 3).await;
@@ -48,7 +52,10 @@ fn fixed_send_pool_end_to_end() {
             pool.try_acquire().expect("slot free"),
             pool.try_acquire().expect("slot free"),
         ];
-        assert!(pool.try_acquire().is_none(), "drained pool must report empty");
+        assert!(
+            pool.try_acquire().is_none(),
+            "drained pool must report empty"
+        );
 
         let [a, b, c] = held;
         let a_slot = a.ptr();

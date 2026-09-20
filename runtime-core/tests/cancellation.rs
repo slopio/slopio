@@ -226,10 +226,7 @@ fn a_stream_dropped_mid_batch_gives_the_ring_its_buffers_back() {
             // Scripted here rather than up front, so what follows measures the
             // ring's buffers and not whatever the cancel handed back to the
             // scenario.
-            scripted.on_multishot_read(
-                socket.fd(),
-                [ReadEvent::data(b"c"), ReadEvent::data(b"d")],
-            );
+            scripted.on_multishot_read(socket.fd(), [ReadEvent::data(b"c"), ReadEvent::data(b"d")]);
 
             // Both buffers are held at once on purpose: a ring that lost the
             // undelivered one to the cancel has a single buffer left, and the

@@ -95,11 +95,7 @@ fn test_zc_echo_server() {
                 let (result, buffer) = socket_recv(&socket, buffer).await;
                 let n_bytes = result.unwrap();
 
-                socket
-                    .send_zc(buffer[..n_bytes].to_vec())
-                    .await
-                    .0
-                    .unwrap()
+                socket.send_zc(buffer[..n_bytes].to_vec()).await.0.unwrap()
             } else {
                 0
             }
@@ -142,11 +138,7 @@ fn test_zc_send_drop_cancel_safe() {
             // Second connection: a normal completed zero-copy send must still
             // work, proving the slab/keepalive machinery recovered.
             let socket = ma.next().await.unwrap();
-            socket
-                .send_zc(b"after-cancel".to_vec())
-                .await
-                .0
-                .unwrap()
+            socket.send_zc(b"after-cancel".to_vec()).await.0.unwrap()
         })
     });
 

@@ -7,7 +7,10 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER, PooledBuf,
-    operations::{OneshotToken, sockets::{OpSocket, SocketWrapper}},
+    operations::{
+        OneshotToken,
+        sockets::{OpSocket, SocketWrapper},
+    },
 };
 
 /// Zero-copy send (`IORING_OP_SEND_ZC`) over a pre-registered ("fixed")

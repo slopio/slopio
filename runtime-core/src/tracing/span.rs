@@ -79,7 +79,9 @@ impl SpanWrapper {
     pub fn push_event_dyn(&mut self, message: &str, level: Level) {
         let s = self.alloc_str(message);
         let mut event = SpanEvent::new(s);
-        event.attributes.push(KeyValue::new("level", level.as_str()));
+        event
+            .attributes
+            .push(KeyValue::new("level", level.as_str()));
         self.data.events.events.push(event);
     }
 
@@ -93,7 +95,9 @@ impl SpanWrapper {
     ) {
         let name = self.alloc_str(message);
         let mut event = SpanEvent::new(name);
-        event.attributes.push(KeyValue::new("level", level.as_str()));
+        event
+            .attributes
+            .push(KeyValue::new("level", level.as_str()));
         for &(k, v) in attrs {
             let v = self.alloc_str(v);
             event.attributes.push(KeyValue::new(k, v));

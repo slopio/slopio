@@ -17,9 +17,8 @@ fn select3_first_wins_ties() {
 
 #[test]
 fn select3_skips_pending() {
-    let result = main_thread(async {
-        select3(pending::<i32>(), ready("mid"), pending::<i32>()).await
-    });
+    let result =
+        main_thread(async { select3(pending::<i32>(), ready("mid"), pending::<i32>()).await });
     match result {
         SelectResult3::Second(v) => assert_eq!(v, "mid"),
         _ => panic!("expected the only ready future (second) to complete"),

@@ -4,7 +4,6 @@
 
 #![cfg(feature = "tracing")]
 
-use runtime_core::tracing::{Level, level_enabled};
 #[cfg(not(any(
     feature = "up_to_off",
     feature = "up_to_error",
@@ -14,6 +13,7 @@ use runtime_core::tracing::{Level, level_enabled};
     feature = "up_to_trace",
 )))]
 use runtime_core::tracing::STATIC_MAX_LEVEL;
+use runtime_core::tracing::{Level, level_enabled};
 
 #[test]
 fn level_enabled_is_const() {

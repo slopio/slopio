@@ -154,7 +154,10 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
     }
 }
 
-impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Unpin for MultiRecv<S, O, QUEUE_SIZE> {}
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Unpin
+    for MultiRecv<S, O, QUEUE_SIZE>
+{
+}
 
 impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QUEUE_SIZE> {
     fn try_drain_one(&mut self) -> Poll<Option<Result<BorrowedBuffer<S>, CompletionError>>> {
@@ -182,7 +185,9 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
     }
 }
 
-impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream for MultiRecv<S, O, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream
+    for MultiRecv<S, O, QUEUE_SIZE>
+{
     type Item = Result<BorrowedBuffer<S>, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

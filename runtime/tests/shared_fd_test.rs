@@ -2,7 +2,7 @@ use std::{io::Read, net::TcpStream, os::fd::FromRawFd, time::Duration};
 
 use runtime::{
     main_thread_with,
-    net::{socket_recv, socket_send, MultiAccept, SocketWrapper},
+    net::{MultiAccept, SocketWrapper, socket_recv, socket_send},
     runtime::{select::select, time::Sleep},
 };
 use runtime_streams::StreamExt;
