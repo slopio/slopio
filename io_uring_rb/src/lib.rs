@@ -1,6 +1,5 @@
 use std::{
     cell::{Cell, UnsafeCell},
-    collections::VecDeque,
     marker::PhantomData,
     mem::MaybeUninit,
     sync::atomic::Ordering,
@@ -71,9 +70,14 @@ unsafe fn setup_ring_entry<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
 /// buffers.
 ///
 /// The kernel only ever sees `RING_SIZE` buffers at once; the rest wait in a
-/// userspace FIFO. A released buffer goes straight into the ring when it has a
-/// hole, into the FIFO otherwise, and [`refill`](Self::refill) tops the ring
-/// up from the FIFO.
+/// userspace stack. A released buffer goes straight into the ring when it has
+/// a hole, onto the stack otherwise, and [`refill`](Self::refill) tops the
+/// ring up from the top of it.
+///
+/// A stack, because the last buffer released is the one still in cache. A
+/// queue hands the ring the buffer that has waited longest instead, so under
+/// load every buffer takes its turn and the working set is the whole pool,
+/// whatever `RING_SIZE` says.
 ///
 /// The ring's consumption cursor is private to the kernel, so whoever reaps
 /// the completions reports each consumed buffer through
@@ -85,8 +89,8 @@ pub struct RingBuffer<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_S
     id: u16,
     /// Buffers published and not yet reported consumed: never below what the ring really holds.
     in_kernel: Cell<u16>,
-    /// Free buffers the ring had no room for, oldest first.
-    reserve: UnsafeCell<VecDeque<BufferId>>,
+    /// Free buffers the ring had no room for, last released on top.
+    reserve: UnsafeCell<Vec<BufferId>>,
     /// How many entries have been handed out, for a ring consumed in
     /// userspace.
     ///
@@ -162,7 +166,10 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32>
             id: buffer_group_id,
             in_kernel: Cell::new(RING_SIZE),
             reserve: UnsafeCell::new(
+                // Lowest id on top: none is warmer than another yet, and
+                // this hands them out in order.
                 (RING_SIZE as u32..POOL_SIZE)
+                    .rev()
                     .map(|bid| bid as u16)
                     .collect(),
             ),
@@ -254,7 +261,8 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32>
         let ring_ptr = unsafe { &*self.mapped_ring.get() }.inner().as_ptr();
         unsafe {
             let tail = get_tail(ring_ptr);
-            for (offset, bid) in reserve.drain(..count as usize).enumerate() {
+            let kept = reserve.len() - count as usize;
+            for (offset, bid) in reserve.drain(kept..).rev().enumerate() {
                 setup_ring_entry::<BUFFER_SIZE, RING_SIZE>(
                     ring_ptr,
                     tail.wrapping_add(offset as u16),
@@ -303,7 +311,7 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32>
                  It was recycled twice.",
                 self.id,
             );
-            reserve.push_back(bid);
+            reserve.push(bid);
             return;
         }
 

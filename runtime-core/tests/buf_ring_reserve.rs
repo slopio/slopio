@@ -63,7 +63,7 @@ fn held_buffers_are_replaced_from_the_reserve() {
         |run| run(),
     );
 
-    // The ring's own two first, then the reserve's, oldest first.
+    // The ring's own two first, then the reserve's, which starts in id order.
     assert_eq!(bids, [0, 1, 2, 3]);
 }
 
