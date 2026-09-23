@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Waker};
+use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
 use crate::io_driver::{
@@ -60,6 +60,21 @@ pub async fn yield_now() {
 scoped_thread_local!(pub(crate) static TASK_LIST: TaskList);
 scoped_thread_local!(pub static TIME_DRIVER: TimeDriver);
 thread_local!(static THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+thread_local!(static ROOT_WOKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// The root future's waker: no data, no allocation, it only flags the thread.
+static ROOT_WAKER_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(root_waker_clone, root_wake, root_wake, root_waker_drop);
+
+fn root_waker_clone(_: *const ()) -> RawWaker {
+    RawWaker::new(std::ptr::null(), &ROOT_WAKER_VTABLE)
+}
+
+fn root_wake(_: *const ()) {
+    ROOT_WOKEN.set(true);
+}
+
+fn root_waker_drop(_: *const ()) {}
 
 #[derive(Default)]
 pub struct RuntimeInner {
@@ -117,8 +132,9 @@ impl RuntimeInner {
         event_fd: Option<RawFd>,
         wrap: impl FnOnce(Box<dyn FnOnce() -> F::Output + '_>) -> F::Output,
     ) -> F::Output {
-        let waker = Waker::noop();
-        let mut context = Context::from_waker(waker);
+        // SAFETY: the vtable ignores the data pointer, so any clone stays valid.
+        let waker = unsafe { Waker::from_raw(root_waker_clone(std::ptr::null())) };
+        let mut context = Context::from_waker(&waker);
         set_thread_id(self.thread_id);
         self.io_driver.with(|| {
             self.io_driver.init_buf_rings::<R>();
@@ -163,6 +179,7 @@ impl RuntimeInner {
                                     self.io_driver.process_completion_queue();
                                 }
 
+                                ROOT_WOKEN.set(false);
                                 let pinned = pinned_f.as_mut();
                                 match pinned.poll(&mut context) {
                                     std::task::Poll::Ready(output) => {
@@ -177,7 +194,8 @@ impl RuntimeInner {
                                     }
                                     std::task::Poll::Pending => {}
                                 }
-                                if self.tasks.is_empty() {
+                                // A root that woke itself mid-poll must run again, not sleep.
+                                if self.tasks.is_empty() && !ROOT_WOKEN.get() {
                                     break;
                                 }
                             }

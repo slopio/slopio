@@ -91,3 +91,7 @@ required-features = ["simulation"]
 [[test]]
 name = "buf_ring_reserve"
 required-features = ["simulation"]
+
+[[test]]
+name = "root_waker"
+required-features = ["simulation"]

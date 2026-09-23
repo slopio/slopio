@@ -158,5 +158,6 @@ fn kill_then_send_on_a_shared_receiver_frees_the_task() {
         // Reaped, and its waker left the channel with its recv future.
         yield_now().await;
         send.send(());
+        yield_now().await;
     });
 }
