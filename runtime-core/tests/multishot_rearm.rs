@@ -5,7 +5,8 @@
 //! the next poll rather than wait for a CQE that will never come, stay armable
 //! but say so, or end — and EOF stays EOF without re-arming anything.
 
-use runtime_core::deterministic_testing::{FakeRing, ReadEvent, simulated_socket};
+use runtime_core::deterministic_testing::{AcceptEvent, FakeRing, ReadEvent, simulated_socket};
+use runtime_core::io_driver::operations::sockets::multi_accept::{AcceptError, MultiAccept};
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
 use runtime_core::runtime::RuntimeInner;
 use runtime_streams::StreamExt;
@@ -163,4 +164,50 @@ fn a_burst_past_the_queue_bound_pauses_and_resumes_in_order() {
     );
 
     assert_eq!(got, chunks);
+}
+
+/// Out of descriptors, a listener reports it and stays open: the next poll
+/// re-arms. A fatal error is reported once, then the stream ends.
+#[test]
+fn an_accept_reports_emfile_and_re_arms_then_ends_on_a_fatal_error() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+
+    let seen = RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            let mut accept = MultiAccept::new(8080).unwrap();
+            let fd = accept.socket().fd();
+            handle.on_multishot_accept(
+                fd,
+                [AcceptEvent::Connection, AcceptEvent::Error(libc::EMFILE)],
+            );
+            handle.on_multishot_accept(
+                fd,
+                [AcceptEvent::Connection, AcceptEvent::Error(libc::EINVAL)],
+            );
+
+            let mut seen = Vec::new();
+            while let Some(item) = accept.next().await {
+                seen.push(match item {
+                    Ok(_) => "conn".to_string(),
+                    Err(AcceptError::Other(errno)) => format!("errno {errno}"),
+                    Err(AcceptError::Cancelled) => "cancelled".to_string(),
+                });
+            }
+            // Ended for good: polling again does not re-arm.
+            assert!(accept.next().await.is_none());
+            seen
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(
+        seen,
+        [
+            "conn".to_string(),
+            format!("errno {}", libc::EMFILE),
+            "conn".to_string(),
+            format!("errno {}", libc::EINVAL),
+        ]
+    );
 }

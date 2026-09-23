@@ -24,7 +24,7 @@ fn test_op_outlives_wrapper() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9104).unwrap();
             cv1.notify();
-            let socket = multiaccept.next().await.unwrap();
+            let socket = multiaccept.next().await.unwrap().unwrap();
 
             // Drop the wrapper before the lazy op's first poll.
             let write = socket_send(&socket, GREETING);
@@ -59,7 +59,7 @@ fn test_last_handle_dropped_mid_op() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9105).unwrap();
             cv1.notify();
-            let socket = multiaccept.next().await.unwrap();
+            let socket = multiaccept.next().await.unwrap().unwrap();
             let recv = socket_recv(&socket, vec![0u8; 32]);
             drop(socket);
             // First poll submits the recv; the client never writes, so the

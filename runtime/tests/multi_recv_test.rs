@@ -31,7 +31,7 @@ fn test_stream_stops_on_close() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9091).unwrap();
             cv1.notify();
-            if let Some(socket) = multiaccept.next().await {
+            if let Some(Ok(socket)) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::<Small>::new(socket);
                 while let Some(Ok(_data)) = multi_recv.next().await {
@@ -60,7 +60,7 @@ fn test_stream_stops_on_abrupt_close_rst() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9092).unwrap();
             cv1.notify();
-            if let Some(socket) = multiaccept.next().await {
+            if let Some(Ok(socket)) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::<Small>::new(socket);
                 while let Some(Ok(_data)) = multi_recv.next().await {
@@ -103,7 +103,7 @@ fn test_stream_stops_on_process_kill() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9093).unwrap();
             cv1.notify();
-            if let Some(socket) = multiaccept.next().await {
+            if let Some(Ok(socket)) = multiaccept.next().await {
                 let mut recv_count = 0;
                 let mut multi_recv = MultiRecv::<Small>::new(socket);
                 while let Some(Ok(_data)) = multi_recv.next().await {
@@ -146,7 +146,7 @@ fn byte_per_byte() {
             let mut multiaccept = MultiAccept::new(9090).unwrap();
             cv1.notify();
 
-            if let Some(socket) = multiaccept.next().await {
+            if let Some(Ok(socket)) = multiaccept.next().await {
                 let mut received: Vec<u8> = Vec::new();
                 let mut multirecv = MultiRecv::<Small>::new(socket);
                 while let Some(Ok(data)) = multirecv.next().await {
@@ -187,7 +187,7 @@ fn test_slow_consumer_triggers_pause() {
         main_thread_with::<Small, _>(async move {
             let mut multiaccept = MultiAccept::new(9095).unwrap();
             cv1.notify();
-            if let Some(socket) = multiaccept.next().await {
+            if let Some(Ok(socket)) = multiaccept.next().await {
                 let mut received: Vec<u8> = Vec::new();
                 let mut multirecv = MultiRecv::<Small>::new(socket);
                 let mut recv_count = 0;
@@ -264,7 +264,7 @@ fn test_fast_drain_triggers_resume() {
         main_thread_with::<Small, _>(async move {
             let mut multiaccept = MultiAccept::new(9096).unwrap();
             cv1.notify();
-            if let Some(socket) = multiaccept.next().await {
+            if let Some(Ok(socket)) = multiaccept.next().await {
                 let mut received = Vec::new();
                 let mut multirecv = MultiRecv::<Small>::new(socket);
                 let mut recv_count = 0;
@@ -373,7 +373,7 @@ fn test_multishot_slab_entry_reaped_after_eof() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9097).unwrap();
             cv1.notify();
-            let socket = multiaccept.next().await.unwrap();
+            let socket = multiaccept.next().await.unwrap().unwrap();
 
             // Baseline includes the still-live MultiAccept entry.
             let baseline = runtime::io_driver::IO_DRIVER.with(|d| d.multishot_ops_in_flight());
@@ -416,7 +416,7 @@ fn cqe_before_first_poll_is_not_lost() {
         main_thread_with::<Small, _>(async move {
             let mut multiaccept = MultiAccept::new(9197).unwrap();
             cv1.notify();
-            let socket = multiaccept.next().await.unwrap();
+            let socket = multiaccept.next().await.unwrap().unwrap();
             let mut multirecv = MultiRecv::<Small>::new(socket);
             // Any await between construction and the first poll.
             runtime::runtime::time::Sleep::during(Duration::from_millis(400)).await;
@@ -445,7 +445,7 @@ fn paused_queue_is_delivered_without_more_traffic() {
         main_thread_with::<Small, _>(async move {
             let mut multiaccept = MultiAccept::new(9195).unwrap();
             cv1.notify();
-            let socket = multiaccept.next().await.unwrap();
+            let socket = multiaccept.next().await.unwrap().unwrap();
             let mut multirecv = MultiRecv::<Small, _, 2>::with_queue_size(socket);
             let mut total = 0usize;
             let mut first = true;
@@ -484,7 +484,7 @@ fn an_accepted_socket_is_close_on_exec() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9198).unwrap();
             cv1.notify();
-            let socket = multiaccept.next().await.unwrap();
+            let socket = multiaccept.next().await.unwrap().unwrap();
             unsafe { libc::fcntl(socket.fd(), libc::F_GETFD) }
         })
     });

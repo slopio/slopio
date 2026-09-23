@@ -28,7 +28,7 @@ fn test_accept_v6_roundtrip() {
             let mut ma = MultiAccept::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).unwrap();
             tx.send(ma.local_addr().unwrap()).unwrap();
 
-            let socket = ma.next().await.unwrap();
+            let socket = ma.next().await.unwrap().unwrap();
             let peer = socket.peer_addr().unwrap();
 
             let buf = Vec::<u8>::with_capacity(64);
@@ -96,7 +96,7 @@ fn test_accept_dual_stack_maps_v4_peer() {
         main_thread(async move {
             let mut ma = MultiAccept::bind_dual_stack(0).unwrap();
             tx.send(ma.local_addr().unwrap()).unwrap();
-            let socket = ma.next().await.unwrap();
+            let socket = ma.next().await.unwrap().unwrap();
             socket.peer_addr().unwrap()
         })
     });
@@ -118,7 +118,7 @@ fn test_accept_v4_roundtrip() {
             let mut ma = MultiAccept::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
             tx.send(ma.local_addr().unwrap()).unwrap();
 
-            let socket = ma.next().await.unwrap();
+            let socket = ma.next().await.unwrap().unwrap();
             let peer = socket.peer_addr().unwrap();
 
             let buf = Vec::<u8>::with_capacity(64);

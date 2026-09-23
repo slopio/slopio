@@ -16,7 +16,7 @@ fn test_socket_send_zc_data() {
         main_thread(async {
             let mut ma = MultiAccept::new(8101).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let data = b"Response from server".to_vec();
                 let (result, buf) = socket.send_zc(data).await;
                 // Buffer is returned only after the notification — safe to read.
@@ -50,7 +50,7 @@ fn test_send_all_zc_large() {
     let server = std::thread::spawn(|| {
         main_thread(async {
             let mut ma = MultiAccept::new(8102).unwrap();
-            let socket = ma.next().await.unwrap();
+            let socket = ma.next().await.unwrap().unwrap();
             // Byte i is `(i % 251) as u8` — a long non-repeating-mod pattern so
             // any reordering or truncation in the loop shows up downstream.
             let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
@@ -90,7 +90,7 @@ fn test_zc_echo_server() {
         main_thread(async {
             let mut ma = MultiAccept::new(8103).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let buffer = Vec::<u8>::with_capacity(128);
                 let (result, buffer) = socket_recv(&socket, buffer).await;
                 let n_bytes = result.unwrap();
@@ -128,7 +128,7 @@ fn test_zc_send_drop_cancel_safe() {
             // First connection: start a large zero-copy send and drop it
             // immediately without awaiting to completion.
             {
-                let socket = ma.next().await.unwrap();
+                let socket = ma.next().await.unwrap().unwrap();
                 let payload = vec![0xABu8; 2 * 1024 * 1024];
                 let fut = socket.send_zc(payload);
                 drop(fut); // cancel mid-flight; keepalive holds the buffer
@@ -137,7 +137,7 @@ fn test_zc_send_drop_cancel_safe() {
 
             // Second connection: a normal completed zero-copy send must still
             // work, proving the slab/keepalive machinery recovered.
-            let socket = ma.next().await.unwrap();
+            let socket = ma.next().await.unwrap().unwrap();
             socket.send_zc(b"after-cancel".to_vec()).await.0.unwrap()
         })
     });

@@ -26,6 +26,10 @@ So a slow consumer never causes unbounded memory growth on the receiving side. T
 
 The queue depth bounds how many completions can be waiting for you, and for receive streams each completion holds one ring buffer. A stream with a depth of 32 on a ring of 4 KiB buffers can therefore hold at most about 128 KiB on your behalf before pausing. Pick the depth per stream with `with_queue_size` when the default does not fit: deeper for a consumer that processes in bursts, shallower when many streams share one ring.
 
+## Accept errors
+
+`MultiAccept` yields `Result<SocketWrapper, AcceptError>`. Errors that concern one connection only, such as a client that gave up before being accepted, are skipped and never reach you. Running out of descriptors or memory (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) is reported, and the listener stays open: the next `next().await` accepts again. Back off a little before polling after one of these, since the process has to release something first. Any other error is reported once, and the stream then ends.
+
 ## Buffers you hold are buffers the kernel cannot use
 
 Receive streams deliver borrowed ring buffers, and a buffer goes back to the ring only when you drop it. The queue protects the ring from a slow consumer, but not from a consumer that keeps the buffers it has already taken. If every buffer of a ring is held by your tasks, the kernel has nowhere to put the next bytes, and the stream yields an `ENOBUFS` error rather than pausing. The stream is not over: poll it again once you have released buffers and it resumes where it stopped.

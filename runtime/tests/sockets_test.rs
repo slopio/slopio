@@ -18,7 +18,7 @@ fn test_multi_accept_single_connection() {
         main_thread(async {
             let mut ma = MultiAccept::new(8081).unwrap();
 
-            if let Some(_socket) = ma.next().await {
+            if let Some(Ok(_socket)) = ma.next().await {
                 // Successfully accepted a connection
                 true
             } else {
@@ -43,7 +43,7 @@ fn test_socket_recv_data() {
         main_thread(async {
             let mut ma = MultiAccept::new(8082).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let buffer = Vec::<u8>::with_capacity(128);
                 let (result, buffer) = socket_recv(&socket, buffer).await;
                 let n_bytes = result.unwrap();
@@ -73,7 +73,7 @@ fn test_socket_send_data() {
         main_thread(async {
             let mut ma = MultiAccept::new(8083).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let data = b"Response from server";
                 socket_send(&socket, data).await.0.unwrap()
             } else {
@@ -101,7 +101,7 @@ fn test_echo_server() {
         main_thread(async {
             let mut ma = MultiAccept::new(8084).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let buffer = Vec::<u8>::with_capacity(128);
                 let (result, buffer) = socket_recv(&socket, buffer).await;
                 let n_bytes = result.unwrap();
@@ -138,7 +138,7 @@ fn test_multiple_recv_send() {
         main_thread(async {
             let mut ma = MultiAccept::new(8085).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let mut total_bytes = 0;
 
                 // Receive first message
@@ -196,7 +196,7 @@ fn test_spawned_socket_handler() {
         main_thread(async {
             let mut ma = MultiAccept::new(8086).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 // Spawn a task to handle the socket
                 let task_handle = spawn(async move {
                     let buffer = Vec::<u8>::with_capacity(128);
@@ -236,7 +236,7 @@ fn test_zero_length_recv() {
         main_thread(async {
             let mut ma = MultiAccept::new(8087).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let buffer = Vec::<u8>::with_capacity(64);
 
                 // Receive some data first
@@ -273,7 +273,7 @@ fn test_socket_peek_leaves_data_in_queue() {
         main_thread(async {
             let mut ma = MultiAccept::new(8092).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 // Peek twice: both see the bytes, neither consumes them.
                 let (result, buffer) = socket_peek(&socket, Vec::<u8>::with_capacity(64)).await;
                 let peeked1 = buffer[..result.unwrap()].to_vec();
@@ -316,7 +316,7 @@ fn test_recv_timeout() {
         main_thread(async {
             let mut ma = MultiAccept::new(8088).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let buf: Vec<u8> = Vec::with_capacity(128);
 
                 // First recv: client sends data quickly, should succeed
@@ -377,7 +377,7 @@ fn test_vectored_write() {
         main_thread(async {
             let mut ma = MultiAccept::new(8089).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 let bufs: Vec<&'static [u8]> = vec![
                     b"Hello".as_slice(),
                     b", ".as_slice(),
@@ -408,7 +408,7 @@ fn test_vectored_write_echo() {
         main_thread(async {
             let mut ma = MultiAccept::new(8090).unwrap();
 
-            if let Some(socket) = ma.next().await {
+            if let Some(Ok(socket)) = ma.next().await {
                 // Receive data first
                 let buf1 = Vec::<u8>::with_capacity(64);
                 let (result, buf1) = socket_recv(&socket, buf1).await;
@@ -460,7 +460,7 @@ fn test_vectored_write_partial() {
     let server = std::thread::spawn(|| {
         main_thread(async {
             let mut ma = MultiAccept::new(8094).unwrap();
-            let socket = ma.next().await.unwrap();
+            let socket = ma.next().await.unwrap().unwrap();
             // Shrink the send buffer to force partial writes. Linux doubles
             // the requested value internally, so the effective size will be
             // around 8 KB — far smaller than the 1 MB payload.
@@ -525,7 +525,7 @@ fn test_local_and_peer_addr() {
     let server = std::thread::spawn(|| {
         main_thread(async {
             let mut ma = MultiAccept::new(8091).unwrap();
-            let accepted = ma.next().await.unwrap();
+            let accepted = ma.next().await.unwrap().unwrap();
             // On the accepted socket, peer_addr is the client; local_addr is
             // the listener's bound endpoint.
             let local = accepted.local_addr().unwrap();
@@ -563,7 +563,7 @@ fn a_managed_recv_reports_eof_as_none() {
     let handle = std::thread::spawn(|| {
         runtime::main_thread_with::<EofRing, _>(async {
             let mut ma = MultiAccept::new(9199).unwrap();
-            let socket = ma.next().await.unwrap();
+            let socket = ma.next().await.unwrap().unwrap();
 
             let data = socket_managed_recv::<EofRing>(&socket).await.unwrap();
             let data = data.expect("data before EOF").as_ref().to_vec();

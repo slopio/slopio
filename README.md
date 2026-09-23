@@ -23,8 +23,10 @@ Experimental. The API changes without notice, there is no release on crates.io, 
 An echo server on one core, receiving through a kernel-provided buffer ring and streaming connections and bytes with multishot operations:
 
 ```rust
+use std::time::Duration;
+
 use runtime::net::{MultiAccept, MultiRecv, socket_send};
-use runtime::runtime::spawn;
+use runtime::runtime::{spawn, time::Sleep};
 use runtime_streams::StreamExt;
 
 runtime::define_buf_ring!(pub Ring, bgid = 1, buffer_size = 4096, ring_size = 256);
@@ -32,7 +34,12 @@ runtime::define_buf_ring!(pub Ring, bgid = 1, buffer_size = 4096, ring_size = 25
 fn main() {
     runtime::main_thread_with::<Ring, _>(async {
         let mut accept = MultiAccept::new(8080).expect("bind");
-        while let Some(socket) = accept.next().await {
+        while let Some(accepted) = accept.next().await {
+            let Ok(socket) = accepted else {
+                // Out of fds or memory: give holders a moment before re-arming.
+                Sleep::during(Duration::from_millis(10)).await;
+                continue;
+            };
             spawn(async move {
                 let mut recv = MultiRecv::<Ring>::new(socket);
                 while let Some(Ok(buf)) = recv.next().await {

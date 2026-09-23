@@ -29,7 +29,7 @@ fn test_split_write_from_spawned_task() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9101).unwrap();
             cv1.notify();
-            let socket = multiaccept.next().await.unwrap();
+            let socket = multiaccept.next().await.unwrap().unwrap();
             let (read, write) = socket.into_split();
 
             spawn(async move {
@@ -70,8 +70,8 @@ fn test_split_reunite() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9102).unwrap();
             cv1.notify();
-            let first = multiaccept.next().await.unwrap();
-            let second = multiaccept.next().await.unwrap();
+            let first = multiaccept.next().await.unwrap().unwrap();
+            let second = multiaccept.next().await.unwrap().unwrap();
 
             let (read1, write1) = first.into_split();
             let (read2, write2) = second.into_split();
@@ -115,7 +115,7 @@ fn test_split_shutdown_write_keeps_reading() {
         main_thread_with::<Small, _>(async {
             let mut multiaccept = MultiAccept::new(9103).unwrap();
             cv1.notify();
-            let socket = multiaccept.next().await.unwrap();
+            let socket = multiaccept.next().await.unwrap().unwrap();
             let (read, write) = socket.into_split();
 
             write.sync_shutdown();

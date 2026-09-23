@@ -21,6 +21,8 @@ pub struct MultiAccept<const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
     socket: SocketWrapper,
     sockets: MultiOpQueue,
     cancel_sent: bool,
+    /// A fatal error was yielded: every later poll answers `None` without re-arming.
+    ended: bool,
 }
 
 #[derive(Debug)]
@@ -133,6 +135,7 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
             socket: SocketWrapper::from_fd(fd),
             sockets: MultiOpQueue::new(QUEUE_SIZE),
             cancel_sent: false,
+            ended: false,
         })
     }
 
@@ -180,17 +183,20 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
 impl<const QUEUE_SIZE: usize> Unpin for MultiAccept<QUEUE_SIZE> {}
 
 impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
-    /// Try to drain one valid socket from the queue, skipping errors.
-    fn try_drain_one(&mut self) -> Poll<Option<SocketWrapper>> {
+    /// Drain one socket or reportable error from the queue, skipping the rest.
+    fn try_drain_one(&mut self) -> Poll<Option<Result<SocketWrapper, AcceptError>>> {
         while let Some(event) = self.sockets.pop() {
             match event.try_into() {
-                Ok(socket) => return Poll::Ready(Some(socket)),
+                Ok(socket) => return Poll::Ready(Some(Ok(socket))),
                 Err(e) => match e.continuation() {
                     Continuation::Continue => continue,
-                    // `Item` is a bare socket, so a `ContinueLater` has nowhere
-                    // to be reported and ends the listener like a fatal one.
-                    Continuation::ContinueLater | Continuation::NotContinue => {
-                        return Poll::Ready(None);
+                    // Armable still: the next poll re-arms, so the consumer
+                    // decides when to come back rather than spinning here.
+                    Continuation::ContinueLater => return Poll::Ready(Some(Err(e))),
+                    // Reported once, then the listener is over.
+                    Continuation::NotContinue => {
+                        self.ended = true;
+                        return Poll::Ready(Some(Err(e)));
                     }
                 },
             }
@@ -200,9 +206,12 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
 }
 
 impl<const QUEUE_SIZE: usize> Stream for MultiAccept<QUEUE_SIZE> {
-    type Item = SocketWrapper;
+    type Item = Result<SocketWrapper, AcceptError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
         let shutting_down = IO_DRIVER.with(|d| d.shutdown());
 
         // Never armed: nothing to cancel, nothing queued.
