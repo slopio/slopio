@@ -33,8 +33,10 @@ pub struct WriteFile<B: IoBuf> {
 impl<B: IoBuf> WriteFile<B> {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_ref().expect("buf taken before submit");
-        let entry =
-            opcode::Write::new(Fd(self.fd.fd()), buf.stable_ptr(), buf.bytes_init() as u32).build();
+        // Offset -1: at the fd's current position, which the kernel advances.
+        let entry = opcode::Write::new(Fd(self.fd.fd()), buf.stable_ptr(), buf.bytes_init() as u32)
+            .offset(u64::MAX)
+            .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }

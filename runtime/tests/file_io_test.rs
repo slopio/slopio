@@ -160,7 +160,6 @@ fn test_file_read_write() {
 }
 
 #[test]
-#[ignore] // TODO: Requires file position tracking (seek support)
 fn test_file_multiple_writes() {
     let test_file = "/tmp/test_multi_write.txt";
     let _ = fs::remove_file(test_file);
@@ -227,7 +226,6 @@ fn test_file_large_write() {
 }
 
 #[test]
-#[ignore] // TODO: Requires file position tracking (seek support)
 fn test_file_read_chunks() {
     let test_file = "/tmp/test_chunks.txt";
 
