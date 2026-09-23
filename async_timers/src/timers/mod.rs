@@ -118,8 +118,10 @@ impl<const MILLIS: u64> Deadlines<MILLIS> {
     }
 }
 
+/// `None` once cancelled: a cancelled entry keeps its place until the clock
+/// reaches it, but not the task its waker would keep alive.
 struct Wakers {
-    inner: VecDeque<Waker>,
+    inner: VecDeque<Option<Waker>>,
 }
 
 impl Wakers {
@@ -130,29 +132,34 @@ impl Wakers {
     }
 
     fn push(&mut self, waker: Waker) {
-        self.inner.push_back(waker);
+        self.inner.push_back(Some(waker));
     }
 
     fn len(&self) -> usize {
         self.inner.len()
     }
 
-    fn get(&self, i: usize) -> &Waker {
-        &self.inner[i]
+    fn get(&self, i: usize) -> Option<&Waker> {
+        self.inner[i].as_ref()
     }
 
     fn replace(&mut self, i: usize, waker: &Waker) {
-        let held = &mut self.inner[i];
-        if !held.will_wake(waker) {
-            *held = waker.clone();
+        match &mut self.inner[i] {
+            Some(held) if held.will_wake(waker) => {}
+            held => *held = Some(waker.clone()),
         }
     }
 
-    fn pop(&mut self) -> Option<Waker> {
-        self.inner.pop_front()
+    fn clear(&mut self, i: usize) {
+        self.inner[i] = None;
     }
 
-    fn pop_n(&mut self, n: usize) -> Drain<'_, Waker> {
+    #[cfg(test)]
+    fn pop(&mut self) -> Option<Waker> {
+        self.inner.pop_front().flatten()
+    }
+
+    fn pop_n(&mut self, n: usize) -> Drain<'_, Option<Waker>> {
         self.inner.drain(..n.min(self.inner.len()))
     }
 }
@@ -233,6 +240,7 @@ impl<const MILLIS: u64> Timers<MILLIS> {
             return;
         };
         self.active.cancel(i);
+        self.wakers.clear(i);
         if i == 0 {
             let n = self.active.first().unwrap_or(self.active.len());
             self.pop_n(n);
@@ -258,7 +266,9 @@ impl<const MILLIS: u64> Timers<MILLIS> {
         }
         let wakers = &self.wakers;
         for i in self.active.iter(n) {
-            wakers.get(i).wake_by_ref();
+            if let Some(waker) = wakers.get(i) {
+                waker.wake_by_ref();
+            }
         }
         self.drop_front(n);
     }
@@ -461,6 +471,23 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_timer_behind_the_head_lets_go_of_its_waker() {
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let held = Arc::new(Noop);
+        let mut t = Timers::<D>::new();
+        t.push(waker(), 0);
+        let token = t.push(Waker::from(held.clone()), 0);
+        assert_eq!(Arc::strong_count(&held), 2);
+
+        // Not the head: the entry stays queued, but not the task behind it.
+        t.cancel(token);
+        assert_eq!(Arc::strong_count(&held), 1);
+    }
+
+    #[test]
     fn wakers_start_empty() {
         assert!(Wakers::new().pop().is_none());
     }
@@ -485,7 +512,7 @@ mod tests {
         w.push(b.clone());
         w.push(c.clone());
 
-        let taken: Vec<Waker> = w.pop_n(2).collect();
+        let taken: Vec<Waker> = w.pop_n(2).flatten().collect();
         assert_eq!(taken.len(), 2);
         assert!(taken[0].will_wake(&a));
         assert!(taken[1].will_wake(&b));
