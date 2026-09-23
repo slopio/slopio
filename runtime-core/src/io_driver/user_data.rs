@@ -14,7 +14,7 @@ pub(crate) const TAG_MSG_PTR: u8 = 0b11;
 /// [`TAG_IO`]. `Single` MUST stay 0 (see the invariant on [`UserData`]).
 pub(crate) const IO_SINGLE: u8 = 0b00;
 pub(crate) const IO_MULTI: u8 = 0b01;
-pub(crate) const IO_SEND_BUFFER: u8 = 0b10;
+// 0b10 is free.
 /// Not an IO op at all: a pointer-free reply-slot wakeup posted by a peer over
 /// MSG_RING. It lives in this sub-tag space because the four top-level tags are
 /// already allocated, and it fits naturally — the 60-bit `index` field carries
@@ -23,7 +23,7 @@ pub(crate) const IO_SEND_BUFFER: u8 = 0b10;
 ///
 /// Unlike [`TAG_MSG_PTR`], it carries no pointer and transfers no ownership:
 /// there is nothing to reclaim on arrival, so a wakeup that finds no slot is
-/// simply dropped. This exhausts the sub-tag space.
+/// simply dropped.
 pub(crate) const IO_REPLY_SIGNAL: u8 = 0b11;
 
 /// Tagged `u64` stored in every io_uring SQE's `user_data`. The kernel copies
@@ -99,15 +99,6 @@ impl UserData {
         Self::check(token);
         Self::from_bits(token)
             .with_io_kind(IO_MULTI)
-            .with_tag(TAG_IO)
-    }
-
-    #[inline]
-    pub const fn send_buffer_op(index: u64) -> Self {
-        Self::check(index);
-        Self::new()
-            .with_index(index)
-            .with_io_kind(IO_SEND_BUFFER)
             .with_tag(TAG_IO)
     }
 

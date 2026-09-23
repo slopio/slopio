@@ -34,13 +34,12 @@ mod completion_events;
 mod fixed_buf_pool;
 mod message;
 pub mod operations;
-mod sending_buffers;
 pub(crate) mod sys;
 mod user_data;
 
 pub(crate) use user_data::{
-    IO_MULTI, IO_REPLY_SIGNAL, IO_SEND_BUFFER, MsgPtrUserData, PeerUserData, TAG_IGNORED, TAG_IO,
-    TAG_MESSAGE, TAG_MSG_PTR, UserData,
+    IO_MULTI, IO_REPLY_SIGNAL, MsgPtrUserData, PeerUserData, TAG_IGNORED, TAG_IO, TAG_MESSAGE,
+    TAG_MSG_PTR, UserData,
 };
 
 pub use message::{Endpoint, ErasedMessage, Header, Message};
@@ -49,7 +48,6 @@ pub use buf_ring::{
     BorrowedBuffer, BufRingSet, BufRingSpec, BufRingTake, BufRingUsage, install_buf_ring,
 };
 pub use fixed_buf_pool::{FixedSendBufPool, PooledBuf, SLAB_BUF_INDEX};
-pub use sending_buffers::{SEND_BUFFER_SIZE, SendingBuffer, SendingBufferPool};
 
 pub const DEFAULT_QUEUE_SIZE: usize = 32;
 
@@ -69,7 +67,6 @@ pub struct IODriver {
     ring: UnsafeCell<Ring>,
     slab: Rc<UnsafeCell<OneshotSlab>>,
     multishot_slab: Rc<UnsafeCell<MultishotSlab>>,
-    sending_buffers: SendingBufferPool,
     shutting_down: Cell<bool>,
     /// Installed buffer rings, indexed by bgid — the ring bits of a CQE's
     /// `user_data`. Consumption is accounted here on every `F_BUFFER` CQE;
@@ -388,7 +385,6 @@ impl IODriver {
             ring: UnsafeCell::new(ring),
             slab: Default::default(),
             multishot_slab: Default::default(),
-            sending_buffers: Default::default(),
             shutting_down: Default::default(),
             buf_rings: UnsafeCell::new([None; UserData::MAX_RINGS as usize]),
             peers: Default::default(),
@@ -495,10 +491,6 @@ impl IODriver {
                         slab.remove_raw(index);
                     }
                 }
-            }
-            Event::SendBuffer => {
-                // Fire-and-forget: the slot goes back whether the send landed or not.
-                self.sending_buffers.release(index);
             }
             Event::PeerMessage { payload, data } => {
                 // No slab entry — `index` is unused for peer messages.
@@ -1474,11 +1466,6 @@ impl IODriver {
         ring.add(&entry);
 
         true
-    }
-
-    /// Returns a reference to the sending buffer pool.
-    pub fn sending_buffers(&self) -> &SendingBufferPool {
-        &self.sending_buffers
     }
 }
 
