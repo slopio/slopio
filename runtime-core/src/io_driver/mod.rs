@@ -65,8 +65,8 @@ pub(crate) struct BufRingHooks {
 
 pub struct IODriver {
     ring: UnsafeCell<Ring>,
-    slab: Rc<UnsafeCell<OneshotSlab>>,
-    multishot_slab: Rc<UnsafeCell<MultishotSlab>>,
+    slab: UnsafeCell<OneshotSlab>,
+    multishot_slab: UnsafeCell<MultishotSlab>,
     shutting_down: Cell<bool>,
     /// Installed buffer rings, indexed by bgid — the ring bits of a CQE's
     /// `user_data`. Consumption is accounted here on every `F_BUFFER` CQE;
