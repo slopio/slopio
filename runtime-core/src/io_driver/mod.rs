@@ -478,7 +478,10 @@ impl IODriver {
                     SingleProcessResult::Shutdown => {
                         self.shutting_down.replace(true);
                     }
-                    SingleProcessResult::InvalidState(_msg) => {}
+                    // Single-shot ops submit at first poll, so a CQE never finds Init.
+                    SingleProcessResult::InvalidState(msg) => {
+                        panic!("single-shot slot {index}: {msg}")
+                    }
                     SingleProcessResult::CancelledRecycling { id, bgid } => {
                         self.recycle_by_bgid(bgid, id);
                         slab.remove_raw(index);

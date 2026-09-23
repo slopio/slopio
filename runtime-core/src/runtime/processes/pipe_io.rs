@@ -1,101 +1,138 @@
+use std::any::Any;
 use std::future::Future;
-use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::IO_DRIVER;
-use crate::io_driver::operations::OneshotToken;
+use crate::io_driver::operations::{IoBuf, IoBufMut, OneshotToken};
 
-/// Async read from a pipe fd via io_uring.
-pub struct ReadPipe<'a> {
+/// Async read from a pipe fd via io_uring. Takes ownership of the buffer and
+/// returns it on completion; if dropped mid-flight the buffer is kept alive
+/// until the cancelled CQE arrives.
+pub struct ReadPipe<B: IoBufMut> {
+    fd: i32,
     id: Option<OneshotToken>,
-    _phantom: PhantomData<&'a mut [u8]>,
+    buf: Option<B>,
 }
 
-impl<'a> ReadPipe<'a> {
-    pub fn new(fd: i32, buf: &'a mut [u8]) -> Self {
-        let entry = opcode::Read::new(Fd(fd), buf.as_mut_ptr(), buf.len() as u32).build();
-        let token = IO_DRIVER.with(|d| d.push_op(entry));
+impl<B: IoBufMut> ReadPipe<B> {
+    pub fn new(fd: i32, buf: B) -> Self {
         Self {
-            id: Some(token),
-            _phantom: PhantomData,
+            fd,
+            id: None,
+            buf: Some(buf),
         }
+    }
+
+    fn register_to_driver(&mut self) {
+        let buf = self.buf.as_mut().expect("buf taken before submit");
+        let entry =
+            opcode::Read::new(Fd(self.fd), buf.stable_mut_ptr(), buf.bytes_total() as u32).build();
+        let token = IO_DRIVER.with(|d| d.push_op(entry));
+        self.id = Some(token);
     }
 }
 
-impl<'a> Future for ReadPipe<'a> {
-    type Output = std::io::Result<usize>;
+impl<B: IoBufMut> Future for ReadPipe<B> {
+    type Output = (std::io::Result<usize>, B);
 
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let waker = cx.waker();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.id.is_none() {
+            self.register_to_driver();
+        }
         let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(io_result) => {
+        match IO_DRIVER.with(|d| d.poll_op(token, cx.waker())) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(io_result) => {
                 self.id = None;
-                std::task::Poll::Ready(match io_result.result {
-                    bytes_read @ 0.. => Ok(bytes_read as usize),
+                let mut buf = self.buf.take().expect("buf already taken");
+                let result = match io_result.result {
+                    n @ 0.. => {
+                        let n = n as usize;
+                        // SAFETY: the kernel wrote `n` bytes into `stable_mut_ptr`.
+                        unsafe { buf.set_init(n) };
+                        Ok(n)
+                    }
                     err => Err(std::io::Error::from_raw_os_error(-err)),
-                })
+                };
+                Poll::Ready((result, buf))
             }
         }
     }
 }
 
-impl<'a> Drop for ReadPipe<'a> {
+impl<B: IoBufMut> Drop for ReadPipe<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
+            // The kernel writes into the buffer until the cancel CQE.
+            let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, None));
         }
     }
 }
 
-/// Async write to a pipe fd via io_uring.
-pub struct WritePipe<'a> {
+/// Async write to a pipe fd via io_uring. Takes ownership of the buffer and
+/// returns it on completion; if dropped mid-flight the buffer is kept alive
+/// until the cancelled CQE arrives.
+pub struct WritePipe<B: IoBuf> {
+    fd: i32,
     id: Option<OneshotToken>,
-    _phantom: PhantomData<&'a [u8]>,
+    buf: Option<B>,
 }
 
-impl<'a> WritePipe<'a> {
-    pub fn new(fd: i32, buf: &'a [u8]) -> Self {
-        let entry = opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32).build();
-        let token = IO_DRIVER.with(|d| d.push_op(entry));
+impl<B: IoBuf> WritePipe<B> {
+    pub fn new(fd: i32, buf: B) -> Self {
         Self {
-            id: Some(token),
-            _phantom: PhantomData,
+            fd,
+            id: None,
+            buf: Some(buf),
         }
+    }
+
+    fn register_to_driver(&mut self) {
+        let buf = self.buf.as_ref().expect("buf taken before submit");
+        let entry =
+            opcode::Write::new(Fd(self.fd), buf.stable_ptr(), buf.bytes_init() as u32).build();
+        let token = IO_DRIVER.with(|d| d.push_op(entry));
+        self.id = Some(token);
     }
 }
 
-impl<'a> Future for WritePipe<'a> {
-    type Output = std::io::Result<usize>;
+impl<B: IoBuf> Future for WritePipe<B> {
+    type Output = (std::io::Result<usize>, B);
 
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let waker = cx.waker();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.id.is_none() {
+            self.register_to_driver();
+        }
         let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(io_result) => {
+        match IO_DRIVER.with(|d| d.poll_op(token, cx.waker())) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(io_result) => {
                 self.id = None;
-                std::task::Poll::Ready(match io_result.result {
-                    bytes_written @ 0.. => Ok(bytes_written as usize),
+                let buf = self.buf.take().expect("buf already taken");
+                let result = match io_result.result {
+                    n @ 0.. => Ok(n as usize),
                     err => Err(std::io::Error::from_raw_os_error(-err)),
-                })
+                };
+                Poll::Ready((result, buf))
             }
         }
     }
 }
 
-impl<'a> Drop for WritePipe<'a> {
+impl<B: IoBuf> Drop for WritePipe<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            IO_DRIVER.with(|d| d.cancel_single_op(token, None))
+            // The kernel reads the buffer until the cancel CQE.
+            let keep = if B::NEEDS_KEEPALIVE {
+                self.buf.take().map(|b| Box::new(b) as Box<dyn Any>)
+            } else {
+                None
+            };
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, None));
         }
     }
 }

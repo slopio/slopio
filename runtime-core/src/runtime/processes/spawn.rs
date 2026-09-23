@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 
 use super::pipe_io::{ReadPipe, WritePipe};
 use super::wait_id::{ExitStatus, WaitProcess};
+use crate::io_driver::operations::{IoBuf, IoBufMut};
 
 /// A child process in one of two states.
 ///
@@ -94,20 +95,20 @@ impl Process {
         }
     }
 
-    /// Async read from the child's stdout into `buf`.
+    /// Async read from the child's stdout into `buf`, handed back on completion.
     /// Returns the number of bytes read, or 0 at EOF.
-    pub fn read_stdout<'a>(&self, buf: &'a mut [u8]) -> Option<ReadPipe<'a>> {
+    pub fn read_stdout<B: IoBufMut>(&self, buf: B) -> Option<ReadPipe<B>> {
         self.stdout_fd().map(|fd| ReadPipe::new(fd, buf))
     }
 
     /// Async read from the child's stderr into `buf`.
-    pub fn read_stderr<'a>(&self, buf: &'a mut [u8]) -> Option<ReadPipe<'a>> {
+    pub fn read_stderr<B: IoBufMut>(&self, buf: B) -> Option<ReadPipe<B>> {
         self.stderr_fd().map(|fd| ReadPipe::new(fd, buf))
     }
 
     /// Async write to the child's stdin.
     /// Only available while `Running`.
-    pub fn write_stdin<'a>(&self, buf: &'a [u8]) -> Option<WritePipe<'a>> {
+    pub fn write_stdin<B: IoBuf>(&self, buf: B) -> Option<WritePipe<B>> {
         self.stdin_fd().map(|fd| WritePipe::new(fd, buf))
     }
 

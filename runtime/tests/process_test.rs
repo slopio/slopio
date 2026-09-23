@@ -91,20 +91,23 @@ fn test_pipe_ping_pong() {
 
         // ping: write to stdin
         let ping = b"hello from runtime\n";
-        let written = proc.write_stdin(ping).unwrap().await.unwrap();
-        assert_eq!(written, ping.len());
+        let (written, _) = proc.write_stdin(ping).unwrap().await;
+        assert_eq!(written.unwrap(), ping.len());
 
         // pong: read back from stdout
-        let mut buf = [0u8; 64];
-        let read = proc.read_stdout(&mut buf).unwrap().await.unwrap();
-        assert_eq!(&buf[..read], ping);
+        let (read, buf) = proc.read_stdout(Vec::with_capacity(64)).unwrap().await;
+        read.unwrap();
+        assert_eq!(&buf[..], ping);
 
         // second round
         let ping2 = b"ping two\n";
-        proc.write_stdin(ping2).unwrap().await.unwrap();
+        proc.write_stdin(ping2).unwrap().await.0.unwrap();
 
-        let read2 = proc.read_stdout(&mut buf).unwrap().await.unwrap();
-        assert_eq!(&buf[..read2], ping2);
+        let mut buf = buf;
+        buf.clear();
+        let (read2, buf) = proc.read_stdout(buf).unwrap().await;
+        read2.unwrap();
+        assert_eq!(&buf[..], ping2);
 
         // close stdin (EOF) → cat exits
         let mut proc = proc;
@@ -122,12 +125,12 @@ fn test_pipe_byte_by_byte() {
 
         // write one byte, read it back, 1024 times
         for i in 0u16..1024 {
-            let byte = [(i % 256) as u8];
-            let written = proc.write_stdin(&byte).unwrap().await.unwrap();
-            assert_eq!(written, 1);
+            let byte = vec![(i % 256) as u8];
+            let (written, _) = proc.write_stdin(byte).unwrap().await;
+            assert_eq!(written.unwrap(), 1);
 
-            let mut buf = [0u8; 1];
-            let n = proc.read_stdout(&mut buf).unwrap().await.unwrap();
+            let (n, buf) = proc.read_stdout(Vec::with_capacity(1)).unwrap().await;
+            let n = n.unwrap();
             assert_eq!(n, 1, "expected 1 byte back at round {}", i);
             assert_eq!(buf[0], (i % 256) as u8, "mismatch at round {}", i);
         }
@@ -137,6 +140,55 @@ fn test_pipe_byte_by_byte() {
         let finished = proc.wait().await.unwrap();
         let code = unwrap_finished(finished).into_result().unwrap();
         assert_eq!(code, 0);
+    });
+}
+
+#[test]
+fn a_pipe_read_created_before_the_data_arrives_still_completes() {
+    main_thread(async {
+        let mut proc = Process::new("cat", &[]).unwrap();
+
+        // Built, then left unpolled while the data lands.
+        let read = proc.read_stdout(Vec::with_capacity(16)).unwrap();
+        proc.write_stdin(b"early\n").unwrap().await.0.unwrap();
+        Sleep::during(Duration::from_millis(50)).await;
+
+        match select(read, Sleep::during(Duration::from_secs(5))).await {
+            SelectResult::First((n, buf)) => {
+                n.unwrap();
+                assert_eq!(&buf[..], b"early\n");
+            }
+            SelectResult::Second(_) => panic!("pipe read never completed"),
+        }
+
+        proc.close_stdin();
+        proc.wait().await.unwrap();
+    });
+}
+
+#[test]
+fn a_pipe_read_dropped_mid_flight_leaves_the_pipe_usable() {
+    main_thread(async {
+        let mut proc = Process::new("cat", &[]).unwrap();
+
+        // Nothing to read yet: the timer wins and the read is cancelled.
+        match select(
+            proc.read_stdout(Vec::with_capacity(16)).unwrap(),
+            Sleep::during(Duration::from_millis(20)),
+        )
+        .await
+        {
+            SelectResult::First(_) => panic!("nothing was written"),
+            SelectResult::Second(_) => {}
+        }
+
+        proc.write_stdin(b"after\n").unwrap().await.0.unwrap();
+        let (n, buf) = proc.read_stdout(Vec::with_capacity(16)).unwrap().await;
+        n.unwrap();
+        assert_eq!(&buf[..], b"after\n");
+
+        proc.close_stdin();
+        proc.wait().await.unwrap();
     });
 }
 
