@@ -90,11 +90,18 @@ impl BucketLevels {
 impl TimeWheel {
     #[must_use]
     pub fn new() -> Self {
+        Self::new_at(Instant::now(), SystemTime::now())
+    }
+
+    /// A wheel whose time starts at a caller-supplied instant, for a clock
+    /// that [`tick_at`](Self::tick_at) will keep driving.
+    #[must_use]
+    pub fn new_at(now: Instant, now_wall: SystemTime) -> Self {
         Self {
             storage: TimerStorage::default(),
             buckets: BucketLevels::new(),
-            last_tick: Instant::now(),
-            last_tick_wall: SystemTime::now(),
+            last_tick: now,
+            last_tick_wall: now_wall,
             ticks: 0,
         }
     }

@@ -636,3 +636,21 @@ fn a_sent_ring_buffer_returns_to_the_ring_once_the_send_completes() {
     );
     assert_eq!(handle.scenario_remaining(), 0);
 }
+
+/// The wheel starts on the virtual clock, not on the real one: real time spent
+/// before the runtime starts must not shift when a sleep fires.
+#[test]
+fn a_sleep_fires_on_virtual_time_whatever_real_time_setup_took() {
+    let (fake, handle) = simulated();
+    let clock = handle.clock().expect("built with virtual time");
+    // Real time passes between the clock's birth and the runtime's.
+    std::thread::sleep(Duration::from_millis(25));
+    let start = clock.now();
+    RuntimeInner::simulated(fake).block_on::<(), _>(
+        async { Sleep::during(Duration::from_millis(100)).await },
+        None,
+        |run| run(),
+    );
+    let slept = clock.now() - start;
+    assert_eq!(slept, Duration::from_millis(100));
+}

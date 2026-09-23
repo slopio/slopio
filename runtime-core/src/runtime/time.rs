@@ -165,8 +165,11 @@ impl TimeDriver {
     /// A driver on a clock a simulation advances rather than the OS.
     #[cfg(feature = "simulation")]
     pub fn simulated(clock: Rc<VirtualClock>) -> Self {
+        // Started on the virtual clock: a real `Instant::now()` would sit ahead
+        // of it by however long setup took, a gap that changes every run.
+        let wheel = async_timers::TimeWheel::new_at(clock.now(), clock.now_wall());
         Self {
-            wheel: UnsafeCell::default(),
+            wheel: UnsafeCell::new(wheel),
             fixed_5s: UnsafeCell::default(),
             clock: ClockSource::Virtual(clock),
         }
