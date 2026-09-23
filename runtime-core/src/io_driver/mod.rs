@@ -88,6 +88,9 @@ pub struct IODriver {
     /// Deferred because a ref parked in a slab keepalive drops mid-CQ-
     /// processing, where pushing an SQE would alias the ring borrow.
     pending_closes: UnsafeCell<Vec<i32>>,
+    /// Multishot user_data whose pause cancel was decided mid-CQ-processing,
+    /// pushed once the ring borrow of that loop has ended.
+    pending_pause_cancels: UnsafeCell<Vec<u64>>,
 }
 
 impl Drop for IODriver {
@@ -397,6 +400,7 @@ impl IODriver {
             msg_inbox: Default::default(),
             reply_slab: Default::default(),
             pending_closes: Default::default(),
+            pending_pause_cancels: Default::default(),
         }
     }
 
@@ -443,9 +447,11 @@ impl IODriver {
                 ) {
                     MultiProcessResult::Queued => {}
                     MultiProcessResult::WakeConsumer => {}
-                    MultiProcessResult::PauseRequired(token) => {
-                        self.send_multiop_cancel_event(UserData::multi(token).into_bits());
-                    }
+                    // Deferred: the CQ loop still holds the ring.
+                    MultiProcessResult::PauseRequired(token) => unsafe {
+                        (*self.pending_pause_cancels.get())
+                            .push(UserData::multi(token).into_bits());
+                    },
                     MultiProcessResult::FullyPaused => {}
                     MultiProcessResult::CancelComplete => {
                         slab.remove_raw(index);
@@ -1178,6 +1184,14 @@ impl IODriver {
     }
 
     pub(crate) fn process_completion_queue(&self) {
+        self.drain_completions();
+        let cancels = unsafe { &mut *self.pending_pause_cancels.get() };
+        for raw in cancels.drain(..) {
+            self.send_multiop_cancel_event(raw);
+        }
+    }
+
+    fn drain_completions(&self) {
         let ring = unsafe { &mut *self.ring.get() };
         match &mut ring.inner {
             RingBackend::Uring(ring) => {

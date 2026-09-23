@@ -132,3 +132,35 @@ fn a_fatal_error_is_reported_once_and_ends_the_stream() {
     assert!(reset);
     assert_eq!(ends, 3, "the error is not repeated, and nothing re-arms");
 }
+
+// Enough buffers for a whole burst, so only the queue bound can stop it.
+runtime_core::define_buf_ring!(BurstRing, bgid = 2, buffer_size = 64, ring_size = 16);
+
+/// A burst larger than the queue pauses the multishot mid-CQ-processing: the
+/// pause cancel is pushed once the CQ loop lets go of the ring, and the stream
+/// resumes where it stopped. Under Miri this is the aliasing check.
+#[test]
+fn a_burst_past_the_queue_bound_pauses_and_resumes_in_order() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+
+    let chunks: Vec<Vec<u8>> = (0..12u8).map(|i| vec![i]).collect();
+    // One batch: every chunk lands in the same CQ pass, past the bound of 4.
+    let burst: Vec<ReadEvent> = chunks.iter().map(|c| ReadEvent::data(c.clone())).collect();
+    handle.on_multishot_read(socket.fd(), [burst, vec![ReadEvent::Eof]]);
+
+    let got = RuntimeInner::simulated(fake).block_on::<BurstRing, _>(
+        async move {
+            let mut recv = MultiRecv::<BurstRing, _, 4>::with_queue_size(socket);
+            let mut got = Vec::new();
+            while let Some(chunk) = recv.next().await {
+                got.push(chunk.expect("no error").as_ref().to_vec());
+            }
+            got
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(got, chunks);
+}
