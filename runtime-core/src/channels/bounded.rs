@@ -120,12 +120,14 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let state = unsafe { &mut *(*self.shared.0).get() };
         state.receiver_dropped = true;
-        state.data.clear();
+        // Dropped last: an item may own the Sender, whose drop frees the state.
+        let data = std::mem::take(&mut state.data);
         if state.sender_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
         } else {
             state.wake_send();
         }
+        drop(data);
     }
 }
 

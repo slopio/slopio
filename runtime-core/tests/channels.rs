@@ -21,8 +21,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use runtime_core::channels::{BoundedReceiver, Receiver, bounded_channel, unbounded_channel};
-use runtime_core::channels::{VecReceiver, vec_channel};
+use runtime_core::channels::{
+    BoundedReceiver, BoundedSender, Receiver, Sender, bounded_channel, unbounded_channel,
+};
+use runtime_core::channels::{VecReceiver, VecSender, vec_channel};
 
 /// A waker that records how often it was woken and nothing else.
 ///
@@ -423,4 +425,51 @@ fn _vec_receiver_is_the_borrow_root<T>(
     rx: &VecReceiver<T>,
 ) -> impl Future<Output = Option<Vec<T>>> + '_ {
     rx.recv()
+}
+
+// ------------------------------------------------------- re-entrant drops
+
+// Items that own the last handle on their own channel: dropping the queue
+// runs that handle's drop, which must not find the queue still borrowed or
+// the state already freed.
+struct OwnsSender(#[allow(dead_code)] Rc<Sender<OwnsSender>>);
+struct OwnsBoundedSender(#[allow(dead_code)] Rc<BoundedSender<OwnsBoundedSender>>);
+struct OwnsVecSender(#[allow(dead_code)] Rc<VecSender<OwnsVecSender>>);
+struct OwnsReceiver(#[allow(dead_code)] Receiver<OwnsReceiver>);
+
+#[test]
+fn dropping_the_receiver_may_drop_the_last_sender_from_the_queue() {
+    let (tx, rx) = unbounded_channel();
+    let tx = Rc::new(tx);
+    tx.send(OwnsSender(tx.clone()));
+    drop(tx);
+    drop(rx);
+}
+
+#[test]
+fn dropping_a_bounded_receiver_may_drop_the_last_sender_from_the_queue() {
+    let (_counter, waker) = Counter::new();
+    let (tx, rx) = bounded_channel(1);
+    let tx = Rc::new(tx);
+    let mut send = tx.send(OwnsBoundedSender(tx.clone()));
+    assert!(matches!(poll_once(&mut send, &waker), Poll::Ready(Ok(()))));
+    drop(send);
+    drop(tx);
+    drop(rx);
+}
+
+#[test]
+fn dropping_a_vec_receiver_may_drop_the_last_sender_from_the_queue() {
+    let (tx, rx) = vec_channel();
+    let tx = Rc::new(tx);
+    tx.push(OwnsVecSender(tx.clone()));
+    drop(tx);
+    drop(rx);
+}
+
+#[test]
+fn purge_may_drop_the_receiver_from_the_queue() {
+    let (tx, rx) = unbounded_channel();
+    tx.send(OwnsReceiver(rx));
+    tx.purge();
 }
