@@ -473,3 +473,9 @@ fn purge_may_drop_the_receiver_from_the_queue() {
     tx.send(OwnsReceiver(rx));
     tx.purge();
 }
+
+#[test]
+#[should_panic(expected = "capacity must be at least 1")]
+fn a_bounded_channel_cannot_have_zero_capacity() {
+    let _ = bounded_channel::<u32>(0);
+}

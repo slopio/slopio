@@ -206,8 +206,10 @@ impl<T> Receiver<T> {
     }
 }
 
+/// Panics if `capacity` is 0: a send would never find room.
 #[inline]
 pub fn bounded_channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    assert!(capacity > 0, "bounded_channel capacity must be at least 1");
     let shared = Shared::new(capacity);
     (
         Sender {
