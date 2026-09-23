@@ -53,13 +53,7 @@ impl SocketInner {
 
 impl Drop for SocketInner {
     fn drop(&mut self) {
-        let fd = self.fd;
-        // Close through the ring when inside the runtime; synchronously
-        // otherwise (socket dropped outside the driver scope).
-        crate::io_driver::IO_DRIVER.try_with(|driver| match driver {
-            Some(d) => d.close_fd(fd),
-            None => crate::io_driver::sys::close(fd),
-        });
+        crate::io_driver::close_owned_fd(self.fd);
     }
 }
 

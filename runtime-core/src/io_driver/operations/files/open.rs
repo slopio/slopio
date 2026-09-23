@@ -50,7 +50,7 @@ impl Future for OpenFile {
             std::task::Poll::Ready(io_result) => {
                 self.id = None;
                 std::task::Poll::Ready(match io_result.result {
-                    fd @ 0.. => Ok(OpenedFile { fd }),
+                    fd @ 0.. => Ok(OpenedFile::from_fd(fd)),
                     err => Err(std::io::Error::from_raw_os_error(-err)),
                 })
             }
@@ -66,7 +66,7 @@ impl Drop for OpenFile {
             // any in-flight kernel access after cancel.
             let filename = std::mem::take(&mut self.filename);
             let keep: Box<dyn Any> = Box::new(filename);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep), None));
+            IO_DRIVER.with(|d| d.cancel_fd_producing_op(token, Some(keep)));
         }
     }
 }

@@ -124,6 +124,8 @@ pub(crate) enum SingleProcessResult {
         id: u16,
         bgid: u16,
     },
+    /// A cancelled open still produced an fd nobody will own: close it.
+    CancelledFd(i32),
     InvalidState(&'static str),
 }
 
@@ -183,6 +185,13 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
         SingleOpState::Ended(_) => SingleProcessResult::InvalidState("received CQE for ended op"),
         SingleOpState::Signal(_) => SingleProcessResult::Shutdown,
         SingleOpState::LinkedSent(_next) => SingleProcessResult::LinkCompleted,
+        SingleOpState::CancelledOpen { .. } => {
+            if data.result >= 0 {
+                SingleProcessResult::CancelledFd(data.result)
+            } else {
+                SingleProcessResult::CancelComplete
+            }
+        }
         SingleOpState::Cancelled { bgid, .. } => {
             if cqueue::more(data.flags) {
                 // Zero-copy completion landed mid-cancel; the notification (and

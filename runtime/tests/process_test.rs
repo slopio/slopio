@@ -193,6 +193,20 @@ fn a_pipe_read_dropped_mid_flight_leaves_the_pipe_usable() {
 }
 
 #[test]
+fn a_pipe_read_outlives_the_process_handle() {
+    main_thread(async {
+        let proc = Process::new("sh", &["-c", "sleep 0.05; echo late"]).unwrap();
+        let read = proc.read_stdout(Vec::with_capacity(16)).unwrap();
+        // The read holds its own ref: the fd stays open until it completes.
+        drop(proc);
+
+        let (n, buf) = read.await;
+        n.unwrap();
+        assert_eq!(&buf[..], b"late\n");
+    });
+}
+
+#[test]
 fn test_stop_notification() {
     main_thread(async {
         let proc = Process::new("sleep", &["60"]).unwrap();

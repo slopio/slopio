@@ -472,6 +472,10 @@ impl IODriver {
                     SingleProcessResult::CancelComplete => {
                         slab.remove_raw(index);
                     }
+                    SingleProcessResult::CancelledFd(fd) => {
+                        self.close_fd(fd);
+                        slab.remove_raw(index);
+                    }
                     SingleProcessResult::LinkCompleted => {
                         slab.remove_raw(index);
                     }
@@ -1195,6 +1199,28 @@ impl IODriver {
         };
     }
 
+    /// Cancel an op whose successful result is a new fd (`openat`): an fd
+    /// that lands after the drop is closed instead of leaked.
+    pub(crate) fn cancel_fd_producing_op(
+        &self,
+        token: OneshotToken,
+        keepalive: Option<Box<dyn std::any::Any>>,
+    ) {
+        let slab = unsafe { &mut *self.slab.get() };
+        if let Some(SingleOpState::Ended(meta)) = slab.get_mut(token) {
+            let result = meta.result;
+            slab.remove(token);
+            if result >= 0 {
+                self.close_fd(result);
+            }
+            return;
+        }
+        self.send_singleop_cancel_event(token);
+        *slab.get_mut(token).unwrap() = SingleOpState::CancelledOpen {
+            keepalive: keepalive.map(CancelKeepalive),
+        };
+    }
+
     /// Submit an async cancel SQE for `token`.
     fn send_singleop_cancel_event(&self, token: OneshotToken) {
         let raw = token.raw();
@@ -1424,12 +1450,22 @@ impl std::fmt::Debug for CancelKeepalive {
 }
 
 /// A parked fd owner, held by a cancelled op until its terminal CQE so the
-/// close posts only after the kernel is done with the fd. Socket-only today;
-/// a `File` variant slots in when file fds get refcounted ownership.
+/// close posts only after the kernel is done with the fd.
 #[derive(Debug)]
 pub(crate) enum ParkedFd {
     #[allow(dead_code)]
     Socket(Rc<operations::sockets::SocketInner>),
+    /// A file or pipe.
+    #[allow(dead_code)]
+    File(Rc<operations::fd::FdInner>),
+}
+
+/// Close an owned fd: through the ring inside the runtime, synchronously outside it.
+pub(crate) fn close_owned_fd(fd: i32) {
+    IO_DRIVER.try_with(|driver| match driver {
+        Some(d) => d.close_fd(fd),
+        None => sys::close(fd),
+    });
 }
 
 #[derive(Debug)]
@@ -1461,6 +1497,11 @@ enum SingleOpState {
         keepalive: Option<CancelKeepalive>,
         #[allow(dead_code)]
         parked_fd: Option<ParkedFd>,
+    },
+    /// A cancelled op whose success result is an fd with no owner left.
+    CancelledOpen {
+        #[allow(dead_code)]
+        keepalive: Option<CancelKeepalive>,
     },
 }
 

@@ -1,5 +1,6 @@
 use io_uring::squeue::Entry;
 
+pub(crate) mod fd;
 pub mod files;
 pub mod fixed_buf;
 pub mod io_traits;

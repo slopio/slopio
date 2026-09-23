@@ -1,10 +1,9 @@
 use std::io;
-use std::os::fd::AsRawFd;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
-use super::pipe_io::{ReadPipe, WritePipe};
+use super::pipe_io::{PipeFd, ReadPipe, WritePipe};
 use super::wait_id::{ExitStatus, WaitProcess};
 use crate::io_driver::operations::{IoBuf, IoBufMut};
 
@@ -20,14 +19,14 @@ pub enum Process {
     Running {
         pid: u32,
         _thread: JoinHandle<()>,
-        stdin: Option<ChildStdin>,
-        stdout: Option<ChildStdout>,
-        stderr: Option<ChildStderr>,
+        stdin: Option<PipeFd>,
+        stdout: Option<PipeFd>,
+        stderr: Option<PipeFd>,
     },
     Finished {
         status: ExitStatus,
-        stdout: Option<ChildStdout>,
-        stderr: Option<ChildStderr>,
+        stdout: Option<PipeFd>,
+        stderr: Option<PipeFd>,
     },
 }
 
@@ -59,9 +58,9 @@ impl Process {
         Ok(Self::Running {
             pid: child.id(),
             _thread: handle,
-            stdin: child.stdin.take(),
-            stdout: child.stdout.take(),
-            stderr: child.stderr.take(),
+            stdin: child.stdin.take().map(PipeFd::new),
+            stdout: child.stdout.take().map(PipeFd::new),
+            stderr: child.stderr.take().map(PipeFd::new),
         })
     }
 
@@ -72,9 +71,28 @@ impl Process {
         }
     }
 
+    pub fn stdin(&self) -> Option<&PipeFd> {
+        match self {
+            Self::Running { stdin, .. } => stdin.as_ref(),
+            Self::Finished { .. } => None,
+        }
+    }
+
+    pub fn stdout(&self) -> Option<&PipeFd> {
+        match self {
+            Self::Running { stdout, .. } | Self::Finished { stdout, .. } => stdout.as_ref(),
+        }
+    }
+
+    pub fn stderr(&self) -> Option<&PipeFd> {
+        match self {
+            Self::Running { stderr, .. } | Self::Finished { stderr, .. } => stderr.as_ref(),
+        }
+    }
+
     pub fn stdin_fd(&self) -> Option<i32> {
         match self {
-            Self::Running { stdin, .. } => stdin.as_ref().map(|s| s.as_raw_fd()),
+            Self::Running { stdin, .. } => stdin.as_ref().map(PipeFd::fd),
             Self::Finished { .. } => None,
         }
     }
@@ -82,7 +100,7 @@ impl Process {
     pub fn stdout_fd(&self) -> Option<i32> {
         match self {
             Self::Running { stdout, .. } | Self::Finished { stdout, .. } => {
-                stdout.as_ref().map(|s| s.as_raw_fd())
+                stdout.as_ref().map(PipeFd::fd)
             }
         }
     }
@@ -90,7 +108,7 @@ impl Process {
     pub fn stderr_fd(&self) -> Option<i32> {
         match self {
             Self::Running { stderr, .. } | Self::Finished { stderr, .. } => {
-                stderr.as_ref().map(|s| s.as_raw_fd())
+                stderr.as_ref().map(PipeFd::fd)
             }
         }
     }
@@ -98,18 +116,18 @@ impl Process {
     /// Async read from the child's stdout into `buf`, handed back on completion.
     /// Returns the number of bytes read, or 0 at EOF.
     pub fn read_stdout<B: IoBufMut>(&self, buf: B) -> Option<ReadPipe<B>> {
-        self.stdout_fd().map(|fd| ReadPipe::new(fd, buf))
+        self.stdout().map(|p| p.read(buf))
     }
 
     /// Async read from the child's stderr into `buf`.
     pub fn read_stderr<B: IoBufMut>(&self, buf: B) -> Option<ReadPipe<B>> {
-        self.stderr_fd().map(|fd| ReadPipe::new(fd, buf))
+        self.stderr().map(|p| p.read(buf))
     }
 
     /// Async write to the child's stdin.
     /// Only available while `Running`.
     pub fn write_stdin<B: IoBuf>(&self, buf: B) -> Option<WritePipe<B>> {
-        self.stdin_fd().map(|fd| WritePipe::new(fd, buf))
+        self.stdin().map(|p| p.write(buf))
     }
 
     /// Close stdin, sending EOF to the child.

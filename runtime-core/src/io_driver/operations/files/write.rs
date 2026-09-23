@@ -7,7 +7,7 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, files::OpenedFile},
+    operations::{IoBuf, OneshotToken, fd::OpFd, files::OpenedFile},
 };
 
 impl OpenedFile {
@@ -17,7 +17,7 @@ impl OpenedFile {
     /// the kernel never reads from freed memory.
     pub fn write<B: IoBuf>(&self, buf: B) -> WriteFile<B> {
         WriteFile {
-            fd: self.fd,
+            fd: self.share(),
             id: None,
             buf: Some(buf),
         }
@@ -25,7 +25,7 @@ impl OpenedFile {
 }
 
 pub struct WriteFile<B: IoBuf> {
-    fd: i32,
+    fd: OpFd,
     id: Option<OneshotToken>,
     buf: Option<B>,
 }
@@ -34,7 +34,7 @@ impl<B: IoBuf> WriteFile<B> {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_ref().expect("buf taken before submit");
         let entry =
-            opcode::Write::new(Fd(self.fd), buf.stable_ptr(), buf.bytes_init() as u32).build();
+            opcode::Write::new(Fd(self.fd.fd()), buf.stable_ptr(), buf.bytes_init() as u32).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
@@ -72,7 +72,8 @@ impl<B: IoBuf> Drop for WriteFile<B> {
             } else {
                 None
             };
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, None));
+            let parked = Some(self.fd.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
     }
 }

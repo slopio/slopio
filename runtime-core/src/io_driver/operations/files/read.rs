@@ -7,7 +7,7 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBufMut, OneshotToken, files::OpenedFile},
+    operations::{IoBufMut, OneshotToken, fd::OpFd, files::OpenedFile},
 };
 
 impl OpenedFile {
@@ -18,7 +18,7 @@ impl OpenedFile {
     /// memory.
     pub fn read<B: IoBufMut>(&self, buf: B) -> ReadFile<B> {
         ReadFile {
-            fd: self.fd,
+            fd: self.share(),
             id: None,
             buf: Some(buf),
         }
@@ -26,7 +26,7 @@ impl OpenedFile {
 }
 
 pub struct ReadFile<B: IoBufMut> {
-    fd: i32,
+    fd: OpFd,
     id: Option<OneshotToken>,
     buf: Option<B>,
 }
@@ -34,8 +34,12 @@ pub struct ReadFile<B: IoBufMut> {
 impl<B: IoBufMut> ReadFile<B> {
     fn register_to_driver(&mut self) {
         let buf = self.buf.as_mut().expect("buf taken before submit");
-        let entry =
-            opcode::Read::new(Fd(self.fd), buf.stable_mut_ptr(), buf.bytes_total() as u32).build();
+        let entry = opcode::Read::new(
+            Fd(self.fd.fd()),
+            buf.stable_mut_ptr(),
+            buf.bytes_total() as u32,
+        )
+        .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
@@ -79,7 +83,8 @@ impl<B: IoBufMut> Drop for ReadFile<B> {
             // Kernel writes into the buffer — must keep it alive until the
             // cancel CQE arrives.
             let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, None));
+            let parked = Some(self.fd.park());
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
         }
     }
 }
