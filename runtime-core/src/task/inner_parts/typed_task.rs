@@ -40,10 +40,13 @@ impl<F: Future> TypedTask<F> {
     }
 
     /// The handle is gone: free now if nothing else can reach us.
-    pub fn detach(self) {
+    pub fn detach(mut self) {
+        // Nobody awaits the output anymore: release the awaiting task's waker.
+        let awaiter = unsafe { self.inner.as_mut() }.waker.waker.take();
         let header = unsafe { &(*self.inner.as_ptr()).header };
         header.detached_mode.set(true);
         self.free_if_unreachable();
+        drop(awaiter);
     }
 
     pub fn poll(mut self) {
