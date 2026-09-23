@@ -15,6 +15,8 @@ use crate::io_driver::{
     },
 };
 
+/// One recv into a buffer picked from ring `S`. Resolves to `Ok(None)` once
+/// the peer has closed its side.
 pub struct ManagedRecv<S: BufRingSpec> {
     id: Option<OneshotToken>,
     socket: OpSocket,
@@ -43,24 +45,27 @@ impl<S: BufRingSpec> ManagedRecv<S> {
         self.id = Some(token);
     }
 
-    fn parse_completion(&self, event: OpMetadata) -> std::io::Result<BorrowedBuffer<S>> {
+    fn parse_completion(&self, event: OpMetadata) -> std::io::Result<Option<BorrowedBuffer<S>>> {
         if event.result <= 0 {
             // The flag alone says a buffer was consumed, whatever the result.
             if let Some(bid) = buffer_select(event.flags) {
                 S::recycle_bid(bid);
             }
+            if event.result == 0 {
+                return Ok(None);
+            }
             return Err(std::io::Error::from_raw_os_error(-event.result));
         }
         let len = event.result as usize;
         let buffer_id = buffer_select(event.flags).unwrap();
-        Ok(S::make_buffer(buffer_id, len))
+        Ok(Some(S::make_buffer(buffer_id, len)))
     }
 }
 
 impl<S: BufRingSpec> Unpin for ManagedRecv<S> {}
 
 impl<S: BufRingSpec> Future for ManagedRecv<S> {
-    type Output = std::io::Result<BorrowedBuffer<S>>;
+    type Output = std::io::Result<Option<BorrowedBuffer<S>>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.id.is_none() {

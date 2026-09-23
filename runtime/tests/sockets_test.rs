@@ -1,4 +1,5 @@
 use runtime::io_driver::operations::sockets::connect::connect_tcp;
+use runtime::io_driver::operations::sockets::managed_recv::socket_managed_recv;
 use runtime::io_driver::operations::sockets::multi_accept::MultiAccept;
 use runtime::io_driver::operations::sockets::recv::{socket_peek, socket_recv};
 use runtime::io_driver::operations::sockets::send::socket_send;
@@ -553,4 +554,30 @@ fn test_local_and_peer_addr() {
     // The accepted socket's peer is the client; the client's local is itself.
     assert_eq!(server_peer, client_local);
     assert_eq!(client_peer, server_local);
+}
+
+runtime::define_buf_ring!(pub EofRing, bgid = 0, buffer_size = 4096, ring_size = 8);
+
+#[test]
+fn a_managed_recv_reports_eof_as_none() {
+    let handle = std::thread::spawn(|| {
+        runtime::main_thread_with::<EofRing, _>(async {
+            let mut ma = MultiAccept::new(9199).unwrap();
+            let socket = ma.next().await.unwrap();
+
+            let data = socket_managed_recv::<EofRing>(&socket).await.unwrap();
+            let data = data.expect("data before EOF").as_ref().to_vec();
+            let eof = socket_managed_recv::<EofRing>(&socket).await.unwrap();
+            (data, eof.is_none())
+        })
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+    let mut client = TcpStream::connect("127.0.0.1:9199").unwrap();
+    client.write_all(b"Data").unwrap();
+    drop(client);
+
+    let (data, eof) = handle.join().unwrap();
+    assert_eq!(data, b"Data");
+    assert!(eof, "EOF should be Ok(None), not an error");
 }

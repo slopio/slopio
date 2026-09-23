@@ -66,7 +66,8 @@ fn kill_after_a_managed_recv_completed_gives_the_buffer_back() {
             let mut held = Vec::new();
             for _ in 0..2 {
                 match socket_managed_recv::<KillRing>(&probe).await {
-                    Ok(buffer) => held.push(buffer),
+                    Ok(Some(buffer)) => held.push(buffer),
+                    Ok(None) => panic!("the probe was never closed"),
                     Err(error) => panic!("the ring ran dry: {error:?}"),
                 }
             }
