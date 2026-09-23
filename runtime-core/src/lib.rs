@@ -10,7 +10,7 @@ pub mod task;
 pub mod tracing;
 
 pub use macros::scoped_tls;
-pub use task::{Handle, TypeAgnosticTask, new_task};
+pub use task::Handle;
 
 /// Re-exports used by `define_buf_ring!`-generated code. Not part of the
 /// public API; callers should not rely on items here directly.

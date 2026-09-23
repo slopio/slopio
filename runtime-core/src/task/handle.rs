@@ -9,16 +9,15 @@ pub struct Handle<T> {
 }
 impl<T> Unpin for Handle<T> {}
 
-impl<T> From<TypeAgnosticTask> for Handle<T> {
-    fn from(task: TypeAgnosticTask) -> Self {
+impl<T> Handle<T> {
+    /// `task`'s output type must be `T`.
+    pub(crate) fn new(task: TypeAgnosticTask) -> Self {
         Self {
             task: Some(task),
             _data: PhantomData,
         }
     }
-}
 
-impl<T> Handle<T> {
     /// Kills the task: its future is dropped by the scheduler on the next pass,
     /// running cancellation for anything it had in flight. An output already
     /// produced but not yet awaited is dropped too.

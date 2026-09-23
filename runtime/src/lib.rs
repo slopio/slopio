@@ -8,7 +8,7 @@ use runtime_core::runtime::eventfd;
 // Re-export core
 pub use runtime_core::io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec};
 pub use runtime_core::runtime::{RuntimeInner, spawn, yield_now};
-pub use runtime_core::task::{Handle, new_task};
+pub use runtime_core::task::Handle;
 pub use runtime_core::{channels, io_driver, net, runtime, task};
 // Re-export the buf-ring declaration macro so downstream crates can do
 // `runtime::define_buf_ring!(...)` without naming `runtime_core`.
