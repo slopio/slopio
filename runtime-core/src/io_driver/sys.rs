@@ -126,30 +126,57 @@ fn getname(
         return Err(io::Error::last_os_error());
     }
     let storage = unsafe { storage.assume_init() };
+    decode_sockaddr(&storage)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unsupported address family"))
+}
+
+/// A kernel-written address; `None` for a family other than v4/v6.
+pub(crate) fn decode_sockaddr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
     match storage.ss_family as c_int {
         libc::AF_INET => {
             let sin: libc::sockaddr_in =
-                unsafe { *(&storage as *const _ as *const libc::sockaddr_in) };
+                unsafe { *(storage as *const _ as *const libc::sockaddr_in) };
             let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-            Ok(SocketAddr::V4(SocketAddrV4::new(
+            Some(SocketAddr::V4(SocketAddrV4::new(
                 ip,
                 u16::from_be(sin.sin_port),
             )))
         }
         libc::AF_INET6 => {
             let sin6: libc::sockaddr_in6 =
-                unsafe { *(&storage as *const _ as *const libc::sockaddr_in6) };
+                unsafe { *(storage as *const _ as *const libc::sockaddr_in6) };
             let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-            Ok(SocketAddr::V6(SocketAddrV6::new(
+            Some(SocketAddr::V6(SocketAddrV6::new(
                 ip,
                 u16::from_be(sin6.sin6_port),
                 sin6.sin6_flowinfo,
                 sin6.sin6_scope_id,
             )))
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported address family",
-        )),
+        _ => None,
     }
+}
+
+/// `addr` in kernel form; the length covers only the family's own struct.
+pub(crate) fn encode_sockaddr(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(v4) => {
+            let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_addr.s6_addr = v6.ip().octets();
+            sin6.sin6_scope_id = v6.scope_id();
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (storage, len as libc::socklen_t)
 }

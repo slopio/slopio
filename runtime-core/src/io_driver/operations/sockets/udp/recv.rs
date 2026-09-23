@@ -2,15 +2,15 @@ use crate::io_driver::operations::sockets::OpSocket;
 use std::{
     any::Any,
     future::Future,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use io_uring::{opcode, types::Fd};
 
-use crate::io_driver::IO_DRIVER;
 use crate::io_driver::operations::{IoBufMut, OneshotToken};
+use crate::io_driver::{IO_DRIVER, sys};
 
 /// Heap-stable kernel-visible state for an in-flight `RecvMsg` op.
 /// `msghdr.msg_name` points into this struct's `addr` (kernel writes the
@@ -21,7 +21,7 @@ use crate::io_driver::operations::{IoBufMut, OneshotToken};
 struct UdpRecvState {
     msghdr: libc::msghdr,
     iovec: libc::iovec,
-    addr: libc::sockaddr_in,
+    addr: libc::sockaddr_storage,
 }
 
 /// Cancellation-safe UDP recv: takes ownership of the buffer, returns it on
@@ -59,11 +59,14 @@ impl<B: IoBufMut> UdpRecvFrom<B> {
         let iovec_ptr = &mut state.iovec as *mut libc::iovec;
 
         state.msghdr.msg_name = addr_ptr;
-        state.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        state.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
         state.msghdr.msg_iov = iovec_ptr;
         state.msghdr.msg_iovlen = 1;
 
-        let entry = opcode::RecvMsg::new(Fd(self.socket.fd()), &mut state.msghdr).build();
+        // MSG_TRUNC: the result is the datagram's real length, even past the buffer.
+        let entry = opcode::RecvMsg::new(Fd(self.socket.fd()), &mut state.msghdr)
+            .flags(libc::MSG_TRUNC as u32)
+            .build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
         self.id = Some(token);
     }
@@ -72,6 +75,7 @@ impl<B: IoBufMut> UdpRecvFrom<B> {
 pub struct UdpPacket {
     len: usize,
     addr: SocketAddr,
+    truncated: bool,
 }
 
 impl UdpPacket {
@@ -85,6 +89,11 @@ impl UdpPacket {
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The datagram was larger than the buffer; only `len()` bytes were kept.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 }
 
@@ -104,20 +113,25 @@ impl<B: IoBufMut> Future for UdpRecvFrom<B> {
                 let mut buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     len @ 0.. => {
-                        let n = len as usize;
+                        let full = len as usize;
+                        let n = full.min(buf.bytes_total());
                         // SAFETY: the kernel wrote `n` bytes into the buffer
                         // we handed it via `stable_mut_ptr` / `bytes_total`.
                         unsafe {
                             buf.set_init(n);
                         }
                         let state = self.state.as_ref().expect("state present");
-                        let addr = &state.addr;
-                        let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-                        let port = u16::from_be(addr.sin_port);
-                        Ok(UdpPacket {
-                            len: n,
-                            addr: SocketAddr::V4(SocketAddrV4::new(ip, port)),
-                        })
+                        match sys::decode_sockaddr(&state.addr) {
+                            Some(addr) => Ok(UdpPacket {
+                                len: n,
+                                addr,
+                                truncated: full > n,
+                            }),
+                            None => Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "unsupported address family",
+                            )),
+                        }
                     }
                     err => Err(std::io::Error::from_raw_os_error(-err)),
                 };

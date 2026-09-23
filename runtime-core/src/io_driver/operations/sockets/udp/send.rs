@@ -9,8 +9,8 @@ use std::{
 
 use io_uring::{opcode, types::Fd};
 
-use crate::io_driver::IO_DRIVER;
 use crate::io_driver::operations::{IoBuf, OneshotToken};
+use crate::io_driver::{IO_DRIVER, sys};
 
 /// Heap-stable kernel-visible state for an in-flight `SendMsg` op.
 /// `msghdr.msg_name` and `msghdr.msg_iov` point into this struct's `addr`
@@ -20,7 +20,8 @@ use crate::io_driver::operations::{IoBuf, OneshotToken};
 struct UdpSendState {
     msghdr: libc::msghdr,
     iovec: libc::iovec,
-    addr: libc::sockaddr_in,
+    addr: libc::sockaddr_storage,
+    addr_len: libc::socklen_t,
 }
 
 /// Cancellation-safe UDP send: takes ownership of the buffer, returns it on
@@ -36,22 +37,12 @@ pub struct UdpSendTo<B: IoBuf> {
 
 impl<B: IoBuf> UdpSendTo<B> {
     pub(super) fn new(socket: OpSocket, buf: B, dest: SocketAddr) -> Self {
-        let (ip, port) = match dest {
-            SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-            SocketAddr::V6(_) => panic!("IPv6 not supported"),
-        };
-
+        let (addr, addr_len) = sys::encode_sockaddr(&dest);
         let state = Box::new(UdpSendState {
             msghdr: unsafe { std::mem::zeroed() },
             iovec: unsafe { std::mem::zeroed() },
-            addr: libc::sockaddr_in {
-                sin_family: libc::AF_INET as u16,
-                sin_port: port.to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from(ip).to_be(),
-                },
-                sin_zero: [0; 8],
-            },
+            addr,
+            addr_len,
         });
 
         Self {
@@ -73,7 +64,7 @@ impl<B: IoBuf> UdpSendTo<B> {
         let iovec_ptr = &mut state.iovec as *mut libc::iovec;
 
         state.msghdr.msg_name = addr_ptr;
-        state.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        state.msghdr.msg_namelen = state.addr_len;
         state.msghdr.msg_iov = iovec_ptr;
         state.msghdr.msg_iovlen = 1;
 

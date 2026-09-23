@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -16,24 +16,23 @@ use super::UdpSocket;
 use crate::io_driver::{
     BorrowedBuffer, BufRingSpec, DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult,
     MultishotCompletionEvent,
-    operations::{IoOP, MultishotToken},
+    operations::{Continuation, IoOP, MultishotToken, sockets::multi_recv::CompletionError},
+    sys,
 };
 
 /// Stable storage for the msghdr template, boxed so it survives moves of the
-/// owning `UdpMultiRecv`.
+/// owning `UdpMultiRecv`. The kernel writes names into each buffer, not here;
+/// only `msg_namelen` is read, and it fits a v4 or v6 peer.
 struct MsgHdrBox {
     msghdr: libc::msghdr,
-    addr: libc::sockaddr_in,
 }
 
 impl MsgHdrBox {
     fn new() -> Box<Self> {
         let mut b = Box::new(Self {
             msghdr: unsafe { std::mem::zeroed() },
-            addr: unsafe { std::mem::zeroed() },
         });
-        b.msghdr.msg_name = &mut b.addr as *mut _ as *mut _;
-        b.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        b.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as u32;
         b
     }
 
@@ -50,6 +49,8 @@ pub struct UdpMultiRecv<S: BufRingSpec, const QUEUE_SIZE: usize = DEFAULT_QUEUE_
     /// `Some` until `into_inner` moves the socket out.
     socket: Option<UdpSocket>,
     reads: MultiOpQueue,
+    /// A fatal error was yielded: every later poll answers `None` without re-arming.
+    ended: bool,
     /// `Some` until `driver_cleanup` runs in `Drop`, at which point the Box
     /// is moved into the driver's keepalive slot.
     hdr: Option<Box<MsgHdrBox>>,
@@ -61,6 +62,7 @@ pub struct UdpDatagram<S: BufRingSpec> {
     payload_offset: usize,
     payload_len: usize,
     addr: SocketAddr,
+    truncated: bool,
 }
 
 impl<S: BufRingSpec> UdpDatagram<S> {
@@ -80,6 +82,11 @@ impl<S: BufRingSpec> UdpDatagram<S> {
     pub fn is_empty(&self) -> bool {
         self.payload_len == 0
     }
+
+    /// The datagram was larger than the ring's buffers; only `len()` bytes were kept.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 impl<S: BufRingSpec> UdpMultiRecv<S, DEFAULT_QUEUE_SIZE> {
@@ -94,6 +101,7 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
             id: None,
             socket: Some(socket),
             reads: MultiOpQueue::new(QUEUE_SIZE),
+            ended: false,
             hdr: Some(MsgHdrBox::new()),
             _spec: PhantomData,
         }
@@ -120,50 +128,76 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
         }
     }
 
-    fn try_parse(&self, event: MultishotCompletionEvent) -> Result<UdpDatagram<S>, ()> {
+    /// `Ok(None)`: a completion that carries no datagram, to be skipped.
+    fn try_parse(
+        &self,
+        event: MultishotCompletionEvent,
+    ) -> Result<Option<UdpDatagram<S>>, CompletionError> {
         if event.result <= 0 {
             if let Some(bid) = buffer_select(event.flags) {
                 S::recycle_bid(bid);
             }
-            return Err(());
+            if event.result == 0 {
+                return Ok(None);
+            }
+            return Err(CompletionError::from_code(event.result, event.flags));
         }
 
         let len = event.result as usize;
-        let bid = buffer_select(event.flags).ok_or(())?;
+        let Some(bid) = buffer_select(event.flags) else {
+            return Ok(None);
+        };
         let buffer = S::make_buffer(bid, len);
 
-        let parsed = RecvMsgOut::parse(
+        let Ok(parsed) = RecvMsgOut::parse(
             buffer.as_ref(),
             &self.hdr.as_ref().expect("hdr present").msghdr,
-        )
-        .map_err(|_| ())?;
+        ) else {
+            return Ok(None);
+        };
 
         let name = parsed.name_data();
-        if name.len() < std::mem::size_of::<libc::sockaddr_in>() {
-            return Err(());
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let copied = name
+            .len()
+            .min(std::mem::size_of::<libc::sockaddr_storage>());
+        unsafe {
+            std::ptr::copy_nonoverlapping(name.as_ptr(), &mut storage as *mut _ as *mut u8, copied);
         }
-
-        let sockaddr: libc::sockaddr_in = unsafe { std::ptr::read_unaligned(name.as_ptr().cast()) };
-        let ip = Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr));
-        let port = u16::from_be(sockaddr.sin_port);
-        let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
+        let Some(addr) = sys::decode_sockaddr(&storage) else {
+            return Ok(None);
+        };
 
         let payload = parsed.payload_data();
         let payload_offset = payload.as_ptr() as usize - buffer.as_ref().as_ptr() as usize;
         let payload_len = payload.len();
+        let truncated = parsed.is_payload_truncated();
 
-        Ok(UdpDatagram {
+        Ok(Some(UdpDatagram {
             buffer,
             payload_offset,
             payload_len,
             addr,
-        })
+            truncated,
+        }))
     }
 
-    fn try_drain_one(&mut self) -> Poll<Option<UdpDatagram<S>>> {
+    fn try_drain_one(&mut self) -> Poll<Option<Result<UdpDatagram<S>, CompletionError>>> {
         while let Some(event) = self.reads.pop() {
-            if let Ok(datagram) = self.try_parse(event) {
-                return Poll::Ready(Some(datagram));
+            match self.try_parse(event) {
+                Ok(Some(datagram)) => return Poll::Ready(Some(Ok(datagram))),
+                Ok(None) => continue,
+                Err(e) => match e.continuation() {
+                    Continuation::Continue => continue,
+                    // Armable still: the next poll re-arms, so the consumer
+                    // decides when to come back rather than spinning here.
+                    Continuation::ContinueLater => return Poll::Ready(Some(Err(e))),
+                    // Reported once, then the stream is over.
+                    Continuation::NotContinue => {
+                        self.ended = true;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
             }
         }
         Poll::Pending
@@ -193,14 +227,17 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
 impl<S: BufRingSpec, const QUEUE_SIZE: usize> Unpin for UdpMultiRecv<S, QUEUE_SIZE> {}
 
 impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for UdpMultiRecv<S, QUEUE_SIZE> {
-    type Item = UdpDatagram<S>;
+    type Item = Result<UdpDatagram<S>, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.ensure_registered();
-
+        if self.ended {
+            return Poll::Ready(None);
+        }
         if let Poll::Ready(result) = self.try_drain_one() {
             return Poll::Ready(result);
         }
+
+        self.ensure_registered();
 
         let waker = cx.waker();
         let token = self.id.unwrap();
