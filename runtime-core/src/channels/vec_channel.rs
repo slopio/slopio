@@ -3,12 +3,14 @@ use std::{
     future::Future,
     mem,
     pin::Pin,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
+
+use super::wait_list::{Left, WaitList};
 
 struct SharedState<T> {
     data: Vec<T>,
-    waker: Option<Waker>,
+    receivers: WaitList,
     sender_dropped: bool,
     receiver_dropped: bool,
 }
@@ -18,16 +20,9 @@ impl<T> SharedState<T> {
     fn new() -> Self {
         Self {
             data: Vec::new(),
-            waker: None,
+            receivers: WaitList::new(),
             sender_dropped: false,
             receiver_dropped: false,
-        }
-    }
-
-    #[inline]
-    fn wake(&mut self) {
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
         }
     }
 }
@@ -54,11 +49,8 @@ impl<T> Sender<T> {
         if state.receiver_dropped {
             return;
         }
-        let was_empty = state.data.is_empty();
         state.data.push(element);
-        if was_empty {
-            state.wake();
-        }
+        state.receivers.wake_one();
     }
 
     pub fn extend(&self, slice: &[T])
@@ -72,11 +64,8 @@ impl<T> Sender<T> {
         if state.receiver_dropped {
             return;
         }
-        let was_empty = state.data.is_empty();
         state.data.extend_from_slice(slice);
-        if was_empty {
-            state.wake();
-        }
+        state.receivers.wake_one();
     }
 }
 
@@ -87,7 +76,7 @@ impl<T> Drop for Sender<T> {
         if state.receiver_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
         } else {
-            state.wake();
+            state.receivers.wake_all();
         }
     }
 }
@@ -125,6 +114,7 @@ impl<T> Receiver<T> {
     pub fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture {
             shared: &self.shared,
+            waiter: None,
         }
     }
 }
@@ -144,6 +134,7 @@ impl<T> Drop for Receiver<T> {
 
 pub struct RecvFuture<'a, T> {
     shared: &'a Shared<T>,
+    waiter: Option<u64>,
 }
 
 impl<'a, T> Future for RecvFuture<'a, T> {
@@ -151,22 +142,31 @@ impl<'a, T> Future for RecvFuture<'a, T> {
 
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = unsafe { &mut *(*self.shared.0).get() };
+        let this = self.get_mut();
+        let state = unsafe { &mut *(*this.shared.0).get() };
 
         if !state.data.is_empty() {
+            state.receivers.leave(&mut this.waiter);
             return Poll::Ready(Some(mem::take(&mut state.data)));
         }
 
         if state.sender_dropped {
+            state.receivers.leave(&mut this.waiter);
             return Poll::Ready(None);
         }
 
-        match &state.waker {
-            Some(w) if w.will_wake(cx.waker()) => {}
-            _ => state.waker = Some(cx.waker().clone()),
-        }
-
+        state.receivers.park(&mut this.waiter, cx.waker());
         Poll::Pending
+    }
+}
+
+impl<T> Drop for RecvFuture<'_, T> {
+    fn drop(&mut self) {
+        let state = unsafe { &mut *(*self.shared.0).get() };
+        // Woken for a batch it will never take: hand the wake on.
+        if state.receivers.leave(&mut self.waiter) == Left::Woken && !state.data.is_empty() {
+            state.receivers.wake_one();
+        }
     }
 }
 

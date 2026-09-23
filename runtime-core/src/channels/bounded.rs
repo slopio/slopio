@@ -3,14 +3,16 @@ use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
+
+use super::wait_list::{Left, WaitList};
 
 struct SharedState<T> {
     data: VecDeque<T>,
     capacity: usize,
-    recv_waker: Option<Waker>,
-    send_waker: Option<Waker>,
+    receivers: WaitList,
+    senders: WaitList,
     sender_dropped: bool,
     receiver_dropped: bool,
 }
@@ -20,24 +22,10 @@ impl<T> SharedState<T> {
         Self {
             data: VecDeque::new(),
             capacity,
-            recv_waker: None,
-            send_waker: None,
+            receivers: WaitList::new(),
+            senders: WaitList::new(),
             sender_dropped: false,
             receiver_dropped: false,
-        }
-    }
-
-    #[inline]
-    fn wake_recv(&mut self) {
-        if let Some(waker) = self.recv_waker.take() {
-            waker.wake();
-        }
-    }
-
-    #[inline]
-    fn wake_send(&mut self) {
-        if let Some(waker) = self.send_waker.take() {
-            waker.wake();
         }
     }
 }
@@ -63,6 +51,7 @@ pub struct Receiver<T> {
 pub struct SendFuture<'a, T> {
     shared: &'a Shared<T>,
     element: Option<T>,
+    waiter: Option<u64>,
 }
 
 impl<T> Unpin for SendFuture<'_, T> {}
@@ -76,21 +65,30 @@ impl<'a, T> Future for SendFuture<'a, T> {
         let state = unsafe { &mut *(*this.shared.0).get() };
 
         if state.receiver_dropped {
+            state.senders.leave(&mut this.waiter);
             return Poll::Ready(Err(this.element.take().unwrap()));
         }
 
         if state.data.len() < state.capacity {
+            state.senders.leave(&mut this.waiter);
             state.data.push_back(this.element.take().unwrap());
-            state.wake_recv();
+            state.receivers.wake_one();
             return Poll::Ready(Ok(()));
         }
 
-        match &state.send_waker {
-            Some(w) if w.will_wake(cx.waker()) => {}
-            _ => state.send_waker = Some(cx.waker().clone()),
-        }
-
+        state.senders.park(&mut this.waiter, cx.waker());
         Poll::Pending
+    }
+}
+
+impl<T> Drop for SendFuture<'_, T> {
+    fn drop(&mut self) {
+        let state = unsafe { &mut *(*self.shared.0).get() };
+        // Woken for a free slot it will never take: hand the wake on.
+        if state.senders.leave(&mut self.waiter) == Left::Woken && state.data.len() < state.capacity
+        {
+            state.senders.wake_one();
+        }
     }
 }
 
@@ -100,6 +98,7 @@ impl<T> Sender<T> {
         SendFuture {
             shared: &self.shared,
             element: Some(element),
+            waiter: None,
         }
     }
 }
@@ -111,7 +110,7 @@ impl<T> Drop for Sender<T> {
         if state.receiver_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
         } else {
-            state.wake_recv();
+            state.receivers.wake_all();
         }
     }
 }
@@ -125,7 +124,7 @@ impl<T> Drop for Receiver<T> {
         if state.sender_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
         } else {
-            state.wake_send();
+            state.senders.wake_all();
         }
         drop(data);
     }
@@ -133,6 +132,7 @@ impl<T> Drop for Receiver<T> {
 
 pub struct RecvFuture<'a, T> {
     shared: &'a Shared<T>,
+    waiter: Option<u64>,
 }
 
 impl<'a, T> Future for RecvFuture<'a, T> {
@@ -140,28 +140,34 @@ impl<'a, T> Future for RecvFuture<'a, T> {
 
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = unsafe { &mut *(*self.shared.0).get() };
+        let this = self.get_mut();
+        let state = unsafe { &mut *(*this.shared.0).get() };
 
         if let Some(e) = state.data.pop_front() {
-            state.wake_send();
+            state.receivers.leave(&mut this.waiter);
+            state.senders.wake_one();
             return Poll::Ready(Some(e));
         }
 
         if state.sender_dropped {
+            state.receivers.leave(&mut this.waiter);
             return Poll::Ready(None);
         }
 
-        match &state.recv_waker {
-            Some(w) if w.will_wake(cx.waker()) => {}
-            _ => state.recv_waker = Some(cx.waker().clone()),
-        }
-
+        state.receivers.park(&mut this.waiter, cx.waker());
         Poll::Pending
+    }
+}
+
+impl<T> Drop for RecvFuture<'_, T> {
+    fn drop(&mut self) {
+        pass_on_recv_wake(self.shared, &mut self.waiter);
     }
 }
 
 pub struct RecvAllFuture<'a, T> {
     shared: &'a Shared<T>,
+    waiter: Option<u64>,
 }
 
 impl<'a, T> Future for RecvAllFuture<'a, T> {
@@ -169,24 +175,37 @@ impl<'a, T> Future for RecvAllFuture<'a, T> {
 
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = unsafe { &mut *(*self.shared.0).get() };
+        let this = self.get_mut();
+        let state = unsafe { &mut *(*this.shared.0).get() };
 
         if !state.data.is_empty() {
-            let items = state.data.drain(..).collect();
-            state.wake_send();
+            state.receivers.leave(&mut this.waiter);
+            let items: Vec<T> = state.data.drain(..).collect();
+            state.senders.wake_n(items.len());
             return Poll::Ready(Some(items));
         }
 
         if state.sender_dropped {
+            state.receivers.leave(&mut this.waiter);
             return Poll::Ready(None);
         }
 
-        match &state.recv_waker {
-            Some(w) if w.will_wake(cx.waker()) => {}
-            _ => state.recv_waker = Some(cx.waker().clone()),
-        }
-
+        state.receivers.park(&mut this.waiter, cx.waker());
         Poll::Pending
+    }
+}
+
+impl<T> Drop for RecvAllFuture<'_, T> {
+    fn drop(&mut self) {
+        pass_on_recv_wake(self.shared, &mut self.waiter);
+    }
+}
+
+/// A receive future woken for an item it will never take hands the wake on.
+fn pass_on_recv_wake<T>(shared: &Shared<T>, waiter: &mut Option<u64>) {
+    let state = unsafe { &mut *(*shared.0).get() };
+    if state.receivers.leave(waiter) == Left::Woken && !state.data.is_empty() {
+        state.receivers.wake_one();
     }
 }
 
@@ -195,6 +214,7 @@ impl<T> Receiver<T> {
     pub fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture {
             shared: &self.shared,
+            waiter: None,
         }
     }
 
@@ -202,6 +222,7 @@ impl<T> Receiver<T> {
     pub fn recv_all(&self) -> RecvAllFuture<'_, T> {
         RecvAllFuture {
             shared: &self.shared,
+            waiter: None,
         }
     }
 }

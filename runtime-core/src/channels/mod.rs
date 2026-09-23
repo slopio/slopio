@@ -1,6 +1,7 @@
 mod bounded;
 mod unbounded;
 mod vec_channel;
+mod wait_list;
 
 pub use bounded::{
     Receiver as BoundedReceiver, RecvAllFuture as BoundedRecvAllFuture,

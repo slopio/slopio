@@ -11,12 +11,14 @@
 
 mod common;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::future::poll_fn;
 use std::rc::Rc;
+use std::task::{Poll, Waker};
 
 use common::on_runtime;
 use runtime_core::Handle;
-use runtime_core::channels::{Receiver, Sender, unbounded_channel};
+use runtime_core::channels::unbounded_channel;
 use runtime_core::runtime::{spawn, yield_now};
 
 /// Flips a shared flag when dropped, so a test can see the future go away.
@@ -123,24 +125,33 @@ fn kill_from_inside_the_task() {
     });
 }
 
-/// Fields drop in declaration order: the sender goes first and wakes the
-/// receiver's registered waker, which is the task being dropped.
-struct Both {
-    _send: Sender<()>,
-    recv: Receiver<()>,
+/// Wakes the task that dropped it: parks with the task's waker, and its drop
+/// glue fires that waker while the task is being killed.
+struct WakeOnDrop(Rc<RefCell<Option<Waker>>>);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        if let Some(waker) = self.0.borrow_mut().take() {
+            waker.wake();
+        }
+    }
 }
 
 #[test]
 fn kill_survives_a_self_wake_during_drop() {
     on_runtime(async {
         let dropped = Rc::new(Cell::new(false));
-        let (send, recv) = unbounded_channel::<()>();
         let handle = spawn({
             let flag = DropFlag(dropped.clone());
             async move {
                 let _flag = flag;
-                let both = Both { _send: send, recv };
-                both.recv.recv().await;
+                let slot = Rc::new(RefCell::new(None));
+                let _guard = WakeOnDrop(slot.clone());
+                poll_fn(|cx| {
+                    *slot.borrow_mut() = Some(cx.waker().clone());
+                    Poll::<()>::Pending
+                })
+                .await;
             }
         });
         yield_now().await;

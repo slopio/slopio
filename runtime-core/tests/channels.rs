@@ -479,3 +479,146 @@ fn purge_may_drop_the_receiver_from_the_queue() {
 fn a_bounded_channel_cannot_have_zero_capacity() {
     let _ = bounded_channel::<u32>(0);
 }
+
+// ------------------------------------------------------- several waiters
+
+#[test]
+fn every_parked_sender_is_woken_as_slots_open() {
+    let (tx, rx) = bounded_channel(1);
+    let (_, waker) = Counter::new();
+    assert!(poll_once(&mut tx.send(0u32), &waker).is_ready());
+
+    let (a, wa) = Counter::new();
+    let (b, wb) = Counter::new();
+    let mut send_a = tx.send(1);
+    let mut send_b = tx.send(2);
+    assert!(poll_once(&mut send_a, &wa).is_pending());
+    assert!(poll_once(&mut send_b, &wb).is_pending());
+
+    assert_eq!(poll_once(&mut rx.recv(), &waker), Poll::Ready(Some(0)));
+    assert_eq!(
+        (a.count(), b.count()),
+        (1, 0),
+        "one slot, one sender, in order"
+    );
+    assert!(matches!(poll_once(&mut send_a, &wa), Poll::Ready(Ok(()))));
+
+    assert_eq!(poll_once(&mut rx.recv(), &waker), Poll::Ready(Some(1)));
+    assert_eq!(b.count(), 1, "the second sender must not be forgotten");
+    assert!(matches!(poll_once(&mut send_b, &wb), Poll::Ready(Ok(()))));
+    assert_eq!(poll_once(&mut rx.recv(), &waker), Poll::Ready(Some(2)));
+}
+
+#[test]
+fn recv_all_wakes_one_sender_per_freed_slot() {
+    let (tx, rx) = bounded_channel(2);
+    let (_, waker) = Counter::new();
+    assert!(poll_once(&mut tx.send(0u32), &waker).is_ready());
+    assert!(poll_once(&mut tx.send(1), &waker).is_ready());
+
+    let counters: Vec<_> = (0..3).map(|_| Counter::new()).collect();
+    let mut sends: Vec<_> = (2..5).map(|i| tx.send(i)).collect();
+    for (send, (_, w)) in sends.iter_mut().zip(&counters) {
+        assert!(poll_once(send, w).is_pending());
+    }
+
+    assert_eq!(
+        poll_once(&mut rx.recv_all(), &waker),
+        Poll::Ready(Some(vec![0, 1]))
+    );
+    let woken: Vec<_> = counters.iter().map(|(c, _)| c.count()).collect();
+    assert_eq!(woken, [1, 1, 0]);
+}
+
+#[test]
+fn a_woken_sender_dropped_hands_its_slot_to_the_next() {
+    let (tx, rx) = bounded_channel(1);
+    let (_, waker) = Counter::new();
+    assert!(poll_once(&mut tx.send(0u32), &waker).is_ready());
+
+    let (a, wa) = Counter::new();
+    let (b, wb) = Counter::new();
+    let mut send_a = tx.send(1);
+    let mut send_b = tx.send(2);
+    assert!(poll_once(&mut send_a, &wa).is_pending());
+    assert!(poll_once(&mut send_b, &wb).is_pending());
+
+    assert_eq!(poll_once(&mut rx.recv(), &waker), Poll::Ready(Some(0)));
+    assert_eq!(a.count(), 1);
+    drop(send_a);
+    assert_eq!(b.count(), 1, "the wake A never used must reach B");
+    assert!(matches!(poll_once(&mut send_b, &wb), Poll::Ready(Ok(()))));
+}
+
+#[test]
+fn a_gone_receiver_wakes_every_parked_sender() {
+    let (tx, rx) = bounded_channel(1);
+    let (_, waker) = Counter::new();
+    assert!(poll_once(&mut tx.send(0u32), &waker).is_ready());
+
+    let (a, wa) = Counter::new();
+    let (b, wb) = Counter::new();
+    let mut send_a = tx.send(1);
+    let mut send_b = tx.send(2);
+    assert!(poll_once(&mut send_a, &wa).is_pending());
+    assert!(poll_once(&mut send_b, &wb).is_pending());
+
+    drop(rx);
+    assert_eq!((a.count(), b.count()), (1, 1));
+    assert!(matches!(poll_once(&mut send_a, &wa), Poll::Ready(Err(1))));
+    assert!(matches!(poll_once(&mut send_b, &wb), Poll::Ready(Err(2))));
+}
+
+#[test]
+fn every_parked_receiver_is_woken_by_a_send() {
+    let (tx, rx) = unbounded_channel();
+    let (a, wa) = Counter::new();
+    let (b, wb) = Counter::new();
+    let mut recv_a = rx.recv();
+    let mut recv_b = rx.recv();
+    assert!(poll_once(&mut recv_a, &wa).is_pending());
+    assert!(poll_once(&mut recv_b, &wb).is_pending());
+
+    tx.send(1u32);
+    tx.send(2);
+    assert_eq!(
+        (a.count(), b.count()),
+        (1, 1),
+        "the second send must not be lost"
+    );
+    assert_eq!(poll_once(&mut recv_a, &wa), Poll::Ready(Some(1)));
+    assert_eq!(poll_once(&mut recv_b, &wb), Poll::Ready(Some(2)));
+}
+
+#[test]
+fn a_woken_receiver_dropped_hands_its_item_to_the_next() {
+    let (tx, rx) = unbounded_channel();
+    let (a, wa) = Counter::new();
+    let (b, wb) = Counter::new();
+    let mut recv_a = rx.recv();
+    let mut recv_b = rx.recv();
+    assert!(poll_once(&mut recv_a, &wa).is_pending());
+    assert!(poll_once(&mut recv_b, &wb).is_pending());
+
+    tx.send(7u32);
+    assert_eq!((a.count(), b.count()), (1, 0));
+    drop(recv_a);
+    assert_eq!(b.count(), 1, "the item A never took must wake B");
+    assert_eq!(poll_once(&mut recv_b, &wb), Poll::Ready(Some(7)));
+}
+
+#[test]
+fn a_gone_sender_wakes_every_parked_receiver() {
+    let (tx, rx) = unbounded_channel::<u32>();
+    let (a, wa) = Counter::new();
+    let (b, wb) = Counter::new();
+    let mut recv_a = rx.recv();
+    let mut recv_b = rx.recv();
+    assert!(poll_once(&mut recv_a, &wa).is_pending());
+    assert!(poll_once(&mut recv_b, &wb).is_pending());
+
+    drop(tx);
+    assert_eq!((a.count(), b.count()), (1, 1));
+    assert_eq!(poll_once(&mut recv_a, &wa), Poll::Ready(None));
+    assert_eq!(poll_once(&mut recv_b, &wb), Poll::Ready(None));
+}

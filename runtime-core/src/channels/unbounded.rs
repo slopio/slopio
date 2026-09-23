@@ -3,12 +3,14 @@ use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
+
+use super::wait_list::{Left, WaitList};
 
 struct SharedState<T> {
     data: VecDeque<T>,
-    waker: Option<Waker>,
+    receivers: WaitList,
     sender_dropped: bool,
     receiver_dropped: bool,
 }
@@ -18,16 +20,9 @@ impl<T> SharedState<T> {
     fn new() -> Self {
         Self {
             data: VecDeque::new(),
-            waker: None,
+            receivers: WaitList::new(),
             sender_dropped: false,
             receiver_dropped: false,
-        }
-    }
-
-    #[inline]
-    fn wake(&mut self) {
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
         }
     }
 }
@@ -55,11 +50,8 @@ impl<T> Sender<T> {
         if state.receiver_dropped {
             return;
         }
-        let was_empty = state.data.is_empty();
         state.data.push_back(element);
-        if was_empty {
-            state.wake();
-        }
+        state.receivers.wake_one();
     }
 
     #[inline]
@@ -78,7 +70,7 @@ impl<T> Drop for Sender<T> {
         if state.receiver_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
         } else {
-            state.wake();
+            state.receivers.wake_all();
         }
     }
 }
@@ -109,6 +101,7 @@ impl<T> Drop for Receiver<T> {
 
 pub struct RecvFuture<'a, T> {
     shared: &'a Shared<T>,
+    waiter: Option<u64>,
 }
 
 impl<'a, T> Future for RecvFuture<'a, T> {
@@ -116,27 +109,33 @@ impl<'a, T> Future for RecvFuture<'a, T> {
 
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = unsafe { &mut *(*self.shared.0).get() };
+        let this = self.get_mut();
+        let state = unsafe { &mut *(*this.shared.0).get() };
 
         if let Some(e) = state.data.pop_front() {
+            state.receivers.leave(&mut this.waiter);
             return Poll::Ready(Some(e));
         }
 
         if state.sender_dropped {
+            state.receivers.leave(&mut this.waiter);
             return Poll::Ready(None);
         }
 
-        match &state.waker {
-            Some(w) if w.will_wake(cx.waker()) => {}
-            _ => state.waker = Some(cx.waker().clone()),
-        }
-
+        state.receivers.park(&mut this.waiter, cx.waker());
         Poll::Pending
+    }
+}
+
+impl<T> Drop for RecvFuture<'_, T> {
+    fn drop(&mut self) {
+        pass_on_recv_wake(self.shared, &mut self.waiter);
     }
 }
 
 pub struct RecvAllFuture<'a, T> {
     shared: &'a Shared<T>,
+    waiter: Option<u64>,
 }
 
 impl<'a, T> Future for RecvAllFuture<'a, T> {
@@ -144,23 +143,36 @@ impl<'a, T> Future for RecvAllFuture<'a, T> {
 
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = unsafe { &mut *(*self.shared.0).get() };
+        let this = self.get_mut();
+        let state = unsafe { &mut *(*this.shared.0).get() };
 
         if !state.data.is_empty() {
+            state.receivers.leave(&mut this.waiter);
             let items = state.data.drain(..).collect();
             return Poll::Ready(Some(items));
         }
 
         if state.sender_dropped {
+            state.receivers.leave(&mut this.waiter);
             return Poll::Ready(None);
         }
 
-        match &state.waker {
-            Some(w) if w.will_wake(cx.waker()) => {}
-            _ => state.waker = Some(cx.waker().clone()),
-        }
-
+        state.receivers.park(&mut this.waiter, cx.waker());
         Poll::Pending
+    }
+}
+
+impl<T> Drop for RecvAllFuture<'_, T> {
+    fn drop(&mut self) {
+        pass_on_recv_wake(self.shared, &mut self.waiter);
+    }
+}
+
+/// A receive future woken for an item it will never take hands the wake on.
+fn pass_on_recv_wake<T>(shared: &Shared<T>, waiter: &mut Option<u64>) {
+    let state = unsafe { &mut *(*shared.0).get() };
+    if state.receivers.leave(waiter) == Left::Woken && !state.data.is_empty() {
+        state.receivers.wake_one();
     }
 }
 
@@ -169,6 +181,7 @@ impl<T> Receiver<T> {
     pub fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture {
             shared: &self.shared,
+            waiter: None,
         }
     }
 
@@ -176,6 +189,7 @@ impl<T> Receiver<T> {
     pub fn recv_all(&self) -> RecvAllFuture<'_, T> {
         RecvAllFuture {
             shared: &self.shared,
+            waiter: None,
         }
     }
 

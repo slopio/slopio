@@ -137,9 +137,9 @@ fn kill_after_a_fixed_5s_timer_fired_holds_a_stale_token() {
     });
 }
 
-/// A receiver shared with the killed task keeps that task's waker past the
-/// reap. The waker holds the box alive; the send consumes it and the
-/// scheduler frees the box on the pass after. Miri checks both halves: no
+/// A receiver shared with the killed task outlives it. Reaping drops the
+/// task's recv future, which takes its waker out of the channel, so the send
+/// that follows finds no one to wake. Miri checks both halves: no
 /// use-after-free on the send, no leak at exit.
 #[test]
 fn kill_then_send_on_a_shared_receiver_frees_the_task() {
@@ -155,10 +155,8 @@ fn kill_then_send_on_a_shared_receiver_frees_the_task() {
         // Task polled once: its waker is now parked in the channel.
         yield_now().await;
         handle.kill();
-        // Reaped; the channel's waker is the last ref to the box.
+        // Reaped, and its waker left the channel with its recv future.
         yield_now().await;
         send.send(());
-        // The send queued the reaped task; this pass pops and frees it.
-        yield_now().await;
     });
 }
