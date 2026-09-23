@@ -168,11 +168,11 @@ impl SocketWrapper {
         socket_send_vectored_fixed_zc(self, bufs)
     }
 
-    pub fn send_control_record<'a>(
+    pub fn send_control_record<B: IoBuf>(
         &self,
         record_type: u8,
-        payload: &'a [u8],
-    ) -> WriteControlRecord<'a> {
+        payload: B,
+    ) -> WriteControlRecord<B> {
         socket_send_control_record(self, record_type, payload)
     }
 

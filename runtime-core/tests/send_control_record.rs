@@ -73,11 +73,12 @@ fn control_record_emits_correct_content_type() {
             panic!("kTLS setup failed ({e}); load the `tls` kernel module: `sudo modprobe tls`");
         }
         // record_type 21 = TLS Alert; payload is a close_notify (level=warning, desc=0).
-        let payload = [1u8, 0];
-        let n = socket_send_control_record(&socket, 21, &payload)
+        let payload = vec![1u8, 0];
+        let len = payload.len();
+        let n = socket_send_control_record(&socket, 21, payload)
             .await
             .expect("sendmsg failed");
-        assert_eq!(n, payload.len());
+        assert_eq!(n, len);
     });
 
     let hdr = rx.join().unwrap();

@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use crate::io_driver::{
     IO_DRIVER,
     operations::{
-        OneshotToken,
+        IoBuf, OneshotToken,
         sockets::{OpSocket, SocketWrapper},
     },
 };
@@ -21,51 +21,52 @@ struct ControlBuf {
 }
 
 /// Heap-stable kernel-visible state for an in-flight `SendMsg` with a cmsg
-/// payload. `msghdr.msg_iov` points into `iovec`; `msghdr.msg_control` points
-/// into `ctrl.words`. Boxed so the address stays stable across future moves
-/// and outlives the future when cancelled.
+/// payload. `msghdr.msg_iov` points into `iovec`, which points into `payload`;
+/// `msghdr.msg_control` points into `ctrl.words`. Boxed so the address stays
+/// stable across future moves and outlives the future when cancelled.
 #[allow(dead_code)]
-struct ControlRecordState {
+struct ControlRecordState<B> {
     msghdr: libc::msghdr,
     iovec: libc::iovec,
     ctrl: ControlBuf,
+    payload: B,
 }
 
-pub fn socket_send_control_record<'a>(
+/// Cancellation-safe: owns the payload, which is kept alive with the msghdr
+/// until the cancelled CQE arrives if the future is dropped mid-flight.
+pub fn socket_send_control_record<B: IoBuf>(
     socket: &SocketWrapper,
     record_type: u8,
-    payload: &'a [u8],
-) -> WriteControlRecord<'a> {
+    payload: B,
+) -> WriteControlRecord<B> {
     let state = Box::new(ControlRecordState {
         msghdr: unsafe { std::mem::zeroed() },
         iovec: unsafe { std::mem::zeroed() },
         ctrl: ControlBuf { words: [0; 4] },
+        payload,
     });
     WriteControlRecord {
         socket: socket.share(),
         id: None,
-        payload,
         record_type,
         state: Some(state),
     }
 }
 
-pub struct WriteControlRecord<'a> {
+pub struct WriteControlRecord<B: IoBuf> {
     socket: OpSocket,
     id: Option<OneshotToken>,
-    payload: &'a [u8],
     record_type: u8,
-    state: Option<Box<ControlRecordState>>,
+    state: Option<Box<ControlRecordState<B>>>,
 }
 
-impl<'a> WriteControlRecord<'a> {
-    fn register_to_driver(self: Pin<&mut Self>) {
-        let this = unsafe { self.get_unchecked_mut() };
-        let state = this.state.as_mut().expect("state present");
+impl<B: IoBuf> WriteControlRecord<B> {
+    fn register_to_driver(&mut self) {
+        let state = self.state.as_mut().expect("state present");
 
         state.iovec = libc::iovec {
-            iov_base: this.payload.as_ptr() as *mut _,
-            iov_len: this.payload.len(),
+            iov_base: state.payload.stable_ptr() as *mut _,
+            iov_len: state.payload.bytes_init(),
         };
 
         let ctrl_ptr = state.ctrl.words.as_mut_ptr() as *mut u8;
@@ -79,7 +80,7 @@ impl<'a> WriteControlRecord<'a> {
             (*cmsg).cmsg_level = SOL_TLS;
             (*cmsg).cmsg_type = TLS_SET_RECORD_TYPE;
             (*cmsg).cmsg_len = libc::CMSG_LEN(1) as _;
-            *libc::CMSG_DATA(cmsg) = this.record_type;
+            *libc::CMSG_DATA(cmsg) = self.record_type;
         }
 
         let iovec_ptr = &mut state.iovec as *mut libc::iovec;
@@ -93,18 +94,18 @@ impl<'a> WriteControlRecord<'a> {
             msg_flags: 0,
         };
 
-        let entry = opcode::SendMsg::new(Fd(this.socket.fd()), &state.msghdr).build();
+        let entry = opcode::SendMsg::new(Fd(self.socket.fd()), &state.msghdr).build();
         let token = IO_DRIVER.with(|d| d.push_op(entry));
-        this.id = Some(token);
+        self.id = Some(token);
     }
 }
 
-impl<'a> Future for WriteControlRecord<'a> {
+impl<B: IoBuf> Future for WriteControlRecord<B> {
     type Output = std::io::Result<usize>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.id.is_none() {
-            self.as_mut().register_to_driver();
+            self.register_to_driver();
         }
         let waker = cx.waker();
         let token = self.id.unwrap();
@@ -121,11 +122,11 @@ impl<'a> Future for WriteControlRecord<'a> {
     }
 }
 
-impl<'a> Drop for WriteControlRecord<'a> {
+impl<B: IoBuf> Drop for WriteControlRecord<B> {
     fn drop(&mut self) {
         if let Some(token) = self.id {
-            // Move the boxed msghdr/iovec/ctrl into keepalive — kernel may
-            // still dereference msghdr → iovec/ctrl until cancel completes.
+            // Move the boxed msghdr/iovec/ctrl/payload into keepalive — kernel
+            // may still dereference msghdr → iovec/ctrl until cancel completes.
             let keep = self.state.take().map(|s| s as Box<dyn Any>);
             let parked = Some(self.socket.park());
             IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
