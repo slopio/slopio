@@ -378,3 +378,20 @@ fn test_sleep_completes_while_scheduler_is_busy() {
         elapsed
     );
 }
+
+/// Polled again after it fired, a sleep stays ready instead of re-arming.
+#[test]
+fn a_fired_sleep_stays_ready() {
+    main_thread(async {
+        let mut sleep = std::pin::pin!(Sleep::during(Duration::from_millis(10)));
+        sleep.as_mut().await;
+
+        let start = Instant::now();
+        sleep.as_mut().await;
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "the second await slept again: {:?}",
+            start.elapsed()
+        );
+    });
+}

@@ -92,6 +92,8 @@ enum Armed {
 pub struct Sleep {
     duration: Duration,
     armed: Option<Armed>,
+    /// Fired once: every later poll is Ready without re-arming.
+    fired: bool,
 }
 
 impl Sleep {
@@ -103,6 +105,7 @@ impl Sleep {
         Self {
             duration,
             armed: None,
+            fired: false,
         }
     }
 }
@@ -114,10 +117,14 @@ impl Future for Sleep {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        if self.fired {
+            return std::task::Poll::Ready(());
+        }
         if let Some(armed) = self.armed {
             let result = TIME_DRIVER.with(|d| d.poll(armed, cx.waker()));
             if result.is_ready() {
                 self.armed = None;
+                self.fired = true;
             }
             result
         } else {
