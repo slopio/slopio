@@ -196,9 +196,14 @@ impl MultiOpQueue {
     }
 }
 
+/// The placeholder `mem::take` leaves behind in a state transition: never
+/// pushed to, so it must not allocate.
 impl Default for MultiOpQueue {
     fn default() -> Self {
-        Self::new(DEFAULT_QUEUE_SIZE)
+        Self {
+            inner: VecDeque::new(),
+            pause_threshold: DEFAULT_QUEUE_SIZE,
+        }
     }
 }
 
