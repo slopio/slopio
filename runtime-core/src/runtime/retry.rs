@@ -25,7 +25,8 @@ where
         attempt += 1;
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e) if max == Some(attempt) => return Err(RetryError::Failed(e)),
+            // `Some(0)` still makes the one attempt that yields an error to return.
+            Err(e) if max.is_some_and(|m| attempt >= m) => return Err(RetryError::Failed(e)),
             Err(_) if IO_DRIVER.with(|d| d.shutdown()) => return Err(RetryError::Shutdown),
             Err(e) if should_retry(&e) => Sleep::during(delay).await,
             Err(e) => return Err(RetryError::Failed(e)),

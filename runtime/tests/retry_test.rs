@@ -137,3 +137,22 @@ fn test_retry_selective_should_retry() {
     });
     assert_eq!(result, Err(RetryError::Failed(MyErr::Permanent)));
 }
+
+#[test]
+fn a_max_of_zero_attempts_once_and_gives_up() {
+    let attempts = Cell::new(0);
+    let result: Result<i32, RetryError<&str>> = main_thread(async {
+        retry(
+            Some(0),
+            Duration::from_millis(1),
+            || async {
+                attempts.set(attempts.get() + 1);
+                Err("nope")
+            },
+            |_| true,
+        )
+        .await
+    });
+    assert_eq!(result, Err(RetryError::Failed("nope")));
+    assert_eq!(attempts.get(), 1);
+}
