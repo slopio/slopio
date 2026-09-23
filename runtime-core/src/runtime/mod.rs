@@ -232,7 +232,7 @@ pub fn send_to_peer(thread_id: usize, data: i32, payload: u64) {
 
 /// Await the next message sent to this worker by a peer.
 pub fn recv_from_peer() -> RecvFromPeer {
-    RecvFromPeer { _priv: () }
+    RecvFromPeer { parked: false }
 }
 
 /// Send a heap-allocated, typed message to peer `thread_id`. The payload is
@@ -302,6 +302,7 @@ pub unsafe fn send_shared_to_peer<T: Send + 'static>(thread_id: usize, msg: Arc<
 /// undefined behaviour.
 pub unsafe fn recv_msg_from_peer<T: 'static>() -> RecvMsgFromPeer<T> {
     RecvMsgFromPeer {
+        parked: false,
         _marker: std::marker::PhantomData,
     }
 }
@@ -310,7 +311,21 @@ pub unsafe fn recv_msg_from_peer<T: 'static>() -> RecvMsgFromPeer<T> {
 /// message cast to `Arc<Message<T>>`, parking on the worker's message inbox until
 /// one arrives.
 pub struct RecvMsgFromPeer<T> {
+    /// This future is the inbox's parked consumer.
+    parked: bool,
     _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Drop for RecvMsgFromPeer<T> {
+    fn drop(&mut self) {
+        if self.parked {
+            crate::io_driver::IO_DRIVER.try_with(|d| {
+                if let Some(d) = d {
+                    d.leave_msg_inbox(&mut self.parked);
+                }
+            });
+        }
+    }
 }
 
 impl<T: 'static> std::future::Future for RecvMsgFromPeer<T> {
@@ -320,8 +335,9 @@ impl<T: 'static> std::future::Future for RecvMsgFromPeer<T> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> std::task::Poll<Arc<Message<T>>> {
+        let this = self.get_mut();
         crate::io_driver::IO_DRIVER
-            .with(|d| d.poll_msg_inbox(cx.waker()))
+            .with(|d| d.poll_msg_inbox(cx.waker(), &mut this.parked))
             // SAFETY: forwarded from `recv_msg_from_peer`'s contract — the
             // caller guarantees the next message is a `Message<T>`.
             .map(|erased| unsafe { erased.into_typed::<T>() })
@@ -556,14 +572,28 @@ impl Drop for ReplySignal {
 /// Future returned by [`recv_from_peer`]. Resolves to the next inbound
 /// [`PeerMessage`], parking on the worker's inbox until one arrives.
 pub struct RecvFromPeer {
-    _priv: (),
+    /// This future is the inbox's parked consumer.
+    parked: bool,
 }
 
 impl std::future::Future for RecvFromPeer {
     type Output = PeerMessage;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<PeerMessage> {
-        crate::io_driver::IO_DRIVER.with(|d| d.poll_peer_inbox(cx.waker()))
+        let this = self.get_mut();
+        crate::io_driver::IO_DRIVER.with(|d| d.poll_peer_inbox(cx.waker(), &mut this.parked))
+    }
+}
+
+impl Drop for RecvFromPeer {
+    fn drop(&mut self) {
+        if self.parked {
+            crate::io_driver::IO_DRIVER.try_with(|d| {
+                if let Some(d) = d {
+                    d.leave_peer_inbox(&mut self.parked);
+                }
+            });
+        }
     }
 }
 

@@ -136,12 +136,16 @@ pub struct PeerMessage {
 struct PeerInbox {
     queue: VecDeque<PeerMessage>,
     waker: Option<Waker>,
+    /// A receive future is parked here; the inbox has a single consumer.
+    parked: bool,
 }
 
 #[derive(Default)]
 struct MsgInbox {
     queue: VecDeque<ErasedMessage>,
     waker: Option<Waker>,
+    /// A receive future is parked here; the inbox has a single consumer.
+    parked: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -717,15 +721,37 @@ impl IODriver {
 
     /// Poll for the next peer message. Returns `Ready` immediately if the
     /// inbox is non-empty; otherwise registers `waker` and returns `Pending`.
-    pub fn poll_peer_inbox(&self, waker: &Waker) -> std::task::Poll<PeerMessage> {
+    ///
+    /// `parked` is the calling future's own flag. Panics if another future is
+    /// already parked: the inbox has a single consumer.
+    pub fn poll_peer_inbox(
+        &self,
+        waker: &Waker,
+        parked: &mut bool,
+    ) -> std::task::Poll<PeerMessage> {
         let inbox = unsafe { &mut *self.peer_inbox.get() };
         match inbox.queue.pop_front() {
-            Some(msg) => std::task::Poll::Ready(msg),
+            Some(msg) => {
+                unpark(&mut inbox.parked, &mut inbox.waker, parked);
+                std::task::Poll::Ready(msg)
+            }
             None => {
-                inbox.waker = Some(waker.clone());
+                park(
+                    &mut inbox.parked,
+                    &mut inbox.waker,
+                    parked,
+                    waker,
+                    "peer inbox",
+                );
                 std::task::Poll::Pending
             }
         }
+    }
+
+    /// A `recv_from_peer` future is gone: free the inbox for the next consumer.
+    pub fn leave_peer_inbox(&self, parked: &mut bool) {
+        let inbox = unsafe { &mut *self.peer_inbox.get() };
+        unpark(&mut inbox.parked, &mut inbox.waker, parked);
     }
 
     /// Route an inbound typed message. If it names an existing reply slot
@@ -939,15 +965,37 @@ impl IODriver {
 
     /// Poll for the next typed message. Returns `Ready` immediately if the
     /// inbox is non-empty; otherwise registers `waker` and returns `Pending`.
-    pub fn poll_msg_inbox(&self, waker: &Waker) -> std::task::Poll<ErasedMessage> {
+    ///
+    /// `parked` is the calling future's own flag. Panics if another future is
+    /// already parked: the inbox has a single consumer.
+    pub fn poll_msg_inbox(
+        &self,
+        waker: &Waker,
+        parked: &mut bool,
+    ) -> std::task::Poll<ErasedMessage> {
         let inbox = unsafe { &mut *self.msg_inbox.get() };
         match inbox.queue.pop_front() {
-            Some(msg) => std::task::Poll::Ready(msg),
+            Some(msg) => {
+                unpark(&mut inbox.parked, &mut inbox.waker, parked);
+                std::task::Poll::Ready(msg)
+            }
             None => {
-                inbox.waker = Some(waker.clone());
+                park(
+                    &mut inbox.parked,
+                    &mut inbox.waker,
+                    parked,
+                    waker,
+                    "message inbox",
+                );
                 std::task::Poll::Pending
             }
         }
+    }
+
+    /// A `recv_msg_from_peer` future is gone: free the inbox for the next consumer.
+    pub fn leave_msg_inbox(&self, parked: &mut bool) {
+        let inbox = unsafe { &mut *self.msg_inbox.get() };
+        unpark(&mut inbox.parked, &mut inbox.waker, parked);
     }
 
     pub fn push_op(&self, entry: squeue::Entry) -> OneshotToken {
@@ -1458,6 +1506,36 @@ pub(crate) enum ParkedFd {
     /// A file or pipe.
     #[allow(dead_code)]
     File(Rc<operations::fd::FdInner>),
+}
+
+/// Park the one consumer of an inbox, or refresh its waker.
+fn park(
+    inbox_parked: &mut bool,
+    inbox_waker: &mut Option<Waker>,
+    parked: &mut bool,
+    waker: &Waker,
+    inbox: &str,
+) {
+    if !*parked {
+        assert!(
+            !*inbox_parked,
+            "two futures await the {inbox} at once; it has a single consumer"
+        );
+        *inbox_parked = true;
+        *parked = true;
+    }
+    match inbox_waker {
+        Some(w) if w.will_wake(waker) => {}
+        _ => *inbox_waker = Some(waker.clone()),
+    }
+}
+
+/// The inbox's consumer took a message or went away.
+fn unpark(inbox_parked: &mut bool, inbox_waker: &mut Option<Waker>, parked: &mut bool) {
+    if std::mem::take(parked) {
+        *inbox_parked = false;
+        *inbox_waker = None;
+    }
 }
 
 /// Close an owned fd: through the ring inside the runtime, synchronously outside it.
