@@ -266,7 +266,7 @@ impl<const QUEUE_SIZE: usize> IoOP for MultiAccept<QUEUE_SIZE> {
 
     fn to_entry(&self) -> io_uring::squeue::Entry {
         opcode::AcceptMulti::new(Fd(self.socket.fd()))
-            .flags(libc::SOCK_NONBLOCK)
+            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
             .build()
     }
 

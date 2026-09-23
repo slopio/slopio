@@ -475,3 +475,28 @@ fn paused_queue_is_delivered_without_more_traffic() {
     assert_eq!(got, Ok(8), "consumer never saw all 8 bytes");
     drop(client);
 }
+
+#[test]
+fn an_accepted_socket_is_close_on_exec() {
+    let (cv1, cv2) = Cv::new();
+
+    let server = std::thread::spawn(move || {
+        main_thread_with::<Small, _>(async {
+            let mut multiaccept = MultiAccept::new(9198).unwrap();
+            cv1.notify();
+            let socket = multiaccept.next().await.unwrap();
+            unsafe { libc::fcntl(socket.fd(), libc::F_GETFD) }
+        })
+    });
+
+    cv2.wait();
+    let _client = TcpStream::connect("localhost:9198").unwrap();
+
+    let fd_flags = server.join().unwrap();
+    assert!(fd_flags >= 0, "fcntl failed");
+    assert_ne!(
+        fd_flags & libc::FD_CLOEXEC,
+        0,
+        "accepted fd leaks into exec'd children"
+    );
+}
