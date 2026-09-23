@@ -170,7 +170,7 @@ impl<const QUEUE_SIZE: usize> Drop for MultiAccept<QUEUE_SIZE> {
 impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
     fn close_pending_fds(&mut self) {
         while let Some(event) = self.sockets.pop() {
-            if event.result > 0 {
+            if event.result >= 0 {
                 sys::close(event.result);
             }
         }

@@ -241,7 +241,7 @@ enum MultiOpState {
         parked_fd: Option<ParkedFd>,
     },
     /// Cancelled multishot accept. Separate from `Cancelled` because for
-    /// accept-style ops `event.result > 0` means "a freshly-accepted fd",
+    /// accept-style ops `event.result >= 0` means "a freshly-accepted fd",
     /// not a buffer index. The driver closes these fds as they arrive
     /// instead of trying to recycle them as buffers.
     AcceptCancelled {
@@ -1373,7 +1373,7 @@ impl IODriver {
             _ => return,
         };
         while let Some(event) = queue.pop() {
-            if event.result > 0 {
+            if event.result >= 0 {
                 sys::close(event.result);
             }
         }

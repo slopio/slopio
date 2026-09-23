@@ -290,9 +290,9 @@ pub(crate) fn process_multi(
             if !cqueue::more(event.flags) {
                 *last_cqe = true;
             }
-            // Any positive result is a freshly-accepted fd we'll never hand
-            // to the user — close it.
-            if event.result > 0 {
+            // Any non-negative result is a freshly-accepted fd we'll never
+            // hand to the user — close it (0 is a valid fd).
+            if event.result >= 0 {
                 crate::io_driver::sys::close(event.result);
             }
             if *last_cqe {
