@@ -169,7 +169,11 @@ where
 {
     ignore_sigpipe();
     block_signals_for_thread();
+    // Never more workers than CPUs this process may run on; `available_parallelism`
+    // can be lower still under a cgroup CPU quota.
+    let cpus = allowed_cpus();
     let num_threads: usize = std::thread::available_parallelism().unwrap().into();
+    let num_threads = num_threads.min(cpus.len());
     let fds = (0..num_threads)
         .map(|_| eventfd::create_eventfd())
         .collect::<Vec<_>>();
@@ -186,12 +190,41 @@ where
         .zip(0..num_threads)
         .map(|(sig_handler_fd, n)| {
             let f = f.clone();
-            spawn_worker_on::<R, F>(n, num_threads, f, *sig_handler_fd, peers.clone())
+            spawn_worker_on::<R, F>(n, cpus[n], num_threads, f, *sig_handler_fd, peers.clone())
         })
         .collect::<Vec<_>>();
 
     for handle in handles {
         handle.join().unwrap();
+    }
+}
+
+/// The CPUs the calling thread may run on, in ascending order. Not `0..n`: a
+/// cpuset such as `0-2,4` leaves holes.
+fn allowed_cpus() -> Vec<usize> {
+    unsafe {
+        let mut cpu_set: cpu_set_t = std::mem::zeroed();
+        let result = libc::sched_getaffinity(0, std::mem::size_of::<cpu_set_t>(), &mut cpu_set);
+        if result != 0 {
+            panic!(
+                "sched_getaffinity failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &cpu_set))
+            .collect()
+    }
+}
+
+/// Aborts the process if dropped armed: a worker that fails before its runtime
+/// is up takes the whole process down rather than leave its peers waiting.
+struct StartupGuard(usize);
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        eprintln!("worker {} failed during startup; aborting", self.0);
+        std::process::abort();
     }
 }
 
@@ -222,6 +255,7 @@ mod numa {
 
 fn spawn_worker_on<R, F>(
     n: usize,
+    cpu: usize,
     num_threads: usize,
     f: std::sync::Arc<F>,
     event_fd: i32,
@@ -232,12 +266,18 @@ where
     F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
     std::thread::spawn(move || {
-        pin_core(n);
+        let startup = StartupGuard(n);
+        pin_core(cpu);
         let ctx = WorkerContext {
             thread_id: n,
             num_threads,
         };
         let fut = f(ctx);
+        // First polled once the ring is up and every peer has published: startup is over.
+        let fut = async move {
+            std::mem::forget(startup);
+            fut.await
+        };
         let rt = RuntimeInner::with_peers(n, peers);
         #[cfg(feature = "otlp")]
         return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
