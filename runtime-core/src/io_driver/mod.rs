@@ -348,6 +348,7 @@ impl Ring {
     fn simulated(fake: FakeRing) -> Self {
         Self {
             inner: RingBackend::Fake(fake),
+            overflow: VecDeque::new(),
             pending: 0,
             wakeup_timeout: Timespec::new(),
         }
@@ -368,6 +369,7 @@ impl Default for Ring {
 
         Self {
             inner: RingBackend::Uring(ring),
+            overflow: VecDeque::new(),
             pending: 0,
             wakeup_timeout: Timespec::new(),
         }
@@ -1158,13 +1160,7 @@ impl IODriver {
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
         match &mut ring.inner {
-            RingBackend::Uring(ring) => match ring.submit() {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    panic!("io_uring submit failed: {:?}", e);
-                }
-            },
+            RingBackend::Uring(_) => self.enter_uring(0),
             #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.submit(),
         }
@@ -1176,15 +1172,33 @@ impl IODriver {
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
         match &mut ring.inner {
-            RingBackend::Uring(ring) => match ring.submit_and_wait(1) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    panic!("io_uring submit_and_wait failed: {:?}", e);
-                }
-            },
+            RingBackend::Uring(_) => self.enter_uring(1),
             #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.submit_and_wait(),
+        }
+    }
+
+    /// Enters until the kernel has every SQE, overflow included. Runs at the
+    /// scheduler's safe points only, so it may process completions.
+    fn enter_uring(&self, mut want: usize) {
+        loop {
+            let ring = unsafe { &mut *self.ring.get() };
+            let RingBackend::Uring(uring) = &mut ring.inner else {
+                unreachable!()
+            };
+            match Ring::enter_once(uring, &mut ring.overflow, want) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Completions processed below may have queued more, all submitted now.
+                    ring.pending = 0;
+                    return;
+                }
+                // Transient (CQ overflow, request allocation): the drained CQEs are the events to wake on.
+                Err(Busy) => {
+                    want = 0;
+                    self.drain_completions();
+                }
+            }
         }
     }
 
@@ -1674,8 +1688,13 @@ impl MultishotSlab {
     }
 }
 
+/// The kernel refused an enter until its completion queue is drained.
+struct Busy;
+
 struct Ring {
     inner: RingBackend,
+    /// SQEs queued while the submission queue was full, submitted in order at the next enter.
+    overflow: VecDeque<squeue::Entry>,
     pending: u32,
     wakeup_timeout: Timespec,
 }
@@ -1725,10 +1744,9 @@ impl Ring {
     ///
     /// [`block_on`]: crate::runtime::RuntimeInner::block_on
     ///
-    /// Submitting mid-pass is the price, and it is the right one: a syscall on
-    /// the rare full queue against a process that dies on it. Nothing else has
-    /// to change, because the kernel consumes the whole queue on a successful
-    /// `submit`, so the retry cannot find it full again.
+    /// Past 4096 the entry waits in `overflow` for the next enter: never a
+    /// syscall mid-pass, and the common path pays one emptiness check.
+    ///
     /// Passes the next timeout's duration to the simulated ring, which cannot
     /// soundly read it from the sqe. A no-op on a real one.
     #[cfg(feature = "simulation")]
@@ -1743,15 +1761,10 @@ impl Ring {
             RingBackend::Uring(ring) => {
                 // SAFETY: the caller's contract for `add` is the caller's
                 // contract for `push` — the entry's buffers outlive the op.
-                if unsafe { ring.submission().push(entry) }.is_err() {
-                    // The borrow above ends here, which `submit` needs.
-                    Self::submit_uring(ring);
-                    // The queue was drained by the submit, so this cannot be
-                    // the full-queue error again.
-                    unsafe { ring.submission().push(entry) }
-                        .expect("submission queue drained by the submit above");
-                    // Everything queued went with it; only this entry is new.
-                    self.pending = 0;
+                // Behind any overflowed entry, so submission order is kept.
+                if !self.overflow.is_empty() || unsafe { ring.submission().push(entry) }.is_err()
+                {
+                    self.overflow.push_back(entry.clone());
                 }
             }
             #[cfg(feature = "simulation")]
@@ -1760,20 +1773,35 @@ impl Ring {
         self.pending += 1;
     }
 
-    /// `submit` with the one error that is not a failure folded away, so the
-    /// full-queue path and [`IODriver::submit`] agree on what `EINTR` means.
-    fn submit_uring(ring: &mut IoUring) {
-        loop {
-            match ring.submit() {
-                Ok(_) => return,
-                // Interrupted before the kernel took anything: nothing was
-                // consumed, so there is still no room and retrying is the only
-                // way out. `IODriver::submit` can return here and let the next
-                // pass flush; this one cannot.
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => panic!("io_uring submit failed while making room: {e:?}"),
+    /// One enter: moves overflowed SQEs into the queue, submits, and reports
+    /// whether any SQE is still left on our side.
+    fn enter_once(
+        ring: &mut IoUring,
+        overflow: &mut VecDeque<squeue::Entry>,
+        want: usize,
+    ) -> Result<bool, Busy> {
+        {
+            let mut sq = ring.submission();
+            while let Some(entry) = overflow.front() {
+                // SAFETY: `add`'s contract, carried by the entry since it was queued.
+                if unsafe { sq.push(entry) }.is_err() {
+                    break;
+                }
+                overflow.pop_front();
             }
         }
+        // Sleep only once the kernel holds everything.
+        let want = if overflow.is_empty() { want } else { 0 };
+        match ring.submit_and_wait(want) {
+            // Possibly partial: the kernel ran short of requests.
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EBUSY)) => {
+                return Err(Busy);
+            }
+            Err(e) => panic!("io_uring submit failed: {e:?}"),
+        }
+        Ok(!overflow.is_empty() || !ring.submission().is_empty())
     }
 
     fn handle(&self) -> RingHandle<'_> {
@@ -1789,30 +1817,24 @@ impl Ring {
 mod ring_tests {
     use super::*;
 
-    /// Pushing past the submission queue's capacity flushes and carries on.
-    ///
-    /// It used to unwrap the `PushError` instead, which is a panic on a worker
-    /// thread and so the death of the process. A scheduler pass polls every
-    /// runnable task before flushing, so any workload with more IO-issuing
-    /// tasks awake at once than the queue is deep reaches this.
+    /// Pushing past the submission queue's capacity parks the rest, in order,
+    /// for the next enter instead of entering the kernel mid-pass.
     #[test]
-    fn a_full_submission_queue_is_flushed_rather_than_unwrapped() {
+    fn a_full_submission_queue_overflows_to_the_next_enter() {
         let mut ring = Ring::default();
 
         // Nops: no fd, no buffer, so nothing has to outlive the call and the
         // `add` safety contract is trivially met.
-        let nop = opcode::Nop::new().build();
-        for _ in 0..5_000 {
-            ring.add(&nop);
+        for i in 0..5_000 {
+            ring.add(&opcode::Nop::new().build().user_data(i));
         }
+        assert_eq!(ring.overflow.len(), 5_000 - 4096);
 
-        // The flush reset the count, so what is left is only what was queued
-        // after it — the point being that this is bounded by the queue rather
-        // than by how many times `add` was called.
-        assert!(
-            ring.pending < 4096,
-            "the mid-pass flush should have reset the count, not let it grow: {}",
-            ring.pending
-        );
+        let RingBackend::Uring(uring) = &mut ring.inner else {
+            unreachable!()
+        };
+        while Ring::enter_once(uring, &mut ring.overflow, 0).ok().expect("nops never busy") {}
+        let order: Vec<u64> = uring.completion().map(|cqe| cqe.user_data()).collect();
+        assert_eq!(order, (0..5_000).collect::<Vec<_>>());
     }
 }

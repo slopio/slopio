@@ -62,7 +62,7 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   the wakers the driver already holds. No per-task registry.
 
 ### Bugs
-- [ ] **B1** `submit` / `submit_and_wait` panic on `EAGAIN` / `EBUSY`, which
+- [x] **B1** `submit` / `submit_and_wait` panic on `EAGAIN` / `EBUSY`, which
   are transient: drain the CQ and retry.
 - [ ] **B2** `has_deferred_completions` ignores `IORING_SQ_CQ_OVERFLOW`, so
   overflowed CQEs wait until the task queue empties (latency, not loss).
