@@ -1,11 +1,10 @@
-use self::slab::TimerStorage;
-use smallvec::SmallVec;
+use self::nodes::{BUCKET, NIL, Nodes, State};
 use std::{
     task::Waker,
     time::{Duration, Instant},
 };
 
-mod slab;
+mod nodes;
 
 // Two levels, ms → s. The seconds period is a whole number of ms ticks, so a
 // seconds slot cascades exactly when its window opens.
@@ -19,16 +18,18 @@ const TICKS_PER_S: u64 = MS_BUCKETS as u64;
 const MAX_TICKS: u64 = TICKS_PER_S * (S_BUCKETS as u64 - 1);
 /// The longest timer [`TimeWheel::init_timer`] accepts, inclusive.
 pub const MAX_DURATION: Duration = Duration::from_millis(MAX_TICKS * MS_TICK);
-const SMALLVEC_SIZE: usize = 8;
-
-type TimerId = usize;
-type Bucket = SmallVec<[TimerId; SMALLVEC_SIZE]>;
+// One list head per slot, ms slots first: bucket `b` is ms slot `b` below
+// `MS_BUCKETS`, seconds slot `b - MS_BUCKETS` above.
+const BUCKETS: usize = MS_BUCKETS + S_BUCKETS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurationTooLong;
 
+/// Each slot is an intrusive doubly linked list threaded through the timers'
+/// nodes, kernel style: arming links at the head, cancelling unlinks in O(1)
+/// and frees the node at once, and a cascade relinks without copying.
 pub struct TimeWheel {
-    storage: TimerStorage,
+    nodes: Nodes,
     buckets: BucketLevels,
     last_tick: Instant,
     // Whole ticks processed since creation; every level index derives from it.
@@ -69,8 +70,9 @@ macro_rules! impl_bitset {
 impl_bitset!(u64, u128);
 
 struct BucketLevels {
-    ms_level: [Bucket; MS_BUCKETS],
-    s_level: [Bucket; S_BUCKETS],
+    /// First node of each slot's list, or `NIL`.
+    heads: [u32; BUCKETS],
+    /// Exact: a bit is set iff its list is non-empty.
     ms_occupied: Bitset<u128>,
     s_occupied: Bitset<u64>,
 }
@@ -78,11 +80,33 @@ struct BucketLevels {
 impl BucketLevels {
     fn new() -> Self {
         Self {
-            ms_level: std::array::from_fn(|_| SmallVec::new()),
-            s_level: std::array::from_fn(|_| SmallVec::new()),
+            heads: [NIL; BUCKETS],
             ms_occupied: Bitset(0),
             s_occupied: Bitset(0),
         }
+    }
+
+    #[inline]
+    fn mark(&mut self, bucket: usize) {
+        match bucket.checked_sub(MS_BUCKETS) {
+            None => self.ms_occupied.set(bucket),
+            Some(s) => self.s_occupied.set(s),
+        }
+    }
+
+    #[inline]
+    fn unmark(&mut self, bucket: usize) {
+        match bucket.checked_sub(MS_BUCKETS) {
+            None => self.ms_occupied.clear(bucket),
+            Some(s) => self.s_occupied.clear(s),
+        }
+    }
+
+    /// Detach a whole slot: its list, now owned by the caller, and an empty slot.
+    #[inline]
+    fn take(&mut self, bucket: usize) -> u32 {
+        self.unmark(bucket);
+        std::mem::replace(&mut self.heads[bucket], NIL)
     }
 }
 
@@ -97,7 +121,7 @@ impl TimeWheel {
     #[must_use]
     pub fn new_at(now: Instant) -> Self {
         Self {
-            storage: TimerStorage::default(),
+            nodes: Nodes::default(),
             buckets: BucketLevels::new(),
             last_tick: now,
             ticks: 0,
@@ -132,10 +156,10 @@ impl TimeWheel {
         self.last_tick += Duration::from_millis(ticks_to_process * MS_TICK);
     }
 
-    /// Number of timers currently occupying slab slots: waiting, fired but
-    /// not yet polled, or cancelled but not yet swept by their bucket.
+    /// Number of timers holding a node: waiting, or fired but not yet polled.
+    /// A cancelled timer's node is freed by the cancel itself.
     pub fn active_timers(&self) -> usize {
-        self.storage.len()
+        self.nodes.live()
     }
 
     /// Whole ticks processed since creation. The reference clock for anything
@@ -157,9 +181,14 @@ impl TimeWheel {
     fn process_single_tick(&mut self) {
         let idx = self.ms_idx();
         if self.buckets.ms_occupied.is_set(idx) {
-            self.buckets.ms_occupied.clear(idx);
-            for timer_id in self.buckets.ms_level[idx].drain(..) {
-                self.storage.wake(timer_id);
+            let mut id = self.buckets.take(idx);
+            while id != NIL {
+                // Read before firing: `next` is dead once the node is `Done`.
+                let next = self.nodes.get(id).next;
+                if let Some(waker) = self.nodes.fire(id) {
+                    waker.wake();
+                }
+                id = next;
             }
         }
 
@@ -170,43 +199,87 @@ impl TimeWheel {
         if self.ticks.is_multiple_of(TICKS_PER_S) {
             let idx = self.s_idx();
             if self.buckets.s_occupied.is_set(idx) {
-                self.buckets.s_occupied.clear(idx);
-                let bucket = std::mem::take(&mut self.buckets.s_level[idx]);
-                self.cascade(bucket);
+                let head = self.buckets.take(MS_BUCKETS + idx);
+                self.cascade(head);
             }
         }
     }
 
-    // Re-place each timer by its remaining time; cancelled ids are freed here.
-    fn cascade(&mut self, bucket: Bucket) {
-        for timer_id in bucket {
-            if let Some(deadline) = self.storage.deadline(timer_id) {
-                self.place(timer_id, deadline);
-            }
+    // Relink each timer by its remaining time; nothing is copied or freed.
+    fn cascade(&mut self, mut id: u32) {
+        while id != NIL {
+            let node = self.nodes.get(id);
+            let (next, deadline) = (node.next, node.deadline);
+            self.place(id, deadline);
+            id = next;
         }
     }
 
     // Finest level whose window still contains `deadline`. A deadline a second
     // or more out is a whole seconds-slot ahead of the current one, which has
     // already cascaded, so that slot is never targeted.
-    fn place(&mut self, timer_id: TimerId, deadline: u64) {
+    fn place(&mut self, id: u32, deadline: u64) {
         let now = self.ticks;
         let deadline = deadline.max(now);
-        let b = &mut self.buckets;
-
-        if deadline - now < TICKS_PER_S {
-            let idx = (deadline % TICKS_PER_S) as usize;
-            b.ms_occupied.set(idx);
-            b.ms_level[idx].push(timer_id);
+        let bucket = if deadline - now < TICKS_PER_S {
+            (deadline % TICKS_PER_S) as usize
         } else {
-            let idx = ((deadline / TICKS_PER_S) % S_BUCKETS as u64) as usize;
-            b.s_occupied.set(idx);
-            b.s_level[idx].push(timer_id);
+            MS_BUCKETS + ((deadline / TICKS_PER_S) % S_BUCKETS as u64) as usize
+        };
+        self.link(id, bucket);
+    }
+
+    // At the head, like the kernel: no tail to keep, so a slot fires newest first.
+    #[inline]
+    fn link(&mut self, id: u32, bucket: usize) {
+        let head = self.buckets.heads[bucket];
+        let node = self.nodes.get_mut(id);
+        node.next = head;
+        node.prev = BUCKET | bucket as u32;
+        if head != NIL {
+            self.nodes.get_mut(head).prev = id;
+        }
+        self.buckets.heads[bucket] = id;
+        self.buckets.mark(bucket);
+    }
+
+    // O(1) wherever the node sits: `prev` names its predecessor or its bucket.
+    #[inline]
+    fn unlink(&mut self, id: u32) {
+        let node = self.nodes.get(id);
+        let (prev, next) = (node.prev, node.next);
+        if prev & BUCKET != 0 {
+            let bucket = (prev & !BUCKET) as usize;
+            self.buckets.heads[bucket] = next;
+            if next == NIL {
+                self.buckets.unmark(bucket);
+            }
+        } else {
+            self.nodes.get_mut(prev).next = next;
+        }
+        if next != NIL {
+            self.nodes.get_mut(next).prev = prev;
         }
     }
 
+    /// `Ready` once the timer has fired, which also frees it: the id must not
+    /// be used again after `Ready` or after [`drop`](Self::drop).
     pub fn poll(&mut self, id: usize, waker: &Waker) -> std::task::Poll<()> {
-        self.storage.poll(id, waker)
+        let id = id as u32;
+        match self.nodes.state(id) {
+            State::Waiting => {
+                match &mut self.nodes.get_mut(id).waker {
+                    Some(held) if held.will_wake(waker) => {}
+                    slot => *slot = Some(waker.clone()),
+                }
+                std::task::Poll::Pending
+            }
+            State::Done => {
+                self.nodes.release(id);
+                std::task::Poll::Ready(())
+            }
+            State::Free => unreachable!("timer {id} polled after it was freed"),
+        }
     }
 
     /// Arm a timer, rounded down to the enclosing 10ms tick.
@@ -235,13 +308,21 @@ impl TimeWheel {
         // tick asks for the slot behind us, which is the one about to drain.
         let ticks = (duration.as_millis() as u64 / MS_TICK).saturating_sub(1);
         let deadline = self.ticks + ticks;
-        let timer_id = self.storage.create(waker, deadline);
-        self.place(timer_id, deadline);
-        Ok(timer_id)
+        let id = self.nodes.alloc(waker, deadline);
+        self.place(id, deadline);
+        Ok(id as usize)
     }
 
+    /// Cancel a timer, or release one that fired unpolled. Either way its node
+    /// is freed now, not when its slot comes around.
     pub fn drop(&mut self, id: usize) {
-        self.storage.drop(id);
+        let id = id as u32;
+        match self.nodes.state(id) {
+            State::Waiting => self.unlink(id),
+            State::Done => {}
+            State::Free => unreachable!("timer {id} dropped twice"),
+        }
+        self.nodes.release(id);
     }
 
     // Ticks until the slot `i` ahead on a level of period `period` opens.

@@ -249,33 +249,27 @@ fn test_cancel_timer_before_fire() {
 }
 
 #[test]
-fn test_cancel_timer_idempotent() {
+#[should_panic(expected = "dropped twice")]
+fn test_a_timer_cannot_be_dropped_twice() {
     let mut wheel = TimeWheel::new();
-    let (counter, waker) = make_waker();
+    let (_, waker) = make_waker();
 
     let id = wheel.init_timer(Duration::from_millis(50), &waker).unwrap();
-
-    // Cancel multiple times should not panic
+    // The id is freed by the first drop: reused, a second one would cancel
+    // another timer, so it is refused rather than tolerated.
     wheel.drop(id);
     wheel.drop(id);
-
-    sleep(Duration::from_millis(60));
-    wheel.tick();
-
-    assert_eq!(counter.count(), 0);
 }
 
 #[test]
-fn test_poll_cancelled_timer() {
+#[should_panic(expected = "polled after it was freed")]
+fn test_a_cancelled_timer_cannot_be_polled() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
     let id = wheel.init_timer(Duration::from_millis(50), &waker).unwrap();
     wheel.drop(id);
-
-    // Polling a cancelled timer should return Ready (it's done, just cancelled)
-    let result = wheel.poll(id, &waker);
-    assert_eq!(result, Poll::Ready(()));
+    let _ = wheel.poll(id, &waker);
 }
 
 #[test]
@@ -674,24 +668,15 @@ fn test_next_deadline_multiple_same_bucket() {
 }
 
 #[test]
-fn test_next_deadline_cancelled_timer_still_in_bucket() {
+fn test_next_deadline_forgets_a_cancelled_timer() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
     let id = wheel.init_timer(Duration::from_millis(30), &waker).unwrap();
-
-    // Cancel the timer
     wheel.drop(id);
 
-    // next_deadline still sees the occupied bucket (timer is cancelled but bucket bit is set)
-    // This documents current behavior - the occupied bit isn't cleared on cancel
-    let deadline = wheel.next_deadline();
-    // Note: This may return Some even though timer is cancelled, since we don't
-    // clear the bucket occupied bit on cancel
-    assert!(
-        deadline.is_some(),
-        "Bucket occupied bit should still be set after cancel"
-    );
+    // The slot's list emptied, so its bit went with it: no wakeup for nothing.
+    assert_eq!(wheel.next_deadline(), None);
 }
 
 #[test]
@@ -957,43 +942,164 @@ fn test_timer_inserted_mid_second_fires_at_its_own_deadline() {
 }
 
 #[test]
-fn test_cancelled_timer_freed_on_cascade() {
+fn test_cancelled_seconds_timer_is_freed_at_once() {
     let mut wheel = TimeWheel::new();
-    let mut clock = Clock::new();
     let (_, waker) = make_waker();
 
     let id = wheel.init_timer(Duration::from_secs(5), &waker).unwrap();
     wheel.drop(id);
     assert_eq!(
         wheel.active_timers(),
-        1,
-        "the bucket still references the id"
+        0,
+        "freed by the cancel, not the cascade"
     );
-
-    // The seconds slot cascades at t=5s; the cancelled id is released there,
-    // without ever reaching the ms level.
-    clock.advance(&mut wheel, Duration::from_millis(5_000));
-    assert_eq!(wheel.active_timers(), 0);
+    assert_eq!(wheel.next_deadline(), None, "its slot's bit is cleared too");
 }
 
 #[test]
-fn test_cancelled_timer_freed_when_its_bucket_fires() {
+fn test_cancelled_ms_timer_is_freed_at_once() {
     let mut wheel = TimeWheel::new();
-    let mut clock = Clock::new();
     let (_, waker) = make_waker();
 
     let id = wheel
         .init_timer(Duration::from_millis(500), &waker)
         .unwrap();
     wheel.drop(id);
-    assert_eq!(
-        wheel.active_timers(),
-        1,
-        "the bucket still references the id"
-    );
-
-    clock.advance(&mut wheel, Duration::from_millis(510));
     assert_eq!(wheel.active_timers(), 0);
+    assert_eq!(wheel.next_deadline(), None);
+}
+
+/// Three timers share one slot; cancelling any position in its list, head,
+/// middle or tail, leaves the others to fire and the cancelled one silent.
+#[test]
+fn test_cancel_at_each_position_of_a_slot() {
+    for (level, duration) in [("ms", 300), ("seconds", 3_000)] {
+        for cancel in 0..3 {
+            let mut wheel = TimeWheel::new();
+            let mut clock = Clock::new();
+            let timers: Vec<_> = (0..3)
+                .map(|_| {
+                    let (counter, waker) = make_waker();
+                    let id = wheel
+                        .init_timer(Duration::from_millis(duration), &waker)
+                        .unwrap();
+                    (id, counter)
+                })
+                .collect();
+
+            wheel.drop(timers[cancel].0);
+            assert_eq!(wheel.active_timers(), 2);
+            clock.advance(&mut wheel, Duration::from_millis(duration + 10));
+
+            for (i, (_, counter)) in timers.iter().enumerate() {
+                let fired = usize::from(i != cancel);
+                assert_eq!(
+                    counter.count(),
+                    fired,
+                    "{level} slot, cancelled #{cancel}, timer #{i}"
+                );
+            }
+        }
+    }
+}
+
+/// A freed id is reused at once; the slot it left must not remember it.
+#[test]
+fn test_a_reused_id_fires_on_its_own_deadline() {
+    let mut wheel = TimeWheel::new();
+    let mut clock = Clock::new();
+    let (old, old_waker) = make_waker();
+    let (new, new_waker) = make_waker();
+
+    let id = wheel
+        .init_timer(Duration::from_millis(200), &old_waker)
+        .unwrap();
+    wheel.drop(id);
+    let reused = wheel
+        .init_timer(Duration::from_secs(2), &new_waker)
+        .unwrap();
+    assert_eq!(reused, id, "the free list hands the id straight back");
+
+    clock.advance(&mut wheel, Duration::from_millis(500));
+    assert_eq!((old.count(), new.count()), (0, 0));
+    clock.advance(&mut wheel, Duration::from_millis(1_510));
+    assert_eq!((old.count(), new.count()), (0, 1));
+}
+
+/// Random arms, cancels, polls and clock steps, each checked against a model:
+/// a timer with deadline tick `d` has fired exactly once iff the wheel has
+/// processed tick `d`, never if cancelled; `active_timers` counts the timers
+/// neither cancelled nor polled after firing; the next deadline exists iff
+/// some timer still waits.
+#[test]
+fn test_random_operations_match_a_model() {
+    struct Armed {
+        id: usize,
+        deadline: u64,
+        counter: std::sync::Arc<common::CountingWaker>,
+        waker: std::task::Waker,
+    }
+
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |bound: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % bound
+    };
+
+    let mut wheel = TimeWheel::new();
+    let mut clock = Clock::new();
+    let mut armed: Vec<Armed> = Vec::new();
+
+    for step in 0..40_000 {
+        match next(10) {
+            // Arm: mostly short, some up to the full minute.
+            0..=4 => {
+                let ms = match next(4) {
+                    0 => next(100),
+                    1 => next(1_000),
+                    _ => next(MAX_DURATION.as_millis() as u64 + 1),
+                };
+                let (counter, waker) = make_waker();
+                let id = wheel.init_timer(Duration::from_millis(ms), &waker).unwrap();
+                let deadline = wheel.ticks() + (ms / 10).saturating_sub(1);
+                armed.push(Armed {
+                    id,
+                    deadline,
+                    counter,
+                    waker,
+                });
+            }
+            // Cancel a random timer, fired or not.
+            5 | 6 if !armed.is_empty() => {
+                let t = armed.swap_remove(next(armed.len() as u64) as usize);
+                wheel.drop(t.id);
+            }
+            // Poll a random timer with its own waker; a fired one is freed by it.
+            7 if !armed.is_empty() => {
+                let i = next(armed.len() as u64) as usize;
+                if wheel.poll(armed[i].id, &armed[i].waker).is_ready() {
+                    armed.swap_remove(i);
+                }
+            }
+            _ => clock.advance(&mut wheel, Duration::from_millis(10 * next(300))),
+        }
+
+        let now = wheel.ticks();
+        for t in &armed {
+            let fired = usize::from(now > t.deadline);
+            assert_eq!(
+                t.counter.count(),
+                fired,
+                "step {step}: deadline {} at tick {now}",
+                t.deadline
+            );
+        }
+        assert_eq!(wheel.active_timers(), armed.len(), "step {step}");
+        let waiting = armed.iter().any(|t| now <= t.deadline);
+        assert_eq!(wheel.next_deadline().is_some(), waiting, "step {step}");
+    }
 }
 
 /// An occupied ms slot must not hide a seconds slot that cascades ahead of it.
