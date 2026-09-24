@@ -43,33 +43,38 @@ impl<F: Future> TypedTask<F> {
     }
 
     /// The handle is gone: free now if nothing else can reach us.
-    pub fn detach(mut self) {
+    pub fn detach(self) {
+        // Tail only: the task may be dropping its own handle mid-poll.
+        let tail = unsafe { &mut (*self.inner.as_ptr()).waker };
         // Nobody awaits the output anymore: release the awaiting task's waker.
-        let awaiter = unsafe { self.inner.as_mut() }.waker.waker.take();
+        let awaiter = tail.waker.take();
         let header = unsafe { &(*self.inner.as_ptr()).header };
         header.detached_mode.set(true);
         self.free_if_unreachable();
         drop(awaiter);
     }
 
-    pub fn poll(mut self) {
-        let inner = unsafe { self.inner.as_mut() };
-        inner.header.queued.set(false);
+    pub fn poll(self) {
+        let ptr = self.inner.as_ptr();
+        // Disjoint borrows: wakers and `detach` reach the header and tail mid-poll.
+        let header = unsafe { &(*ptr).header };
+        let state = unsafe { &mut (*ptr).data.state };
+        header.queued.set(false);
         // One ref for the whole poll: nothing can free the task under us.
-        inner.header.wakers.set(inner.header.wakers.get() + 1);
-        if inner.header.killed.get() {
-            Self::reap(inner);
-        } else if let State::Running(future) = &mut inner.data.state {
+        header.wakers.set(header.wakers.get() + 1);
+        if header.killed.get() {
+            Self::reap(state);
+        } else if let State::Running(future) = state {
             let pinned = unsafe { pin::Pin::new_unchecked(future) };
-            let raw_waker = crate::task::waker::raw_waker::<F>(self.inner.as_ptr() as *const _);
+            let raw_waker = crate::task::waker::raw_waker::<F>(ptr as *const _);
             // Never dropped: its ref is the one taken above.
             let waker = ManuallyDrop::new(unsafe { Waker::from_raw(raw_waker) });
             let mut ctx = Context::from_waker(&waker);
             if let std::task::Poll::Ready(r) = pinned.poll(&mut ctx) {
-                inner.data.state = State::Finished(r);
+                *state = State::Finished(r);
                 // Taken and woken by value: the awaiter only needs waking once.
-                if !inner.header.detached_mode.get()
-                    && let Some(waker) = inner.waker.waker.take()
+                if !header.detached_mode.get()
+                    && let Some(waker) = unsafe { &mut (*ptr).waker }.waker.take()
                 {
                     waker.wake();
                 }
@@ -81,8 +86,8 @@ impl<F: Future> TypedTask<F> {
     /// Kill path: drops the future, or an output nobody will collect.
     #[cold]
     #[inline(never)]
-    fn reap(inner: &mut TypedTaskInner<F>) {
-        inner.data.state = State::Ended;
+    fn reap(state: &mut State<F>) {
+        *state = State::Ended;
     }
 
     pub fn wake_by_val(self) {

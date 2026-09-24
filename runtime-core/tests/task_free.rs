@@ -20,6 +20,7 @@ use std::task::{Context, Poll};
 
 use common::on_runtime;
 use runtime_core::runtime::{spawn, yield_now};
+use runtime_core::task::Handle;
 
 /// Flips a shared flag when dropped, so a test can see the allocation go away.
 struct DropFlag(Rc<Cell<bool>>);
@@ -89,5 +90,38 @@ fn dropping_the_handle_after_completion_frees_the_task() {
         assert!(!dropped.get(), "output is held for the handle");
         drop(handle);
         assert!(dropped.get(), "nothing will poll it again: freed on detach");
+    });
+}
+
+/// Drops its own task's handle, then finishes, in a single poll. `Unpin`, so
+/// the task's `&mut` over it is a real unique borrow: an `async` block would
+/// make the task `!Unpin` and hide an overlapping one from Miri.
+struct DropOwnHandle {
+    slot: Rc<Cell<Option<Handle<()>>>>,
+    flag: Option<DropFlag>,
+}
+
+impl Future for DropOwnHandle {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        drop(self.slot.take());
+        drop(self.flag.take());
+        Poll::Ready(())
+    }
+}
+
+#[test]
+fn a_task_dropping_its_own_handle_mid_poll_is_freed_once_it_finishes() {
+    on_runtime(async {
+        let dropped = Rc::new(Cell::new(false));
+        let slot = Rc::new(Cell::new(None));
+        let handle = spawn(DropOwnHandle {
+            slot: slot.clone(),
+            flag: Some(DropFlag(dropped.clone())),
+        });
+        slot.set(Some(handle));
+        yield_now().await;
+        assert!(dropped.get());
     });
 }

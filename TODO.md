@@ -13,7 +13,7 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   single-waker code was O(1). Ids are handed out increasing and removals keep
   the order, so the list stays sorted: binary search, or answer `Woken` at once
   when the list is empty or the id is below the front one.
-- [ ] **`detach` takes `&mut` over a task whose future may be mid-poll.**
+- [x] **`detach` takes `&mut` over a task whose future may be mid-poll.**
   `typed_task.rs:48` does `self.inner.as_mut().waker.waker.take()`, a second
   `&mut` over the future's bytes when a task drops its own `Handle` while it
   runs (or `reap` drops it). Stacked Borrows UB, Miri-visible. Reach the tail
