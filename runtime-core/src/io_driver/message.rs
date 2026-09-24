@@ -104,7 +104,13 @@ impl<T: Send + 'static> Message<T> {
     /// it (interior-mutability-free data, a handoff protocol, its own locking).
     ///
     /// [`into_typed`]: ErasedMessage::into_typed
-    pub fn erase(self: Arc<Self>) -> ErasedMessage {
+    ///
+    /// # Safety
+    /// The erased reference is meant to cross to another thread. If any clone
+    /// of `self` outlives this call, the payload is then shared between that
+    /// thread and this one, which must be sound for `T` — always so for a
+    /// `T: Sync`. Dropping every clone first, the plain move, discharges it.
+    pub unsafe fn erase(self: Arc<Self>) -> ErasedMessage {
         // SAFETY-adjacent: `Arc::into_raw` is never null, and `repr(C)` puts
         // `header` at offset 0 so the downcast to `Header` is in-bounds.
         let ptr = Arc::into_raw(self) as *mut Header;

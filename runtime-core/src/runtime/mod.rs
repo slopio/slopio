@@ -302,8 +302,9 @@ pub fn send_msg_to_peer<T: Send + 'static>(thread_id: usize, payload: T) {
 /// contract outright: the receiver's `Arc` is unique and no `&T` ever exists on
 /// two threads at once. That case is what safe [`send_msg_to_peer`] wraps.
 pub unsafe fn send_shared_to_peer<T: Send + 'static>(thread_id: usize, msg: Arc<Message<T>>) {
-    let erased = msg.erase();
-    crate::io_driver::IO_DRIVER.with(|d| d.send_erased_to_peer(thread_id, erased));
+    // SAFETY: forwarded from this function's own contract, which is theirs.
+    let erased = unsafe { msg.erase() };
+    crate::io_driver::IO_DRIVER.with(|d| unsafe { d.send_erased_to_peer(thread_id, erased) });
 }
 
 /// Await the next typed message sent to this worker by a peer, recovering it as
@@ -400,7 +401,8 @@ pub unsafe fn request_msg_from_peer<Req: Send + 'static, Rep>(
             Endpoint::with_slab(thread_id() as u16, slot),
             Endpoint::new(peer as u16),
         );
-        d.send_erased_to_peer(peer, Message::with_header(header, payload).erase());
+        // SAFETY: the `Arc` is allocated here and moved straight in: unique.
+        unsafe { d.send_erased_to_peer(peer, Message::with_header(header, payload).erase()) };
         slot
     });
     RecvMsgReply {
@@ -435,8 +437,10 @@ pub unsafe fn request_msg_from_peer<Req: Send + 'static, Rep>(
 pub fn reply_msg_to_peer<Rep: Send + 'static>(request_header: &Header, payload: Rep) {
     let header = request_header.swapped();
     let peer = header.receiver.thread as usize;
-    crate::io_driver::IO_DRIVER
-        .with(|d| d.send_erased_to_peer(peer, Message::with_header(header, payload).erase()));
+    // SAFETY: the `Arc` is allocated here and moved straight in: unique.
+    crate::io_driver::IO_DRIVER.with(|d| unsafe {
+        d.send_erased_to_peer(peer, Message::with_header(header, payload).erase())
+    });
 }
 
 /// Future returned by [`request_msg_from_peer`]. Resolves to the peer's reply

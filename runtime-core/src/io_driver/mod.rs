@@ -692,7 +692,12 @@ impl IODriver {
     /// the receiver's `user_data`, and the peer reclaims that reference in its
     /// message inbox. Whether it is the *last* reference depends on what the
     /// sender kept — see [`Message::erase`].
-    pub fn send_erased_to_peer(&self, thread_id: usize, msg: ErasedMessage) {
+    ///
+    /// # Safety
+    /// Same contract as [`Message::erase`]: any clone of the original `Arc`
+    /// still alive makes the payload shared with `thread_id`, which must be
+    /// sound for its type.
+    pub unsafe fn send_erased_to_peer(&self, thread_id: usize, msg: ErasedMessage) {
         let peers = self
             .peers
             .as_ref()
