@@ -1,5 +1,5 @@
 use std::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     future::Future,
     rc::Rc,
     task::Waker,
@@ -61,6 +61,9 @@ pub const FIXED_5S_MS: u64 = 5_000;
 /// The one duration served exactly, outside the wheel.
 pub const FIXED_5S: Duration = Duration::from_millis(FIXED_5S_MS);
 
+/// How often the wall clock is read again: once a second of 10ms ticks.
+const REANCHOR_TICKS: u64 = 100;
+
 pub struct TimeDriver {
     /// Any duration up to `MAX_DURATION`, at 10ms resolution.
     wheel: UnsafeCell<async_timers::TimeWheel>,
@@ -68,15 +71,18 @@ pub struct TimeDriver {
     /// FIFO — arming later can only end later, so nothing is ever sorted.
     fixed_5s: UnsafeCell<async_timers::Timers<FIXED_5S_MS>>,
     clock: ClockSource,
+    /// The monotonic time read at the start of the current pass.
+    last_now: Cell<Instant>,
+    /// A monotonic instant and the wall time it matched: [`now`](Self::now)
+    /// derives from it instead of reading the wall clock every pass.
+    anchor: Cell<(Instant, SystemTime)>,
+    /// Wheel tick of the last anchor; re-anchored every [`REANCHOR_TICKS`].
+    anchor_tick: Cell<u64>,
 }
 
 impl Default for TimeDriver {
     fn default() -> Self {
-        Self {
-            wheel: UnsafeCell::default(),
-            fixed_5s: UnsafeCell::default(),
-            clock: ClockSource::System,
-        }
+        Self::on(ClockSource::System)
     }
 }
 
@@ -143,9 +149,24 @@ impl Drop for Sleep {
 }
 
 impl TimeDriver {
+    /// Wall time at the start of the current pass, derived from the monotonic
+    /// clock: at most a second behind a step of the system clock.
     pub fn now(&self) -> SystemTime {
-        let wheel = unsafe { &*self.wheel.get() };
-        wheel.now()
+        let (mono, wall) = self.anchor.get();
+        wall + (self.last_now.get() - mono)
+    }
+
+    /// Every store starting at the clock's current time.
+    fn on(clock: ClockSource) -> Self {
+        let now = clock.now();
+        Self {
+            wheel: UnsafeCell::new(async_timers::TimeWheel::new_at(now)),
+            fixed_5s: UnsafeCell::default(),
+            last_now: Cell::new(now),
+            anchor: Cell::new((now, clock.now_wall())),
+            anchor_tick: Cell::new(0),
+            clock,
+        }
     }
 
     /// Drive every store with whichever clock this runtime was built on.
@@ -155,8 +176,14 @@ impl TimeDriver {
     /// what the deadline rings assume.
     pub fn tick(&self) {
         let wheel = unsafe { &mut *self.wheel.get() };
-        wheel.tick_at(self.clock.now(), self.clock.now_wall());
+        let instant = self.clock.now();
+        self.last_now.set(instant);
+        wheel.tick_at(instant);
         let now = wheel.ticks();
+        if now - self.anchor_tick.get() >= REANCHOR_TICKS {
+            self.anchor.set((instant, self.clock.now_wall()));
+            self.anchor_tick.set(now);
+        }
 
         let fixed_5s = unsafe { &mut *self.fixed_5s.get() };
         fixed_5s.tick(now);
@@ -167,12 +194,7 @@ impl TimeDriver {
     pub fn simulated(clock: Rc<VirtualClock>) -> Self {
         // Started on the virtual clock: a real `Instant::now()` would sit ahead
         // of it by however long setup took, a gap that changes every run.
-        let wheel = async_timers::TimeWheel::new_at(clock.now(), clock.now_wall());
-        Self {
-            wheel: UnsafeCell::new(wheel),
-            fixed_5s: UnsafeCell::default(),
-            clock: ClockSource::Virtual(clock),
-        }
+        Self::on(ClockSource::Virtual(clock))
     }
 
     /// Pick the store that can hold `duration` and arm it there.

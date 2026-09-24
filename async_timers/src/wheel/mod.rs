@@ -2,7 +2,7 @@ use self::slab::TimerStorage;
 use smallvec::SmallVec;
 use std::{
     task::Waker,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 mod slab;
@@ -31,7 +31,6 @@ pub struct TimeWheel {
     storage: TimerStorage,
     buckets: BucketLevels,
     last_tick: Instant,
-    last_tick_wall: SystemTime,
     // Whole ticks processed since creation; every level index derives from it.
     ticks: u64,
 }
@@ -90,18 +89,17 @@ impl BucketLevels {
 impl TimeWheel {
     #[must_use]
     pub fn new() -> Self {
-        Self::new_at(Instant::now(), SystemTime::now())
+        Self::new_at(Instant::now())
     }
 
     /// A wheel whose time starts at a caller-supplied instant, for a clock
     /// that [`tick_at`](Self::tick_at) will keep driving.
     #[must_use]
-    pub fn new_at(now: Instant, now_wall: SystemTime) -> Self {
+    pub fn new_at(now: Instant) -> Self {
         Self {
             storage: TimerStorage::default(),
             buckets: BucketLevels::new(),
             last_tick: now,
-            last_tick_wall: now_wall,
             ticks: 0,
         }
     }
@@ -109,7 +107,7 @@ impl TimeWheel {
     /// Advance the wheel to the current time.
     #[inline]
     pub fn tick(&mut self) {
-        self.tick_at(Instant::now(), SystemTime::now());
+        self.tick_at(Instant::now());
     }
 
     /// Advance the wheel to a caller-supplied instant.
@@ -118,7 +116,7 @@ impl TimeWheel {
     /// drive it from a clock it controls, without this crate learning what a
     /// simulation is — and leaves [`tick`](Self::tick) as the only path
     /// production takes.
-    pub fn tick_at(&mut self, now: Instant, now_wall: SystemTime) {
+    pub fn tick_at(&mut self, now: Instant) {
         let elapsed = now.duration_since(self.last_tick);
         let ticks_to_process = (elapsed.as_millis() / MS_TICK as u128) as u64;
 
@@ -132,7 +130,6 @@ impl TimeWheel {
         // event loop), the wheel would never accumulate a full tick and never
         // advance.
         self.last_tick += Duration::from_millis(ticks_to_process * MS_TICK);
-        self.last_tick_wall = now_wall;
     }
 
     /// Number of timers currently occupying slab slots: waiting, fired but
@@ -245,10 +242,6 @@ impl TimeWheel {
 
     pub fn drop(&mut self, id: usize) {
         self.storage.drop(id);
-    }
-
-    pub fn now(&self) -> SystemTime {
-        self.last_tick_wall
     }
 
     // Ticks until the slot `i` ahead on a level of period `period` opens.

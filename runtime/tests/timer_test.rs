@@ -395,3 +395,18 @@ fn a_fired_sleep_stays_ready() {
         );
     });
 }
+
+/// `now()` is derived from the monotonic clock and re-anchored every second:
+/// it stays within a pass of the system wall clock.
+#[test]
+fn now_tracks_the_system_wall_clock() {
+    main_thread(async {
+        for _ in 0..3 {
+            let wall = std::time::SystemTime::now();
+            let now = runtime::runtime::now();
+            let gap = wall.duration_since(now).unwrap_or_else(|e| e.duration());
+            assert!(gap < Duration::from_millis(50), "now() is {gap:?} off");
+            Sleep::during(Duration::from_millis(600)).await;
+        }
+    });
+}

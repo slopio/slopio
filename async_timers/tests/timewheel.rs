@@ -747,7 +747,6 @@ fn test_fired_timer_releases_slab_slot_on_poll() {
 // Synthetic clock driving the wheel through `tick_at` in 10ms steps.
 struct Clock {
     origin: std::time::Instant,
-    wall: std::time::SystemTime,
     elapsed: Duration,
 }
 
@@ -755,14 +754,13 @@ impl Clock {
     fn new() -> Self {
         Self {
             origin: std::time::Instant::now(),
-            wall: std::time::SystemTime::now(),
             elapsed: Duration::ZERO,
         }
     }
 
     fn advance(&mut self, wheel: &mut TimeWheel, by: Duration) {
         self.elapsed += by;
-        wheel.tick_at(self.origin + self.elapsed, self.wall + self.elapsed);
+        wheel.tick_at(self.origin + self.elapsed);
     }
 
     // Elapsed clock time at the first wake, panicking past `limit`.

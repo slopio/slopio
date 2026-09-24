@@ -654,3 +654,26 @@ fn a_sleep_fires_on_virtual_time_whatever_real_time_setup_took() {
     let slept = clock.now() - start;
     assert_eq!(slept, Duration::from_millis(100));
 }
+
+/// Wall time is derived from the monotonic clock between anchors, and the
+/// anchor moves every second: across both, `now()` is the virtual wall time.
+#[test]
+fn now_is_the_wall_time_across_re_anchors() {
+    let (fake, handle) = simulated();
+    let clock = handle.clock().expect("built with virtual time");
+    RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            assert_eq!(runtime_core::runtime::now(), clock.now_wall());
+            for ms in [30, 990, 1_500, 20, 2_000] {
+                Sleep::during(Duration::from_millis(ms)).await;
+                assert_eq!(
+                    runtime_core::runtime::now(),
+                    clock.now_wall(),
+                    "after {ms}ms"
+                );
+            }
+        },
+        None,
+        |run| run(),
+    );
+}

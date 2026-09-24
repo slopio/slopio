@@ -1057,7 +1057,7 @@ mod tests {
     #[ignore]
     fn against_the_wheel() {
         use crate::TimeWheel;
-        use std::time::{Instant, SystemTime};
+        use std::time::Instant;
 
         const TICKS: u64 = 3_000;
         const DURATION_TICKS: u64 = 500;
@@ -1102,7 +1102,6 @@ mod tests {
             // --- the wheel ---
             let mut wheel = TimeWheel::new();
             let start = Instant::now();
-            let wall = SystemTime::now();
             let mut ids = vec![0usize; total];
             let mut arm = Duration::ZERO;
             let mut cancel = Duration::ZERO;
@@ -1128,7 +1127,7 @@ mod tests {
                 cancel += t0.elapsed();
 
                 let t0 = Instant::now();
-                wheel.tick_at(start + Duration::from_millis(t * 10), wall);
+                wheel.tick_at(start + Duration::from_millis(t * 10));
                 tick += t0.elapsed();
                 peak = peak.max(wheel.active_timers());
             }
