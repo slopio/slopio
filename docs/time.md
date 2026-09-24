@@ -30,7 +30,7 @@ Timers are cooperative, like everything else in the runtime. A task that runs fo
 
 A sleep must be one of:
 
-- **any duration up to one minute**, or
+- **any duration up to one hour**, or
 - **exactly five seconds**.
 
 Anything else panics on the first poll. This applies to everything above, not just `Sleep::during` — `timeout`, `repeat` and `retry` all sleep, so their durations are bound by the same set. This is deliberate: rather than one structure stretched to cover everything from a millisecond to a day, each class of duration is served by the structure that suits it, and a duration nothing covers fails loudly instead of quietly firing at the wrong time.
@@ -39,13 +39,13 @@ Five seconds is in the first set too, and still gets its own store: a duration a
 
 The set is meant to grow as the runtime needs it to. Adding a fixed duration is a localised change in `runtime-core/src/runtime/time.rs`: a constant, a store to hold it, and a routing arm. Adding one is cheap; needing one you did not add is a panic you will see immediately.
 
-Until the duration you want exists, build it out of what does — a loop of one-minute sleeps, or a counter over a repeating five-second one.
+Until the duration you want exists, build it out of what does — a loop of one-hour sleeps, or a counter over a repeating five-second one.
 
 ## Cost
 
 Arming a timer, cancelling it and finding the next deadline are all constant time, regardless of how many timers exist. Holding hundreds of thousands of pending sleeps is fine.
 
-Cancelling a sleep does not free its slot immediately; the slot is reclaimed when the clock reaches the deadline it was holding. A dropped timer therefore still occupies memory until the moment it would have fired. That bounds what a burst of cancelled timeouts can cost you: the live set is the *rate* of timers armed times their duration, not the number still waiting. At a high request rate with a timeout per request, size for that product — and prefer a duration with its own store, five seconds today, since the alternative is the wheel holding every cancelled slot for as long as a minute.
+Cancelling a sleep frees it at once, so a timeout per request costs only the timeouts still pending, whatever their duration. The one exception is a five-second sleep: its store keeps a small entry for a cancelled sleep until the five seconds are up, so its live set is the rate of sleeps armed times five seconds. That store is still the cheaper one to arm and cancel.
 
 ## Time in simulation
 

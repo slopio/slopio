@@ -6,21 +6,26 @@ use std::{
 
 mod nodes;
 
-// Two levels, ms → s. The seconds period is a whole number of ms ticks, so a
-// seconds slot cascades exactly when its window opens.
+// Three levels, ms → s → min. Each period is a whole number of the finer
+// level's, so a slot cascades exactly when its window opens.
 const MS_TICK: u64 = 10;
 // No spare slot: the ms level only ever holds deadlines under a second out.
 const MS_BUCKETS: usize = 100;
 // 61 and not 60: a minute-out deadline must not alias the seconds slot the
 // clock stands on, which has already cascaded.
 const S_BUCKETS: usize = 61;
+// Same shape as the seconds level.
+const M_BUCKETS: usize = 61;
 const TICKS_PER_S: u64 = MS_BUCKETS as u64;
-const MAX_TICKS: u64 = TICKS_PER_S * (S_BUCKETS as u64 - 1);
+const TICKS_PER_M: u64 = TICKS_PER_S * 60;
+const MAX_TICKS: u64 = TICKS_PER_M * (M_BUCKETS as u64 - 1);
 /// The longest timer [`TimeWheel::init_timer`] accepts, inclusive.
 pub const MAX_DURATION: Duration = Duration::from_millis(MAX_TICKS * MS_TICK);
-// One list head per slot, ms slots first: bucket `b` is ms slot `b` below
-// `MS_BUCKETS`, seconds slot `b - MS_BUCKETS` above.
-const BUCKETS: usize = MS_BUCKETS + S_BUCKETS;
+// One list head per slot, finest level first: ms slots, then seconds, then
+// minutes.
+const S_BASE: usize = MS_BUCKETS;
+const M_BASE: usize = S_BASE + S_BUCKETS;
+const BUCKETS: usize = M_BASE + M_BUCKETS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurationTooLong;
@@ -75,6 +80,7 @@ struct BucketLevels {
     /// Exact: a bit is set iff its list is non-empty.
     ms_occupied: Bitset<u128>,
     s_occupied: Bitset<u64>,
+    m_occupied: Bitset<u64>,
 }
 
 impl BucketLevels {
@@ -83,22 +89,25 @@ impl BucketLevels {
             heads: [NIL; BUCKETS],
             ms_occupied: Bitset(0),
             s_occupied: Bitset(0),
+            m_occupied: Bitset(0),
         }
     }
 
     #[inline]
     fn mark(&mut self, bucket: usize) {
-        match bucket.checked_sub(MS_BUCKETS) {
-            None => self.ms_occupied.set(bucket),
-            Some(s) => self.s_occupied.set(s),
+        match bucket {
+            ..S_BASE => self.ms_occupied.set(bucket),
+            S_BASE..M_BASE => self.s_occupied.set(bucket - S_BASE),
+            _ => self.m_occupied.set(bucket - M_BASE),
         }
     }
 
     #[inline]
     fn unmark(&mut self, bucket: usize) {
-        match bucket.checked_sub(MS_BUCKETS) {
-            None => self.ms_occupied.clear(bucket),
-            Some(s) => self.s_occupied.clear(s),
+        match bucket {
+            ..S_BASE => self.ms_occupied.clear(bucket),
+            S_BASE..M_BASE => self.s_occupied.clear(bucket - S_BASE),
+            _ => self.m_occupied.clear(bucket - M_BASE),
         }
     }
 
@@ -178,6 +187,11 @@ impl TimeWheel {
         ((self.ticks / TICKS_PER_S) % S_BUCKETS as u64) as usize
     }
 
+    #[inline]
+    fn m_idx(&self) -> usize {
+        ((self.ticks / TICKS_PER_M) % M_BUCKETS as u64) as usize
+    }
+
     fn process_single_tick(&mut self) {
         let idx = self.ms_idx();
         if self.buckets.ms_occupied.is_set(idx) {
@@ -194,12 +208,20 @@ impl TimeWheel {
 
         self.ticks += 1;
 
-        // The seconds slot cascades as its own window opens, into ms slots that
-        // have not fired yet — the one just fired is a tick behind.
+        // A slot cascades as its own window opens, into finer slots that have
+        // not fired yet — the ms slot just fired is a tick behind. Minutes go
+        // first, and never into the seconds slot about to cascade.
         if self.ticks.is_multiple_of(TICKS_PER_S) {
+            if self.ticks.is_multiple_of(TICKS_PER_M) {
+                let idx = self.m_idx();
+                if self.buckets.m_occupied.is_set(idx) {
+                    let head = self.buckets.take(M_BASE + idx);
+                    self.cascade(head);
+                }
+            }
             let idx = self.s_idx();
             if self.buckets.s_occupied.is_set(idx) {
-                let head = self.buckets.take(MS_BUCKETS + idx);
+                let head = self.buckets.take(S_BASE + idx);
                 self.cascade(head);
             }
         }
@@ -216,15 +238,17 @@ impl TimeWheel {
     }
 
     // Finest level whose window still contains `deadline`. A deadline a second
-    // or more out is a whole seconds-slot ahead of the current one, which has
-    // already cascaded, so that slot is never targeted.
+    // (a minute) or more out is a whole slot ahead of the current one, which
+    // has already cascaded, so that slot is never targeted.
     fn place(&mut self, id: u32, deadline: u64) {
         let now = self.ticks;
         let deadline = deadline.max(now);
-        let bucket = if deadline - now < TICKS_PER_S {
-            (deadline % TICKS_PER_S) as usize
-        } else {
-            MS_BUCKETS + ((deadline / TICKS_PER_S) % S_BUCKETS as u64) as usize
+        let bucket = match deadline - now {
+            ..TICKS_PER_S => (deadline % TICKS_PER_S) as usize,
+            TICKS_PER_S..TICKS_PER_M => {
+                S_BASE + ((deadline / TICKS_PER_S) % S_BUCKETS as u64) as usize
+            }
+            _ => M_BASE + ((deadline / TICKS_PER_M) % M_BUCKETS as u64) as usize,
         };
         self.link(id, bucket);
     }
@@ -285,7 +309,7 @@ impl TimeWheel {
     /// Arm a timer, rounded down to the enclosing 10ms tick.
     ///
     /// Anything past [`MAX_DURATION`] is rejected rather than truncated: the
-    /// seconds level reaches exactly one minute and has nowhere to put it.
+    /// minutes level reaches exactly one hour and has nowhere to put it.
     ///
     /// A slot is drained by the tick that *reaches* it, so a deadline `n` ticks
     /// out is served by the n+1-th tick from here — the duration plus whatever
@@ -332,8 +356,8 @@ impl TimeWheel {
     }
 
     /// Lower bound on the time until the next timer fires, or None if no timers
-    /// are registered. Exact for the ms level; a seconds slot answers with when
-    /// it cascades, which is never past the earliest deadline it holds.
+    /// are registered. Exact for the ms level; a seconds or minutes slot answers
+    /// with when it cascades, which is never past the earliest deadline it holds.
     ///
     /// The `+ 1` is the same offset [`init_timer`](Self::init_timer) takes off:
     /// a slot `i` ahead is drained by the i+1-th tick, so answering `i` sends
@@ -348,11 +372,12 @@ impl TimeWheel {
             .s_occupied
             .next_set(self.s_idx(), S_BUCKETS)
             .map(|i| self.ticks_until(i, TICKS_PER_S));
-        // Both: a seconds slot can cascade into an ms slot ahead of the occupied one.
-        let ticks = match (ms, s) {
-            (Some(ms), Some(s)) => ms.min(s),
-            (ms, s) => ms.or(s)?,
-        };
+        let m = b
+            .m_occupied
+            .next_set(self.m_idx(), M_BUCKETS)
+            .map(|i| self.ticks_until(i, TICKS_PER_M));
+        // All three: a coarser slot can cascade ahead of an occupied finer one.
+        let ticks = [ms, s, m].into_iter().flatten().min()?;
         Some(Duration::from_millis((ticks + 1) * MS_TICK))
     }
 }

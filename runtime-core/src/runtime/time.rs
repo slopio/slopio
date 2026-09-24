@@ -105,7 +105,7 @@ pub struct Sleep {
 impl Sleep {
     /// Sleeps for `duration`, up to 10ms late.
     ///
-    /// Two shapes are served: anything up to one minute, and 5s exactly.
+    /// Two shapes are served: anything up to one hour, and 5s exactly.
     /// Anything else panics on the first poll — no store can hold it.
     pub fn during(duration: Duration) -> Self {
         Self {

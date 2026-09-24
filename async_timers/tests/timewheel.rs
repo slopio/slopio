@@ -44,8 +44,8 @@ fn test_duration_at_limit() {
     let mut wheel = TimeWheel::new();
     let (_, waker) = make_waker();
 
-    // One minute exactly is the last duration the seconds level can hold.
-    assert_eq!(MAX_DURATION, Duration::from_secs(60));
+    // One hour exactly is the last duration the minutes level can hold.
+    assert_eq!(MAX_DURATION, Duration::from_secs(3_600));
     assert!(wheel.init_timer(MAX_DURATION, &waker).is_ok());
 }
 
@@ -821,44 +821,70 @@ fn test_timer_inserted_mid_ring_wraps_to_its_own_slot() {
     assert_fired_within_tick(fired_at, idle + duration);
 }
 
-/// The aliasing case the 61st seconds slot exists for: a full-window timer
-/// armed at an arbitrary second must not land on the slot the clock stands on,
-/// which has already cascaded.
-#[test]
-fn test_full_window_timer_never_aliases_the_current_slot() {
-    // Every slot of the seconds ring, so the wrap past slot 0 is covered too,
-    // each from a second boundary and from part-way into a second.
-    let seconds_ring = MAX_DURATION.as_secs() + 1;
-    for offset in 0..seconds_ring {
-        for skew in [Duration::ZERO, Duration::from_millis(370)] {
+// Arms `window` from every slot of a ring of `slots` slots of `period`, from a
+// slot boundary and from part-way into one, and checks it fires on time.
+fn assert_window_never_aliases(window: Duration, period: Duration, slots: u32, skews: &[Duration]) {
+    for offset in 0..slots {
+        for &skew in skews {
             let mut wheel = TimeWheel::new();
             let mut clock = Clock::new();
             let (counter, waker) = make_waker();
 
-            clock.advance(&mut wheel, Duration::from_secs(offset) + skew);
-            wheel.init_timer(MAX_DURATION, &waker).unwrap();
+            clock.advance(&mut wheel, period * offset + skew);
+            wheel.init_timer(window, &waker).unwrap();
 
             // An aliased deadline would land on a slot that cascades at the
-            // next second, firing a minute early.
-            clock.advance(&mut wheel, MAX_DURATION - Duration::from_millis(10));
-            assert_eq!(counter.count(), 0, "fired early at {offset}s + {skew:?}");
+            // next period, firing a whole ring early.
+            clock.advance(&mut wheel, window - Duration::from_millis(10));
+            assert_eq!(counter.count(), 0, "fired early at {offset} + {skew:?}");
 
             clock.advance(&mut wheel, Duration::from_millis(10));
-            assert_eq!(counter.count(), 1, "never fired at {offset}s + {skew:?}");
+            assert_eq!(counter.count(), 1, "never fired at {offset} + {skew:?}");
         }
     }
 }
 
+/// A minute-long timer, armed anywhere in a second, reaches a whole seconds
+/// ring ahead: it must fire on its own tick, not a ring early or late.
+#[test]
+fn test_minute_timer_never_aliases_the_current_seconds_slot() {
+    assert_window_never_aliases(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        61,
+        &[
+            Duration::ZERO,
+            Duration::from_millis(370),
+            Duration::from_millis(990),
+        ],
+    );
+}
+
+/// The same case one level up, for a full-window timer on the minutes ring.
+#[test]
+fn test_full_window_timer_never_aliases_the_current_minutes_slot() {
+    assert_window_never_aliases(
+        MAX_DURATION,
+        Duration::from_secs(60),
+        61,
+        &[
+            Duration::ZERO,
+            Duration::from_millis(37_370),
+            Duration::from_millis(59_990),
+        ],
+    );
+}
+
 /// Every duration the wheel takes, armed together, must fire on exactly the
-/// tick its deadline names: the two levels have to agree on where a deadline
+/// tick its deadline names: the levels have to agree on where a deadline
 /// lives, and the cascade has to carry it down without rounding.
 #[test]
 fn test_every_duration_fires_on_the_tick_its_deadline_names() {
     let max_ticks = MAX_DURATION.as_millis() as usize / 10;
 
-    // Arming at, just before and just after a second boundary: where the ms
-    // level hands over to the seconds level and where a cascade lands.
-    for skew in [0, 37, 99, 100] {
+    // Arming at, just before and just after a second and a minute boundary:
+    // where one level hands over to the next and where a cascade lands.
+    for skew in [0, 37, 99, 100, 5_999, 6_000] {
         let mut wheel = TimeWheel::new();
         let mut clock = Clock::new();
         clock.advance(&mut wheel, Duration::from_millis(skew * 10));
@@ -1054,11 +1080,12 @@ fn test_random_operations_match_a_model() {
 
     for step in 0..40_000 {
         match next(10) {
-            // Arm: mostly short, some up to the full minute.
+            // Arm: mostly short, some up to the full hour.
             0..=4 => {
-                let ms = match next(4) {
+                let ms = match next(5) {
                     0 => next(100),
                     1 => next(1_000),
+                    2 | 3 => next(60_001),
                     _ => next(MAX_DURATION.as_millis() as u64 + 1),
                 };
                 let (counter, waker) = make_waker();
