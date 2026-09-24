@@ -139,8 +139,8 @@ impl Wakers {
         self.inner.len()
     }
 
-    fn get(&self, i: usize) -> Option<&Waker> {
-        self.inner[i].as_ref()
+    fn take(&mut self, i: usize) -> Option<Waker> {
+        self.inner[i].take()
     }
 
     fn replace(&mut self, i: usize, waker: &Waker) {
@@ -264,10 +264,11 @@ impl<const MILLIS: u64> Timers<MILLIS> {
         if n == 0 {
             return;
         }
-        let wakers = &self.wakers;
+        let wakers = &mut self.wakers;
         for i in self.active.iter(n) {
-            if let Some(waker) = wakers.get(i) {
-                waker.wake_by_ref();
+            // Taken and woken by value: the entry leaves the queue right after.
+            if let Some(waker) = wakers.take(i) {
+                waker.wake();
             }
         }
         self.drop_front(n);

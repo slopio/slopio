@@ -61,9 +61,11 @@ impl TimerStorage {
     pub(crate) fn wake(&mut self, id: usize) {
         let timer = self.inner.get_mut(id).unwrap();
         match timer {
-            Timer::Waiting(waker, _) => {
-                waker.wake_by_ref();
-                *timer = Timer::Done;
+            Timer::Waiting(..) => {
+                // Moved out and woken by value: `Done` keeps no waker.
+                if let Timer::Waiting(waker, _) = std::mem::replace(timer, Timer::Done) {
+                    waker.wake();
+                }
                 return;
             }
             Timer::Done => unreachable!(),

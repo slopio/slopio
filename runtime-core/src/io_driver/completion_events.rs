@@ -149,7 +149,15 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
         SingleOpState::Init => {
             SingleProcessResult::InvalidState("submitted entry shouldn't be in init")
         }
-        SingleOpState::Sent(waker) => {
+        SingleOpState::Sent(_) => {
+            let ended = SingleOpState::Ended(OpMetadata {
+                result: data.result,
+                flags: data.flags,
+            });
+            // The waker is moved out, not cloned: the state it leaves is over.
+            let SingleOpState::Sent(waker) = std::mem::replace(op_state, ended) else {
+                unreachable!()
+            };
             if cqueue::more(data.flags) {
                 // Zero-copy completion: a notification still follows, and the
                 // kernel may keep reading the buffer until it lands. Stash the
@@ -157,27 +165,26 @@ pub(crate) fn process_single(op_state: &mut SingleOpState, data: CQEData) -> Sin
                 // progress while its buffer is pinned.
                 *op_state = SingleOpState::Notif {
                     result: data.result,
-                    waker: waker.clone(),
+                    waker,
                 };
             } else {
                 // Normal send, or a zero-copy error / copy-fallback success:
                 // no notification is coming, so this CQE is terminal.
-                waker.wake_by_ref();
-                *op_state = SingleOpState::Ended(OpMetadata {
-                    result: data.result,
-                    flags: data.flags,
-                });
+                waker.wake();
             }
             SingleProcessResult::Completed
         }
-        SingleOpState::Notif { result, waker } => {
+        SingleOpState::Notif { result, .. } => {
             // The zero-copy notification (`F_NOTIF`): the buffer is now free.
             // Deliver the byte count stashed from the completion CQE.
-            waker.wake_by_ref();
-            *op_state = SingleOpState::Ended(OpMetadata {
+            let ended = SingleOpState::Ended(OpMetadata {
                 result: *result,
                 flags: data.flags,
             });
+            let SingleOpState::Notif { waker, .. } = std::mem::replace(op_state, ended) else {
+                unreachable!()
+            };
+            waker.wake();
             SingleProcessResult::Completed
         }
         SingleOpState::Ended(_) => SingleProcessResult::InvalidState("received CQE for ended op"),

@@ -31,7 +31,10 @@ pub struct TypedTask<F: Future> {
 impl<F: Future> TypedTask<F> {
     pub fn register_waker(&mut self, waker: &Waker) {
         let inner = unsafe { self.inner.as_mut() };
-        inner.waker.waker.replace(waker.clone());
+        match &mut inner.waker.waker {
+            Some(held) if held.will_wake(waker) => {}
+            slot => *slot = Some(waker.clone()),
+        }
     }
 
     fn take_output(&mut self) -> Option<F::Output> {
@@ -64,10 +67,11 @@ impl<F: Future> TypedTask<F> {
             let mut ctx = Context::from_waker(&waker);
             if let std::task::Poll::Ready(r) = pinned.poll(&mut ctx) {
                 inner.data.state = State::Finished(r);
+                // Taken and woken by value: the awaiter only needs waking once.
                 if !inner.header.detached_mode.get()
-                    && let Some(waker) = &inner.waker.waker
+                    && let Some(waker) = inner.waker.waker.take()
                 {
-                    waker.wake_by_ref();
+                    waker.wake();
                 }
             }
         }
@@ -190,9 +194,12 @@ unsafe fn detach<F: Future>(ptr: NonNull<Metadata>) {
 
 unsafe fn get_output<F: Future>(ptr: NonNull<Metadata>, dest: *mut (), waker: &Waker) {
     let mut typed_task = TypedTask::<F>::from_raw(ptr);
-    typed_task.register_waker(waker);
-    if let Some(result) = typed_task.take_output() {
-        let p = dest as *mut std::task::Poll<F::Output>;
-        unsafe { *p = std::task::Poll::Ready(result) };
+    match typed_task.take_output() {
+        Some(result) => {
+            let p = dest as *mut std::task::Poll<F::Output>;
+            unsafe { *p = std::task::Poll::Ready(result) };
+        }
+        // Only a handle that still waits needs to be woken later.
+        None => typed_task.register_waker(waker),
     }
 }
