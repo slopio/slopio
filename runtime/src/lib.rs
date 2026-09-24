@@ -217,13 +217,22 @@ fn allowed_cpus() -> Vec<usize> {
     }
 }
 
-/// Aborts the process if dropped armed: a worker that fails before its runtime
-/// is up takes the whole process down rather than leave its peers waiting.
-struct StartupGuard(usize);
+/// Aborts the process if dropped armed, which only a panic can do: a worker
+/// that dies takes the whole process down rather than leave its peers waiting
+/// on it or sending into a ring that is gone.
+struct WorkerGuard {
+    worker: usize,
+    started: std::rc::Rc<std::cell::Cell<bool>>,
+}
 
-impl Drop for StartupGuard {
+impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        eprintln!("worker {} failed during startup; aborting", self.0);
+        let when = if self.started.get() {
+            ""
+        } else {
+            " during startup"
+        };
+        eprintln!("worker {} panicked{when}; aborting", self.worker);
         std::process::abort();
     }
 }
@@ -266,37 +275,58 @@ where
     F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
     std::thread::spawn(move || {
-        let startup = StartupGuard(n);
-        pin_core(cpu);
-        let ctx = WorkerContext {
-            thread_id: n,
-            num_threads,
+        let guard = WorkerGuard {
+            worker: n,
+            started: Default::default(),
         };
-        let fut = f(ctx);
-        // First polled once the ring is up and every peer has published: startup is over.
-        let fut = async move {
-            std::mem::forget(startup);
-            fut.await
-        };
-        let rt = RuntimeInner::with_peers(n, peers);
-        #[cfg(feature = "otlp")]
-        return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
-            use crate::otlp_collector::OtlpCollector;
-            use runtime_core::tracing::{TRACING_SINK, init_trace_sink, set_thread_id};
-            set_thread_id(n);
-            let sink = init_trace_sink::<OtlpCollector>();
-            TRACING_SINK.set(&sink, run)
-        });
-        #[cfg(all(feature = "tracing", not(feature = "otlp")))]
-        return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
-            use runtime_core::tracing::{
-                ConsoleCollector, TRACING_SINK, init_trace_sink, set_thread_id,
-            };
-            set_thread_id(n);
-            let sink = init_trace_sink::<ConsoleCollector>();
-            TRACING_SINK.set(&sink, run)
-        });
-        #[cfg(not(feature = "tracing"))]
-        rt.block_on::<R, _>(fut, Some(event_fd), |run| run())
+        let started = guard.started.clone();
+        run_worker::<R, F>(n, cpu, num_threads, f, event_fd, peers, started);
+        // Returned rather than unwound: nothing to abort for.
+        std::mem::forget(guard);
     })
+}
+
+fn run_worker<R, F>(
+    n: usize,
+    cpu: usize,
+    num_threads: usize,
+    f: std::sync::Arc<F>,
+    event_fd: i32,
+    peers: std::sync::Arc<runtime_core::runtime::peers::PeerTable>,
+    started: std::rc::Rc<std::cell::Cell<bool>>,
+) where
+    R: BufRingSet + 'static,
+    F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
+{
+    pin_core(cpu);
+    let ctx = WorkerContext {
+        thread_id: n,
+        num_threads,
+    };
+    let fut = f(ctx);
+    // First polled once the ring is up and every peer has published: startup is over.
+    let fut = async move {
+        started.set(true);
+        fut.await
+    };
+    let rt = RuntimeInner::with_peers(n, peers);
+    #[cfg(feature = "otlp")]
+    return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
+        use crate::otlp_collector::OtlpCollector;
+        use runtime_core::tracing::{TRACING_SINK, init_trace_sink, set_thread_id};
+        set_thread_id(n);
+        let sink = init_trace_sink::<OtlpCollector>();
+        TRACING_SINK.set(&sink, run)
+    });
+    #[cfg(all(feature = "tracing", not(feature = "otlp")))]
+    return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
+        use runtime_core::tracing::{
+            ConsoleCollector, TRACING_SINK, init_trace_sink, set_thread_id,
+        };
+        set_thread_id(n);
+        let sink = init_trace_sink::<ConsoleCollector>();
+        TRACING_SINK.set(&sink, run)
+    });
+    #[cfg(not(feature = "tracing"))]
+    rt.block_on::<R, _>(fut, Some(event_fd), |run| run())
 }

@@ -1,5 +1,5 @@
-//! `thread_per_core` startup: workers are pinned to the CPUs the process may
-//! use, and a worker that fails before its runtime is up stops the process.
+//! `thread_per_core` workers: pinned to the CPUs the process may use, and a
+//! worker that panics, starting or running, stops the whole process.
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
@@ -65,25 +65,31 @@ fn workers_are_pinned_to_the_allowed_cpus_not_to_their_index() {
     }
 }
 
-const CHILD: &str = "RUNTIME_STARTUP_PANIC_CHILD";
+const CHILD: &str = "RUNTIME_WORKER_PANIC_CHILD";
 
-/// Run by the test below in a child process only.
+/// Run by the tests below in a child process only: worker 1 panics either
+/// while starting (`f(ctx)`) or once running, while its peers run forever.
 #[test]
 #[ignore]
-fn startup_panic_child() {
-    if std::env::var_os(CHILD).is_none() {
+fn worker_panic_child() {
+    let Some(mode) = std::env::var_os(CHILD) else {
         return;
-    }
-    thread_per_core(|ctx| {
-        if ctx.thread_id == 1 {
+    };
+    let while_starting = mode == "startup";
+    thread_per_core(move |ctx| {
+        if ctx.thread_id == 1 && while_starting {
             panic!("worker 1 cannot start");
         }
-        Box::pin(async {})
+        Box::pin(async move {
+            if ctx.thread_id == 1 {
+                panic!("worker 1 died while running");
+            }
+            std::future::pending::<()>().await;
+        })
     });
 }
 
-#[test]
-fn a_worker_that_fails_at_startup_aborts_the_process() {
+fn assert_child_aborts(mode: &str) {
     if std::thread::available_parallelism().unwrap().get() < 2 {
         eprintln!("skipping: need at least 2 CPUs");
         return;
@@ -91,11 +97,11 @@ fn a_worker_that_fails_at_startup_aborts_the_process() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "startup_panic_child",
+            "worker_panic_child",
             "--include-ignored",
             "--nocapture",
         ])
-        .env(CHILD, "1")
+        .env(CHILD, mode)
         .spawn()
         .unwrap();
 
@@ -106,9 +112,19 @@ fn a_worker_that_fails_at_startup_aborts_the_process() {
         }
         if Instant::now() > deadline {
             child.kill().unwrap();
-            panic!("the process hung instead of aborting");
+            panic!("the process kept running instead of aborting");
         }
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(status.signal(), Some(libc::SIGABRT), "{status:?}");
+}
+
+#[test]
+fn a_worker_that_fails_at_startup_aborts_the_process() {
+    assert_child_aborts("startup");
+}
+
+#[test]
+fn a_worker_that_panics_while_running_aborts_the_process() {
+    assert_child_aborts("running");
 }
