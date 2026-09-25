@@ -1,10 +1,12 @@
 mod multi_recv;
 mod recv;
 mod send;
+mod split;
 
 pub use multi_recv::{UdpDatagram, UdpMultiRecv};
 pub use recv::{UdpPacket, UdpRecvFrom};
 pub use send::UdpSendTo;
+pub use split::{UdpRecvHalf, UdpReuniteError, UdpSendHalf, UdpSocketOwner};
 
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -17,6 +19,7 @@ use crate::io_driver::ParkedFd;
 use crate::io_driver::operations::sockets::SocketWrapper;
 use crate::io_driver::operations::{IoBuf, IoBufMut};
 
+#[derive(Debug)]
 pub struct UdpSocket {
     socket: SocketWrapper,
 }

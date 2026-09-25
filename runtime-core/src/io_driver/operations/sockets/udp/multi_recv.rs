@@ -12,7 +12,7 @@ use io_uring::{
 };
 use runtime_streams::Stream;
 
-use super::UdpSocket;
+use super::{UdpSocket, UdpSocketOwner};
 use crate::io_driver::{
     BorrowedBuffer, BufRingSpec, DEFAULT_QUEUE_SIZE, IO_DRIVER, MultiOpQueue, MultiPollResult,
     MultishotCompletionEvent,
@@ -41,13 +41,19 @@ impl MsgHdrBox {
     }
 }
 
-/// Owns its socket for as long as it streams, like `MultiRecv` does for TCP.
-/// Reply through [`UdpMultiRecv::socket`]'s `send_to`; take the socket back
-/// with [`UdpMultiRecv::into_inner`].
-pub struct UdpMultiRecv<S: BufRingSpec, const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
+/// Owns its socket handle for as long as it streams, like `MultiRecv` does
+/// for TCP. The handle is a whole [`UdpSocket`], or a
+/// [`UdpRecvHalf`](super::UdpRecvHalf) when the send half lives in another
+/// task. Reply through [`UdpMultiRecv::socket`]'s `send_to`; take the handle
+/// back with [`UdpMultiRecv::into_inner`].
+pub struct UdpMultiRecv<
+    S: BufRingSpec,
+    O: UdpSocketOwner = UdpSocket,
+    const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE,
+> {
     id: Option<MultishotToken>,
-    /// `Some` until `into_inner` moves the socket out.
-    socket: Option<UdpSocket>,
+    /// `Some` until `into_inner` moves the socket handle out.
+    socket: Option<O>,
     reads: MultiOpQueue,
     /// A fatal error was yielded: every later poll answers `None` without re-arming.
     ended: bool,
@@ -89,14 +95,14 @@ impl<S: BufRingSpec> UdpDatagram<S> {
     }
 }
 
-impl<S: BufRingSpec> UdpMultiRecv<S, DEFAULT_QUEUE_SIZE> {
-    pub fn new(socket: UdpSocket) -> Self {
+impl<S: BufRingSpec, O: UdpSocketOwner> UdpMultiRecv<S, O, DEFAULT_QUEUE_SIZE> {
+    pub fn new(socket: O) -> Self {
         Self::with_queue_size(socket)
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
-    pub fn with_queue_size(socket: UdpSocket) -> Self {
+impl<S: BufRingSpec, O: UdpSocketOwner, const QUEUE_SIZE: usize> UdpMultiRecv<S, O, QUEUE_SIZE> {
+    pub fn with_queue_size(socket: O) -> Self {
         Self {
             id: None,
             socket: Some(socket),
@@ -109,13 +115,13 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
 
     /// The socket this stream reads from — replies go through its `send_to`.
     pub fn socket(&self) -> &UdpSocket {
-        self.socket.as_ref().expect("socket present")
+        self.socket.as_ref().expect("socket present").socket()
     }
 
-    /// Stop streaming and take the socket back. Cancels the multishot the
+    /// Stop streaming and take the socket handle back. Cancels the multishot the
     /// same way `Drop` does; the driver absorbs the cancelled op's final
     /// CQEs and recycles their buffers.
-    pub fn into_inner(mut self) -> UdpSocket {
+    pub fn into_inner(mut self) -> O {
         self.recycle_pending_buffers();
         self.driver_cleanup();
         // Drop then finds `id` and `socket` both empty and does nothing.
@@ -204,7 +210,9 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> Drop for UdpMultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: UdpSocketOwner, const QUEUE_SIZE: usize> Drop
+    for UdpMultiRecv<S, O, QUEUE_SIZE>
+{
     fn drop(&mut self) {
         // Recycle kernel buffers from any unprocessed completion events
         // before cancelling, otherwise buffer-ring entries leak.
@@ -213,7 +221,7 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> Drop for UdpMultiRecv<S, QUEUE_SIZ
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: UdpSocketOwner, const QUEUE_SIZE: usize> UdpMultiRecv<S, O, QUEUE_SIZE> {
     fn recycle_pending_buffers(&mut self) {
         while let Some(event) = self.reads.pop() {
             // The flag alone says a buffer was consumed, whatever the result.
@@ -224,9 +232,14 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> UdpMultiRecv<S, QUEUE_SIZE> {
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> Unpin for UdpMultiRecv<S, QUEUE_SIZE> {}
+impl<S: BufRingSpec, O: UdpSocketOwner, const QUEUE_SIZE: usize> Unpin
+    for UdpMultiRecv<S, O, QUEUE_SIZE>
+{
+}
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for UdpMultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: UdpSocketOwner, const QUEUE_SIZE: usize> Stream
+    for UdpMultiRecv<S, O, QUEUE_SIZE>
+{
     type Item = Result<UdpDatagram<S>, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -265,7 +278,9 @@ impl<S: BufRingSpec, const QUEUE_SIZE: usize> Stream for UdpMultiRecv<S, QUEUE_S
     }
 }
 
-impl<S: BufRingSpec, const QUEUE_SIZE: usize> IoOP for UdpMultiRecv<S, QUEUE_SIZE> {
+impl<S: BufRingSpec, O: UdpSocketOwner, const QUEUE_SIZE: usize> IoOP
+    for UdpMultiRecv<S, O, QUEUE_SIZE>
+{
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
         let token = IO_DRIVER

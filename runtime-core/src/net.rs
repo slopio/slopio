@@ -48,7 +48,9 @@ pub use crate::io_driver::operations::sockets::multi_recv::MultiRecv;
 // ── UDP ──
 
 pub use crate::io_driver::operations::sockets::udp::UdpMultiRecv;
-pub use crate::io_driver::operations::sockets::udp::UdpSocket;
+pub use crate::io_driver::operations::sockets::udp::{
+    UdpRecvHalf, UdpReuniteError, UdpSendHalf, UdpSocket, UdpSocketOwner,
+};
 
 // ── Buffers ──
 

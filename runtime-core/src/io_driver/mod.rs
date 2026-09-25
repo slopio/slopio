@@ -1762,8 +1762,7 @@ impl Ring {
                 // SAFETY: the caller's contract for `add` is the caller's
                 // contract for `push` — the entry's buffers outlive the op.
                 // Behind any overflowed entry, so submission order is kept.
-                if !self.overflow.is_empty() || unsafe { ring.submission().push(entry) }.is_err()
-                {
+                if !self.overflow.is_empty() || unsafe { ring.submission().push(entry) }.is_err() {
                     self.overflow.push_back(entry.clone());
                 }
             }
@@ -1833,7 +1832,10 @@ mod ring_tests {
         let RingBackend::Uring(uring) = &mut ring.inner else {
             unreachable!()
         };
-        while Ring::enter_once(uring, &mut ring.overflow, 0).ok().expect("nops never busy") {}
+        while Ring::enter_once(uring, &mut ring.overflow, 0)
+            .ok()
+            .expect("nops never busy")
+        {}
         let order: Vec<u64> = uring.completion().map(|cqe| cqe.user_data()).collect();
         assert_eq!(order, (0..5_000).collect::<Vec<_>>());
     }
