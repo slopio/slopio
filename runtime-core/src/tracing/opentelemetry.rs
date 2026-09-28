@@ -14,10 +14,9 @@ impl TraceSink {
     }
 }
 
-pub fn init_trace_sink<P: Collector + 'static>() -> TraceSink {
+pub fn init_trace_sink<P: Collector + 'static>(mut processor: P) -> TraceSink {
     let (sender, recv) = unbounded_channel();
     spawn(async move {
-        let mut processor = P::init();
         while let Some(batch) = recv.recv_all().await {
             processor.process(batch).await;
         }

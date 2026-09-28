@@ -70,8 +70,8 @@ pub struct LocalDebugCollector {
     config: &'static LocalDebugConfig,
 }
 
-impl Collector for LocalDebugCollector {
-    fn init() -> Self {
+impl Default for LocalDebugCollector {
+    fn default() -> Self {
         let config = local_debug_config();
         if let Err(e) = std::fs::create_dir_all(&config.dir) {
             eprintln!(
@@ -89,7 +89,9 @@ impl Collector for LocalDebugCollector {
             config,
         }
     }
+}
 
+impl Collector for LocalDebugCollector {
     async fn process(&mut self, batch: Vec<SpanWrapper>) {
         if self.needs_rotation() {
             self.rotate();

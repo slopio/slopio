@@ -64,4 +64,4 @@ To exercise the HTTP/3 path against a running server by hand, a `curl` built wit
 curl --http3 -k https://localhost:4433/{1,2,3} --parallel
 ```
 
-Optional features on the `runtime` crate: `tracing`, `local_debug_collector`, `otlp`, `ebpf_balancer` (needs `clang`), `simulation`.
+Optional features on the `runtime` crate: `tracing`, `local_debug_collector`, `ebpf_balancer` (needs `clang`), `simulation`.

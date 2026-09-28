@@ -17,42 +17,34 @@ pub use runtime_core::define_buf_ring;
 #[cfg(feature = "tracing")]
 pub use runtime_core::tracing;
 
-#[cfg(feature = "otlp")]
-mod otlp_collector;
-
-#[cfg(feature = "otlp")]
-pub use otlp_collector::{OtlpConfig, set_otlp_config};
-
-/// Selects which collector to use for telemetry. Picked at runtime by the
-/// caller and passed to the runtime entry point.
-///
-/// Each variant is gated behind its collector's feature flag: enabling the
-/// feature exposes the variant, disabling it compiles the variant (and the
-/// collector itself) away. So `--features otlp` is the only way to get
-/// `CollectorChoice::Otlp`, etc.
-///
-/// Each variant reads its own configuration from a dedicated setter
-/// (`set_otlp_config`, `set_local_debug_config`, ...) — the enum only picks
-/// *which* collector runs, not *how* it's configured.
-///
-/// There is intentionally no `None` variant: if you want no telemetry, build
-/// without the `tracing` feature and the entire span machinery compiles away.
-/// Enabling `tracing` means you've committed to picking a collector.
-#[cfg(feature = "tracing")]
-#[derive(Debug, Clone, Copy)]
-pub enum CollectorChoice {
-    /// `ConsoleCollector` — one line per span to stderr. Available whenever
-    /// `tracing` is enabled.
-    Console,
-    /// `LocalDebugCollector` — per-worker JSONL files for local inspection.
-    /// Configured via `runtime_core::tracing::set_local_debug_config`.
-    #[cfg(feature = "local_debug_collector")]
-    LocalDebug,
-    /// `OtlpCollector` — gRPC export to an OTLP backend (e.g. Tempo).
-    /// Configured via [`set_otlp_config`].
-    #[cfg(feature = "otlp")]
-    Otlp,
+/// What a worker installs around its root future: a span collector under
+/// `tracing`, built on the worker by a factory; nothing otherwise.
+trait Telemetry {
+    fn install<O>(&self, thread_id: Option<usize>, run: impl FnOnce() -> O) -> O;
 }
+
+#[cfg(feature = "tracing")]
+impl<C: tracing::Collector + 'static, M: Fn() -> C> Telemetry for M {
+    fn install<O>(&self, thread_id: Option<usize>, run: impl FnOnce() -> O) -> O {
+        if let Some(n) = thread_id {
+            tracing::set_thread_id(n);
+        }
+        let sink = tracing::init_trace_sink(self());
+        tracing::TRACING_SINK.set(&sink, run)
+    }
+}
+
+#[cfg(not(feature = "tracing"))]
+impl Telemetry for () {
+    fn install<O>(&self, _: Option<usize>, run: impl FnOnce() -> O) -> O {
+        run()
+    }
+}
+
+#[cfg(feature = "tracing")]
+const DEFAULT_TELEMETRY: fn() -> tracing::ConsoleCollector = || tracing::ConsoleCollector;
+#[cfg(not(feature = "tracing"))]
+const DEFAULT_TELEMETRY: () = ();
 
 pub mod http;
 
@@ -68,23 +60,22 @@ pub fn main_thread<F: Future>(f: F) -> F::Output {
 /// worker thread before running `f`. `R` may be `()`, a single
 /// `BufRingSpec`, or a tuple of `BufRingSpec`s.
 pub fn main_thread_with<R: BufRingSet, F: Future>(f: F) -> F::Output {
+    main_thread_on::<R, _, F>(DEFAULT_TELEMETRY, f)
+}
+
+/// Like [`main_thread_with`], but exports spans through the collector
+/// `collector` builds instead of printing them to stderr.
+#[cfg(feature = "tracing")]
+pub fn main_thread_traced<R: BufRingSet, C: tracing::Collector + 'static, F: Future>(
+    collector: impl Fn() -> C,
+    f: F,
+) -> F::Output {
+    main_thread_on::<R, _, F>(collector, f)
+}
+
+fn main_thread_on<R: BufRingSet, T: Telemetry, F: Future>(telemetry: T, f: F) -> F::Output {
     ignore_sigpipe();
-    let rt = RuntimeInner::default();
-    #[cfg(feature = "otlp")]
-    return rt.block_on::<R, F>(f, None, |run| {
-        use crate::otlp_collector::OtlpCollector;
-        use runtime_core::tracing::{TRACING_SINK, init_trace_sink};
-        let sink = init_trace_sink::<OtlpCollector>();
-        TRACING_SINK.set(&sink, run)
-    });
-    #[cfg(all(feature = "tracing", not(feature = "otlp")))]
-    return rt.block_on::<R, F>(f, None, |run| {
-        use runtime_core::tracing::{ConsoleCollector, TRACING_SINK, init_trace_sink};
-        let sink = init_trace_sink::<ConsoleCollector>();
-        TRACING_SINK.set(&sink, run)
-    });
-    #[cfg(not(feature = "tracing"))]
-    rt.block_on::<R, F>(f, None, |run| run())
+    RuntimeInner::default().block_on::<R, F>(f, None, |run| telemetry.install(None, run))
 }
 
 /// Set `SIGPIPE`'s disposition to `SIG_IGN` for the whole process.
@@ -167,6 +158,28 @@ where
     R: BufRingSet + 'static,
     F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
+    thread_per_core_on::<R, _, F>(DEFAULT_TELEMETRY, f)
+}
+
+/// Like [`thread_per_core_with`], but each worker exports its spans through
+/// its own collector, built on the worker by `collector`, instead of printing
+/// them to stderr.
+#[cfg(feature = "tracing")]
+pub fn thread_per_core_traced<R, C, F>(collector: impl Fn() -> C + Send + Sync + 'static, f: F)
+where
+    R: BufRingSet + 'static,
+    C: tracing::Collector + 'static,
+    F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
+{
+    thread_per_core_on::<R, _, F>(collector, f)
+}
+
+fn thread_per_core_on<R, T, F>(telemetry: T, f: F)
+where
+    R: BufRingSet + 'static,
+    T: Telemetry + Send + Sync + 'static,
+    F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
+{
     ignore_sigpipe();
     block_signals_for_thread();
     // Never more workers than CPUs this process may run on; `available_parallelism`
@@ -185,12 +198,22 @@ where
     let peers = std::sync::Arc::new(runtime_core::runtime::peers::PeerTable::new(&fds));
 
     let f = std::sync::Arc::new(f);
+    let telemetry = std::sync::Arc::new(telemetry);
     let handles = fds
         .iter()
         .zip(0..num_threads)
         .map(|(sig_handler_fd, n)| {
             let f = f.clone();
-            spawn_worker_on::<R, F>(n, cpus[n], num_threads, f, *sig_handler_fd, peers.clone())
+            let telemetry = telemetry.clone();
+            spawn_worker_on::<R, T, F>(
+                n,
+                cpus[n],
+                num_threads,
+                f,
+                telemetry,
+                *sig_handler_fd,
+                peers.clone(),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -262,16 +285,18 @@ mod numa {
     }
 }
 
-fn spawn_worker_on<R, F>(
+fn spawn_worker_on<R, T, F>(
     n: usize,
     cpu: usize,
     num_threads: usize,
     f: std::sync::Arc<F>,
+    telemetry: std::sync::Arc<T>,
     event_fd: i32,
     peers: std::sync::Arc<runtime_core::runtime::peers::PeerTable>,
 ) -> JoinHandle<()>
 where
     R: BufRingSet + 'static,
+    T: Telemetry + Send + Sync + 'static,
     F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
     std::thread::spawn(move || {
@@ -280,22 +305,33 @@ where
             started: Default::default(),
         };
         let started = guard.started.clone();
-        run_worker::<R, F>(n, cpu, num_threads, f, event_fd, peers, started);
+        run_worker::<R, T, F>(
+            n,
+            cpu,
+            num_threads,
+            f,
+            &*telemetry,
+            event_fd,
+            peers,
+            started,
+        );
         // Returned rather than unwound: nothing to abort for.
         std::mem::forget(guard);
     })
 }
 
-fn run_worker<R, F>(
+fn run_worker<R, T, F>(
     n: usize,
     cpu: usize,
     num_threads: usize,
     f: std::sync::Arc<F>,
+    telemetry: &T,
     event_fd: i32,
     peers: std::sync::Arc<runtime_core::runtime::peers::PeerTable>,
     started: std::rc::Rc<std::cell::Cell<bool>>,
 ) where
     R: BufRingSet + 'static,
+    T: Telemetry,
     F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
     pin_core(cpu);
@@ -309,24 +345,6 @@ fn run_worker<R, F>(
         started.set(true);
         fut.await
     };
-    let rt = RuntimeInner::with_peers(n, peers);
-    #[cfg(feature = "otlp")]
-    return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
-        use crate::otlp_collector::OtlpCollector;
-        use runtime_core::tracing::{TRACING_SINK, init_trace_sink, set_thread_id};
-        set_thread_id(n);
-        let sink = init_trace_sink::<OtlpCollector>();
-        TRACING_SINK.set(&sink, run)
-    });
-    #[cfg(all(feature = "tracing", not(feature = "otlp")))]
-    return rt.block_on::<R, _>(fut, Some(event_fd), |run| {
-        use runtime_core::tracing::{
-            ConsoleCollector, TRACING_SINK, init_trace_sink, set_thread_id,
-        };
-        set_thread_id(n);
-        let sink = init_trace_sink::<ConsoleCollector>();
-        TRACING_SINK.set(&sink, run)
-    });
-    #[cfg(not(feature = "tracing"))]
-    rt.block_on::<R, _>(fut, Some(event_fd), |run| run())
+    RuntimeInner::with_peers(n, peers)
+        .block_on::<R, _>(fut, Some(event_fd), |run| telemetry.install(Some(n), run))
 }

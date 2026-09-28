@@ -111,8 +111,6 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
 
 ## Outside this repository
 
-- [ ] The `otlp` build is broken: `H2Connection::connect` no longer exists in
-  popple-h2 (`runtime/src/otlp_collector.rs:76`).
 - [ ] popple-h2 and popple-tls must adapt to the API changes: `MultiAccept`
   and `UdpMultiRecv` yield `Result`, `send_control_record<B: IoBuf>` /
   `WriteControlRecord<B>`, `Process` pipes are `PipeFd`,

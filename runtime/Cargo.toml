@@ -7,13 +7,11 @@ edition = "2024"
 # Forwarded so a test crate can build the simulated ring.
 simulation = ["runtime-core/simulation"]
 tracing               = ["runtime-core/tracing"]
-otlp                  = ["tracing", "dep:runtime-h2"]
 local_debug_collector = ["runtime-core/local_debug_collector"]
 ebpf_balancer         = ["runtime-core/ebpf_balancer"]
 
 [dependencies]
 runtime-core = { path = "../runtime-core" }
-runtime-h2 = { package = "popple-h2", git = "ssh://git@github.com/saucisoupe/popple-h2", optional = true }
 libc = "0.2.178"
 
 # Miri cannot call into mimalloc's C; it runs on its own allocator instead.

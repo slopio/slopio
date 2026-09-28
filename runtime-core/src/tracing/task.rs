@@ -106,7 +106,8 @@ pub fn set_thread_id(n: usize) {
     THREAD_ID.with(|c| c.set(Some(n)));
 }
 
-pub(crate) fn thread_id() -> Option<usize> {
+/// The worker this thread runs, `None` under `main_thread`.
+pub fn thread_id() -> Option<usize> {
     THREAD_ID.with(|c| c.get())
 }
 

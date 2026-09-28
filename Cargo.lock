@@ -7,37 +7,6 @@ name = "async_timers"
 version = "0.1.0"
 
 [[package]]
-name = "async_timers"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
-dependencies = [
- "slab",
- "smallvec",
-]
-
-[[package]]
-name = "aws-lc-rs"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
-dependencies = [
- "aws-lc-sys",
- "zeroize",
-]
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
-]
-
-[[package]]
 name = "bitfield-struct"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -73,8 +42,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1dce859f0832a7d088c4f1119888ab94ef4b5d6795d1ce05afb7fe159d79f98"
 dependencies = [
  "find-msvc-tools",
- "jobserver",
- "libc",
  "shlex",
 ]
 
@@ -83,21 +50,6 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "dunce"
-version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "errno"
@@ -114,18 +66,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "fnv"
-version = "1.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
-name = "fs_extra"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "getrandom"
@@ -149,12 +89,6 @@ dependencies = [
  "r-efi",
  "wasip2",
 ]
-
-[[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "http"
@@ -187,29 +121,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "io_uring_rb"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
-dependencies = [
- "io-uring",
- "rustix",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "jobserver"
-version = "0.1.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9afb3de4395d6b3e67a780b6de64b51c978ecf11cb9a462c66be7d4ca9039d33"
-dependencies = [
- "getrandom 0.3.4",
- "libc",
-]
 
 [[package]]
 name = "libc"
@@ -232,12 +147,6 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
-
-[[package]]
-name = "log"
-version = "0.4.30"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 
 [[package]]
 name = "memchr"
@@ -264,12 +173,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "once_cell"
-version = "1.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -287,34 +190,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "popple-h2"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/popple-h2#66070565ea381be6ff90e4cd5a4bc457e3b321da"
-dependencies = [
- "bytes",
- "fnv",
- "hex",
- "http",
- "popple-tls",
- "runtime 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
- "runtime-streams 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
- "rustls",
- "zerocopy",
-]
-
-[[package]]
-name = "popple-tls"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/popple-tls.git#474b12e43163c6a7e49dd7d2c5ca761c44fae1e7"
-dependencies = [
- "libc",
- "runtime 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
- "runtime-streams 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
- "rustls",
- "zeroize",
 ]
 
 [[package]]
@@ -410,20 +285,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ring"
-version = "0.17.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
-dependencies = [
- "cc",
- "cfg-if",
- "getrandom 0.2.17",
- "libc",
- "untrusted",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "runtime"
 version = "0.1.0"
 dependencies = [
@@ -431,58 +292,26 @@ dependencies = [
  "http",
  "libc",
  "mimalloc",
- "popple-h2",
  "rand 0.8.6",
- "runtime-core 0.1.0",
- "runtime-streams 0.1.0",
+ "runtime-core",
+ "runtime-streams",
  "socket2 0.5.10",
 ]
 
 [[package]]
-name = "runtime"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
-dependencies = [
- "libc",
- "mimalloc",
- "runtime-core 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
-]
-
-[[package]]
 name = "runtime-core"
 version = "0.1.0"
 dependencies = [
- "async_timers 0.1.0",
+ "async_timers",
  "bitfield-struct",
  "bumpalo",
  "io-uring",
- "io_uring_rb 0.1.0",
+ "io_uring_rb",
  "libc",
  "pin-project",
  "rand 0.8.6",
- "runtime-streams 0.1.0",
- "runtime_ebpf_balancer 0.1.0",
- "slab",
- "smallvec",
- "socket2 0.6.3",
-]
-
-[[package]]
-name = "runtime-core"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
-dependencies = [
- "async_timers 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
- "bitfield-struct",
- "bumpalo",
- "io-uring",
- "io_uring_rb 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
- "libc",
- "mimalloc",
- "pin-project",
- "rand 0.8.6",
- "runtime-streams 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
- "runtime_ebpf_balancer 0.1.0 (git+ssh://git@github.com/saucisoupe/runtime.git)",
+ "runtime-streams",
+ "runtime_ebpf_balancer",
  "slab",
  "smallvec",
  "socket2 0.6.3",
@@ -493,22 +322,8 @@ name = "runtime-streams"
 version = "0.1.0"
 
 [[package]]
-name = "runtime-streams"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
-
-[[package]]
 name = "runtime_ebpf_balancer"
 version = "0.1.0"
-dependencies = [
- "libc",
- "object",
-]
-
-[[package]]
-name = "runtime_ebpf_balancer"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
 dependencies = [
  "libc",
  "object",
@@ -525,42 +340,6 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rustls"
-version = "0.23.40"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
-dependencies = [
- "aws-lc-rs",
- "log",
- "once_cell",
- "rustls-pki-types",
- "rustls-webpki",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "rustls-pki-types"
-version = "1.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
-dependencies = [
- "zeroize",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.103.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
-dependencies = [
- "aws-lc-rs",
- "ring",
- "rustls-pki-types",
- "untrusted",
 ]
 
 [[package]]
@@ -602,12 +381,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "subtle"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -623,12 +396,6 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "untrusted"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "wasi"
@@ -758,9 +525,3 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "zeroize"
-version = "1.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"

@@ -4,10 +4,6 @@ use crate::tracing::span::SpanWrapper;
 pub struct ConsoleCollector;
 
 impl Collector for ConsoleCollector {
-    fn init() -> Self {
-        Self
-    }
-
     async fn process(&mut self, batch: Vec<SpanWrapper>) {
         for buf in &batch {
             let trace_id = u128::from_be_bytes(buf.data.trace_id.to_bytes());
