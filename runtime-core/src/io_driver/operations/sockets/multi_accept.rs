@@ -122,6 +122,8 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
                 if addr.is_ipv6() {
                     socket.set_only_v6(only_v6)?;
                 }
+                // Rebind over TIME_WAIT even when the previous owner ran under another UID.
+                socket.set_reuse_address(true)?;
                 socket.set_reuse_port(true)?;
                 socket.set_nonblocking(true)?;
                 socket.bind(&addr.into())?;
