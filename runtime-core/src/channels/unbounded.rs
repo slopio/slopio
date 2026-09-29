@@ -11,7 +11,7 @@ use super::wait_list::{Left, WaitList};
 struct SharedState<T> {
     data: VecDeque<T>,
     receivers: WaitList,
-    sender_dropped: bool,
+    sender_count: usize,
     receiver_dropped: bool,
 }
 
@@ -21,7 +21,7 @@ impl<T> SharedState<T> {
         Self {
             data: VecDeque::new(),
             receivers: WaitList::new(),
-            sender_dropped: false,
+            sender_count: 1,
             receiver_dropped: false,
         }
     }
@@ -63,10 +63,24 @@ impl<T> Sender<T> {
     }
 }
 
+impl<T> Clone for Sender<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        let state = unsafe { &mut *(*self.shared.0).get() };
+        state.sender_count += 1;
+        Self {
+            shared: Shared(self.shared.0),
+        }
+    }
+}
+
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let state = unsafe { &mut *(*self.shared.0).get() };
-        state.sender_dropped = true;
+        state.sender_count -= 1;
+        if state.sender_count > 0 {
+            return;
+        }
         if state.receiver_dropped {
             drop(unsafe { Box::from_raw(self.shared.0) });
         } else {
@@ -90,9 +104,9 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let state = unsafe { &mut *(*self.shared.0).get() };
         state.receiver_dropped = true;
-        // Dropped last: an item may own the Sender, whose drop frees the state.
+        // Dropped last: an item may own the last Sender, whose drop frees the state.
         let data = std::mem::take(&mut state.data);
-        if state.sender_dropped {
+        if state.sender_count == 0 {
             drop(unsafe { Box::from_raw(self.shared.0) });
         }
         drop(data);
@@ -117,7 +131,7 @@ impl<'a, T> Future for RecvFuture<'a, T> {
             return Poll::Ready(Some(e));
         }
 
-        if state.sender_dropped {
+        if state.sender_count == 0 {
             state.receivers.leave(&mut this.waiter);
             return Poll::Ready(None);
         }
@@ -152,7 +166,7 @@ impl<'a, T> Future for RecvAllFuture<'a, T> {
             return Poll::Ready(Some(items));
         }
 
-        if state.sender_dropped {
+        if state.sender_count == 0 {
             state.receivers.leave(&mut this.waiter);
             return Poll::Ready(None);
         }

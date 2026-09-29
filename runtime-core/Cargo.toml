@@ -73,6 +73,10 @@ name = "channels_vec"
 required-features = ["simulation"]
 
 [[test]]
+name = "channels_mpsc"
+required-features = ["simulation"]
+
+[[test]]
 name = "kill"
 required-features = ["simulation"]
 
