@@ -26,7 +26,7 @@ use crate::{
 };
 use io_uring::{
     IoUring, opcode, squeue,
-    types::{Fd, Timespec},
+    types::{Fd, SubmitArgs, Timespec},
 };
 use slab::Slab;
 mod buf_ring;
@@ -34,6 +34,7 @@ mod completion_events;
 mod fixed_buf_pool;
 mod message;
 pub mod operations;
+mod ring_config;
 pub(crate) mod sys;
 mod user_data;
 
@@ -48,6 +49,7 @@ pub use buf_ring::{
     BorrowedBuffer, BufRingSet, BufRingSpec, BufRingTake, BufRingUsage, install_buf_ring,
 };
 pub use fixed_buf_pool::{FixedSendBufPool, PooledBuf, SLAB_BUF_INDEX};
+pub use ring_config::{RingConfig, SqPoll};
 
 pub const DEFAULT_QUEUE_SIZE: usize = 32;
 
@@ -351,28 +353,55 @@ impl Ring {
             overflow: VecDeque::new(),
             pending: 0,
             wakeup_timeout: Timespec::new(),
+            timed_wait: false,
         }
     }
-}
 
-impl Default for Ring {
-    fn default() -> Self {
+    fn new(config: RingConfig) -> Self {
         let mut builder = IoUring::builder();
+        match config.sqpoll {
+            None => {
+                builder
+                    .setup_coop_taskrun()
+                    .setup_single_issuer()
+                    .setup_defer_taskrun()
+                    // Lets `has_deferred_completions` see task work without a syscall.
+                    .setup_taskrun_flag();
+            }
+            // The kernel rejects the task-run flags alongside SQPOLL.
+            Some(sqpoll) => {
+                let idle = u32::try_from(sqpoll.idle.as_millis()).unwrap_or(u32::MAX);
+                builder.setup_single_issuer().setup_sqpoll(idle);
+                if let Some(cpu) = sqpoll.cpu {
+                    builder.setup_sqpoll_cpu(cpu);
+                }
+            }
+        }
         let ring = builder
-            .setup_coop_taskrun()
-            .setup_single_issuer()
-            .setup_defer_taskrun()
-            // Lets `has_deferred_completions` see task work without a syscall.
-            .setup_taskrun_flag()
             .build(4096)
-            .unwrap();
+            .unwrap_or_else(|e| panic!("io_uring setup failed for {config:?}: {e}"));
 
         Self {
             inner: RingBackend::Uring(ring),
             overflow: VecDeque::new(),
             pending: 0,
             wakeup_timeout: Timespec::new(),
+            timed_wait: false,
         }
+    }
+
+    fn is_sqpoll(&self) -> bool {
+        match &self.inner {
+            RingBackend::Uring(ring) => ring.params().is_setup_sqpoll(),
+            #[cfg(feature = "simulation")]
+            RingBackend::Fake(_) => false,
+        }
+    }
+}
+
+impl Default for Ring {
+    fn default() -> Self {
+        Self::new(RingConfig::default())
     }
 }
 
@@ -385,6 +414,10 @@ impl Default for IODriver {
 }
 
 impl IODriver {
+    pub fn new(config: RingConfig) -> Self {
+        Self::around(Ring::new(config))
+    }
+
     /// A driver around `ring`, everything above it fresh.
     ///
     /// Spelled out field by field rather than `..Default::default()`, because
@@ -1025,6 +1058,11 @@ impl IODriver {
     pub fn push_wakeup_timeout(&self, duration: Duration) {
         let ring_inner = unsafe { &mut *self.ring.get() };
         ring_inner.wakeup_timeout = Timespec::from(duration);
+        // The SQ thread may read the sqe after the next push overwrote the timespec: the enter waits instead.
+        if ring_inner.is_sqpoll() {
+            ring_inner.timed_wait = true;
+            return;
+        }
         let entry = io_uring::opcode::Timeout::new(&ring_inner.wakeup_timeout)
             .count(1)
             .build()
@@ -1160,7 +1198,7 @@ impl IODriver {
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
         match &mut ring.inner {
-            RingBackend::Uring(_) => self.enter_uring(0),
+            RingBackend::Uring(_) => self.enter_uring(0, false),
             #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.submit(),
         }
@@ -1171,8 +1209,9 @@ impl IODriver {
         self.flush_pending_closes();
         let ring = unsafe { &mut *self.ring.get() };
         ring.pending = 0;
+        let timed = std::mem::take(&mut ring.timed_wait);
         match &mut ring.inner {
-            RingBackend::Uring(_) => self.enter_uring(1),
+            RingBackend::Uring(_) => self.enter_uring(1, timed),
             #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.submit_and_wait(),
         }
@@ -1180,13 +1219,14 @@ impl IODriver {
 
     /// Enters until the kernel has every SQE, overflow included. Runs at the
     /// scheduler's safe points only, so it may process completions.
-    fn enter_uring(&self, mut want: usize) {
+    fn enter_uring(&self, mut want: usize, timed: bool) {
         loop {
             let ring = unsafe { &mut *self.ring.get() };
             let RingBackend::Uring(uring) = &mut ring.inner else {
                 unreachable!()
             };
-            match Ring::enter_once(uring, &mut ring.overflow, want) {
+            let timeout = timed.then_some(&ring.wakeup_timeout);
+            match Ring::enter_once(uring, &mut ring.overflow, want, timeout) {
                 Ok(true) => {}
                 Ok(false) => {
                     // Completions processed below may have queued more, all submitted now.
@@ -1697,6 +1737,8 @@ struct Ring {
     overflow: VecDeque<squeue::Entry>,
     pending: u32,
     wakeup_timeout: Timespec,
+    /// SQPOLL only: the next wait is bounded by `wakeup_timeout`, passed to the enter.
+    timed_wait: bool,
 }
 
 /// Where submissions go and completions come from.
@@ -1778,6 +1820,7 @@ impl Ring {
         ring: &mut IoUring,
         overflow: &mut VecDeque<squeue::Entry>,
         want: usize,
+        timeout: Option<&Timespec>,
     ) -> Result<bool, Busy> {
         {
             let mut sq = ring.submission();
@@ -1791,14 +1834,29 @@ impl Ring {
         }
         // Sleep only once the kernel holds everything.
         let want = if overflow.is_empty() { want } else { 0 };
-        match ring.submit_and_wait(want) {
+        let entered = match timeout {
+            Some(ts) if want > 0 => ring
+                .submitter()
+                .submit_with_args(want, &SubmitArgs::new().timespec(ts)),
+            _ => ring.submit_and_wait(want),
+        };
+        match entered {
             // Possibly partial: the kernel ran short of requests.
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => {}
             Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EBUSY)) => {
                 return Err(Busy);
             }
             Err(e) => panic!("io_uring submit failed: {e:?}"),
+        }
+        // The SQ thread drains the queue on its own: only our overflow is still ours to hand over.
+        if ring.params().is_setup_sqpoll() {
+            if !overflow.is_empty() {
+                // Best effort: an interrupted wait just spins one more enter.
+                let _ = ring.submitter().squeue_wait();
+            }
+            return Ok(!overflow.is_empty());
         }
         Ok(!overflow.is_empty() || !ring.submission().is_empty())
     }
@@ -1832,7 +1890,7 @@ mod ring_tests {
         let RingBackend::Uring(uring) = &mut ring.inner else {
             unreachable!()
         };
-        while Ring::enter_once(uring, &mut ring.overflow, 0)
+        while Ring::enter_once(uring, &mut ring.overflow, 0, None)
             .ok()
             .expect("nops never busy")
         {}

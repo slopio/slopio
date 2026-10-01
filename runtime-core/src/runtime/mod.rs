@@ -7,7 +7,7 @@ use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
 use crate::io_driver::{
-    BufRingSet, Endpoint, ErasedMessage, Header, IODriver, Message, PeerMessage,
+    BufRingSet, Endpoint, ErasedMessage, Header, IODriver, Message, PeerMessage, RingConfig,
 };
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
@@ -116,11 +116,19 @@ impl RuntimeInner {
     }
 
     /// Like [`with_thread_id`](Self::with_thread_id), but attaches the shared
-    /// peer table to this worker's io_driver so it can MSG_RING its peers.
-    pub fn with_peers(thread_id: usize, peers: std::sync::Arc<peers::PeerTable>) -> Self {
+    /// peer table to this worker's io_driver so it can MSG_RING its peers, and
+    /// builds its ring from `ring`.
+    pub fn with_peers(
+        thread_id: usize,
+        peers: std::sync::Arc<peers::PeerTable>,
+        ring: RingConfig,
+    ) -> Self {
+        // Field by field: `..Default::default()` would build a default ring only to drop it.
         let mut rt = Self {
+            tasks: TaskList::default(),
+            io_driver: IODriver::new(ring),
+            time_driver: TimeDriver::default(),
             thread_id,
-            ..Default::default()
         };
         rt.io_driver.attach_peers(peers);
         rt
