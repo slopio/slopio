@@ -2,7 +2,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use runtime_core::io_driver::{BufRingSet, RingConfig};
+use runtime_core::io_driver::{BufRingSet, RingOptions};
 use runtime_core::runtime::RuntimeInner;
 use runtime_core::runtime::peers::PeerTable;
 
@@ -14,7 +14,8 @@ use crate::telemetry::Telemetry;
 pub(super) struct Start<T> {
     pub ctx: WorkerContext,
     pub cpu: usize,
-    pub ring: RingConfig,
+    pub ring: RingOptions,
+    pub sq_cpu: Option<usize>,
     pub telemetry: Arc<T>,
     pub event_fd: RawFd,
     pub peers: Arc<PeerTable>,
@@ -70,6 +71,7 @@ where
         ctx,
         cpu,
         ring,
+        sq_cpu,
         telemetry,
         event_fd,
         peers,
@@ -82,6 +84,9 @@ where
         started.set(true);
         fut.await
     };
-    RuntimeInner::with_peers(n, peers, ring)
-        .block_on::<R, _>(fut, Some(event_fd), |run| telemetry.install(Some(n), run))
+    RuntimeInner::with_peers(n, peers, ring, sq_cpu.map(|cpu| cpu as u32)).block_on::<R, _>(
+        fut,
+        Some(event_fd),
+        |run| telemetry.install(Some(n), run),
+    )
 }

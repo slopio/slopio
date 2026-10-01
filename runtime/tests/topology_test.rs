@@ -1,6 +1,8 @@
-//! A dedicated SQPOLL thread next to the per-core workers: placed on CPUs of
-//! its own, its SQ thread pinned too, and reachable from every worker.
+//! Groups of threads with their own ring mode next to the per-core workers:
+//! placed on CPUs of their own, SQ threads pinned too, all reachable from
+//! every worker.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,7 +10,7 @@ use runtime::io_driver::Message;
 use runtime::runtime::select::{SelectResult, select};
 use runtime::runtime::time::Sleep;
 use runtime::runtime::{recv_msg_from_peer, send_msg_to_peer};
-use runtime::{Cpu, Dedicated, SqPollPlacement, Topology};
+use runtime::{RingOptions, Threads, Topology, WorkerContext};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -42,71 +44,108 @@ fn affinity_of(tid: libc::pid_t) -> Vec<usize> {
     }
 }
 
-/// The kernel names a ring's SQ thread `iou-sqp-<tid of its creator>`.
-fn sq_thread_of(creator: libc::pid_t) -> libc::pid_t {
+/// The kernel names a ring's SQ thread `iou-sqp-<tid of its creator>`, once
+/// that thread first runs: retried for a while when one is `expected`.
+fn sq_thread_of(creator: libc::pid_t, expected: bool) -> Option<libc::pid_t> {
     let name = format!("iou-sqp-{creator}");
-    std::fs::read_dir("/proc/self/task")
-        .unwrap()
-        .filter_map(|task| {
-            let task = task.ok()?;
-            let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
-            (comm.trim() == name).then(|| task.file_name().to_str()?.parse().ok())?
+    let find = || {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|task| {
+                let task = task.ok()?;
+                let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
+                (comm.trim() == name).then(|| task.file_name().to_str()?.parse().ok())?
+            })
+            .next()
+    };
+    let tries = if expected { 100 } else { 1 };
+    (0..tries).find_map(|_| {
+        find().or_else(|| {
+            std::thread::sleep(Duration::from_millis(5));
+            None
         })
-        .next()
-        .unwrap_or_else(|| panic!("no {name} thread"))
+    })
 }
 
-#[derive(Debug, Default)]
+/// One started thread: its context, its CPUs, and its SQ thread's if any.
+#[derive(Debug)]
 struct Seen {
-    db: Option<(usize, Vec<usize>, Vec<usize>, std::ops::Range<usize>)>,
-    workers: Vec<(usize, Vec<usize>)>,
+    ctx: WorkerContext,
+    cpus: Vec<usize>,
+    sq_cpus: Option<Vec<usize>>,
+}
+
+fn record(seen: &Mutex<Vec<Seen>>, ctx: &WorkerContext, sqpoll: bool) {
+    let tid = unsafe { libc::gettid() };
+    seen.lock().unwrap().push(Seen {
+        ctx: ctx.clone(),
+        cpus: affinity_of(0),
+        sq_cpus: sq_thread_of(tid, sqpoll).map(affinity_of),
+    });
+}
+
+/// Every thread on one CPU of its own, SQ threads included.
+fn assert_one_cpu_each(seen: &[Seen]) {
+    let mut taken = HashSet::new();
+    for s in seen {
+        for cpus in std::iter::once(&s.cpus).chain(&s.sq_cpus) {
+            assert_eq!(cpus.len(), 1, "thread {} pinned", s.ctx.thread_id);
+            assert!(taken.insert(cpus[0]), "CPU {} taken twice", cpus[0]);
+        }
+    }
+}
+
+fn sqpoll() -> RingOptions {
+    RingOptions {
+        sqpoll: true,
+        defer_taskrun: false,
+        coop_taskrun: false,
+        sqpoll_idle: Duration::from_millis(10),
+    }
+}
+
+fn cpus_available() -> usize {
+    affinity_of(0)
+        .len()
+        .min(std::thread::available_parallelism().unwrap().get())
 }
 
 #[test]
-fn a_dedicated_sqpoll_thread_answers_every_worker() {
-    if affinity_of(0).len() < 3 {
-        eprintln!("skipping: need at least 3 CPUs");
+fn an_sqpoll_group_answers_every_worker() {
+    if cpus_available() < 5 {
+        eprintln!("skipping: need at least 5 CPUs");
         return;
     }
-    let seen = Arc::new(Mutex::new(Seen::default()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
 
     let mut topology = Topology::new();
-    let record = seen.clone();
-    let db = topology.dedicated::<(), _, _>(
-        Dedicated {
-            cpu: Cpu::Auto,
-            sqpoll: Some(SqPollPlacement {
-                idle: Duration::from_millis(10),
-                cpu: Cpu::Auto,
-            }),
-        },
-        move |ctx| async move {
-            let tid = unsafe { libc::gettid() };
-            let sq = affinity_of(sq_thread_of(tid));
-            record.lock().unwrap().db =
-                Some((ctx.thread_id, affinity_of(0), sq, ctx.workers.clone()));
-            for _ in ctx.workers.clone() {
-                let query = unsafe { recv_or_timeout::<Query>("db") }.await;
-                // A timed wait on the SQPOLL ring.
-                Sleep::during(Duration::from_millis(20)).await;
-                send_msg_to_peer(
-                    query.payload.from,
-                    Answer {
-                        to: query.payload.from,
-                    },
-                );
-            }
-        },
-    );
-    let record = seen.clone();
-    topology.per_core::<(), _, _>(move |ctx| {
-        let record = record.clone();
+    let log = seen.clone();
+    let db = topology.group::<(), _, _>(Threads::Auto(2), sqpoll(), move |ctx| {
+        let log = log.clone();
         async move {
-            record
-                .lock()
-                .unwrap()
+            record(&log, &ctx, true);
+            // Workers alternate between the two db threads by peer id.
+            let mine = ctx
                 .workers
-                .push((ctx.thread_id, affinity_of(0)));
+                .clone()
+                .filter(|w| ctx.group.start + w % ctx.group.len() == ctx.thread_id)
+                .count();
+            for _ in 0..mine {
+                let query = unsafe { recv_or_timeout::<Query>("db") }.await;
+                // A timed wait on an SQPOLL ring.
+                Sleep::during(Duration::from_millis(20)).await;
+                let to = query.payload.from;
+                send_msg_to_peer(to, Answer { to });
+            }
+        }
+    });
+    let log = seen.clone();
+    let group = db.clone();
+    topology.per_core::<(), _, _>(RingOptions::default(), move |ctx| {
+        let log = log.clone();
+        let db = group.start + ctx.thread_id % group.len();
+        async move {
+            record(&log, &ctx, false);
             send_msg_to_peer(
                 db,
                 Query {
@@ -120,20 +159,125 @@ fn a_dedicated_sqpoll_thread_answers_every_worker() {
     topology.run();
 
     let seen = std::mem::take(&mut *seen.lock().unwrap());
-    let (db_id, db_cpus, sq_cpus, workers) = seen.db.expect("db thread ran");
-    assert_eq!(db_id, db);
-    assert_eq!(db_cpus.len(), 1, "db thread pinned");
-    assert_eq!(sq_cpus.len(), 1, "SQ thread pinned");
-    assert_ne!(db_cpus, sq_cpus, "db and SQ threads on CPUs of their own");
-    assert_eq!(workers, 1..1 + seen.workers.len());
-    for (id, cpus) in &seen.workers {
-        assert!(workers.contains(id), "worker {id}");
-        assert_eq!(cpus.len(), 1, "worker {id} pinned");
-        assert!(
-            cpus != &db_cpus && cpus != &sq_cpus,
-            "worker {id} on a reserved CPU"
-        );
+    assert_eq!(db, 0..2);
+    assert_one_cpu_each(&seen);
+    for s in &seen {
+        if db.contains(&s.ctx.thread_id) {
+            assert_eq!(s.ctx.group, db);
+            assert!(
+                s.sq_cpus.is_some(),
+                "db {} has an SQ thread",
+                s.ctx.thread_id
+            );
+        } else {
+            assert_eq!(s.ctx.group, s.ctx.workers);
+            assert!(
+                s.sq_cpus.is_none(),
+                "worker {} has no SQ thread",
+                s.ctx.thread_id
+            );
+        }
     }
+    assert_eq!(seen.len(), 2 + seen[0].ctx.workers.len());
+}
+
+#[test]
+fn sqpoll_workers_take_two_cpus_each() {
+    if cpus_available() < 2 {
+        eprintln!("skipping: need at least 2 CPUs");
+        return;
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let mut topology = Topology::new();
+    topology.per_core::<(), _, _>(sqpoll(), move |ctx| {
+        let log = log.clone();
+        async move {
+            record(&log, &ctx, true);
+            // Ping the next worker, answer the previous one.
+            let n = ctx.workers.len();
+            let next = ctx.workers.start + (ctx.thread_id - ctx.workers.start + 1) % n;
+            send_msg_to_peer(
+                next,
+                Query {
+                    from: ctx.thread_id,
+                },
+            );
+            let query = unsafe { recv_or_timeout::<Query>("worker") }.await;
+            assert_eq!(
+                query.payload.from,
+                ctx.workers.start + (ctx.thread_id + n - 1) % n
+            );
+        }
+    });
+    topology.run();
+
+    let seen = std::mem::take(&mut *seen.lock().unwrap());
+    assert_eq!(seen.len(), cpus_available() / 2);
+    assert_one_cpu_each(&seen);
+    assert!(seen.iter().all(|s| s.sq_cpus.is_some()));
+}
+
+/// A group pinging between its two threads after a timer, on a ring built
+/// with `ring`.
+fn ping_within_a_group(ring: RingOptions) {
+    let mut topology = Topology::new();
+    let group = topology.group::<(), _, _>(Threads::Auto(2), ring, |ctx| async move {
+        let other = if ctx.thread_id == ctx.group.start {
+            ctx.group.end - 1
+        } else {
+            ctx.group.start
+        };
+        Sleep::during(Duration::from_millis(20)).await;
+        send_msg_to_peer(
+            other,
+            Query {
+                from: ctx.thread_id,
+            },
+        );
+        let query = unsafe { recv_or_timeout::<Query>("group") }.await;
+        assert_eq!(query.payload.from, other);
+    });
+    assert_eq!(group, 0..2);
+    topology.run();
+}
+
+#[test]
+fn a_group_without_defer_taskrun_runs_timers_and_messages() {
+    if cpus_available() < 2 {
+        eprintln!("skipping: need at least 2 CPUs");
+        return;
+    }
+    ping_within_a_group(RingOptions {
+        defer_taskrun: false,
+        ..RingOptions::default()
+    });
+}
+
+#[test]
+fn a_group_without_any_task_run_flag_runs_timers_and_messages() {
+    if cpus_available() < 2 {
+        eprintln!("skipping: need at least 2 CPUs");
+        return;
+    }
+    ping_within_a_group(RingOptions {
+        defer_taskrun: false,
+        coop_taskrun: false,
+        ..RingOptions::default()
+    });
+}
+
+#[test]
+#[should_panic(expected = "sqpoll excludes defer_taskrun")]
+fn sqpoll_with_defer_taskrun_is_refused_when_declared() {
+    Topology::new().group::<(), _, _>(
+        Threads::Auto(1),
+        RingOptions {
+            sqpoll: true,
+            ..RingOptions::default()
+        },
+        |_| async {},
+    );
 }
 
 #[test]
@@ -143,11 +287,9 @@ fn a_cpu_outside_the_mask_is_refused_before_anything_starts() {
         .unwrap();
     let panicked = std::thread::spawn(move || {
         let mut topology = Topology::new();
-        topology.dedicated::<(), _, _>(
-            Dedicated {
-                cpu: Cpu::Fixed(outside),
-                sqpoll: None,
-            },
+        topology.group::<(), _, _>(
+            Threads::Fixed(vec![outside]),
+            RingOptions::default(),
             |_| async {},
         );
         topology.run();

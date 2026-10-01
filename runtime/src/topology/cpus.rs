@@ -2,7 +2,12 @@ use std::fmt;
 
 use libc::cpu_set_t;
 
-use super::Cpu;
+/// Where one thread runs, before placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cpu {
+    Auto,
+    Fixed(usize),
+}
 
 /// The CPUs the calling thread may run on, in ascending order. Not `0..n`: a
 /// cpuset such as `0-2,4` leaves holes.
@@ -85,9 +90,23 @@ pub(super) fn place(allowed: &[usize], requests: &[Cpu]) -> Result<Placed, Place
     })
 }
 
+/// Per-core threads that fit in `free` CPUs and a `budget` of them, each
+/// taking `cpus_each` (two when it brings an SQ thread).
+pub(super) fn per_core_count(budget: usize, free: usize, cpus_each: usize) -> usize {
+    budget.min(free) / cpus_each
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_core_threads_with_an_sq_thread_each_take_two_cpus() {
+        assert_eq!(per_core_count(8, 6, 1), 6);
+        assert_eq!(per_core_count(4, 6, 1), 4);
+        assert_eq!(per_core_count(8, 7, 2), 3);
+        assert_eq!(per_core_count(8, 1, 2), 0);
+    }
 
     #[test]
     fn nothing_reserved_leaves_every_cpu_to_the_workers() {

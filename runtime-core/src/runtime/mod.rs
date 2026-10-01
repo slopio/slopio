@@ -7,7 +7,7 @@ use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
 use crate::io_driver::{
-    BufRingSet, Endpoint, ErasedMessage, Header, IODriver, Message, PeerMessage, RingConfig,
+    BufRingSet, Endpoint, ErasedMessage, Header, IODriver, Message, PeerMessage, RingOptions,
 };
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
@@ -117,16 +117,17 @@ impl RuntimeInner {
 
     /// Like [`with_thread_id`](Self::with_thread_id), but attaches the shared
     /// peer table to this worker's io_driver so it can MSG_RING its peers, and
-    /// builds its ring from `ring`.
+    /// builds its ring with `ring`, its SQ thread on `sq_cpu` under `sqpoll`.
     pub fn with_peers(
         thread_id: usize,
         peers: std::sync::Arc<peers::PeerTable>,
-        ring: RingConfig,
+        ring: RingOptions,
+        sq_cpu: Option<u32>,
     ) -> Self {
         // Field by field: `..Default::default()` would build a default ring only to drop it.
         let mut rt = Self {
             tasks: TaskList::default(),
-            io_driver: IODriver::new(ring),
+            io_driver: IODriver::new(ring, sq_cpu),
             time_driver: TimeDriver::default(),
             thread_id,
         };
@@ -198,6 +199,7 @@ impl RuntimeInner {
                                         if self.io_driver.has_pending_sqes() {
                                             self.io_driver.submit();
                                         }
+                                        self.io_driver.wait_sq_drained();
                                         return output;
                                     }
                                     std::task::Poll::Pending => {}

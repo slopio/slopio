@@ -17,8 +17,9 @@ pub use runtime_core::tracing;
 mod telemetry;
 pub mod topology;
 
+pub use runtime_core::io_driver::RingOptions;
 use telemetry::{DEFAULT_TELEMETRY, Telemetry};
-pub use topology::{Cpu, Dedicated, SqPollPlacement, Topology, WorkerContext};
+pub use topology::{Threads, Topology, WorkerContext};
 
 pub mod http;
 
@@ -150,7 +151,7 @@ where
     F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
     let mut topology = Topology::with_telemetry(telemetry);
-    topology.per_core::<R, _, _>(f);
+    topology.per_core::<R, _, _>(RingOptions::default(), f);
     topology.run();
 }
 

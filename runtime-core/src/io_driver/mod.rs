@@ -34,7 +34,7 @@ mod completion_events;
 mod fixed_buf_pool;
 mod message;
 pub mod operations;
-mod ring_config;
+mod ring_options;
 pub(crate) mod sys;
 mod user_data;
 
@@ -49,7 +49,7 @@ pub use buf_ring::{
     BorrowedBuffer, BufRingSet, BufRingSpec, BufRingTake, BufRingUsage, install_buf_ring,
 };
 pub use fixed_buf_pool::{FixedSendBufPool, PooledBuf, SLAB_BUF_INDEX};
-pub use ring_config::{RingConfig, SqPoll};
+pub use ring_options::RingOptions;
 
 pub const DEFAULT_QUEUE_SIZE: usize = 32;
 
@@ -357,29 +357,33 @@ impl Ring {
         }
     }
 
-    fn new(config: RingConfig) -> Self {
+    /// `sq_cpu` pins the SQ thread under `sqpoll`.
+    fn new(options: RingOptions, sq_cpu: Option<u32>) -> Self {
+        if let Err(e) = options.check() {
+            panic!("invalid ring options {options:?}: {e}");
+        }
         let mut builder = IoUring::builder();
-        match config.sqpoll {
-            None => {
-                builder
-                    .setup_coop_taskrun()
-                    .setup_single_issuer()
-                    .setup_defer_taskrun()
-                    // Lets `has_deferred_completions` see task work without a syscall.
-                    .setup_taskrun_flag();
-            }
-            // The kernel rejects the task-run flags alongside SQPOLL.
-            Some(sqpoll) => {
-                let idle = u32::try_from(sqpoll.idle.as_millis()).unwrap_or(u32::MAX);
-                builder.setup_single_issuer().setup_sqpoll(idle);
-                if let Some(cpu) = sqpoll.cpu {
-                    builder.setup_sqpoll_cpu(cpu);
-                }
+        builder.setup_single_issuer();
+        if options.defer_taskrun {
+            builder.setup_defer_taskrun();
+        }
+        if options.coop_taskrun {
+            builder.setup_coop_taskrun();
+        }
+        // Lets `has_deferred_completions` see task work without a syscall; needs one of the two.
+        if options.defer_taskrun || options.coop_taskrun {
+            builder.setup_taskrun_flag();
+        }
+        if options.sqpoll {
+            let idle = u32::try_from(options.sqpoll_idle.as_millis()).unwrap_or(u32::MAX);
+            builder.setup_sqpoll(idle);
+            if let Some(cpu) = sq_cpu {
+                builder.setup_sqpoll_cpu(cpu);
             }
         }
         let ring = builder
             .build(4096)
-            .unwrap_or_else(|e| panic!("io_uring setup failed for {config:?}: {e}"));
+            .unwrap_or_else(|e| panic!("io_uring setup failed for {options:?}: {e}"));
 
         Self {
             inner: RingBackend::Uring(ring),
@@ -401,7 +405,7 @@ impl Ring {
 
 impl Default for Ring {
     fn default() -> Self {
-        Self::new(RingConfig::default())
+        Self::new(RingOptions::default(), None)
     }
 }
 
@@ -414,8 +418,8 @@ impl Default for IODriver {
 }
 
 impl IODriver {
-    pub fn new(config: RingConfig) -> Self {
-        Self::around(Ring::new(config))
+    pub fn new(options: RingOptions, sq_cpu: Option<u32>) -> Self {
+        Self::around(Ring::new(options, sq_cpu))
     }
 
     /// A driver around `ring`, everything above it fresh.
@@ -1214,6 +1218,21 @@ impl IODriver {
             RingBackend::Uring(_) => self.enter_uring(1, timed),
             #[cfg(feature = "simulation")]
             RingBackend::Fake(ring) => ring.submit_and_wait(),
+        }
+    }
+
+    /// Under SQPOLL, waits until the SQ thread has read every submitted SQE:
+    /// once the ring is dropped, those it has not read are lost.
+    pub(crate) fn wait_sq_drained(&self) {
+        let ring = unsafe { &mut *self.ring.get() };
+        if let RingBackend::Uring(uring) = &mut ring.inner
+            && uring.params().is_setup_sqpoll()
+        {
+            while !uring.submission().is_empty() {
+                // Wakes the SQ thread if it fell asleep.
+                let _ = uring.submit();
+                std::thread::yield_now();
+            }
         }
     }
 

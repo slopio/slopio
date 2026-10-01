@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use runtime::net::{MultiAccept, send_all};
 use runtime::runtime::{recv_msg_from_peer, reply_msg_to_peer, request_msg_from_peer};
-use runtime::{Cpu, Dedicated, SqPollPlacement, Topology, spawn};
+use runtime::{RingOptions, Threads, Topology, spawn};
 use runtime_streams::StreamExt;
 
 /// A worker asking for the next visitor number.
@@ -28,13 +28,13 @@ fn main() {
 
     let mut topology = Topology::new();
 
-    let counter = topology.dedicated::<(), _, _>(
-        Dedicated {
-            cpu: Cpu::Auto,
-            sqpoll: Some(SqPollPlacement {
-                idle: Duration::from_millis(50),
-                cpu: Cpu::Auto,
-            }),
+    let counter = topology.group::<(), _, _>(
+        Threads::Auto(1),
+        RingOptions {
+            sqpoll: true,
+            defer_taskrun: false,
+            coop_taskrun: false,
+            sqpoll_idle: Duration::from_millis(50),
         },
         |ctx| async move {
             eprintln!("counter on peer {}", ctx.thread_id);
@@ -48,7 +48,8 @@ fn main() {
         },
     );
 
-    topology.per_core::<(), _, _>(move |ctx| async move {
+    let counter = counter.start;
+    topology.per_core::<(), _, _>(RingOptions::default(), move |ctx| async move {
         // One listener per worker; SO_REUSEPORT spreads connections across them.
         let mut accept = MultiAccept::new(port).unwrap();
         eprintln!("worker {} listening on {port}", ctx.thread_id);
