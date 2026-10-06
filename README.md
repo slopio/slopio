@@ -18,7 +18,7 @@ The rules that follow from that:
 
 Experimental. The API changes without notice, there is no release on crates.io, and some subsystems are stubs. Read [requirements](docs/requirements.md) before trying it: a 6.1 kernel is the floor and containers need a seccomp profile that allows io_uring.
 
-Use `thread_per_core` instead of `main_thread` to run one such loop per core, with the workers able to [message each other](docs/messaging.md).
+Use `thread_per_core` instead of `main_thread` to run one such loop per core, with the workers able to [message each other](docs/messaging.md). When threads do different jobs, a [topology](docs/topology.md) gives each kind its own CPUs and ring settings.
 
 ## Documentation
 
@@ -28,9 +28,10 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 - [Cancelling I/O](docs/cancellation.md). What dropping a future guarantees and what it does not.
 - [Time and timers](docs/time.md). Sleeps, timeouts, which durations are served, resolution, and why reading the clock is free.
 - [Messaging between workers](docs/messaging.md). Raw, typed, shared and request/reply messages over `MSG_RING`.
+- [Topology](docs/topology.md). Groups of threads with their own CPUs and ring options, `SQPOLL` included, next to the per-core workers.
 - [Telemetry](docs/telemetry.md). Spans, events, propagation and export, all behind features.
 - [Deterministic simulation testing](docs/deterministic-testing.md). Running the runtime against a scripted kernel.
-- [Potential improvements](docs/future-work.md). Queue-to-core alignment, NAPI busy polling, NUMA and topology awareness, and when each pays.
+- [Potential improvements](docs/future-work.md). Queue-to-core alignment, NAPI busy polling, NUMA and SMT awareness, and when each pays.
 
 ## Crates
 

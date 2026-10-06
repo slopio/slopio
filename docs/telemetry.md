@@ -4,7 +4,7 @@ The runtime ships its own tracing: spans, events, W3C trace propagation and Open
 
 ## Turning it on
 
-Telemetry is a Cargo feature. With it on, `main_thread_with` and `thread_per_core_with` print spans to stderr; `main_thread_traced` and `thread_per_core_traced` take a closure that builds the collector instead, called once on each worker.
+Telemetry is a Cargo feature. With it on, `main_thread_with` and `thread_per_core_with` print spans to stderr; `main_thread_traced`, `thread_per_core_traced` and `Topology::traced` take a closure that builds the collector instead, called once on each worker.
 
 | Feature | What you get |
 |---------|--------------|

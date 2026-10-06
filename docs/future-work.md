@@ -24,13 +24,12 @@ The option would register NAPI on each worker's ring at startup, in static mode 
 
 **Pays when:** cores are dedicated to workers, load is sustained at tens of thousands of packets per second per core, and the target is tail latency. **Does not pay when:** traffic is idle or bursty, cores are shared, or the process runs under a CPU quota or on a burstable instance, where spinning burns credits and triggers throttling that costs far more latency than it saves. Never on `t4g`, never under a Kubernetes CPU limit.
 
-## Topology: cpuset and SMT
+## Hardware layout: cpuset and SMT
 
 A small module reading sysfs at startup, no libnuma, no hwloc: the allowed CPU mask from `sched_getaffinity`, SMT siblings from `thread_siblings_list`, node per CPU from `/sys/devices/system/node`, the NIC's node from its device entry.
 
-Two uses that do not depend on NUMA:
+Workers and [topology](topology.md) threads are already placed on the allowed CPU mask, so a container restricted to CPUs `4-7` works. One use left that does not depend on NUMA:
 
-- **Respect the cpuset.** Today `thread_per_core` pins worker `n` on CPU `n`, which panics in a container restricted to CPUs `4-7`. Pinning onto the allowed set fixes a real failure and is worth doing on every machine.
 - **Skip SMT siblings** on x86, where a vCPU is one of two hardware threads sharing a core. One worker per physical core, not per thread, so two workers never compete for the same execution units. Irrelevant on ARM, where a vCPU is a core.
 
 ## NUMA

@@ -2,11 +2,11 @@
 
 Under `thread_per_core` each worker owns its tasks, its sockets and its buffers, and shares none of it. Workers talk by sending messages to each other through io_uring itself: a message is posted straight onto the destination worker's completion queue, so the receiver wakes up the same way it does for any I/O completion, even if it was blocked in the kernel with nothing else to do. There are no locks, no shared queues and no atomics for you to manage.
 
-Messaging only exists under `thread_per_core`. Calling any of these functions under `main_thread` panics.
+Messaging only exists under `thread_per_core` or a [topology](topology.md), where every thread of every group is a peer. Calling any of these functions under `main_thread` panics.
 
 ## Addressing
 
-Every worker has an index from `0` to `num_threads - 1`. Your worker closure receives both in its `WorkerContext`, and `thread_id()` returns the current one from anywhere inside a task. A message is addressed to a worker, not to a task: each worker has one inbox, and whichever task on that worker is awaiting it gets the next message.
+Every worker has an index from `0` to `num_threads - 1`. Your worker closure receives both in its `WorkerContext`, and `thread_id()` returns the current one from anywhere inside a task. Under a topology, the groups take the first indices in declaration order and the per-core workers the last ones; see [addressing threads](topology.md#addressing-threads). A message is addressed to a worker, not to a task: each worker has one inbox, and whichever task on that worker is awaiting it gets the next message.
 
 Messages from one worker to another arrive in the order they were sent.
 
