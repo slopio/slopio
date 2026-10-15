@@ -418,7 +418,7 @@ impl Default for IODriver {
 }
 
 impl IODriver {
-    pub fn new(options: RingOptions, sq_cpu: Option<u32>) -> Self {
+    pub(crate) fn new(options: RingOptions, sq_cpu: Option<u32>) -> Self {
         Self::around(Ring::new(options, sq_cpu))
     }
 
@@ -449,7 +449,7 @@ impl IODriver {
     /// buffer recycling — is exactly what `Default` builds for production, so a
     /// test exercises the real driver rather than a variant of it.
     #[cfg(feature = "simulation")]
-    pub fn simulated(fake: FakeRing) -> Self {
+    pub(crate) fn simulated(fake: FakeRing) -> Self {
         Self::around(Ring::simulated(fake))
     }
 
@@ -557,7 +557,7 @@ impl IODriver {
         }
     }
 
-    pub fn with<R>(&self, f: impl FnOnce() -> R) -> R {
+    pub(crate) fn with<R>(&self, f: impl FnOnce() -> R) -> R {
         IO_DRIVER.set(self, f)
     }
 
@@ -565,7 +565,7 @@ impl IODriver {
     /// registering each spec's recycler into the cancel-fallback table.
     /// Must be called exactly once per worker thread, before any IO op that
     /// uses provided buffers is submitted.
-    pub fn init_buf_rings<R: BufRingSet>(&self) {
+    pub(crate) fn init_buf_rings<R: BufRingSet>(&self) {
         let ring_inner = unsafe { &*self.ring.get() };
         R::init_all(ring_inner.handle());
         R::register_fallbacks(self);
@@ -579,7 +579,10 @@ impl IODriver {
     /// # Safety
     /// Each `iov_base`/`iov_len` must point to memory that stays valid for
     /// the registration's lifetime.
-    pub unsafe fn register_fixed_buffers(&self, iovecs: &[libc::iovec]) -> std::io::Result<()> {
+    pub(crate) unsafe fn register_fixed_buffers(
+        &self,
+        iovecs: &[libc::iovec],
+    ) -> std::io::Result<()> {
         let ring_inner = unsafe { &*self.ring.get() };
         match &ring_inner.inner {
             RingBackend::Uring(ring) => unsafe { ring.submitter().register_buffers(iovecs) },
@@ -592,7 +595,7 @@ impl IODriver {
 
     /// Tell the kernel to drop its references to the previously-registered
     /// fixed buffer set. Safe to call without a prior registration.
-    pub fn unregister_fixed_buffers(&self) -> std::io::Result<()> {
+    pub(crate) fn unregister_fixed_buffers(&self) -> std::io::Result<()> {
         let ring_inner = unsafe { &*self.ring.get() };
         match &ring_inner.inner {
             RingBackend::Uring(ring) => ring.submitter().unregister_buffers(),
@@ -636,7 +639,7 @@ impl IODriver {
         slab.len()
     }
 
-    pub fn push_multishot_op(
+    pub(crate) fn push_multishot_op(
         &self,
         entry: squeue::Entry,
         fd: i32,
@@ -647,7 +650,7 @@ impl IODriver {
 
     /// [`push_multishot_op`](Self::push_multishot_op) for an op that selects
     /// its buffers from ring `bgid`.
-    pub fn push_buffered_multishot_op(
+    pub(crate) fn push_buffered_multishot_op(
         &self,
         mut entry: squeue::Entry,
         fd: i32,
@@ -662,20 +665,20 @@ impl IODriver {
         token
     }
 
-    pub fn push_anon_op(&self, entry: squeue::Entry) {
+    pub(crate) fn push_anon_op(&self, entry: squeue::Entry) {
         let ring_inner = unsafe { &mut *self.ring.get() };
         ring_inner.add(&entry)
     }
 
     /// Attach the shared peer table to this driver. Called once at
     /// construction by [`RuntimeInner::with_peers`](crate::runtime::RuntimeInner::with_peers).
-    pub fn attach_peers(&mut self, peers: Arc<PeerTable>) {
+    pub(crate) fn attach_peers(&mut self, peers: Arc<PeerTable>) {
         self.peers = Some(peers);
     }
 
     /// Raw fd of the underlying io_uring, usable as a MSG_RING target from
     /// other threads (the fd table is shared process-wide).
-    pub fn ring_fd(&self) -> RawFd {
+    pub(crate) fn ring_fd(&self) -> RawFd {
         let ring = unsafe { &*self.ring.get() };
         match &ring.inner {
             RingBackend::Uring(ring) => ring.as_raw_fd(),
@@ -686,7 +689,7 @@ impl IODriver {
 
     /// Publish our ring fd into the shared table, then rendezvous on the
     /// startup barrier. No-op when no peer table is attached (`main_thread`).
-    pub fn publish_self(&self, thread_id: usize) {
+    pub(crate) fn publish_self(&self, thread_id: usize) {
         if let Some(peers) = &self.peers {
             peers.publish(thread_id, self.ring_fd());
         }
@@ -695,7 +698,7 @@ impl IODriver {
     /// Post a MSG_RING to peer `thread_id`: looks up its ring fd in the shared
     /// table and pushes the op onto our own ring. The peer receives a
     /// [`PeerMessage`] carrying `payload` and `data` in its inbox.
-    pub fn send_to_peer(&self, thread_id: usize, data: i32, payload: u64) {
+    pub(crate) fn send_to_peer(&self, thread_id: usize, data: i32, payload: u64) {
         let peers = self
             .peers
             .as_ref()
@@ -714,7 +717,7 @@ impl IODriver {
     /// for a reply that carries no payload — because the requester already
     /// holds it. Nothing is owned by the wire, so a wakeup aimed at a slot that
     /// no longer exists is simply dropped.
-    pub fn send_signal_to_peer(&self, thread_id: usize, slot: u32, status: i32) {
+    pub(crate) fn send_signal_to_peer(&self, thread_id: usize, slot: u32, status: i32) {
         let peers = self
             .peers
             .as_ref()
@@ -736,7 +739,7 @@ impl IODriver {
     /// Same contract as [`Message::erase`]: any clone of the original `Arc`
     /// still alive makes the payload shared with `thread_id`, which must be
     /// sound for its type.
-    pub unsafe fn send_erased_to_peer(&self, thread_id: usize, msg: ErasedMessage) {
+    pub(crate) unsafe fn send_erased_to_peer(&self, thread_id: usize, msg: ErasedMessage) {
         let peers = self
             .peers
             .as_ref()
@@ -771,7 +774,7 @@ impl IODriver {
     ///
     /// `parked` is the calling future's own flag. Panics if another future is
     /// already parked: the inbox has a single consumer.
-    pub fn poll_peer_inbox(
+    pub(crate) fn poll_peer_inbox(
         &self,
         waker: &Waker,
         parked: &mut bool,
@@ -796,7 +799,7 @@ impl IODriver {
     }
 
     /// A `recv_from_peer` future is gone: free the inbox for the next consumer.
-    pub fn leave_peer_inbox(&self, parked: &mut bool) {
+    pub(crate) fn leave_peer_inbox(&self, parked: &mut bool) {
         let inbox = unsafe { &mut *self.peer_inbox.get() };
         unpark(&mut inbox.parked, &mut inbox.waker, parked);
     }
@@ -886,7 +889,7 @@ impl IODriver {
     /// Reserve a reply slot for a request about to go out. The returned index
     /// is what the request carries in `sender.slab`; the peer echoes it back in
     /// the reply's `receiver.slab`.
-    pub fn reserve_reply_slot(&self) -> u32 {
+    pub(crate) fn reserve_reply_slot(&self) -> u32 {
         let slab = unsafe { &mut *self.reply_slab.get() };
         let index = slab.insert(ReplySlot::Waiting(None));
         index.try_into().expect("reply slab index exceeds u32")
@@ -894,7 +897,11 @@ impl IODriver {
 
     /// Poll a reserved reply slot: `Ready` once the peer's reply has landed
     /// (removing the slot), otherwise parks `waker` and returns `Pending`.
-    pub fn poll_reply_slot(&self, index: u32, waker: &Waker) -> std::task::Poll<ErasedMessage> {
+    pub(crate) fn poll_reply_slot(
+        &self,
+        index: u32,
+        waker: &Waker,
+    ) -> std::task::Poll<ErasedMessage> {
         let slab = unsafe { &mut *self.reply_slab.get() };
         match slab.get_mut(index as usize) {
             Some(ReplySlot::Delivered(_)) => {
@@ -927,7 +934,7 @@ impl IODriver {
     /// requester's choice of API — so a message landing here is a protocol
     /// error, and unlike the type cast it replaces, it is *caught* rather than
     /// silently reinterpreted.
-    pub fn poll_reply_signal(&self, index: u32, waker: &Waker) -> std::task::Poll<i32> {
+    pub(crate) fn poll_reply_signal(&self, index: u32, waker: &Waker) -> std::task::Poll<i32> {
         let slab = unsafe { &mut *self.reply_slab.get() };
         match slab.get_mut(index as usize) {
             Some(ReplySlot::Signalled(_)) => {
@@ -959,7 +966,7 @@ impl IODriver {
     /// in [`route_msg`](Self::route_msg). Holding the
     /// slot occupied until then stops its index from being reused while a reply
     /// is still in flight toward it.
-    pub fn abandon_reply_slot(&self, index: u32, drop_glue: fn(ErasedMessage)) {
+    pub(crate) fn abandon_reply_slot(&self, index: u32, drop_glue: fn(ErasedMessage)) {
         let slab = unsafe { &mut *self.reply_slab.get() };
         match slab.get_mut(index as usize) {
             Some(ReplySlot::Delivered(_)) => {
@@ -991,7 +998,7 @@ impl IODriver {
     /// be stashed for a late one. The slot is still kept as `Cancelled` while a
     /// wakeup may be racing toward it, so its index cannot be reused and resolve
     /// somebody else's future.
-    pub fn abandon_signal_slot(&self, index: u32) {
+    pub(crate) fn abandon_signal_slot(&self, index: u32) {
         let slab = unsafe { &mut *self.reply_slab.get() };
         match slab.get_mut(index as usize) {
             Some(ReplySlot::Signalled(_)) => {
@@ -1015,7 +1022,7 @@ impl IODriver {
     ///
     /// `parked` is the calling future's own flag. Panics if another future is
     /// already parked: the inbox has a single consumer.
-    pub fn poll_msg_inbox(
+    pub(crate) fn poll_msg_inbox(
         &self,
         waker: &Waker,
         parked: &mut bool,
@@ -1040,17 +1047,17 @@ impl IODriver {
     }
 
     /// A `recv_msg_from_peer` future is gone: free the inbox for the next consumer.
-    pub fn leave_msg_inbox(&self, parked: &mut bool) {
+    pub(crate) fn leave_msg_inbox(&self, parked: &mut bool) {
         let inbox = unsafe { &mut *self.msg_inbox.get() };
         unpark(&mut inbox.parked, &mut inbox.waker, parked);
     }
 
-    pub fn push_op(&self, entry: squeue::Entry) -> OneshotToken {
+    pub(crate) fn push_op(&self, entry: squeue::Entry) -> OneshotToken {
         self.push_buffered_op(entry, 0)
     }
 
     /// [`push_op`](Self::push_op) for an op that selects its buffer from ring `bgid`.
-    pub fn push_buffered_op(&self, mut entry: squeue::Entry, bgid: u16) -> OneshotToken {
+    pub(crate) fn push_buffered_op(&self, mut entry: squeue::Entry, bgid: u16) -> OneshotToken {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
         let token = slab.insert(SingleOpState::Init, bgid);
@@ -1059,7 +1066,7 @@ impl IODriver {
         token
     }
 
-    pub fn push_wakeup_timeout(&self, duration: Duration) {
+    pub(crate) fn push_wakeup_timeout(&self, duration: Duration) {
         let ring_inner = unsafe { &mut *self.ring.get() };
         ring_inner.wakeup_timeout = Timespec::from(duration);
         // The SQ thread may read the sqe after the next push overwrote the timespec: the enter waits instead.
@@ -1080,7 +1087,7 @@ impl IODriver {
         ring_inner.add(&entry);
     }
 
-    pub fn push_signal_op(&self, fd: RawFd) -> OneshotToken {
+    pub(crate) fn push_signal_op(&self, fd: RawFd) -> OneshotToken {
         let slab = unsafe { &mut *self.slab.get() };
         let ring_inner = unsafe { &mut *self.ring.get() };
         let mut sig_data = Box::new([0u8; 8]);
@@ -1147,7 +1154,7 @@ impl IODriver {
     }
 
     /// Polls the op in `slot`, emptied once it is Ready: a finished op cannot be polled again.
-    pub fn poll_op(
+    pub(crate) fn poll_op(
         &self,
         slot: &mut Option<OneshotToken>,
         waker: &Waker,
@@ -1306,13 +1313,6 @@ impl IODriver {
         }
     }
 
-    /// Cancel a single-shot operation. `bgid` must be `Some` if the operation
-    /// used provided buffers (so the buffer can be recycled on late completion),
-    /// or `None` for operations that manage their own buffers.
-    pub fn cancel_single_op(&self, token: OneshotToken, bgid: Option<u16>) {
-        self.cancel_single_op_keep(token, bgid, None, None);
-    }
-
     /// Cancel a single-shot operation, transferring ownership of `keepalive`
     /// to the driver. The kernel may still be reading from memory referenced
     /// by the in-flight SQE; `keepalive` is dropped only when the cancelled
@@ -1392,10 +1392,6 @@ impl IODriver {
                 .user_data(UserData::ignored_only().into_bits());
             ring.add(&entry);
         }
-    }
-
-    pub fn cancel_multishot_op(&self, token: MultishotToken, bgid: u16) {
-        self.cancel_multishot_op_keep(token, bgid, None, None);
     }
 
     /// Cancel a multishot op, transferring ownership of `keepalive` to the
@@ -1537,7 +1533,7 @@ impl IODriver {
         }
     }
 
-    pub fn send_multiop_cancel_event(&self, raw: u64) {
+    pub(crate) fn send_multiop_cancel_event(&self, raw: u64) {
         let ring_inner = unsafe { &mut *self.ring.get() };
         let cancel_op = opcode::AsyncCancel::new(raw)
             .build()
@@ -1545,7 +1541,7 @@ impl IODriver {
         ring_inner.add(&cancel_op);
     }
 
-    pub fn resubmit_multishot(
+    pub(crate) fn resubmit_multishot(
         &self,
         token: &MultishotToken,
         mut entry: squeue::Entry,

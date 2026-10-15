@@ -58,7 +58,7 @@ pub async fn yield_now() {
 }
 
 scoped_thread_local!(pub(crate) static TASK_LIST: TaskList);
-scoped_thread_local!(pub static TIME_DRIVER: TimeDriver);
+scoped_thread_local!(pub(crate) static TIME_DRIVER: TimeDriver);
 thread_local!(static THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
 thread_local!(static ROOT_WOKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
 
@@ -78,7 +78,7 @@ fn root_waker_drop(_: *const ()) {}
 
 #[derive(Default)]
 pub struct RuntimeInner {
-    pub tasks: TaskList,
+    tasks: TaskList,
     io_driver: IODriver,
     time_driver: TimeDriver,
     thread_id: usize,
@@ -235,7 +235,7 @@ impl RuntimeInner {
     }
 }
 
-pub fn set_thread_id(id: usize) {
+pub(crate) fn set_thread_id(id: usize) {
     THREAD_ID.with(|cell| cell.set(id));
 }
 
