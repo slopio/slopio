@@ -78,11 +78,9 @@ impl<B: IoBufMut> Future for ReadPipe<B> {
         if self.id.is_none() {
             self.register_to_driver();
         }
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, cx.waker())) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, cx.waker())) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let mut buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     n @ 0.. => {
@@ -101,7 +99,7 @@ impl<B: IoBufMut> Future for ReadPipe<B> {
 
 impl<B: IoBufMut> Drop for ReadPipe<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // The kernel writes into the buffer until the cancel CQE.
             let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
             let parked = Some(self.fd.park());
@@ -144,11 +142,9 @@ impl<B: IoBuf> Future for WritePipe<B> {
         if self.id.is_none() {
             self.register_to_driver();
         }
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, cx.waker())) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, cx.waker())) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     n @ 0.. => Ok(n as usize),
@@ -162,7 +158,7 @@ impl<B: IoBuf> Future for WritePipe<B> {
 
 impl<B: IoBuf> Drop for WritePipe<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // The kernel reads the buffer until the cancel CQE.
             let keep = if B::NEEDS_KEEPALIVE {
                 self.buf.take().map(|b| Box::new(b) as Box<dyn Any>)

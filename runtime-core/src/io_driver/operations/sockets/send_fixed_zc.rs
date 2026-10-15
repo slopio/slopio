@@ -59,13 +59,11 @@ impl Future for WriteFixedSocketZc {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.id.unwrap();
         // Completion + notification are sequenced inside the slab state machine
         // (Sent -> Notif -> Ended); `poll_op` only returns Ready on the latter.
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     n @ 0.. => Ok(n as usize),
@@ -79,7 +77,7 @@ impl Future for WriteFixedSocketZc {
 
 impl Drop for WriteFixedSocketZc {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // Mid-flight cancel: stash the buffer so its slot-releasing `Drop`
             // fires only after the cancelled op's final CQE. The `Cancelled`
             // arm waits past any `F_MORE` completion, so an in-flight zero-copy

@@ -44,16 +44,12 @@ impl Future for OpenFile {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let waker = cx.waker();
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(io_result) => {
-                self.id = None;
-                std::task::Poll::Ready(match io_result.result {
-                    fd @ 0.. => Ok(OpenedFile::from_fd(fd)),
-                    err => Err(std::io::Error::from_raw_os_error(-err)),
-                })
-            }
+            std::task::Poll::Ready(io_result) => std::task::Poll::Ready(match io_result.result {
+                fd @ 0.. => Ok(OpenedFile::from_fd(fd)),
+                err => Err(std::io::Error::from_raw_os_error(-err)),
+            }),
         }
     }
 }

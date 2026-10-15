@@ -1094,7 +1094,7 @@ impl IODriver {
 
     fn poll_op_multishot(
         &self,
-        token: MultishotToken,
+        token: &MultishotToken,
         waker: &Waker,
         poller_queue: &mut MultiOpQueue,
     ) -> MultiPollResult {
@@ -1146,7 +1146,13 @@ impl IODriver {
         }
     }
 
-    pub fn poll_op(&self, token: OneshotToken, waker: &Waker) -> std::task::Poll<OpMetadata> {
+    /// Polls the op in `slot`, emptied once it is Ready: a finished op cannot be polled again.
+    pub fn poll_op(
+        &self,
+        slot: &mut Option<OneshotToken>,
+        waker: &Waker,
+    ) -> std::task::Poll<OpMetadata> {
+        let token = slot.as_ref().expect("op polled after completion");
         let slab = unsafe { &mut *self.slab.get() };
         let entry = unsafe { slab.get_unchecked_mut(token) };
         let mut to_delete = None;
@@ -1166,7 +1172,7 @@ impl IODriver {
                 std::task::Poll::Pending
             }
             SingleOpState::Ended(e) => {
-                to_delete = Some(token);
+                to_delete = slot.take();
                 std::task::Poll::Ready(*e)
             }
             _ => {
@@ -1174,7 +1180,7 @@ impl IODriver {
             }
         };
         if let Some(token) = to_delete {
-            slab.remove(token);
+            slab.remove(&token);
         }
         res
     }
@@ -1320,16 +1326,16 @@ impl IODriver {
     ) {
         let slab = unsafe { &mut *self.slab.get() };
         // The CQE beat the drop: nothing to cancel, but a buffer it delivered must go back.
-        if let Some(SingleOpState::Ended(meta)) = slab.get_mut(token) {
+        if let Some(SingleOpState::Ended(meta)) = slab.get_mut(&token) {
             let meta = *meta;
-            slab.remove(token);
+            slab.remove(&token);
             if let (Some(bgid), Some(bid)) = (bgid, io_uring::cqueue::buffer_select(meta.flags)) {
                 self.recycle_by_bgid(bgid, bid);
             }
             return;
         }
-        self.send_singleop_cancel_event(token);
-        *slab.get_mut(token).unwrap() = SingleOpState::Cancelled {
+        self.send_singleop_cancel_event(&token);
+        *slab.get_mut(&token).unwrap() = SingleOpState::Cancelled {
             bgid,
             keepalive: keepalive.map(CancelKeepalive),
             parked_fd,
@@ -1344,22 +1350,22 @@ impl IODriver {
         keepalive: Option<Box<dyn std::any::Any>>,
     ) {
         let slab = unsafe { &mut *self.slab.get() };
-        if let Some(SingleOpState::Ended(meta)) = slab.get_mut(token) {
+        if let Some(SingleOpState::Ended(meta)) = slab.get_mut(&token) {
             let result = meta.result;
-            slab.remove(token);
+            slab.remove(&token);
             if result >= 0 {
                 self.close_fd(result);
             }
             return;
         }
-        self.send_singleop_cancel_event(token);
-        *slab.get_mut(token).unwrap() = SingleOpState::CancelledOpen {
+        self.send_singleop_cancel_event(&token);
+        *slab.get_mut(&token).unwrap() = SingleOpState::CancelledOpen {
             keepalive: keepalive.map(CancelKeepalive),
         };
     }
 
     /// Submit an async cancel SQE for `token`.
-    fn send_singleop_cancel_event(&self, token: OneshotToken) {
+    fn send_singleop_cancel_event(&self, token: &OneshotToken) {
         let raw = token.raw();
         let ring_inner = unsafe { &mut *self.ring.get() };
         let cancel_op = opcode::AsyncCancel::new(raw)
@@ -1404,7 +1410,7 @@ impl IODriver {
         parked_fd: Option<ParkedFd>,
     ) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
-        let Some(entry) = slab.get_mut(token) else {
+        let Some(entry) = slab.get_mut(&token) else {
             return;
         };
 
@@ -1420,7 +1426,7 @@ impl IODriver {
             entry,
             MultiOpState::Sent { last_cqe: true, .. } | MultiOpState::Paused { .. }
         ) {
-            let old = slab.remove(token);
+            let old = slab.remove(&token);
             self.recycle_multiop_queue(old, bgid);
             return;
         }
@@ -1464,7 +1470,7 @@ impl IODriver {
         parked_fd: Option<ParkedFd>,
     ) {
         let slab = unsafe { &mut *self.multishot_slab.get() };
-        let Some(entry) = slab.get_mut(token) else {
+        let Some(entry) = slab.get_mut(&token) else {
             return;
         };
 
@@ -1474,7 +1480,7 @@ impl IODriver {
             entry,
             MultiOpState::Sent { last_cqe: true, .. } | MultiOpState::Paused { .. }
         ) {
-            let old = slab.remove(token);
+            let old = slab.remove(&token);
             Self::close_queued_fds(old);
             return;
         }
@@ -1541,7 +1547,7 @@ impl IODriver {
 
     pub fn resubmit_multishot(
         &self,
-        token: MultishotToken,
+        token: &MultishotToken,
         mut entry: squeue::Entry,
         waker: &Waker,
     ) -> bool {
@@ -1681,17 +1687,17 @@ impl OneshotSlab {
         OneshotToken(UserData::token(self.0.insert(val) as u64, ring))
     }
 
-    fn get_mut(&mut self, token: OneshotToken) -> Option<&mut SingleOpState> {
+    fn get_mut(&mut self, token: &OneshotToken) -> Option<&mut SingleOpState> {
         self.0.get_mut(token.index())
     }
 
     /// # Safety
     /// The token must refer to an occupied slot.
-    unsafe fn get_unchecked_mut(&mut self, token: OneshotToken) -> &mut SingleOpState {
+    unsafe fn get_unchecked_mut(&mut self, token: &OneshotToken) -> &mut SingleOpState {
         unsafe { self.0.get_unchecked_mut(token.index()) }
     }
 
-    fn remove(&mut self, token: OneshotToken) -> SingleOpState {
+    fn remove(&mut self, token: &OneshotToken) -> SingleOpState {
         self.0.remove(token.index())
     }
 
@@ -1723,17 +1729,17 @@ impl MultishotSlab {
         self.0.len()
     }
 
-    fn get_mut(&mut self, token: MultishotToken) -> Option<&mut MultiOpState> {
+    fn get_mut(&mut self, token: &MultishotToken) -> Option<&mut MultiOpState> {
         self.0.get_mut(token.index())
     }
 
     /// # Safety
     /// The token must refer to an occupied slot.
-    unsafe fn get_unchecked_mut(&mut self, token: MultishotToken) -> &mut MultiOpState {
+    unsafe fn get_unchecked_mut(&mut self, token: &MultishotToken) -> &mut MultiOpState {
         unsafe { self.0.get_unchecked_mut(token.index()) }
     }
 
-    fn remove(&mut self, token: MultishotToken) -> MultiOpState {
+    fn remove(&mut self, token: &MultishotToken) -> MultiOpState {
         self.0.remove(token.index())
     }
 

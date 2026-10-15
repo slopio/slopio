@@ -65,12 +65,10 @@ impl<B: IoBufMut> Future for ClassicRecv<B> {
         }
 
         let waker = cx.waker();
-        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let mut buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     n @ 0.. => {
@@ -92,7 +90,7 @@ impl<B: IoBufMut> Future for ClassicRecv<B> {
 
 impl<B: IoBufMut> Drop for ClassicRecv<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);
             let parked = Some(self.socket.park());
             IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));

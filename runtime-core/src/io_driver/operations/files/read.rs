@@ -55,11 +55,9 @@ impl<B: IoBufMut> Future for ReadFile<B> {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let mut buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     n @ 0.. => {
@@ -81,7 +79,7 @@ impl<B: IoBufMut> Future for ReadFile<B> {
 
 impl<B: IoBufMut> Drop for ReadFile<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // Kernel writes into the buffer — must keep it alive until the
             // cancel CQE arrives.
             let keep = self.buf.take().map(|b| Box::new(b) as Box<dyn Any>);

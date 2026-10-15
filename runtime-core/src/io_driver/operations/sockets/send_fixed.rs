@@ -61,11 +61,9 @@ impl Future for WriteFixedSocket {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     n @ 0.. => Ok(n as usize),
@@ -79,7 +77,7 @@ impl Future for WriteFixedSocket {
 
 impl Drop for WriteFixedSocket {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // Mid-flight cancel: move the buffer into the keepalive so its
             // slot-releasing `Drop` fires only after the cancelled CQE — at
             // which point the kernel is guaranteed done with the registered

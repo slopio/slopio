@@ -132,11 +132,9 @@ impl Future for ConnectTcp {
                 return Poll::Ready(Err(e));
             }
         }
-        let token = self.token.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, cx.waker())) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.token, cx.waker())) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(meta) => {
-                self.token = None;
                 let _ = self.addr_storage.take();
                 if meta.result < 0 {
                     let _ = self.socket.take();
@@ -151,7 +149,7 @@ impl Future for ConnectTcp {
 
 impl Drop for ConnectTcp {
     fn drop(&mut self) {
-        if let Some(token) = self.token {
+        if let Some(token) = self.token.take() {
             let keep = self
                 .addr_storage
                 .take()

@@ -142,11 +142,9 @@ impl<B: IoBuf> Future for WriteVectoredSocket<B> {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let bufs = self.bufs.take().expect("bufs already taken");
                 let result = match io_result.result {
                     n @ 0.. => Ok(n as usize),
@@ -160,7 +158,7 @@ impl<B: IoBuf> Future for WriteVectoredSocket<B> {
 
 impl<B: IoBuf> Drop for WriteVectoredSocket<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // Three layers of memory the kernel reads: the `msghdr`, the iovec
             // array it names, and each iovec's `iov_base` pointing into a B.
             // The first two travel together in the box; the chunks only need

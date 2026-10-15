@@ -65,20 +65,23 @@ impl<S: OpState> Future for Op<S> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        let token = match this.token {
-            Some(token) => token,
-            None => {
-                let entry = this.state.as_mut().expect("Op polled after completion").entry();
-                *this.token.insert(IO_DRIVER.with(|d| d.push_op(entry)))
-            }
-        };
-        let meta = ready!(IO_DRIVER.with(|d| d.poll_op(token, cx.waker())));
-        this.token = None;
+        if this.token.is_none() {
+            let entry = this
+                .state
+                .as_mut()
+                .expect("Op polled after completion")
+                .entry();
+            this.token = Some(IO_DRIVER.with(|d| d.push_op(entry)));
+        }
+        let meta = ready!(IO_DRIVER.with(|d| d.poll_op(&mut this.token, cx.waker())));
         let result = match meta.result {
             n @ 0.. => Ok(n as u32),
             err => Err(io::Error::from_raw_os_error(-err)),
         };
-        Poll::Ready((result, this.state.take().expect("state present until Ready")))
+        Poll::Ready((
+            result,
+            this.state.take().expect("state present until Ready"),
+        ))
     }
 }
 

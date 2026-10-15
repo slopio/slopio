@@ -105,11 +105,9 @@ impl<B: IoBufMut> Future for UdpRecvFrom<B> {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let mut buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     len @ 0.. => {
@@ -143,7 +141,7 @@ impl<B: IoBufMut> Future for UdpRecvFrom<B> {
 
 impl<B: IoBufMut> Drop for UdpRecvFrom<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // Both must be kept alive: kernel writes into buf and msghdr→addr
             // until the cancel CQE arrives.
             let state = self.state.take().expect("state present");

@@ -83,12 +83,10 @@ impl<B: IoBuf> Future for UdpSendTo<B> {
         }
 
         let waker = cx.waker();
-        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     len @ 0.. => Ok(len as usize),
@@ -102,7 +100,7 @@ impl<B: IoBuf> Future for UdpSendTo<B> {
 
 impl<B: IoBuf> Drop for UdpSendTo<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             let state = self.state.take().expect("state present");
             // The kernel state always needs keeping (msghdr/addr/iovec read
             // until cancel completes). The buffer only needs keeping if

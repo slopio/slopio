@@ -73,21 +73,17 @@ impl<S: BufRingSpec> Future for ManagedRecv<S> {
         }
 
         let waker = cx.waker();
-        let token = self.id.unwrap();
 
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(io_result) => {
-                self.id = None;
-                Poll::Ready(self.parse_completion(io_result))
-            }
+            Poll::Ready(io_result) => Poll::Ready(self.parse_completion(io_result)),
         }
     }
 }
 
 impl<S: BufRingSpec> Drop for ManagedRecv<S> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             let parked = Some(self.socket.park());
             IO_DRIVER.with(|d| d.cancel_single_op_keep(token, Some(S::BGID), None, parked))
         }

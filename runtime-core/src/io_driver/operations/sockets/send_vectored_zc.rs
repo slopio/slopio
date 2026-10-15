@@ -79,11 +79,9 @@ impl<B: IoBuf> Future for WriteVectoredSocketZc<B> {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let bufs = self.bufs.take().expect("bufs already taken");
                 let result = match io_result.result {
                     n @ 0.. => Ok(n as usize),
@@ -97,7 +95,7 @@ impl<B: IoBuf> Future for WriteVectoredSocketZc<B> {
 
 impl<B: IoBuf> Drop for WriteVectoredSocketZc<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // msghdr + iovecs are always kernel-read; chunks only when not `'static`.
             let msg = self.msg.take().expect("msg taken");
             let keep: Box<dyn Any> = if B::NEEDS_KEEPALIVE {

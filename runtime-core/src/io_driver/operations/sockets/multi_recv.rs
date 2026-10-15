@@ -200,24 +200,32 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream
 
         self.ensure_registered();
         let waker = cx.waker();
-        let token = self.id.unwrap();
+        let this = &mut *self;
 
         loop {
-            match IO_DRIVER.with(|d| d.poll_op_multishot(token, waker, &mut self.reads)) {
+            match IO_DRIVER.with(|d| {
+                d.poll_op_multishot(
+                    this.id.as_ref().expect("registered"),
+                    waker,
+                    &mut this.reads,
+                )
+            }) {
                 MultiPollResult::Pending => return Poll::Pending,
                 // Only skippable errors came out: ask again, the op may be over.
                 MultiPollResult::Ready => {
-                    if let Poll::Ready(result) = self.try_drain_one() {
+                    if let Poll::Ready(result) = this.try_drain_one() {
                         return Poll::Ready(result);
                     }
                 }
                 MultiPollResult::NeedsResubmit => {
                     // The paused queue came with the swap, and nothing will wake us for it.
-                    if let Poll::Ready(result) = self.try_drain_one() {
+                    if let Poll::Ready(result) = this.try_drain_one() {
                         return Poll::Ready(result);
                     }
-                    let entry = self.to_entry();
-                    IO_DRIVER.with(|d| d.resubmit_multishot(token, entry, waker));
+                    let entry = this.to_entry();
+                    IO_DRIVER.with(|d| {
+                        d.resubmit_multishot(this.id.as_ref().expect("registered"), entry, waker)
+                    });
                     return Poll::Pending;
                 }
             }

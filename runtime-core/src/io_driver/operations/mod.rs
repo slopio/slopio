@@ -26,31 +26,31 @@ pub enum Continuation {
 }
 
 /// A token for a single-shot io_uring operation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct OneshotToken(pub(crate) u64);
 
 /// A token for a multishot io_uring operation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct MultishotToken(pub(crate) u64);
 
 impl OneshotToken {
     /// Raw u64 value for io_uring user_data: slab index plus buffer-ring bits.
-    pub(crate) fn raw(self) -> u64 {
+    pub(crate) fn raw(&self) -> u64 {
         self.0
     }
 
-    pub(crate) fn index(self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         crate::io_driver::UserData::token_index(self.0)
     }
 }
 
 impl MultishotToken {
     /// Raw u64 value for io_uring user_data: slab index plus buffer-ring bits.
-    pub(crate) fn raw(self) -> u64 {
+    pub(crate) fn raw(&self) -> u64 {
         self.0
     }
 
-    pub(crate) fn index(self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         crate::io_driver::UserData::token_index(self.0)
     }
 }

@@ -55,11 +55,9 @@ impl<B: IoBuf> Future for WriteSocket<B> {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => {
-                self.id = None;
                 let buf = self.buf.take().expect("buf already taken");
                 let result = match io_result.result {
                     n @ 0.. => Ok(n as usize),
@@ -73,7 +71,7 @@ impl<B: IoBuf> Future for WriteSocket<B> {
 
 impl<B: IoBuf> Drop for WriteSocket<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // Keep the buffer unless `'static`; park the fd ref so the
             // close posts only after the cancel's terminal CQE.
             let keep = if B::NEEDS_KEEPALIVE {

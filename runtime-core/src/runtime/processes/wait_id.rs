@@ -173,37 +173,33 @@ impl Future for WaitProcess {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.token.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.token, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(io_result) => {
-                self.token = None;
-                std::task::Poll::Ready(match io_result.result {
-                    0.. => {
-                        let info = &**self.siginfo.as_ref().expect("siginfo present");
-                        let pid = unsafe { info.si_pid() } as u32;
-                        let status = unsafe { info.si_status() };
-                        let code = match info.si_code {
-                            libc::CLD_EXITED => ExitCode::Exited(status),
-                            libc::CLD_KILLED => ExitCode::Killed(status),
-                            libc::CLD_DUMPED => ExitCode::Dumped(status),
-                            libc::CLD_STOPPED => ExitCode::Stopped(status),
-                            libc::CLD_CONTINUED => ExitCode::Continued,
-                            libc::CLD_TRAPPED => ExitCode::Trapped(status),
-                            other => ExitCode::Killed(other),
-                        };
-                        Ok(ExitStatus { pid, code })
-                    }
-                    err => Err(std::io::Error::from_raw_os_error(-err)),
-                })
-            }
+            std::task::Poll::Ready(io_result) => std::task::Poll::Ready(match io_result.result {
+                0.. => {
+                    let info = &**self.siginfo.as_ref().expect("siginfo present");
+                    let pid = unsafe { info.si_pid() } as u32;
+                    let status = unsafe { info.si_status() };
+                    let code = match info.si_code {
+                        libc::CLD_EXITED => ExitCode::Exited(status),
+                        libc::CLD_KILLED => ExitCode::Killed(status),
+                        libc::CLD_DUMPED => ExitCode::Dumped(status),
+                        libc::CLD_STOPPED => ExitCode::Stopped(status),
+                        libc::CLD_CONTINUED => ExitCode::Continued,
+                        libc::CLD_TRAPPED => ExitCode::Trapped(status),
+                        other => ExitCode::Killed(other),
+                    };
+                    Ok(ExitStatus { pid, code })
+                }
+                err => Err(std::io::Error::from_raw_os_error(-err)),
+            }),
         }
     }
 }
 
 impl Drop for WaitProcess {
     fn drop(&mut self) {
-        if let Some(token) = self.token {
+        if let Some(token) = self.token.take() {
             // The kernel writes the siginfo until the cancelled op's CQE.
             let keep = self.siginfo.take().map(|b| b as Box<dyn std::any::Any>);
             IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, None))

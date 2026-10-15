@@ -108,23 +108,19 @@ impl<B: IoBuf> Future for WriteControlRecord<B> {
             self.register_to_driver();
         }
         let waker = cx.waker();
-        let token = self.id.unwrap();
-        match IO_DRIVER.with(|d| d.poll_op(token, waker)) {
+        match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(io_result) => {
-                self.id = None;
-                match io_result.result {
-                    n @ 0.. => Poll::Ready(Ok(n as usize)),
-                    err => Poll::Ready(Err(std::io::Error::from_raw_os_error(-err))),
-                }
-            }
+            Poll::Ready(io_result) => match io_result.result {
+                n @ 0.. => Poll::Ready(Ok(n as usize)),
+                err => Poll::Ready(Err(std::io::Error::from_raw_os_error(-err))),
+            },
         }
     }
 }
 
 impl<B: IoBuf> Drop for WriteControlRecord<B> {
     fn drop(&mut self) {
-        if let Some(token) = self.id {
+        if let Some(token) = self.id.take() {
             // Move the boxed msghdr/iovec/ctrl/payload into keepalive — kernel
             // may still dereference msghdr → iovec/ctrl until cancel completes.
             let keep = self.state.take().map(|s| s as Box<dyn Any>);
