@@ -4,10 +4,12 @@ pub(crate) mod fd;
 pub mod files;
 pub mod fixed_buf;
 pub mod io_traits;
+pub mod op;
 pub mod sockets;
 
 pub use fixed_buf::FixedBufIndex;
 pub use io_traits::{IoBuf, IoBufMut, Slice};
+pub use op::{Op, OpState};
 
 /// What a failed completion says about the multishot op that produced it. The
 /// kernel ended the op either way; this is whether re-arming it is worth
