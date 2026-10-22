@@ -9,7 +9,7 @@ MIRIFLAGS := "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-tree-
 # Every suite that runs without a kernel. Naming them is not optional: with no
 # `--test`, Miri also builds the lib's inline unit tests, which open a real
 # io_uring and take the whole run down with an unsupported syscall.
-MIRI_SUITES := "--test channels --test channels_unbounded --test channels_bounded --test channels_vec --test simulated_runtime --test cancellation"
+MIRI_SUITES := "--test channels --test channels_unbounded --test channels_bounded --test channels_vec --test channels_mpsc --test fake_ring --test simulated_runtime --test cancellation --test kill --test kill_drop --test task_free --test multishot_rearm --test root_waker --test buf_ring_reserve"
 
 # Launch Tempo + Grafana, then run the HTTP example
 dev: observability
@@ -81,9 +81,13 @@ miri-setup:
     rustup toolchain install nightly
     rustup component add miri --toolchain nightly
 
+# Every kernel-free suite against the simulated ring, without Miri
+test-sim *args:
+    cargo test -p runtime-core --features simulation {{MIRI_SUITES}} {{args}}
+
 # Check every Miri-able suite for undefined behaviour and leaks
-miri:
-    MIRIFLAGS="{{MIRIFLAGS}}" cargo +nightly miri test -p runtime-core --features simulation {{MIRI_SUITES}}
+miri *args:
+    MIRIFLAGS="{{MIRIFLAGS}}" cargo +nightly miri test -p runtime-core --features simulation {{MIRI_SUITES}} {{args}}
 
 # One suite, optionally one test:  just miri-one cancellation a_multishot
 miri-one suite filter="":
