@@ -23,4 +23,6 @@ jobs:
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo test --workspace --no-fail-fast
       - name: Test simulated suites
-        run: cargo test -p runtime-core --features simulation --no-fail-fast
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo test -p runtime-core --features simulation --no-fail-fast
