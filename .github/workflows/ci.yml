@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # runtime_ebpf_balancer's build.rs compiles the BPF object unconditionally
+      - name: Install eBPF build deps
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Test simulated suites
+        run: cargo test -p runtime-core --features simulation
