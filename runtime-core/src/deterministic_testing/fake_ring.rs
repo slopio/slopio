@@ -16,7 +16,7 @@ use crate::io_driver::BufRingTake;
 
 use super::clock::{self, Nanos};
 use super::fds::{self, FdKind};
-use super::scenario::{Batch, Delay, Entry, Scenario, Scripted, Trigger};
+use super::scenario::{Batch, Delay, Entry, Flow, Scenario, Scripted, Trigger};
 use super::sqe::{
     IORING_ACCEPT_MULTISHOT, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE,
     IORING_RECV_MULTISHOT, Sqe,
@@ -154,10 +154,86 @@ pub fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
     }
 }
 
+/// What the far end of a simulated connection has done, as the reads and
+/// writes on it see it. A connection with no entry is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    /// Sent FIN: reads see EOF from here on; writes still go through.
+    Closed,
+    /// Sent RST, reported by the completion that brought it. From then on
+    /// reads see EOF and writes `EPIPE`, as Linux answers a reset socket.
+    Reset,
+}
+
+/// The state a completion leaves its connection in, if it changes it. Only a
+/// simulated socket has a far end; a file read of zero bytes is just its end.
+fn peer_after(sqe: &Sqe, result: i32) -> Option<Peer> {
+    if fds::kind(sqe.fd) != Some(FdKind::Socket) {
+        return None;
+    }
+    match (trigger_for(sqe)?, -result) {
+        (Trigger::Read(_), 0) => Some(Peer::Closed),
+        (
+            Trigger::Read(_) | Trigger::Write(_),
+            libc::ECONNRESET | libc::EPIPE | libc::ETIMEDOUT,
+        ) => Some(Peer::Reset),
+        _ => None,
+    }
+}
+
+/// How an op on a closed or reset connection completes, whatever was scripted.
+fn peer_outcome(state: &FakeRingState, sqe: &Sqe) -> Option<Outcome> {
+    let peer = state.peers.get(&sqe.fd)?;
+    match (trigger_for(sqe)?, peer) {
+        (Trigger::Read(_), _) => Some(Outcome::result(0)),
+        (Trigger::Write(_), Peer::Reset) => Some(Outcome::result(-libc::EPIPE)),
+        _ => None,
+    }
+}
+
+/// Scripted completions an op still carries, delivered or not.
+fn owed(source: &Source) -> usize {
+    match source {
+        Source::Default => 0,
+        Source::Scenario(_) => 1,
+        Source::Stream { also, rest, .. } => {
+            1 + also.len() + rest.iter().map(Batch::len).sum::<usize>()
+        }
+    }
+}
+
+/// Move a connection to `peer`. What the script still says about the sides
+/// that are now dead is voided, and ops parked on them complete from the new
+/// state. Never goes back: a reset connection stays reset.
+fn enter(state: &mut FakeRingState, fd: RawFd, peer: Peer, now: Nanos) {
+    match (state.peers.get(&fd), peer) {
+        (Some(Peer::Reset), _) | (Some(Peer::Closed), Peer::Closed) => return,
+        _ => {}
+    }
+    state.peers.insert(fd, peer);
+
+    state.voided += state.scenario.void(Trigger::Read(fd));
+    if peer == Peer::Reset {
+        state.voided += state.scenario.void(Trigger::Write(fd));
+    }
+    let (woken, still): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut state.waiting)
+        .into_iter()
+        .partition(|p| p.sqe.fd == fd && peer_outcome(state, &p.sqe).is_some());
+    state.waiting = still;
+    for pending in woken {
+        arm(state, pending, now);
+    }
+}
+
 /// Put an op where it belongs: on the timeline if the scenario already says
 /// what happens to it, parked otherwise — unless it is one the kernel finishes
 /// alone, which then completes with its default.
 fn arm(state: &mut FakeRingState, mut pending: Pending, now: Nanos) {
+    if let Some(outcome) = peer_outcome(state, &pending.sqe) {
+        pending.outcome = outcome;
+        state.timeline.schedule(pending, None, now);
+        return;
+    }
     let entry = trigger_for(&pending.sqe).and_then(|t| state.scenario.take(t));
     let multishot = is_multishot(&pending.sqe);
 
@@ -174,6 +250,12 @@ fn arm(state: &mut FakeRingState, mut pending: Pending, now: Nanos) {
                 !multishot,
                 "user_data {:#x} is a multishot, but the scenario declared a single \
                  completion for it — use on_multishot_* to describe its whole life",
+                pending.sqe.user_data,
+            );
+            assert!(
+                !matches!(scripted.outcome, Outcome::Flow(_)),
+                "user_data {:#x}: a flow is split across a multishot's completions — \
+                 declare it with on_multishot_read",
                 pending.sqe.user_data,
             );
             let delay = state.scenario.resolve_delay(scripted.delay);
@@ -296,15 +378,19 @@ unsafe fn gather(iov: *const libc::iovec, count: usize) -> Vec<u8> {
 }
 
 /// Retire an op: deliver its outcome and build the CQE. A CQE carries no
-/// payload, so data goes into the op's buffer and only the count is reported;
-/// data going the other way is recorded in `written`.
+/// payload, so data goes into the op's buffer and only the count is reported.
+/// Data each way is recorded, in `read` and `written`.
+///
+/// Also returns what a flow has left unread, for the completions after this one.
 fn complete_outcome(
     sqe: Sqe,
     outcome: Outcome,
     provider: Option<BufRingTake>,
+    read: &mut HashMap<RawFd, Vec<Vec<u8>>>,
     written: &mut HashMap<RawFd, Vec<Vec<u8>>>,
-) -> Completion {
-    match outcome {
+    scenario: &mut Scenario,
+) -> (Completion, Option<Flow>) {
+    let completion = match outcome {
         Outcome::Result { result, flags } => Completion {
             user_data: sqe.user_data,
             result,
@@ -328,89 +414,136 @@ fn complete_outcome(
             result: fds::mint(kind),
             flags: 0,
         },
-        Outcome::Data(bytes) if sqe.uses_buffer_select() => {
-            let take = provider.unwrap_or_else(|| {
-                panic!(
-                    "user_data {:#x} draws from buffer group {}, which no registered ring \
-                     provides — was the spec passed to the entry point?",
-                    sqe.user_data, sqe.buf_group,
-                )
-            });
-            let Some((bid, ptr, capacity)) = take() else {
-                // Every buffer handed out and none recycled. A real ring says
-                // the same, and a leaked `BorrowedBuffer` is how a test gets
-                // here.
-                return Completion {
+        Outcome::Data(bytes) => deliver(sqe, provider, read, |_| bytes).unwrap_or_else(|| dry(sqe)),
+        Outcome::Flow(mut flow) => {
+            // The connection dies here: no buffer is taken, nothing more follows.
+            if let Some(result) = flow.cut_now(scenario) {
+                let completion = Completion {
                     user_data: sqe.user_data,
-                    result: -libc::ENOBUFS,
+                    result,
                     flags: 0,
                 };
-            };
-
-            assert!(
-                bytes.len() <= capacity as usize,
-                "user_data {:#x}: {} bytes declared for one completion, into a {}-byte \
-                 buffer from group {}. A completion cannot exceed its buffer — declare \
-                 the split, since how the payload divides is what the reader sees.",
-                sqe.user_data,
-                bytes.len(),
-                capacity,
-                sqe.buf_group,
-            );
-
-            let n = bytes.len();
-            if n > 0 {
-                // SAFETY: the pointer comes from the ring's own entry for
-                // `bid`, so it addresses that buffer, and the write is capped
-                // at the buffer size the ring was built with.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), n);
-                }
+                return (completion, None);
             }
-            Completion {
-                user_data: sqe.user_data,
-                result: n as i32,
-                // Which buffer the data landed in. The driver reads it back
-                // with `cqueue::buffer_select`.
-                flags: IORING_CQE_F_BUFFER | ((bid as u32) << IORING_CQE_BUFFER_SHIFT),
-            }
+            // A dry ring takes nothing, so the whole flow is still unread.
+            let completion = deliver(sqe, provider, read, |max| flow.next_chunk(max, scenario))
+                .unwrap_or_else(|| dry(sqe));
+            return (completion, (!flow.is_empty()).then_some(flow));
         }
-        Outcome::Data(bytes) => {
-            assert!(
-                sqe.addr != 0,
-                "delivering data to user_data {:#x}, which has no buffer",
-                sqe.user_data,
-            );
+    };
+    (completion, None)
+}
 
-            assert!(
-                bytes.len() <= sqe.len as usize,
-                "user_data {:#x}: {} bytes declared for one completion, into a {}-byte \
-                 buffer. A completion cannot exceed its buffer — declare the split, \
-                 since how the payload divides is what the reader sees.",
-                sqe.user_data,
-                bytes.len(),
-                sqe.len,
-            );
-
-            // Fewer bytes than the buffer holds is an ordinary short read.
-            let n = bytes.len();
-            if n > 0 {
-                // SAFETY: `addr`/`len` describe a buffer the submitting future
-                // keeps alive until its op completes — the same contract that
-                // lets the kernel write there. The op is being retired now, the
-                // write is capped at the declared length, and source and
-                // destination are distinct allocations.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), sqe.addr as *mut u8, n);
-                }
-            }
-            Completion {
-                user_data: sqe.user_data,
-                result: n as i32,
-                flags: 0,
-            }
-        }
+/// The `-ENOBUFS` a ring with every buffer handed out reports.
+fn dry(sqe: Sqe) -> Completion {
+    Completion {
+        user_data: sqe.user_data,
+        result: -libc::ENOBUFS,
+        flags: 0,
     }
+}
+
+/// Write the bytes `chunk` picks into the op's buffer, record them against the
+/// descriptor, and complete with their count. `chunk` is told the buffer's
+/// capacity; `None` if the op draws from a ring with no buffer left.
+fn deliver(
+    sqe: Sqe,
+    provider: Option<BufRingTake>,
+    read: &mut HashMap<RawFd, Vec<Vec<u8>>>,
+    chunk: impl FnOnce(usize) -> Vec<u8>,
+) -> Option<Completion> {
+    if sqe.uses_buffer_select() {
+        let take = provider.unwrap_or_else(|| {
+            panic!(
+                "user_data {:#x} draws from buffer group {}, which no registered ring \
+                 provides — was the spec passed to the entry point?",
+                sqe.user_data, sqe.buf_group,
+            )
+        });
+        // Every buffer handed out and none recycled. A real ring says the same,
+        // and a leaked `BorrowedBuffer` is how a test gets here.
+        let (bid, ptr, capacity) = take()?;
+        let bytes = chunk(capacity as usize);
+
+        assert!(
+            bytes.len() <= capacity as usize,
+            "user_data {:#x}: {} bytes declared for one completion, into a {}-byte \
+             buffer from group {}. A completion cannot exceed its buffer — declare \
+             the split, since how the payload divides is what the reader sees.",
+            sqe.user_data,
+            bytes.len(),
+            capacity,
+            sqe.buf_group,
+        );
+
+        let n = bytes.len();
+        if n > 0 {
+            read.entry(sqe.fd).or_default().push(bytes.clone());
+            // SAFETY: the pointer comes from the ring's own entry for
+            // `bid`, so it addresses that buffer, and the write is capped
+            // at the buffer size the ring was built with.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), n);
+            }
+        }
+        Some(Completion {
+            user_data: sqe.user_data,
+            result: n as i32,
+            // Which buffer the data landed in. The driver reads it back
+            // with `cqueue::buffer_select`.
+            flags: IORING_CQE_F_BUFFER | ((bid as u32) << IORING_CQE_BUFFER_SHIFT),
+        })
+    } else {
+        assert!(
+            sqe.addr != 0,
+            "delivering data to user_data {:#x}, which has no buffer",
+            sqe.user_data,
+        );
+        let bytes = chunk(sqe.len as usize);
+
+        assert!(
+            bytes.len() <= sqe.len as usize,
+            "user_data {:#x}: {} bytes declared for one completion, into a {}-byte \
+             buffer. A completion cannot exceed its buffer — declare the split, \
+             since how the payload divides is what the reader sees.",
+            sqe.user_data,
+            bytes.len(),
+            sqe.len,
+        );
+
+        // Fewer bytes than the buffer holds is an ordinary short read.
+        let n = bytes.len();
+        if n > 0 {
+            read.entry(sqe.fd).or_default().push(bytes.clone());
+            // SAFETY: `addr`/`len` describe a buffer the submitting future
+            // keeps alive until its op completes — the same contract that
+            // lets the kernel write there. The op is being retired now, the
+            // write is capped at the declared length, and source and
+            // destination are distinct allocations.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), sqe.addr as *mut u8, n);
+            }
+        }
+        Some(Completion {
+            user_data: sqe.user_data,
+            result: n as i32,
+            flags: 0,
+        })
+    }
+}
+
+/// A flow's unread bytes and whatever was declared after them in the same
+/// drain, as the batch that now lands next, `delay` after this one.
+fn carry(flow: Flow, batch: &mut VecDeque<Outcome>, delay: Option<Delay>) -> Batch {
+    let mut carried: Vec<Scripted> = std::iter::once(Outcome::Flow(flow))
+        .chain(batch.drain(..))
+        .map(|outcome| Scripted {
+            outcome,
+            delay: None,
+        })
+        .collect();
+    carried[0].delay = delay;
+    Batch(carried)
 }
 
 /// `io_uring::types::Timespec` is `repr(transparent)` over this but exposes no
@@ -521,12 +654,23 @@ struct FakeRingState {
     next_seq: u64,
     /// Descriptors handed to the runtime, in the order they were minted.
     opened: Vec<RawFd>,
+    /// Connections whose far end closed or reset.
+    peers: HashMap<RawFd, Peer>,
+    /// Scripted completions dropped because their connection ended first.
+    voided: usize,
+    /// What the simulation delivered to reads, per descriptor, one entry per
+    /// completion in completion order.
+    read: HashMap<RawFd, Vec<Vec<u8>>>,
     /// What the runtime wrote and the simulation accepted, per descriptor, one
     /// entry per completed op in completion order.
     written: HashMap<RawFd, Vec<Vec<u8>>>,
     /// Registered buffer rings, by group id.
     buf_rings: Vec<(u16, BufRingTake)>,
     pace: Pace,
+    /// When the ring was last waited on, and how many waits in a row found
+    /// time standing there. Virtual time only moves when the program blocks.
+    stalled_at: Nanos,
+    stalled_waits: u32,
     /// How long the next `TIMEOUT` sqe is for, handed over by the driver.
     ///
     /// A real ring reads that from the `Timespec` the sqe points at, and this
@@ -735,16 +879,7 @@ impl FakeRingHandle {
             .timeline
             .iter()
             .chain(state.waiting.iter())
-            .map(|p| match &p.source {
-                Source::Default => 0,
-                // Taken from the scenario but not yet posted, so still owed.
-                Source::Scenario(_) => 1,
-                // The pending completion, the rest of its batch, and every
-                // batch after it.
-                Source::Stream { also, rest, .. } => {
-                    1 + also.len() + rest.iter().map(Batch::len).sum::<usize>()
-                }
-            })
+            .map(|p| owed(&p.source))
             .sum();
         state.scenario.remaining() + undelivered
     }
@@ -774,6 +909,24 @@ impl FakeRingHandle {
     /// Pair with [`fds::is_open`] to check each was closed.
     pub fn opened_fds(&self) -> Vec<RawFd> {
         self.0.borrow().opened.clone()
+    }
+
+    /// What the far end of `fd` has done, or `None` while it is open.
+    pub fn peer(&self, fd: RawFd) -> Option<Peer> {
+        self.0.borrow().peers.get(&fd).copied()
+    }
+
+    /// Scripted completions dropped because their connection closed or reset
+    /// first. Not counted by [`scenario_remaining`](Self::scenario_remaining).
+    pub fn voided(&self) -> usize {
+        self.0.borrow().voided
+    }
+
+    /// Every chunk delivered to a read on `fd`, one entry per completion,
+    /// oldest first — what the runtime was handed, whether or not the program
+    /// went on to use it. The mirror of [`writes`](Self::writes).
+    pub fn reads(&self, fd: RawFd) -> Vec<Vec<u8>> {
+        self.0.borrow().read.get(&fd).cloned().unwrap_or_default()
     }
 
     /// Every write accepted on `fd`, one entry per completed op, oldest first
@@ -826,7 +979,11 @@ impl FakeRingBuilder {
     }
 
     /// Give the ring to the runtime, keep the handle.
+    ///
+    /// Restarts the simulated fd numbering; panics if a descriptor from an
+    /// earlier run on this thread is still open.
     pub fn build(self) -> (FakeRing, FakeRingHandle) {
+        fds::reset();
         let pace = if self.virtual_time {
             Pace::Virtual(Rc::new(VirtualClock::new()))
         } else {
@@ -841,9 +998,14 @@ impl FakeRingBuilder {
             cq: VecDeque::new(),
             next_seq: 0,
             opened: Vec::new(),
+            peers: HashMap::new(),
+            voided: 0,
+            read: HashMap::new(),
             written: HashMap::new(),
             buf_rings: Vec::new(),
             pace,
+            stalled_at: 0,
+            stalled_waits: 0,
             wakeup_nanos: 0,
         })));
         (FakeRing(handle.clone()), handle)
@@ -863,6 +1025,10 @@ impl FakeRing {
         self.0.0.borrow_mut().wakeup_nanos = duration.as_nanos() as Nanos;
     }
 }
+
+/// Waits in a row at one instant before a run counts as spinning. Far above
+/// what any burst of completions due together needs.
+const STALL_LIMIT: u32 = 100_000;
 
 enum Wait {
     /// Sleep to the next op's due time, then complete everything due.
@@ -957,7 +1123,19 @@ impl FakeRing {
         self.submit();
 
         let (wait, pace) = {
-            let state = self.state();
+            let mut state = self.state();
+            let now = state.pace.now();
+            if now == state.stalled_at {
+                state.stalled_waits += 1;
+            } else {
+                (state.stalled_at, state.stalled_waits) = (now, 1);
+            }
+            assert!(
+                state.stalled_waits <= STALL_LIMIT,
+                "simulated ring: waited on {STALL_LIMIT} times without time moving — \
+                 the program is spinning rather than blocking, so nothing due later \
+                 can ever land",
+            );
             if !state.cq.is_empty() {
                 return;
             }
@@ -1010,6 +1188,13 @@ impl FakeRing {
                         continue;
                     }
 
+                    // Armed before its connection closed or reset: the state answers now.
+                    if let Some(outcome) = peer_outcome(&state, &sqe) {
+                        state.voided += owed(&pending.source);
+                        pending.outcome = outcome;
+                        pending.source = Source::Default;
+                    }
+
                     let seq = pending.seq;
                     // Lifted out before the outcome is consumed, so a stream can
                     // carry on from where it left off.
@@ -1029,7 +1214,7 @@ impl FakeRing {
 
                     // Everything the scenario declared to land in this drain,
                     // and what the op has left afterwards.
-                    let (also, rest) = match source {
+                    let (also, mut rest) = match source {
                         Source::Stream { also, rest, .. } => (also, Some(rest)),
                         _ => (Vec::new(), None),
                     };
@@ -1039,14 +1224,22 @@ impl FakeRing {
                     // back for the next read — with no delay, since they have
                     // by now arrived. An error is consumed even by a peek.
                     let mut peeked = (is_peek(&sqe) && !multishot).then(|| pending.outcome.clone());
-                    let batch =
-                        std::iter::once(pending.outcome).chain(also.into_iter().map(|s| s.outcome));
+                    let mut batch: VecDeque<Outcome> = std::iter::once(pending.outcome)
+                        .chain(also.into_iter().map(|s| s.outcome))
+                        .collect();
 
                     let mut ended = false;
-                    for outcome in batch {
+                    while let Some(outcome) = batch.pop_front() {
                         let minted = matches!(outcome, Outcome::NewFd(_));
-                        let mut completion =
-                            complete_outcome(sqe, outcome, provider, &mut state.written);
+                        let st = &mut *state;
+                        let (mut completion, unread) = complete_outcome(
+                            sqe,
+                            outcome,
+                            provider,
+                            &mut st.read,
+                            &mut st.written,
+                            &mut st.scenario,
+                        );
                         if minted && completion.result >= 0 {
                             state.opened.push(completion.result);
                         }
@@ -1057,7 +1250,19 @@ impl FakeRing {
                         } else if multishot {
                             ended = true;
                         }
-                        if let Some(outcome) = peeked.take().filter(|_| completion.result >= 0) {
+                        let peer = peer_after(&sqe, completion.result);
+                        if let Some(peer) = peer {
+                            enter(&mut state, sqe.fd, peer, fired_at);
+                            // Declared past the end of the connection, so never deliverable.
+                            if ended {
+                                state.voided += batch.len()
+                                    + rest.take().map_or(0, |r| r.iter().map(Batch::len).sum());
+                                batch.clear();
+                            }
+                        }
+                        // A peeked EOF stays with the connection's state, not the script.
+                        let keep = completion.result >= 0 && peer.is_none();
+                        if let Some(outcome) = peeked.take().filter(|_| keep) {
                             let entry = Entry::Once(Scripted {
                                 outcome,
                                 delay: None,
@@ -1065,6 +1270,24 @@ impl FakeRing {
                             restore(&mut state, Trigger::Read(sqe.fd), entry, fired_at);
                         }
                         state.cq.push_back(completion);
+
+                        // The unread bytes go to this drain, the next one, or — once
+                        // the ring ran dry — the op that re-arms, as a socket keeps them.
+                        if let Some(flow) = unread {
+                            if ended {
+                                let mut stream = rest.take().unwrap_or_default();
+                                // Already in the socket, so no gap for the re-armed op.
+                                stream.push_front(carry(flow, &mut batch, None));
+                                let entry = Entry::Stream(stream);
+                                restore(&mut state, Trigger::Read(sqe.fd), entry, fired_at);
+                            } else if state.scenario.same_drain() {
+                                batch.push_front(Outcome::Flow(flow));
+                            } else {
+                                let gap = flow.gap();
+                                rest.get_or_insert_default()
+                                    .push_front(carry(flow, &mut batch, gap));
+                            }
+                        }
                     }
 
                     if multishot && !ended {

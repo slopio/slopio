@@ -148,7 +148,23 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32>
         register(slice)?;
 
         let bp = BufferPool::<BUFFER_SIZE, POOL_SIZE>::new()?;
+        Self::publish_first(slice, &bp);
 
+        Ok(RingBuffer {
+            buffer_pool: UnsafeCell::new(bp),
+            mapped_ring: UnsafeCell::new(mmaped_ring),
+            id: buffer_group_id,
+            in_kernel: Cell::new(RING_SIZE),
+            reserve: UnsafeCell::new(Self::first_reserve()),
+            consumed: Cell::new(0),
+        })
+    }
+
+    /// Fill every ring entry with buffers `0..RING_SIZE`, in order.
+    fn publish_first(
+        slice: &mut [MaybeUninit<BufRingEntry>],
+        bp: &BufferPool<BUFFER_SIZE, POOL_SIZE>,
+    ) {
         for (bid, slot) in slice.iter_mut().enumerate() {
             let entry = slot.write(unsafe { std::mem::zeroed() });
             entry.set_addr(bp.ptr_for_bid(bid as _) as _);
@@ -159,22 +175,40 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32>
         unsafe {
             set_tail(slice.as_mut_ptr().cast::<BufRingEntry>(), RING_SIZE);
         }
+    }
 
-        Ok(RingBuffer {
-            buffer_pool: UnsafeCell::new(bp),
-            mapped_ring: UnsafeCell::new(mmaped_ring),
-            id: buffer_group_id,
-            in_kernel: Cell::new(RING_SIZE),
-            reserve: UnsafeCell::new(
-                // Lowest id on top: none is warmer than another yet, and
-                // this hands them out in order.
-                (RING_SIZE as u32..POOL_SIZE)
-                    .rev()
-                    .map(|bid| bid as u16)
-                    .collect(),
-            ),
-            consumed: Cell::new(0),
-        })
+    /// The buffers past the ring. Lowest id on top: none is warmer than
+    /// another yet, and this hands them out in order.
+    fn first_reserve() -> Vec<BufferId> {
+        (RING_SIZE as u32..POOL_SIZE)
+            .rev()
+            .map(|bid| bid as u16)
+            .collect()
+    }
+
+    /// Put an unregistered ring back as it was built, buffers zeroed, so a
+    /// simulation can run again on this thread. Panics if a buffer is still out.
+    #[cfg(feature = "simulation")]
+    pub fn reset(&self) {
+        let out = self.in_flight();
+        assert!(
+            out == 0,
+            "buffer group {}: {out} buffer(s) still out when the run ended",
+            self.id,
+        );
+        // SAFETY: nothing is out, so no consumer holds the ring, the reserve
+        // or any buffer.
+        let (ring, bp) = unsafe { (&mut *self.mapped_ring.get(), &*self.buffer_pool.get()) };
+        for bid in 0..POOL_SIZE {
+            unsafe {
+                bp.ptr_for_bid(bid as _)
+                    .write_bytes(0, BUFFER_SIZE as usize)
+            };
+        }
+        Self::publish_first(ring.as_slice(), bp);
+        *unsafe { &mut *self.reserve.get() } = Self::first_reserve();
+        self.in_kernel.set(RING_SIZE);
+        self.consumed.set(0);
     }
 
     /// Take the next buffer the ring has published, the way a kernel would.

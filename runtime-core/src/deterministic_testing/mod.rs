@@ -6,10 +6,11 @@
 //! multishot state machine, buffer recycling — runs unmodified, so a test
 //! exercises the real thing against a kernel it controls.
 //!
-//! Time is real: the timeline sleeps on `CLOCK_MONOTONIC` rather than inventing a
-//! virtual clock. That is what lets the runtime's own timewheel keep working
-//! untouched — it reads the same clock, and the simulation makes the time it
-//! believes in actually pass.
+//! Time is either real or virtual, chosen on the builder. By default the
+//! timeline sleeps on `CLOCK_MONOTONIC`. With
+//! [`virtual_time`](FakeRingBuilder::virtual_time) it advances a
+//! [`VirtualClock`] instead, which the runtime's timer stores read too, so a
+//! wait is a jump rather than a sleep and both sides stay on one clock.
 //!
 //! Nothing simulator-shaped lives in [`io_driver`](crate::io_driver); they meet
 //! at its `RingBackend` enum, and at its `sys` module for the syscalls made
@@ -26,10 +27,14 @@ pub mod timeline;
 pub mod virtual_clock;
 
 pub use fake_ring::{
-    Completion, FakeRing, FakeRingBuilder, FakeRingHandle, SIMULATED_RING_FD, trigger_for,
+    Completion, FakeRing, FakeRingBuilder, FakeRingHandle, Peer, SIMULATED_RING_FD, trigger_for,
 };
-pub use fds::{FIRST_SIMULATED_FD, FdKind, is_open, is_simulated, mint, simulated_socket};
-pub use scenario::{AcceptEvent, ConnectEvent, Delay, ReadEvent, Scripted, Trigger, WriteEvent};
+pub use fds::{
+    FIRST_SIMULATED_FD, FdKind, is_open, is_simulated, mint, open_fds, simulated_socket,
+};
+pub use scenario::{
+    AcceptEvent, ConnectEvent, Cut, Delay, ReadEvent, Scripted, Trigger, WriteEvent,
+};
 pub use sqe::{IOSQE_BUFFER_SELECT, Sqe};
 pub use timeline::Outcome;
 pub use virtual_clock::VirtualClock;

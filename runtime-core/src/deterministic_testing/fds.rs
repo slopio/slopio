@@ -7,7 +7,8 @@
 //! lets the simulated suites run under Miri.
 //!
 //! The table is per thread: a simulated runtime runs on the thread that built
-//! it, and numbering stays the same from one run to the next.
+//! it. Building a ring restarts the numbering, so two runs of one scenario on
+//! the same thread see the same descriptors.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -64,8 +65,31 @@ pub fn is_open(fd: RawFd) -> bool {
     TABLE.with_borrow(|t| t.open.contains_key(&fd))
 }
 
-/// Hand out a fresh descriptor of `kind`. Never reuses a number, so a stale
-/// fd cannot alias a newer one.
+/// Descriptors handed out and not yet closed, lowest first.
+pub fn open_fds() -> Vec<RawFd> {
+    TABLE.with_borrow(|t| {
+        let mut fds: Vec<RawFd> = t.open.keys().copied().collect();
+        fds.sort_unstable();
+        fds
+    })
+}
+
+/// Restart the numbering for a new ring. Panics if a descriptor is still open:
+/// the previous run on this thread leaked it.
+pub(crate) fn reset() {
+    let open = open_fds();
+    assert!(
+        open.is_empty(),
+        "simulated fd(s) {open:?} still open when a new ring was built",
+    );
+    TABLE.with_borrow_mut(|t| {
+        t.next_fd = FIRST_SIMULATED_FD;
+        t.next_port = FIRST_EPHEMERAL_PORT;
+    });
+}
+
+/// Hand out a fresh descriptor of `kind`. Never reuses a number within a run,
+/// so a stale fd cannot alias a newer one.
 pub fn mint(kind: FdKind) -> RawFd {
     mint_at(kind, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
 }
@@ -105,6 +129,11 @@ pub(crate) fn bound_socket(mut addr: SocketAddr) -> RawFd {
         addr.set_port(port);
     }
     mint_at(FdKind::Socket, addr)
+}
+
+/// What `fd` is, if it is open.
+pub(crate) fn kind(fd: RawFd) -> Option<FdKind> {
+    TABLE.with_borrow(|t| t.open.get(&fd).map(|open| open.kind))
 }
 
 pub(crate) fn close(fd: RawFd) -> io::Result<()> {

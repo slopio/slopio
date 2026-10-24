@@ -47,6 +47,7 @@ pub use message::{Endpoint, ErasedMessage, Header, Message};
 
 pub use buf_ring::{
     BorrowedBuffer, BufRingSet, BufRingSpec, BufRingTake, BufRingUsage, install_buf_ring,
+    reinstall_buf_ring, reset_buf_ring,
 };
 pub use fixed_buf_pool::{FixedSendBufPool, PooledBuf, SLAB_BUF_INDEX};
 pub use ring_options::RingOptions;

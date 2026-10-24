@@ -13,8 +13,8 @@ use std::time::Duration;
 use io_uring::types::Timespec;
 use io_uring::{cqueue, opcode, types::Fd};
 use runtime_core::deterministic_testing::{
-    AcceptEvent, FIRST_SIMULATED_FD, FakeRing, FakeRingHandle, FdKind, IOSQE_BUFFER_SELECT,
-    ReadEvent, WriteEvent, is_open, mint, simulated_socket,
+    AcceptEvent, FIRST_SIMULATED_FD, FakeRing, FakeRingHandle, FdKind, IOSQE_BUFFER_SELECT, Peer,
+    ReadEvent, WriteEvent, is_open, mint, open_fds, simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::SocketWrapper;
 use runtime_core::io_driver::{BufRingSpec, RingHandle};
@@ -840,6 +840,20 @@ fn a_batch_completes_in_submission_order() {
     assert_eq!(batch, (0..24).collect::<Vec<u64>>());
 }
 
+#[test]
+#[cfg_attr(miri, ignore = "a hundred thousand trips through the ring")]
+#[should_panic(expected = "spinning rather than blocking")]
+fn waiting_on_and_on_without_time_moving_is_a_spin() {
+    let (mut ring, _handle) = ring();
+    let payload = [0u8; 1];
+    // Each send completes at once, so no wait ever lets time move.
+    for user_data in 0.. {
+        ring.add(&send(FIRST_SIMULATED_FD - 1, &payload, user_data));
+        ring.submit_and_wait();
+        while ring.pop_completion().is_some() {}
+    }
+}
+
 // ------------------------------------------------------- the wakeup timeout
 
 #[test]
@@ -1043,6 +1057,31 @@ fn a_close_sqe_closes_at_submit() {
     assert_eq!(ring.pop_completion().expect("posted at submit").result, 0);
 }
 
+#[test]
+fn a_new_ring_restarts_the_numbering() {
+    let (_ring, _handle) = ring();
+    let first = simulated_socket();
+    let fd = first.fd();
+    // Dropped outside any runtime, so it closes on the spot.
+    drop(first);
+
+    let (_ring, _handle) = ring();
+    assert!(open_fds().is_empty());
+    assert_eq!(
+        simulated_socket().fd(),
+        fd,
+        "a second run saw other descriptors"
+    );
+}
+
+#[test]
+#[should_panic(expected = "still open when a new ring was built")]
+fn a_new_ring_refuses_a_descriptor_left_open() {
+    let (_ring, _handle) = ring();
+    let _leaked = mint(FdKind::Socket);
+    let _ = ring();
+}
+
 // ------------------------------------------------------------- multishot
 
 #[test]
@@ -1179,6 +1218,23 @@ fn cancelling_an_unknown_token_reports_enoent() {
 }
 
 // ------------------------------------------------------- delivering data
+
+#[test]
+fn delivered_bytes_are_recorded_against_the_descriptor() {
+    let (mut ring, handle) = ring();
+    let mut buf = [0u8; 32];
+
+    ring.add(&recv(11, &mut buf, 7));
+    ring.submit();
+    handle.deliver(7, b"hello");
+    ring.submit_and_wait();
+
+    assert_eq!(handle.reads(11), vec![b"hello".to_vec()]);
+    assert!(
+        handle.reads(12).is_empty(),
+        "each descriptor keeps its own reads"
+    );
+}
 
 #[test]
 fn delivering_bytes_writes_them_into_the_ops_own_buffer() {
@@ -1542,4 +1598,124 @@ fn a_delayed_write_lands_after_an_undelayed_one() {
     let second = ring.pop_completion().expect("the write");
     assert_eq!(second.user_data, 7);
     assert_eq!(handle.writes(11), vec![b"late".to_vec()]);
+}
+
+// ----------------------------------------------------------- the far end
+
+/// Wait on the ring until `n` completions came back, oldest first.
+fn collect(ring: &mut FakeRing, n: usize) -> Vec<(u64, i32)> {
+    let mut got = Vec::new();
+    while got.len() < n {
+        ring.submit_and_wait();
+        while let Some(c) = ring.pop_completion() {
+            got.push((c.user_data, c.result));
+        }
+    }
+    got
+}
+
+#[test]
+fn a_reset_answers_later_reads_with_eof_and_writes_with_epipe() {
+    let (mut ring, handle) = ring();
+    let fd = mint(FdKind::Socket);
+    let (mut buf, payload) = ([0u8; 8], [1u8; 4]);
+    handle.on_read(fd, ReadEvent::Error(libc::ECONNRESET));
+
+    ring.add(&recv(fd, &mut buf, 1));
+    assert_eq!(collect(&mut ring, 1), vec![(1, -libc::ECONNRESET)]);
+    assert_eq!(handle.peer(fd), Some(Peer::Reset));
+
+    // Nothing scripted, yet neither waits: the reset answers both.
+    ring.add(&recv(fd, &mut buf, 2));
+    ring.add(&send(fd, &payload, 3));
+    assert_eq!(collect(&mut ring, 2), vec![(2, 0), (3, -libc::EPIPE)]);
+    assert!(handle.writes(fd).is_empty());
+}
+
+#[test]
+fn a_close_answers_later_reads_with_eof_but_still_takes_writes() {
+    let (mut ring, handle) = ring();
+    let fd = mint(FdKind::Socket);
+    let (mut buf, payload) = ([0u8; 8], *b"late");
+    handle.on_read(fd, ReadEvent::Eof);
+
+    ring.add(&recv(fd, &mut buf, 1));
+    assert_eq!(collect(&mut ring, 1), vec![(1, 0)]);
+    assert_eq!(handle.peer(fd), Some(Peer::Closed));
+
+    // The peer closed its side only.
+    ring.add(&recv(fd, &mut buf, 2));
+    ring.add(&send(fd, &payload, 3));
+    assert_eq!(collect(&mut ring, 2), vec![(2, 0), (3, 4)]);
+    assert_eq!(handle.writes(fd), vec![b"late".to_vec()]);
+}
+
+#[test]
+fn a_reset_voids_what_the_script_still_said() {
+    let (mut ring, handle) = ring();
+    let fd = mint(FdKind::Socket);
+    let mut buf = [0u8; 8];
+    handle.on_read(fd, ReadEvent::Error(libc::ECONNRESET));
+    handle.on_read(fd, ReadEvent::data(b"late"));
+    handle.on_write(fd, WriteEvent::Short(1));
+
+    ring.add(&recv(fd, &mut buf, 1));
+    collect(&mut ring, 1);
+
+    assert_eq!(handle.voided(), 2, "the late read and the short write");
+    assert_eq!(handle.scenario_remaining(), 0);
+}
+
+#[test]
+fn a_read_parked_when_the_connection_resets_completes_from_its_state() {
+    let (mut ring, handle) = ring();
+    let fd = mint(FdKind::Socket);
+    let (mut buf, payload) = ([0u8; 8], [1u8; 4]);
+
+    ring.add(&recv(fd, &mut buf, 1));
+    ring.submit();
+    assert_eq!(handle.parked(), 1, "nothing scripted, so the read waits");
+
+    handle.on_write(fd, WriteEvent::Error(libc::ECONNRESET));
+    ring.add(&send(fd, &payload, 2));
+    assert_eq!(collect(&mut ring, 2), vec![(2, -libc::ECONNRESET), (1, 0)]);
+    assert_eq!(handle.parked(), 0);
+}
+
+#[test]
+fn a_write_in_flight_when_the_connection_resets_fails_with_epipe() {
+    let (mut ring, handle) = ring();
+    let fd = mint(FdKind::Socket);
+    let (mut buf, payload) = ([0u8; 8], [1u8; 4]);
+    handle.on_write(fd, WriteEvent::All.after(10 * STEP));
+    handle.on_read(fd, ReadEvent::Error(libc::ECONNRESET));
+
+    ring.add(&send(fd, &payload, 1));
+    ring.add(&recv(fd, &mut buf, 2));
+    assert_eq!(
+        collect(&mut ring, 2),
+        vec![(2, -libc::ECONNRESET), (1, -libc::EPIPE)]
+    );
+    assert!(
+        handle.writes(fd).is_empty(),
+        "the peer was gone when it landed"
+    );
+    assert_eq!(handle.voided(), 1);
+}
+
+#[test]
+fn a_file_has_no_far_end() {
+    let (mut ring, handle) = ring();
+    let fd = mint(FdKind::File);
+    let mut buf = [0u8; 8];
+    handle.on_read(fd, ReadEvent::Eof);
+
+    ring.add(&recv(fd, &mut buf, 1));
+    collect(&mut ring, 1);
+    assert_eq!(handle.peer(fd), None);
+
+    // A file read of zero bytes is just its end; the next read is the script's.
+    ring.add(&recv(fd, &mut buf, 2));
+    ring.submit();
+    assert_eq!(handle.parked(), 1);
 }

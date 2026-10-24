@@ -8,13 +8,14 @@
 use std::time::{Duration, Instant};
 
 use runtime_core::deterministic_testing::{
-    FakeRing, FakeRingHandle, ReadEvent, WriteEvent, is_open, simulated_socket,
+    Cut, FakeRing, FakeRingHandle, Peer, ReadEvent, WriteEvent, is_open, simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
 use runtime_core::io_driver::operations::sockets::recv::{socket_peek, socket_recv};
 use runtime_core::io_driver::operations::sockets::send::socket_send;
 use runtime_core::io_driver::operations::sockets::send_vectored::socket_send_vectored;
 use runtime_core::io_driver::operations::sockets::send_vectored_zc::socket_send_vectored_zc;
+use runtime_core::io_driver::{BufRingSpec, BufRingUsage};
 use runtime_core::runtime::select::{SelectResult, select};
 use runtime_core::runtime::{RuntimeInner, spawn, time::Sleep, yield_now};
 use runtime_streams::StreamExt;
@@ -25,6 +26,10 @@ runtime_core::define_buf_ring!(ManagedRing, bgid = 3, buffer_size = 64, ring_siz
 // Room for a whole batch at once: every buffer of a batch is taken before any
 // of them is recycled, so a batch cannot outgrow its ring.
 runtime_core::define_buf_ring!(BigRing, bgid = 2, buffer_size = 64, ring_size = 8);
+// Small buffers, so a flow splits into many completions.
+runtime_core::define_buf_ring!(FlowRing, bgid = 1, buffer_size = 16, ring_size = 8);
+// One tiny buffer, so holding it runs the ring dry mid-flow.
+runtime_core::define_buf_ring!(OneFlowBuf, bgid = 0, buffer_size = 4, ring_size = 1);
 
 fn simulated() -> (FakeRing, FakeRingHandle) {
     FakeRing::builder().virtual_time().build()
@@ -441,6 +446,56 @@ fn holding_every_buffer_drains_the_ring() {
     );
 }
 
+/// One managed read of `hello` on a fresh ring, as a scenario replayed per seed would.
+fn read_hello_through_the_ring() -> Vec<u8> {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket();
+    handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"hello"), ReadEvent::Eof]);
+
+    RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ManagedRing>::new(socket);
+            let buffer = recv.next().await.expect("a chunk").expect("no error");
+            buffer.as_ref().to_vec()
+        },
+        None,
+        |run| run(),
+    )
+}
+
+#[test]
+fn a_buf_ring_serves_a_second_run_on_the_same_thread() {
+    assert_eq!(read_hello_through_the_ring(), b"hello");
+    // The ring outlives the runtime in a thread-local; the run handed it back
+    // as it was built.
+    let fresh = BufRingUsage {
+        in_kernel: 2,
+        reserved: 0,
+        in_flight: 0,
+    };
+    assert_eq!(ManagedRing::usage(), fresh);
+    assert_eq!(read_hello_through_the_ring(), b"hello");
+    assert_eq!(ManagedRing::usage(), fresh);
+}
+
+#[test]
+#[should_panic(expected = "still out when the run ended")]
+fn a_buffer_kept_past_the_run_is_refused() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket();
+    handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"hello"), ReadEvent::Eof]);
+
+    // Recycled after the reset, it would land in the ring the next run uses.
+    let _kept = RuntimeInner::simulated(fake).block_on::<ManagedRing, _>(
+        async move {
+            let mut recv = MultiRecv::<ManagedRing>::new(socket);
+            recv.next().await.expect("a chunk").expect("no error")
+        },
+        None,
+        |run| run(),
+    );
+}
+
 #[test]
 fn a_timed_out_read_leaves_its_data_for_the_next_one() {
     let (fake, handle) = simulated();
@@ -673,6 +728,260 @@ fn now_is_the_wall_time_across_re_anchors() {
                 );
             }
         },
+        None,
+        |run| run(),
+    );
+}
+
+// ------------------------------------------------------------------- flows
+
+/// Bytes that say where they sit in the payload, so a misplaced chunk shows.
+fn marked(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 + 3) as u8).collect()
+}
+
+/// Read a whole flow through a multishot recv, giving each buffer straight back.
+/// The chunk lengths, and whether the ring ever ran dry on the way.
+fn read_flow(seed: u64, payload: &[u8]) -> (Vec<u8>, Vec<usize>, bool) {
+    let (fake, handle) = FakeRing::builder().seed(seed).virtual_time().build();
+    let socket = simulated_socket();
+    handle.on_multishot_read(socket.fd(), [ReadEvent::flow(payload), ReadEvent::Eof]);
+
+    let out = RuntimeInner::simulated(fake).block_on::<FlowRing, _>(
+        async move {
+            let mut recv = MultiRecv::<FlowRing>::new(socket);
+            let (mut got, mut lens, mut dry) = (Vec::new(), Vec::new(), false);
+            while let Some(chunk) = recv.next().await {
+                match chunk {
+                    Ok(buffer) => {
+                        got.extend_from_slice(buffer.as_ref());
+                        lens.push(buffer.len());
+                    }
+                    Err(CompletionError::Other(code)) if code == -libc::ENOBUFS => dry = true,
+                    Err(other) => panic!("seed {seed}: {other:?}"),
+                }
+            }
+            (got, lens, dry)
+        },
+        None,
+        |run| run(),
+    );
+    assert_eq!(handle.scenario_remaining(), 0, "seed {seed}");
+    out
+}
+
+#[test]
+fn a_flow_arrives_whole_whatever_the_split() {
+    let payload = marked(200);
+    let mut counts = std::collections::BTreeSet::new();
+    let (mut one_byte, mut full) = (false, false);
+
+    for seed in 0..32 {
+        let (got, lens, _) = read_flow(seed, &payload);
+        assert_eq!(got, payload, "seed {seed}: split {lens:?}");
+        assert!(
+            lens.iter().all(|&n| (1..=16).contains(&n)),
+            "seed {seed}: {lens:?}"
+        );
+
+        counts.insert(lens.len());
+        one_byte |= lens.contains(&1);
+        full |= lens.contains(&16);
+    }
+
+    assert!(
+        counts.len() > 1,
+        "every seed split the flow alike: {counts:?}"
+    );
+    assert!(one_byte, "no seed delivered a single byte");
+    assert!(full, "no seed filled a buffer");
+}
+
+#[test]
+fn a_flow_splits_the_same_way_for_the_same_seed() {
+    let payload = marked(200);
+    for seed in 0..8 {
+        assert_eq!(
+            read_flow(seed, &payload),
+            read_flow(seed, &payload),
+            "seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn a_dry_ring_keeps_the_rest_of_a_flow_for_the_re_armed_recv() {
+    let payload = marked(12);
+    for seed in 0..16 {
+        let (fake, handle) = FakeRing::builder().seed(seed).virtual_time().build();
+        let socket = simulated_socket();
+        handle.on_multishot_read(socket.fd(), [ReadEvent::flow(&payload[..]), ReadEvent::Eof]);
+
+        let (got, dry) = RuntimeInner::simulated(fake).block_on::<OneFlowBuf, _>(
+            async move {
+                let mut recv = MultiRecv::<OneFlowBuf>::new(socket);
+                // Held, so the next chunk finds the one buffer gone.
+                let first = recv.next().await.expect("a chunk").expect("no error");
+                let mut got = first.as_ref().to_vec();
+                let dry = matches!(
+                    recv.next().await,
+                    Some(Err(CompletionError::Other(code))) if code == -libc::ENOBUFS
+                );
+                drop(first);
+                // Two chunks in one drain still outrun a ring of one.
+                while let Some(chunk) = recv.next().await {
+                    match chunk {
+                        Ok(buffer) => got.extend_from_slice(buffer.as_ref()),
+                        Err(CompletionError::Other(code)) if code == -libc::ENOBUFS => {}
+                        Err(other) => panic!("seed {seed}: {other:?}"),
+                    }
+                }
+                (got, dry)
+            },
+            None,
+            |run| run(),
+        );
+
+        assert!(dry, "seed {seed}: the ring should have run dry");
+        assert_eq!(
+            got, payload,
+            "seed {seed}: the dry ring lost part of the flow"
+        );
+        assert_eq!(handle.scenario_remaining(), 0, "seed {seed}");
+    }
+}
+
+#[test]
+fn a_spaced_flow_waits_a_drawn_gap_between_drains() {
+    let payload = marked(200);
+    let (min, max) = (Duration::from_millis(1), Duration::from_millis(5));
+    let mut gaps = std::collections::BTreeSet::new();
+
+    for seed in 0..16 {
+        let (fake, handle) = FakeRing::builder().seed(seed).virtual_time().build();
+        let clock = handle.clock().expect("virtual time");
+        let socket = simulated_socket();
+        handle.on_multishot_read(
+            socket.fd(),
+            [
+                ReadEvent::flow(&payload[..]).spaced(min, max),
+                ReadEvent::Eof,
+            ],
+        );
+
+        let (got, times) = RuntimeInner::simulated(fake).block_on::<FlowRing, _>(
+            async move {
+                let mut recv = MultiRecv::<FlowRing>::new(socket);
+                let (mut got, mut times) = (Vec::new(), Vec::new());
+                while let Some(chunk) = recv.next().await {
+                    match chunk {
+                        Ok(buffer) => {
+                            got.extend_from_slice(buffer.as_ref());
+                            times.push(clock.elapsed());
+                        }
+                        Err(CompletionError::Other(code)) if code == -libc::ENOBUFS => {}
+                        Err(other) => panic!("seed {seed}: {other:?}"),
+                    }
+                }
+                (got, times)
+            },
+            None,
+            |run| run(),
+        );
+
+        assert_eq!(got, payload, "seed {seed}");
+        // Same drain, same instant; a later drain, one drawn gap later.
+        for step in times.windows(2).map(|w| w[1] - w[0]) {
+            assert!(
+                step.is_zero() || (min..=max).contains(&step),
+                "seed {seed}: {step:?} between two chunks, outside {min:?}..={max:?}",
+            );
+            if !step.is_zero() {
+                gaps.insert(step);
+            }
+        }
+    }
+
+    assert!(gaps.len() > 1, "every gap was drawn alike: {gaps:?}");
+}
+
+/// Read a flow that `cut` kills partway: what arrived, and how the stream ended.
+fn read_cut_flow(seed: u64, payload: &[u8], cut: Cut) -> (Vec<u8>, CompletionError) {
+    let (fake, handle) = FakeRing::builder().seed(seed).virtual_time().build();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    handle.on_multishot_read(fd, [ReadEvent::flow(payload).cut(cut), ReadEvent::Eof]);
+
+    let (got, end) = RuntimeInner::simulated(fake).block_on::<FlowRing, _>(
+        async move {
+            let mut recv = MultiRecv::<FlowRing>::new(socket);
+            let mut got = Vec::new();
+            let end = loop {
+                match recv
+                    .next()
+                    .await
+                    .expect("the stream ends on the cut, not quietly")
+                {
+                    Ok(buffer) => got.extend_from_slice(buffer.as_ref()),
+                    Err(CompletionError::Other(code)) if code == -libc::ENOBUFS => {}
+                    Err(end) => break end,
+                }
+            };
+            assert!(
+                recv.next().await.is_none(),
+                "seed {seed}: nothing after the cut"
+            );
+            (got, end)
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(handle.peer(fd), Some(Peer::Reset), "seed {seed}");
+    assert_eq!(handle.voided(), 1, "seed {seed}: the EOF was past the cut");
+    assert_eq!(handle.scenario_remaining(), 0, "seed {seed}");
+    (got, end)
+}
+
+#[test]
+fn a_cut_flow_delivers_a_prefix_then_the_reset() {
+    let payload = marked(100);
+    let mut lengths = std::collections::BTreeSet::new();
+    for seed in 0..32 {
+        let (got, end) = read_cut_flow(seed, &payload, Cut::Reset);
+        assert!(payload.starts_with(&got), "seed {seed}: not a prefix");
+        assert!(
+            matches!(end, CompletionError::ConnectionReset),
+            "seed {seed}: ended on {end:?}",
+        );
+        lengths.insert(got.len());
+    }
+    assert!(
+        lengths.len() > 1,
+        "every seed cut at the same place: {lengths:?}"
+    );
+}
+
+#[test]
+fn a_timed_out_flow_ends_on_etimedout() {
+    let payload = marked(100);
+    let (got, end) = read_cut_flow(0, &payload, Cut::Timeout);
+    assert!(payload.starts_with(&got));
+    assert!(
+        matches!(end, CompletionError::Other(code) if code == -libc::ETIMEDOUT),
+        "ended on {end:?}",
+    );
+}
+
+#[test]
+#[should_panic(expected = "a flow is split across a multishot")]
+fn a_flow_on_a_single_shot_read_is_refused() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket();
+    handle.on_read(socket.fd(), ReadEvent::flow(b"abc"));
+
+    RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move { socket_recv(&socket, vec![0u8; 8]).await },
         None,
         |run| run(),
     );

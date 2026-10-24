@@ -44,6 +44,34 @@ pub fn install_buf_ring<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL
     }
 }
 
+/// Hand an already-built ring to a new driver on the same thread.
+///
+/// Only a simulated run may: its ring was reset when the previous run ended,
+/// and the new simulator needs `take` to consume it. A real ring is never
+/// installed twice.
+pub fn reinstall_buf_ring(ring: RingHandle<'_>, bgid: u16, take: BufRingTake, name: &str) {
+    let _ = (bgid, take);
+    match ring {
+        RingHandle::Uring(_) => panic!("buf ring `{name}` already initialized on this thread"),
+        #[cfg(feature = "simulation")]
+        RingHandle::Simulated(handle) => handle.register_buf_ring(bgid, take),
+    }
+}
+
+/// Put a ring back as it was built, once a simulated run has ended.
+#[doc(hidden)]
+pub fn reset_buf_ring<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL_SIZE: u32>(
+    rb: &io_uring_rb::RingBuffer<BUFFER_SIZE, RING_SIZE, POOL_SIZE>,
+) {
+    #[cfg(feature = "simulation")]
+    rb.reset();
+    #[cfg(not(feature = "simulation"))]
+    {
+        let _ = rb;
+        unreachable!("only a simulated run resets its buf rings");
+    }
+}
+
 /// A single provided-buffer ring known at compile time.
 ///
 /// Implementors are produced by [`define_buf_ring!`](crate::define_buf_ring).
@@ -86,6 +114,11 @@ pub trait BufRingSpec: 'static + Sized {
 
     /// Where this ring's buffers are right now, on the current thread.
     fn usage() -> BufRingUsage;
+
+    /// Put this thread's ring back as `init` built it. Called when a simulated
+    /// run ends; panics if a buffer is still out.
+    #[doc(hidden)]
+    fn reset();
 }
 
 /// A snapshot of where a ring's buffers are.
@@ -185,6 +218,11 @@ pub trait BufRingSet {
     /// Tell `driver` about every ring in this set: it accounts their
     /// consumption, refills them, and recycles on the type-erased cancel path.
     fn register_fallbacks(driver: &IODriver);
+
+    /// Reset every ring in this set, so the next simulated run on this thread
+    /// starts from fresh rings.
+    #[cfg(feature = "simulation")]
+    fn reset_all();
 }
 
 fn hooks<S: BufRingSpec>() -> BufRingHooks {
@@ -198,6 +236,8 @@ fn hooks<S: BufRingSpec>() -> BufRingHooks {
 impl BufRingSet for () {
     fn init_all(_: RingHandle<'_>) {}
     fn register_fallbacks(_: &IODriver) {}
+    #[cfg(feature = "simulation")]
+    fn reset_all() {}
 }
 
 impl<A: BufRingSpec> BufRingSet for A {
@@ -206,6 +246,10 @@ impl<A: BufRingSpec> BufRingSet for A {
     }
     fn register_fallbacks(driver: &IODriver) {
         driver.register_buf_ring(A::BGID, hooks::<A>());
+    }
+    #[cfg(feature = "simulation")]
+    fn reset_all() {
+        A::reset();
     }
 }
 
@@ -217,6 +261,10 @@ macro_rules! impl_buf_ring_set_tuple {
             }
             fn register_fallbacks(driver: &IODriver) {
                 $( driver.register_buf_ring(<$t as BufRingSpec>::BGID, hooks::<$t>()); )+
+            }
+            #[cfg(feature = "simulation")]
+            fn reset_all() {
+                $( <$t as BufRingSpec>::reset(); )+
             }
         }
     };
@@ -315,24 +363,25 @@ macro_rules! define_buf_ring {
                 const POOL_SIZE: u32 = $psize;
 
                 fn init(ring: $crate::io_driver::RingHandle<'_>) {
+                    fn take() -> ::core::option::Option<(u16, ::core::ptr::NonNull<u8>, u32)> {
+                        RING.with(|cell| {
+                            let rb = cell.get()?;
+                            rb.take().map(|(bid, ptr)| (bid, ptr, $bsize))
+                        })
+                    }
                     RING.with(|cell| {
+                        if cell.get().is_some() {
+                            $crate::io_driver::reinstall_buf_ring(
+                                ring, $bgid, take, stringify!($name),
+                            );
+                            return;
+                        }
                         let rb = $crate::io_driver::install_buf_ring::<$bsize, $rsize, $psize>(
-                            ring,
-                            $bgid,
-                            || {
-                                RING.with(|cell| {
-                                    let rb = cell.get()?;
-                                    rb.take().map(|(bid, ptr)| (bid, ptr, $bsize))
-                                })
-                            },
+                            ring, $bgid, take,
                         )
                         .expect("buf ring init failed");
-                        if cell.set(rb).is_err() {
-                            panic!(concat!(
-                                "buf ring `", stringify!($name),
-                                "` already initialized on this thread",
-                            ));
-                        }
+                        // Checked empty just above.
+                        let _ = cell.set(rb);
                     });
                 }
 
@@ -362,6 +411,10 @@ macro_rules! define_buf_ring {
                     with_ring(|rb| {
                         rb.refill();
                     });
+                }
+
+                fn reset() {
+                    with_ring(|rb| $crate::io_driver::reset_buf_ring(rb));
                 }
 
                 fn usage() -> $crate::io_driver::BufRingUsage {

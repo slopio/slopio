@@ -145,7 +145,7 @@ impl RuntimeInner {
         let waker = unsafe { Waker::from_raw(root_waker_clone(std::ptr::null())) };
         let mut context = Context::from_waker(&waker);
         set_thread_id(self.thread_id);
-        self.io_driver.with(|| {
+        let output = self.io_driver.with(|| {
             self.io_driver.init_buf_rings::<R>();
             TASK_LIST.set(&self.tasks, || {
                 TIME_DRIVER.set(&self.time_driver, || {
@@ -231,7 +231,17 @@ impl RuntimeInner {
                     wrap(run)
                 })
             })
-        })
+        });
+        // Rings outlive the runtime; reset only once tasks and driver dropped their buffers.
+        #[cfg(feature = "simulation")]
+        {
+            let simulated = self.io_driver.is_simulated();
+            drop(self);
+            if simulated {
+                R::reset_all();
+            }
+        }
+        output
     }
 }
 

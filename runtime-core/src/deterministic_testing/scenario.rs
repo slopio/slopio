@@ -50,12 +50,144 @@ pub enum ReadEvent {
     Bytes(u32),
     /// The read fails with this errno, given positive.
     Error(i32),
+    /// These bytes arrive in order, split across as many completions as the
+    /// simulator draws, each at most one buffer. Only in a multishot stream.
+    Flow {
+        bytes: Vec<u8>,
+        /// How long each later drain of the flow is held back; `None` lands it
+        /// as soon as the ring is next waited on.
+        gap: Option<Delay>,
+        /// How the connection dies partway through, if it does.
+        cut: Option<Cut>,
+    },
+}
+
+/// How a connection dies in the middle of a [`ReadEvent::Flow`]: the bytes up
+/// to a drawn offset arrive, the read after them fails, and the rest is never
+/// sent. Either way the connection is reset from then on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// The peer sent RST: `ECONNRESET`.
+    Reset,
+    /// The peer vanished and retransmission gave up: `ETIMEDOUT`.
+    Timeout,
+}
+
+impl Cut {
+    fn errno(self) -> i32 {
+        match self {
+            Self::Reset => libc::ECONNRESET,
+            Self::Timeout => libc::ETIMEDOUT,
+        }
+    }
 }
 
 impl ReadEvent {
     /// [`Data`](Self::Data) without spelling out the conversion.
     pub fn data(bytes: impl Into<Vec<u8>>) -> Self {
         Self::Data(bytes.into())
+    }
+
+    /// [`Flow`](Self::Flow), its later drains landing back to back.
+    pub fn flow(bytes: impl Into<Vec<u8>>) -> Self {
+        let bytes = bytes.into();
+        assert!(!bytes.is_empty(), "an empty flow would read as EOF");
+        Self::Flow {
+            bytes,
+            gap: None,
+            cut: None,
+        }
+    }
+
+    /// Hold each later drain of this flow back by a delay drawn from
+    /// `min..=max`. Chunks drawn into the same drain still land together.
+    pub fn spaced(self, min: Duration, max: Duration) -> Self {
+        assert!(min <= max, "spaced({min:?}, {max:?}) is an empty range");
+        match self {
+            Self::Flow { bytes, cut, .. } => Self::Flow {
+                bytes,
+                gap: Some(Delay::Between(min, max)),
+                cut,
+            },
+            _ => panic!("spaced applies to a flow"),
+        }
+    }
+
+    /// Kill the connection partway through this flow, at an offset drawn from
+    /// `0..=len`: zero cuts before the first byte, `len` after the last.
+    pub fn cut(self, cut: Cut) -> Self {
+        match self {
+            Self::Flow { bytes, gap, .. } => Self::Flow {
+                bytes,
+                gap,
+                cut: Some(cut),
+            },
+            _ => panic!("cut applies to a flow"),
+        }
+    }
+}
+
+/// The unread part of a [`ReadEvent::Flow`], handing out one chunk per
+/// completion.
+#[derive(Clone, Debug)]
+pub struct Flow {
+    bytes: Vec<u8>,
+    at: usize,
+    gap: Option<Delay>,
+    cut: Option<Cut>,
+    /// Where the cut falls, drawn by the first completion.
+    cut_at: Option<usize>,
+}
+
+impl Flow {
+    fn new(bytes: Vec<u8>, gap: Option<Delay>, cut: Option<Cut>) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            gap,
+            cut,
+            cut_at: None,
+        }
+    }
+
+    /// The errno the next completion reports instead of data, once the flow
+    /// has reached its cut. Draws the cut's offset the first time.
+    pub(crate) fn cut_now(&mut self, scenario: &mut Scenario) -> Option<i32> {
+        let cut = self.cut?;
+        let at = *self
+            .cut_at
+            .get_or_insert_with(|| scenario.offset(self.bytes.len()));
+        (self.at == at).then(|| {
+            self.cut = None;
+            -cut.errno()
+        })
+    }
+
+    /// Where delivery stops: the cut, or the end of the bytes.
+    fn end(&self) -> usize {
+        match (self.cut, self.cut_at) {
+            (Some(_), Some(at)) => at,
+            _ => self.bytes.len(),
+        }
+    }
+
+    /// The delay before each later drain, still to be drawn.
+    pub(crate) fn gap(&self) -> Option<Delay> {
+        self.gap
+    }
+
+    /// Nothing left to complete with: every byte delivered and no cut to report.
+    pub fn is_empty(&self) -> bool {
+        self.cut.is_none() && self.at == self.bytes.len()
+    }
+
+    /// The next chunk, at most `max` bytes and never past the cut, its length
+    /// drawn from `scenario`.
+    pub(crate) fn next_chunk(&mut self, max: usize, scenario: &mut Scenario) -> Vec<u8> {
+        let n = scenario.chunk_len(max.min(self.end() - self.at));
+        let chunk = self.bytes[self.at..self.at + n].to_vec();
+        self.at += n;
+        chunk
     }
 }
 
@@ -111,9 +243,9 @@ pub struct Scripted {
 /// SplitMix64: short, good quality, no dependency, and entirely determined by
 /// its seed.
 ///
-/// The scenario is the only thing that draws. Nothing else in the simulator
-/// decides a schedule, so a test that never asks for a range never meets a
-/// random number — and one that does knows exactly where it came from.
+/// The scenario is the only thing that draws, and only for what a test asked to
+/// have drawn — a delay range, a flow's split — so a test that asks for
+/// neither never meets a random number.
 struct SplitMix64(u64);
 
 impl SplitMix64 {
@@ -194,6 +326,7 @@ impl From<ReadEvent> for Outcome {
             ReadEvent::Eof => Outcome::result(0),
             ReadEvent::Bytes(n) => Outcome::Data(vec![0; n as usize]),
             ReadEvent::Error(errno) => Outcome::result(as_errno(errno)),
+            ReadEvent::Flow { bytes, gap, cut } => Outcome::Flow(Flow::new(bytes, gap, cut)),
         }
     }
 }
@@ -329,6 +462,27 @@ impl Scenario {
             }
         }
     }
+
+    /// How many bytes a flow's next completion carries, out of at most `max`.
+    /// Weighted toward a full buffer and a single byte, where readers slip.
+    pub(crate) fn chunk_len(&mut self, max: usize) -> usize {
+        match self.rng.next_u64() % 4 {
+            0 => max,
+            1 => 1,
+            _ => 1 + (self.rng.next_u64() % max as u64) as usize,
+        }
+    }
+
+    /// An offset into `len` bytes, `0..=len` inclusive.
+    pub(crate) fn offset(&mut self, len: usize) -> usize {
+        (self.rng.next_u64() % (len as u64 + 1)) as usize
+    }
+
+    /// Whether the rest of a flow lands in the same drain as its last chunk.
+    pub(crate) fn same_drain(&mut self) -> bool {
+        self.rng.next_u64() & 1 == 0
+    }
+
     pub fn push(&mut self, trigger: Trigger, entry: Entry) {
         self.queued.entry(trigger).or_default().push_back(entry);
     }
@@ -345,6 +499,14 @@ impl Scenario {
     /// would see it.
     pub fn unshift(&mut self, trigger: Trigger, entry: Entry) {
         self.queued.entry(trigger).or_default().push_front(entry);
+    }
+
+    /// Drop everything still declared for `trigger`, and say how many
+    /// completions that was.
+    pub fn void(&mut self, trigger: Trigger) -> usize {
+        self.queued
+            .remove(&trigger)
+            .map_or(0, |entries| entries.iter().map(Entry::len).sum())
     }
 
     /// Take the next declaration for `trigger`.

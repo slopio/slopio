@@ -57,6 +57,10 @@ name = "simulated_runtime"
 required-features = ["simulation"]
 
 [[test]]
+name = "dst_echo"
+required-features = ["simulation"]
+
+[[test]]
 name = "cancellation"
 required-features = ["simulation"]
 

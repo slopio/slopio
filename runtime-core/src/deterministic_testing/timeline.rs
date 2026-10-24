@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use super::clock::Nanos;
 use super::fds::FdKind;
-use super::scenario::{Batch, Scripted};
+use super::scenario::{Batch, Flow, Scripted};
 use super::sqe::Sqe;
 
 /// What an op completes with.
@@ -28,6 +28,9 @@ pub enum Outcome {
     /// them against the descriptor, and complete with the count. The mirror of
     /// `Data`, for the write side.
     Accept(Option<u32>),
+    /// Write the next chunk of these bytes into the op's buffer, and keep the
+    /// rest for the completions after it.
+    Flow(Flow),
 }
 
 impl Outcome {
