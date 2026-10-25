@@ -1172,3 +1172,64 @@ fn a_reader_gets_every_byte_sent_before_a_cut_and_then_the_reset() {
         assert!(cuts.len() > 1, "every seed cut at the same byte");
     }
 }
+
+// ---------------------------------------------------------------- journal
+
+#[test]
+fn the_journal_is_off_unless_asked_and_then_records_what_the_ring_saw() {
+    let (_ring, handle) = ring();
+    assert!(handle.journal().is_none(), "on without being asked");
+
+    let (mut ring, handle) = FakeRing::builder().virtual_time().journal().build();
+    let fd = mint(FdKind::Socket);
+    handle.attach(
+        fd,
+        Canned {
+            reads: [ReadReply::Data(b"hi".to_vec())].into(),
+            ..Canned::default()
+        },
+    );
+    let mut buf = [0u8; 8];
+    ring.add(&recv(fd, &mut buf, 1));
+    collect(&mut ring, 1);
+
+    let journal = handle.journal().expect("journal on");
+    let lines: Vec<String> = journal
+        .iter()
+        .map(|entry| entry.event.to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "submit   RECV ud=0x1",
+            "actor    opened",
+            "actor    read(8) -> Data(2)",
+            "complete ud=0x1 res=2",
+        ],
+    );
+    assert!(journal.iter().all(|entry| entry.fd() == Some(fd)));
+}
+
+#[test]
+fn a_dialogue_notes_its_steps_and_faults_in_the_journal() {
+    let (fake, handle) = FakeRing::builder().virtual_time().journal().build();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    let (peer, _report) = Dialogue::new()
+        .send(b"hi".to_vec())
+        .expect_bytes(b"hi".to_vec())
+        .reset()
+        .build();
+    handle.attach(fd, peer);
+
+    RuntimeInner::simulated(fake).block_on::<PeerRing, _>(guarded_echo(socket), None, |run| run());
+
+    let text = handle.journal_text(&[fd], None).expect("journal on");
+    for note in [
+        "step 1 done: send \"hi\"",
+        "step 2 done: expect \"hi\"",
+        "fault: Reset",
+    ] {
+        assert!(text.contains(note), "no {note:?} in:\n{text}");
+    }
+}

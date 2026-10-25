@@ -140,6 +140,21 @@ Time only moves when the program blocks. A program that spins, polling again at 
 
 A test can build and run several simulated runtimes one after another on the same thread, for instance one per seed. Each run starts from the same state: building a ring restarts descriptor numbering, and a run hands its buffer rings back as they were built. In exchange, a run must give back what it took. Building a ring while a simulated descriptor is still open panics, and so does ending a run while a buffer from a ring is still held, such as one returned out of `block_on`.
 
+## When a seed fails
+
+A run is a function of its seed, so nothing is recorded while a suite runs: the way to look at a failing run is to run it again, watching. `FakeRing::builder().journal()` makes the ring keep a journal of everything it sees: each submission, each completion as the driver reads it, what each actor was asked and answered, timers, the kernel's stumbles, connections closing or resetting, and an actor's own notes (`cx.note(|| …)`, only evaluated when a journal is kept). Keeping it draws nothing and orders nothing, so the replay is the same run.
+
+```text
+      2.014ms fd 1073741824  note     fault: CutInSend { delivered: 12, of: 96 }
+      2.014ms fd 1073741824  actor    read(16) -> Data(8)
+      2.014ms fd 1073741824  actor    read(16) -> Error(ECONNRESET)
+      2.014ms fd 1073741824  actor    write(4) -> Error(EPIPE)
+```
+
+`handle.journal()` hands back the events, and `handle.journal_text(fds, last)` renders them, only those about the given descriptors and only the last few if asked. `Dialogue` notes each step it completes and each fault that strikes.
+
+`dst_echo` does this on its own: a failing seed is replayed by itself with the journal on, on a fresh thread so nothing the failed run left behind gets in the way. The whole journal goes to a file under `target/tmp/`, and the last events about the connections the failure names go into the failure message. `DST_SEED=<n> DST_TRACE=1` keeps the journal of a seed that passes too.
+
 ## What it is good for
 
 The simulator is for the paths a real kernel makes rare or unreproducible: a read cancelled while its data is in flight, a stream dropped mid-batch, a ring that runs out of buffers, a short write followed by a broken pipe, a timeout that wins by one tick. The existing suites under `runtime-core/tests/` cover cancellation, buffer recycling and the runtime's event loop this way, and are the best place to look for patterns.

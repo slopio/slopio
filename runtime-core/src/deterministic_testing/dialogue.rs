@@ -304,7 +304,8 @@ impl Dialogue {
         (self, report)
     }
 
-    fn strike(&mut self, fault: Fault) {
+    fn strike(&mut self, fault: Fault, cx: &mut ActorCx) {
+        cx.note(|| format!("fault: {fault:?}"));
         let mut report = self.report.borrow_mut();
         report.fault.get_or_insert(fault);
     }
@@ -318,15 +319,18 @@ impl Dialogue {
         let delivered = cx.between(0, bytes.len().saturating_sub(1) as u64) as usize;
         self.outbox.extend(&bytes[..delivered]);
         self.reset = true;
-        self.strike(Fault::CutInSend {
-            delivered,
-            of: bytes.len(),
-        });
+        self.strike(
+            Fault::CutInSend {
+                delivered,
+                of: bytes.len(),
+            },
+            cx,
+        );
     }
 
     fn vanish_now(&mut self, cx: &mut ActorCx) {
         self.vanished = Some(cx.between(0, VANISHED_ROOM) as usize);
-        self.strike(Fault::Vanished);
+        self.strike(Fault::Vanished, cx);
     }
 
     /// Play every step that can be played now.
@@ -342,6 +346,7 @@ impl Dialogue {
             let Some(step) = self.steps.front_mut() else {
                 break;
             };
+            let label = cx.journaling.then(|| label(step));
             match step {
                 Step::Send(bytes) => {
                     let bytes = std::mem::take(bytes);
@@ -381,7 +386,7 @@ impl Dialogue {
                 Step::Close => self.closed = true,
                 Step::Reset => {
                     self.reset = true;
-                    self.strike(Fault::Reset);
+                    self.strike(Fault::Reset, cx);
                 }
                 Step::ResetAfter(delay) => cx.timer(*delay, RESET),
                 Step::FailWrite(errno) => self.fail_next_write = Some(*errno),
@@ -394,6 +399,10 @@ impl Dialogue {
             }
             self.steps.pop_front();
             self.report.borrow_mut().done += 1;
+            if let Some(label) = label {
+                let step = self.report.borrow().done;
+                cx.note(|| format!("step {step} done: {label}"));
+            }
         }
         let unconsumed = if self.steps.is_empty() && !self.over() {
             self.received.len()
@@ -409,11 +418,26 @@ impl Dialogue {
     }
 
     /// Fail this send and the connection with it.
-    fn fail(&mut self, errno: i32) -> WriteReply {
+    fn fail(&mut self, errno: i32, cx: &mut ActorCx) -> WriteReply {
         self.reset = true;
         self.reset_reported = true;
-        self.strike(Fault::SendError(errno));
+        self.strike(Fault::SendError(errno), cx);
         WriteReply::Error(errno)
+    }
+}
+
+/// A step as the journal names it.
+fn label(step: &Step) -> String {
+    match step {
+        Step::Send(bytes) => format!("send {}", describe(bytes)),
+        Step::CutSend(bytes) => format!("cut send of {}", describe(bytes)),
+        Step::Expect { what, .. } => format!("expect {what}"),
+        Step::Wait(delay) => format!("wait {delay:?}"),
+        Step::Close => "close".into(),
+        Step::Reset => "reset".into(),
+        Step::ResetAfter(delay) => format!("reset after {delay:?}"),
+        Step::FailWrite(errno) => format!("fail the next write with {errno}"),
+        Step::Vanish => "vanish".into(),
     }
 }
 
@@ -476,7 +500,7 @@ impl Actor for Dialogue {
             };
         }
         if let Some(errno) = self.fail_next_write.take() {
-            return self.fail(errno);
+            return self.fail(errno, cx);
         }
         if chance(cx, self.faults.send_error) {
             let errno = if cx.between(0, 1) == 0 {
@@ -484,7 +508,7 @@ impl Actor for Dialogue {
             } else {
                 libc::ECONNRESET
             };
-            return self.fail(errno);
+            return self.fail(errno, cx);
         }
         let taken = if bytes.len() > 1 && chance(cx, self.short_writes) {
             cx.between(1, bytes.len() as u64 - 1) as usize
@@ -507,7 +531,7 @@ impl Actor for Dialogue {
         match tag {
             RESET if !self.over() => {
                 self.reset = true;
-                self.strike(Fault::Reset);
+                self.strike(Fault::Reset, cx);
             }
             RESET => {}
             _ => {

@@ -79,6 +79,7 @@ pub(crate) enum Effect {
     Timer { after: Duration, tag: u64 },
     Cancel { tag: u64 },
     WakeAt(Duration),
+    Note(String),
 }
 
 /// An actor's view of the world for the length of one call.
@@ -86,6 +87,8 @@ pub struct ActorCx<'a> {
     pub(crate) now: Duration,
     pub(crate) rng: &'a mut SplitMix64,
     pub(crate) effects: Vec<Effect>,
+    /// Whether the ring keeps a journal, so notes are worth writing.
+    pub(crate) journaling: bool,
 }
 
 impl ActorCx<'_> {
@@ -121,5 +124,13 @@ impl ActorCx<'_> {
     /// as bytes in flight on a simulated network.
     pub fn wake_at(&mut self, at: Duration) {
         self.effects.push(Effect::WakeAt(at));
+    }
+
+    /// Write `text` into the ring's journal, if it keeps one. Only then is
+    /// `text` called, so a note costs nothing in a run nobody is watching.
+    pub fn note(&mut self, text: impl FnOnce() -> String) {
+        if self.journaling {
+            self.effects.push(Effect::Note(text()));
+        }
     }
 }

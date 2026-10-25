@@ -17,7 +17,11 @@
 //! healthy client plays its whole dialogue; a faulted one is never answered
 //! wrong, and its connection ends on the fault; the server never echoes a
 //! byte it did not receive; nothing is left open, owed or in flight.
-//! `DST_SEED=<n>` replays one seed.
+//!
+//! `DST_SEED=<n>` replays one seed. A failing seed is replayed by itself with
+//! the ring's journal on: the whole journal goes to a file, and the last of it
+//! about the connections at fault into the failure. `DST_TRACE=1` keeps the
+//! journal of a passing seed too.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -293,17 +297,31 @@ struct Report {
 
 /// Run the echo server once against the world `seed` draws, and check it.
 fn run(seed: u64) -> Result<Report, String> {
-    run_at::<EchoRing>(seed, &SMALL)
+    run_at::<EchoRing>(seed, &SMALL, None)
 }
 
-fn run_at<R: BufRingSpec>(seed: u64, scale: &Scale) -> Result<Report, String> {
+/// [`run`] at any scale. Given a slot, the ring keeps a journal and its
+/// handle is left there, to be read even if the run panics.
+fn run_at<R: BufRingSpec>(
+    seed: u64,
+    scale: &Scale,
+    journal: Option<&RefCell<Option<FakeRingHandle>>>,
+) -> Result<Report, String> {
     let mut rng = Rng(seed);
     let profile = profile(&mut rng);
-    let (fake, handle) = FakeRing::builder()
+    let builder = FakeRing::builder()
         .seed(seed)
         .virtual_time()
-        .kernel_faults(profile.kernel)
-        .build();
+        .kernel_faults(profile.kernel);
+    let builder = if journal.is_some() {
+        builder.journal()
+    } else {
+        builder
+    };
+    let (fake, handle) = builder.build();
+    if let Some(slot) = journal {
+        *slot.borrow_mut() = Some(handle.clone());
+    }
     let (clients, arrivals) = draw(&mut rng, scale, profile, &handle);
     let count = clients.len();
 
@@ -438,11 +456,10 @@ fn divergence(got: &[u8], want: &[u8]) -> String {
 
 /// [`run`], with a panic inside the run reported as that seed's failure.
 fn judged(seed: u64) -> Result<Report, String> {
-    judge(seed, || run(seed))
+    judge(|| run(seed))
 }
 
 fn judge(
-    seed: u64,
     run: impl FnOnce() -> Result<Report, String> + std::panic::UnwindSafe,
 ) -> Result<Report, String> {
     std::panic::catch_unwind(run).unwrap_or_else(|panic| {
@@ -451,8 +468,79 @@ fn judge(
             .map(String::as_str)
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .unwrap_or("a panic with no message");
-        Err(format!("{message}\nreplay with DST_SEED={seed}"))
+        Err(message.to_string())
     })
+}
+
+/// Replay `seed` with the journal on, on a thread of its own, so nothing a
+/// failed run left behind on this one is in its way. The whole journal as
+/// text, and its last events about `fds` (about anything, if `fds` is empty).
+fn trace<R: BufRingSpec>(seed: u64, scale: &'static Scale, fds: Vec<i32>) -> (String, String) {
+    std::thread::spawn(move || {
+        let slot = RefCell::new(None);
+        // The replay fails as the run did; what matters is what it saw.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_at::<R>(seed, scale, Some(&slot))
+        }));
+        let handle = slot.into_inner().expect("the replay built its ring");
+        let all = handle.journal_text(&[], None).unwrap_or_default();
+        let tail = handle.journal_text(&fds, Some(60)).unwrap_or_default();
+        (all, tail)
+    })
+    .join()
+    .expect("the tracing thread")
+}
+
+/// Write `journal` where `cargo` keeps test scratch files; where it went.
+fn keep(name: &str, seed: u64, journal: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{name}-seed-{seed}.journal"));
+    match std::fs::write(&path, journal) {
+        Ok(()) => path.display().to_string(),
+        Err(error) => format!("not written ({error})"),
+    }
+}
+
+/// A failure, with the journal of its seed replayed: kept whole in a file,
+/// and its end about the connections the failure names shown here.
+fn explain<R: BufRingSpec>(name: &str, seed: u64, scale: &'static Scale, failure: &str) -> String {
+    let fds = fds_in(failure);
+    let (all, tail) = trace::<R>(seed, scale, fds.clone());
+    let kept = keep(name, seed, &all);
+    let about = if fds.is_empty() {
+        "the run".to_string()
+    } else {
+        format!("fd {fds:?}")
+    };
+    format!(
+        "seed {seed}:\n{failure}\nreplay with DST_SEED={seed}; whole journal: {kept}\n\
+         last events of {about}:\n{tail}"
+    )
+}
+
+/// Keep the journal of a passing seed too, when `DST_TRACE` asks for it.
+fn trace_if_asked<R: BufRingSpec>(name: &str, seed: u64, scale: &'static Scale) {
+    if std::env::var_os("DST_TRACE").is_some() {
+        let (all, _) = trace::<R>(seed, scale, Vec::new());
+        eprintln!("seed {seed}: journal in {}", keep(name, seed, &all));
+    }
+}
+
+/// The descriptors a failure names, as `fd <n>`.
+fn fds_in(text: &str) -> Vec<i32> {
+    let mut fds: Vec<i32> = text
+        .match_indices("fd ")
+        .filter_map(|(at, _)| {
+            let digits: String = text[at + 3..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .collect();
+    fds.sort_unstable();
+    fds.dedup();
+    fds
 }
 
 /// Every seed, or only `DST_SEED` to replay one.
@@ -473,7 +561,13 @@ fn every_client_is_answered_right_or_let_go_cleanly() {
     let mut ends: BTreeMap<End, usize> = BTreeMap::new();
     for seed in seeds() {
         runs += 1;
-        let report = judged(seed).unwrap_or_else(|failure| panic!("seed {seed}:\n{failure}"));
+        let report = judged(seed).unwrap_or_else(|failure| {
+            panic!(
+                "{}",
+                explain::<EchoRing>("dst_echo", seed, &SMALL, &failure)
+            )
+        });
+        trace_if_asked::<EchoRing>("dst_echo", seed, &SMALL);
         clients += report.served.len();
         chunks += report.served.iter().map(|s| s.chunks).sum::<usize>();
         dry += report.served.iter().map(|s| s.dry).sum::<usize>();
@@ -517,6 +611,43 @@ fn a_seed_replays_the_same_run() {
     }
 }
 
+/// A run with the journal on, and the journal.
+fn journaled(
+    seed: u64,
+) -> (
+    Result<Report, String>,
+    Vec<runtime_core::deterministic_testing::Entry>,
+) {
+    let slot = RefCell::new(None);
+    let report = run_at::<EchoRing>(seed, &SMALL, Some(&slot));
+    let journal = slot
+        .into_inner()
+        .and_then(|h| h.journal())
+        .expect("journal on");
+    (report, journal)
+}
+
+#[test]
+fn the_journal_changes_nothing_and_replays_alike() {
+    for seed in 0..SEEDS.min(8) {
+        let plain = run(seed);
+        let (watched, journal) = journaled(seed);
+        assert_eq!(
+            plain, watched,
+            "seed {seed}: keeping a journal changed the run"
+        );
+        let (_, again) = journaled(seed);
+        if let Some(at) = journal.iter().zip(&again).position(|(a, b)| a != b) {
+            panic!(
+                "seed {seed}: the journals part at event {at}:\n  {}\n  {}",
+                journal[at], again[at]
+            );
+        }
+        assert_eq!(journal.len(), again.len(), "seed {seed}");
+        assert!(!journal.is_empty(), "seed {seed}: an empty journal");
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore = "hundreds of clients, interpreted, would take hours")]
 fn a_crowd_of_clients_holding_long_dialogues() {
@@ -526,8 +657,13 @@ fn a_crowd_of_clients_holding_long_dialogues() {
     };
     for seed in seeds {
         let started = std::time::Instant::now();
-        let report = judge(seed, || run_at::<CrowdRing>(seed, &CROWD))
-            .unwrap_or_else(|failure| panic!("seed {seed}:\n{failure}"));
+        let report = judge(|| run_at::<CrowdRing>(seed, &CROWD, None)).unwrap_or_else(|failure| {
+            panic!(
+                "{}",
+                explain::<CrowdRing>("dst_echo_crowd", seed, &CROWD, &failure)
+            )
+        });
+        trace_if_asked::<CrowdRing>("dst_echo_crowd", seed, &CROWD);
         let echoed: usize = report.bytes.iter().map(|&(_, written)| written).sum();
         let healthy = report.faults.iter().filter(|f| f.is_none()).count();
         // How far into its dialogue each fault struck, in percent.

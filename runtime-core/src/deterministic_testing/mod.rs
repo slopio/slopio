@@ -23,6 +23,7 @@ pub(crate) mod clock;
 pub mod dialogue;
 pub mod fake_ring;
 pub mod fds;
+pub mod journal;
 pub mod scenario;
 pub mod sqe;
 pub mod timeline;
@@ -37,6 +38,7 @@ pub use fake_ring::{
 pub use fds::{
     FIRST_SIMULATED_FD, FdKind, is_open, is_simulated, mint, open_fds, simulated_socket,
 };
+pub use journal::{Answer, Entry, Event};
 pub use scenario::{
     AcceptEvent, ConnectEvent, Cut, Delay, Hiccup, ReadEvent, Scripted, Trigger, WriteEvent,
 };

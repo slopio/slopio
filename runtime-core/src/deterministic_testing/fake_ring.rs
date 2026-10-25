@@ -17,6 +17,7 @@ use crate::io_driver::BufRingTake;
 use super::actor::{Actor, ActorCx, Effect, ReadReply, WriteReply};
 use super::clock::{self, Nanos};
 use super::fds::{self, FdKind};
+use super::journal::{Answer, Entry as Logged, Event, Journal};
 use super::scenario::{Batch, Delay, Entry, Flow, Scenario, Scripted, SplitMix64, Step, Trigger};
 use super::sqe::{
     IORING_ACCEPT_MULTISHOT, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE,
@@ -222,6 +223,7 @@ fn enter(state: &mut FakeRingState, fd: RawFd, peer: Peer, now: Nanos) {
         _ => {}
     }
     state.peers.insert(fd, peer);
+    log(state, now, || Event::Peer { fd, peer });
 
     state.voided += state.scenario.void(Trigger::Read(fd));
     if peer == Peer::Reset {
@@ -270,6 +272,14 @@ fn nanos(d: std::time::Duration) -> Nanos {
     Nanos::try_from(d.as_nanos()).unwrap_or(Nanos::MAX)
 }
 
+/// Record `event` if the ring keeps a journal; `event` is only built then.
+fn log(state: &mut FakeRingState, now: Nanos, event: impl FnOnce() -> Event) {
+    let at = std::time::Duration::from_nanos(now.saturating_sub(state.start));
+    if let Some(journal) = &mut state.journal {
+        journal.record(at, event());
+    }
+}
+
 /// Call `fd`'s actor, then apply what it asked for. `None` if `fd` has none.
 fn call_actor<R>(
     state: &mut FakeRingState,
@@ -278,11 +288,13 @@ fn call_actor<R>(
     f: impl FnOnce(&mut dyn Actor, &mut ActorCx) -> R,
 ) -> Option<R> {
     let since = std::time::Duration::from_nanos(now.saturating_sub(state.start));
+    let journaling = state.journal.is_some();
     let slot = state.actors.get_mut(&fd)?;
     let mut cx = ActorCx {
         now: since,
         rng: &mut slot.rng,
         effects: Vec::new(),
+        journaling,
     };
     let reply = f(slot.actor.as_mut(), &mut cx);
     let effects = cx.effects;
@@ -293,6 +305,10 @@ fn call_actor<R>(
 }
 
 fn apply(state: &mut FakeRingState, fd: RawFd, effect: Effect, now: Nanos) {
+    if let Effect::Note(text) = effect {
+        log(state, now, || Event::Note { fd, text });
+        return;
+    }
     let Some(slot) = state.actors.get_mut(&fd) else {
         return;
     };
@@ -314,6 +330,7 @@ fn apply(state: &mut FakeRingState, fd: RawFd, effect: Effect, now: Nanos) {
             Item::Wake { fd },
             state.start.saturating_add(nanos(at)).max(now),
         ),
+        Effect::Note(_) => unreachable!("taken above"),
     };
     let seq = state.next_seq;
     state.next_seq += 1;
@@ -339,6 +356,7 @@ fn open_actor(state: &mut FakeRingState, fd: RawFd, now: Nanos) {
     if std::mem::replace(&mut slot.opened, true) {
         return;
     }
+    log(state, now, || Event::Opened { fd });
     call_actor(state, fd, now, |actor, cx| actor.on_open(cx));
     repull(state, fd, now);
 }
@@ -364,6 +382,16 @@ fn serve_write(state: &mut FakeRingState, pending: Pending, now: Nanos) {
     let bytes = offered(&sqe);
     let reply = call_actor(state, sqe.fd, now, |actor, cx| actor.write(&bytes, cx))
         .expect("routed here because the fd has an actor");
+    log(state, now, || Event::Write {
+        fd: sqe.fd,
+        offered: bytes.len(),
+        answer: match reply {
+            WriteReply::Accepted(n) => Answer::Accepted(n),
+            WriteReply::AcceptedAfter(n, after) => Answer::AcceptedAfter(n, after),
+            WriteReply::Error(errno) => Answer::Error(errno),
+            WriteReply::Pending => Answer::Pending,
+        },
+    });
     let (result, after) = match reply {
         WriteReply::Pending => {
             state.waiting.push(pending);
@@ -430,6 +458,10 @@ fn serve_read(
     loop {
         // The kernel stumbles before taking anything from the socket.
         if multishot && state.scenario.chance(state.kernel_faults.interrupted) {
+            log(state, now, || Event::Kernel {
+                fd,
+                fault: "interrupted the read: EINTR",
+            });
             state.cq.push_back(Completion {
                 user_data: sqe.user_data,
                 result: -libc::EINTR,
@@ -443,6 +475,16 @@ fn serve_read(
             None => call_actor(state, fd, now, |actor, cx| actor.read(max, cx))
                 .expect("routed here because the fd has an actor"),
         };
+        log(state, now, || Event::Read {
+            fd,
+            max,
+            answer: match &reply {
+                ReadReply::Data(bytes) => Answer::Data(bytes.len()),
+                ReadReply::Eof => Answer::Eof,
+                ReadReply::Error(errno) => Answer::Error(*errno),
+                ReadReply::Pending => Answer::Pending,
+            },
+        });
         let completion = match reply {
             ReadReply::Pending => {
                 state.waiting.push(pending);
@@ -471,6 +513,12 @@ fn serve_read(
                 match deliver(sqe, provider, record, |_| bytes.clone()) {
                     None => {
                         // The socket keeps what no buffer could take.
+                        let kept = bytes.len();
+                        log(state, now, || Event::Read {
+                            fd,
+                            max,
+                            answer: Answer::Dry(kept),
+                        });
                         state.unread.entry(fd).or_default().splice(0..0, bytes);
                         dry(sqe)
                     }
@@ -479,14 +527,20 @@ fn serve_read(
                             state.unread.entry(fd).or_default().splice(0..0, bytes);
                         }
                         // Ended by the kernel on its own: no F_MORE, the op is over.
-                        if multishot && !state.scenario.chance(state.kernel_faults.ended) {
-                            completion.flags |= IORING_CQE_F_MORE;
-                            state.cq.push_back(completion);
-                            if state.scenario.same_drain() {
-                                continue;
+                        if multishot {
+                            if !state.scenario.chance(state.kernel_faults.ended) {
+                                completion.flags |= IORING_CQE_F_MORE;
+                                state.cq.push_back(completion);
+                                if state.scenario.same_drain() {
+                                    continue;
+                                }
+                                state.timeline.schedule(pending, None, now);
+                                return;
                             }
-                            state.timeline.schedule(pending, None, now);
-                            return;
+                            log(state, now, || Event::Kernel {
+                                fd,
+                                fault: "ended the multishot after this chunk",
+                            });
                         }
                         completion
                     }
@@ -984,6 +1038,8 @@ struct FakeRingState {
     /// one does not overtake it.
     writes_due: HashMap<RawFd, Nanos>,
     kernel_faults: KernelFaults,
+    /// What the run did, when asked to keep it.
+    journal: Option<Journal>,
     /// The builder's seed, from which each actor's stream is drawn.
     seed: u64,
     /// When the ring was built, which actors count time from.
@@ -1271,6 +1327,24 @@ impl FakeRingHandle {
         self.0.borrow().opened.clone()
     }
 
+    /// The journal so far, if the ring was built with
+    /// [`journal`](FakeRingBuilder::journal).
+    pub fn journal(&self) -> Option<Vec<Logged>> {
+        self.0
+            .borrow()
+            .journal
+            .as_ref()
+            .map(|j| j.entries().to_vec())
+    }
+
+    /// The journal as text, one event per line: only the events about `fds`
+    /// unless it is empty, and only the last `last` if given.
+    pub fn journal_text(&self, fds: &[RawFd], last: Option<usize>) -> Option<String> {
+        let state = self.0.borrow();
+        let journal = state.journal.as_ref()?;
+        Some(super::journal::render(journal.entries(), fds, last))
+    }
+
     /// What the far end of `fd` has done, or `None` while it is open.
     pub fn peer(&self, fd: RawFd) -> Option<Peer> {
         self.0.borrow().peers.get(&fd).copied()
@@ -1312,6 +1386,7 @@ pub struct FakeRingBuilder {
     virtual_time: bool,
     seed: u64,
     kernel_faults: KernelFaults,
+    journal: bool,
 }
 
 impl FakeRingBuilder {
@@ -1320,6 +1395,15 @@ impl FakeRingBuilder {
     /// them is the same whatever the seed.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
+        self
+    }
+
+    /// Keep a journal of everything the ring sees, for [`FakeRingHandle::journal`].
+    ///
+    /// Off by default. It draws nothing and orders nothing, so a seed replayed
+    /// with it on is the same run, now visible.
+    pub fn journal(mut self) -> Self {
+        self.journal = true;
         self
     }
 
@@ -1374,6 +1458,7 @@ impl FakeRingBuilder {
             unread: HashMap::new(),
             writes_due: HashMap::new(),
             kernel_faults: self.kernel_faults,
+            journal: self.journal.then(Journal::default),
             seed: self.seed,
             start: pace.now(),
             pace,
@@ -1450,8 +1535,17 @@ impl FakeRing {
                 sqe.opcode,
                 sqe.fd,
             );
+            if !matches!(classify(&sqe), Class::Wakeup) {
+                log(state, now, || Event::Submit {
+                    user_data: sqe.user_data,
+                    opcode: sqe.opcode,
+                    fd: sqe.fd,
+                    multishot: is_multishot(&sqe),
+                });
+            }
             // The kernel runs a close inline at submit and posts its CQE there.
             if sqe.opcode == OP_CLOSE {
+                log(state, now, || Event::Closed { fd: sqe.fd });
                 if fds::is_simulated(sqe.fd) {
                     fds::close(sqe.fd).expect("checked open just above");
                 }
@@ -1569,6 +1663,7 @@ impl FakeRing {
                                 slot.generations.get(&tag) == Some(&generation)
                             });
                             if current {
+                                log(&mut state, fired_at, || Event::Timer { fd, tag });
                                 call_actor(&mut state, fd, fired_at, |actor, cx| {
                                     actor.on_timer(tag, cx)
                                 });
@@ -1588,6 +1683,10 @@ impl FakeRing {
                     // through an outcome.
                     if sqe.opcode == OP_ASYNC_CANCEL {
                         let result = apply_cancel(&mut state, sqe.addr, fired_at);
+                        log(&mut state, fired_at, || Event::Cancel {
+                            target: sqe.addr,
+                            result,
+                        });
                         state.cq.push_back(Completion {
                             user_data: sqe.user_data,
                             result,
@@ -1755,7 +1854,23 @@ impl FakeRing {
 
     /// Take the next queued completion, oldest first.
     pub fn pop_completion(&mut self) -> Option<Completion> {
-        self.state().cq.pop_front()
+        let mut state = self.state();
+        let completion = state.cq.pop_front()?;
+        // Read by the driver now; the runtime's own wakeups were never submitted ops.
+        if state
+            .journal
+            .as_ref()
+            .is_some_and(|j| j.knows(completion.user_data))
+        {
+            let now = state.pace.now();
+            log(&mut state, now, || Event::Complete {
+                user_data: completion.user_data,
+                fd: None,
+                result: completion.result,
+                more: completion.flags & IORING_CQE_F_MORE != 0,
+            });
+        }
+        Some(completion)
     }
 
     pub fn ring_fd(&self) -> RawFd {
