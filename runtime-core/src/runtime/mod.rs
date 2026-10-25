@@ -199,6 +199,11 @@ impl RuntimeInner {
                                         if self.io_driver.has_pending_sqes() {
                                             self.io_driver.submit();
                                         }
+                                        // A cancel always gets its answer, so this ends.
+                                        while self.io_driver.cancelled_in_flight() > 0 {
+                                            self.io_driver.submit_and_wait();
+                                            self.io_driver.process_completion_queue();
+                                        }
                                         self.io_driver.wait_sq_drained();
                                         return output;
                                     }

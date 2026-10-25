@@ -640,6 +640,32 @@ impl IODriver {
         slab.len()
     }
 
+    /// Ops whose owner is gone but whose terminal completion has not come
+    /// back: the kernel may still touch the memory or the fd each one holds.
+    pub(crate) fn cancelled_in_flight(&self) -> usize {
+        let single = unsafe { &*self.slab.get() }
+            .0
+            .iter()
+            .filter(|(_, op)| {
+                matches!(
+                    op,
+                    SingleOpState::Cancelled { .. } | SingleOpState::CancelledOpen { .. }
+                )
+            })
+            .count();
+        let multi = unsafe { &*self.multishot_slab.get() }
+            .0
+            .iter()
+            .filter(|(_, op)| {
+                matches!(
+                    op,
+                    MultiOpState::Cancelled { .. } | MultiOpState::AcceptCancelled { .. }
+                )
+            })
+            .count();
+        single + multi
+    }
+
     pub(crate) fn push_multishot_op(
         &self,
         entry: squeue::Entry,

@@ -60,6 +60,9 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   (repro: ignored test `a_task_still_parked_on_a_read_leaks_it`). Cancel every
   in-flight op and drain the CQ before closing, reaching parked tasks through
   the wakers the driver already holds. No per-task registry.
+  Part done: `block_on` now waits out ops already cancelled (their keepalive
+  and parked fd) before returning, found by `dst_echo`. Still open: ops of
+  tasks still parked, which nobody has cancelled.
 
 ### Bugs
 - [x] **B1** `submit` / `submit_and_wait` panic on `EAGAIN` / `EBUSY`, which

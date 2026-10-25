@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{FakeRing, FakeRingHandle, ReadEvent, simulated_socket};
+use runtime_core::deterministic_testing::{
+    FakeRing, FakeRingHandle, ReadEvent, is_open, simulated_socket,
+};
 use runtime_core::io_driver::operations::sockets::multi_recv::MultiRecv;
 use runtime_core::io_driver::operations::sockets::recv::socket_recv;
 use runtime_core::io_driver::operations::sockets::send::socket_send;
@@ -198,6 +200,60 @@ fn a_multishot_dropped_in_flight_is_cancelled() {
         "the multishot outlived its stream: {:?}",
         handle.inflight(),
     );
+}
+
+#[test]
+fn block_on_waits_out_a_multishot_dropped_as_the_root_returns() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    handle.on_multishot_read(fd, [b"one".as_slice(), b"two"].map(ReadEvent::data));
+
+    // No settling: the stream goes, and the root is done in the same breath.
+    RuntimeInner::simulated(fake).block_on::<CancelRing, _>(
+        async move {
+            let mut recv = MultiRecv::<CancelRing>::new(socket);
+            drop(recv.next().await.expect("a chunk").expect("no error"));
+        },
+        None,
+        |run| run(),
+    );
+
+    assert!(
+        handle.inflight().is_empty(),
+        "block_on returned with the cancel still out: {:?}",
+        handle.inflight(),
+    );
+    assert!(!is_open(fd), "the fd outlived the run");
+}
+
+#[test]
+fn block_on_waits_out_a_read_dropped_as_the_root_returns() {
+    let (fake, handle) = simulated();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    handle.on_read(fd, ReadEvent::data(b"late").after(Duration::from_secs(10)));
+
+    RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            // The sleep wins, the losing read is dropped, and the root returns.
+            let raced = select(
+                socket_recv(&socket, vec![0u8; 16]),
+                Sleep::during(Duration::from_millis(1)),
+            )
+            .await;
+            assert!(matches!(raced, SelectResult::Second(_)));
+        },
+        None,
+        |run| run(),
+    );
+
+    assert!(
+        handle.inflight().is_empty(),
+        "block_on returned with the cancel still out: {:?}",
+        handle.inflight(),
+    );
+    assert!(!is_open(fd), "the fd outlived the run");
 }
 
 #[test]
