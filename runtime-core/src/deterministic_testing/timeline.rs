@@ -5,6 +5,7 @@
 //! Everything else is due at once, so submission order is completion order
 //! unless a test says otherwise — nothing here invents a latency.
 
+use std::os::fd::RawFd;
 use std::time::Duration;
 
 use std::collections::VecDeque;
@@ -31,6 +32,11 @@ pub enum Outcome {
     /// Write the next chunk of these bytes into the op's buffer, and keep the
     /// rest for the completions after it.
     Flow(Flow),
+    /// Asked of the descriptor's actor when the completion is posted.
+    Actor,
+    /// Already done by the actor, waiting only to be reported: past the point
+    /// a cancel can undo.
+    Committed(i32),
 }
 
 impl Outcome {
@@ -71,14 +77,33 @@ pub struct Pending {
     pub source: Source,
 }
 
+/// Something the timeline holds until it falls due.
+// Ops are nearly every entry; boxing them would allocate one per op.
+#[allow(clippy::large_enum_variant)]
+pub enum Item {
+    /// An op, completing as its outcome says.
+    Op(Pending),
+    /// An actor's timer, still current only while its generation is.
+    Timer {
+        fd: RawFd,
+        tag: u64,
+        generation: u64,
+    },
+    /// Ask an actor again for the ops waiting on it.
+    Wake { fd: RawFd },
+}
+
 struct Scheduled {
-    pending: Pending,
+    item: Item,
     due: Nanos,
+    seq: u64,
 }
 
 pub struct Timeline {
     /// Ordered by `(due, seq)`, so the front is the next event. Kept sorted on
     /// insert rather than searched: the front is read on every blocking wait.
+    /// Ops and actor events share one order, so nothing at the same instant is
+    /// left for chance to decide.
     scheduled: Vec<Scheduled>,
 }
 
@@ -102,16 +127,22 @@ impl Timeline {
     /// however long the submit loop took.
     pub fn schedule(&mut self, pending: Pending, delay: Option<Duration>, now: Nanos) {
         let after = delay.map_or(0, |d| Nanos::try_from(d.as_nanos()).unwrap_or(Nanos::MAX));
-        let due = now.saturating_add(after);
-
-        let key = (due, pending.seq);
-        let at = self
-            .scheduled
-            .partition_point(|s| (s.due, s.pending.seq) < key);
-        self.scheduled.insert(at, Scheduled { pending, due });
+        let seq = pending.seq;
+        self.insert(Item::Op(pending), now.saturating_add(after), seq);
     }
 
-    /// When the next op completes, or `None` if nothing is scheduled.
+    /// Enqueue an actor event at `due`, ordered among ops by `seq`.
+    pub fn schedule_at(&mut self, item: Item, due: Nanos, seq: u64) {
+        self.insert(item, due, seq);
+    }
+
+    fn insert(&mut self, item: Item, due: Nanos, seq: u64) {
+        let key = (due, seq);
+        let at = self.scheduled.partition_point(|s| (s.due, s.seq) < key);
+        self.scheduled.insert(at, Scheduled { item, due, seq });
+    }
+
+    /// When the next item falls due, or `None` if nothing is scheduled.
     pub fn next_due(&self) -> Option<Nanos> {
         self.scheduled.first().map(|s| s.due)
     }
@@ -121,13 +152,17 @@ impl Timeline {
     /// Not just the earliest: a sleep overshoots, and anything that came due
     /// during the overshoot belongs in the same batch rather than stranded a
     /// full cycle behind.
-    pub fn take_due(&mut self, now: Nanos) -> Vec<Pending> {
+    pub fn take_due(&mut self, now: Nanos) -> Vec<Item> {
         let cut = self.scheduled.partition_point(|s| s.due <= now);
-        self.scheduled.drain(..cut).map(|s| s.pending).collect()
+        self.scheduled.drain(..cut).map(|s| s.item).collect()
     }
 
+    /// The ops scheduled, in order; actor events are not ops.
     pub fn iter(&self) -> impl Iterator<Item = &Pending> {
-        self.scheduled.iter().map(|s| &s.pending)
+        self.scheduled.iter().filter_map(|s| match &s.item {
+            Item::Op(pending) => Some(pending),
+            _ => None,
+        })
     }
 
     pub fn contains(&self, user_data: u64) -> bool {
@@ -138,7 +173,10 @@ impl Timeline {
         let i = self
             .scheduled
             .iter()
-            .position(|s| s.pending.sqe.user_data == user_data)?;
-        Some(self.scheduled.remove(i).pending)
+            .position(|s| matches!(&s.item, Item::Op(p) if p.sqe.user_data == user_data))?;
+        match self.scheduled.remove(i).item {
+            Item::Op(pending) => Some(pending),
+            _ => unreachable!("matched an op above"),
+        }
     }
 }

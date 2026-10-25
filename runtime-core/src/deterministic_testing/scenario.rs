@@ -59,6 +59,9 @@ pub enum ReadEvent {
         gap: Option<Delay>,
         /// How the connection dies partway through, if it does.
         cut: Option<Cut>,
+        /// Stumbles that end the multishot reading the flow, but not the
+        /// connection.
+        hiccups: Vec<Hiccup>,
     },
 }
 
@@ -82,6 +85,18 @@ impl Cut {
     }
 }
 
+/// A stumble at a drawn offset inside a [`ReadEvent::Flow`]. It ends the
+/// multishot reading the flow but not the connection, so the rest of the flow
+/// arrives on the read that re-arms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hiccup {
+    /// The read fails with `EINTR`.
+    Interrupted,
+    /// A chunk arrives without `IORING_CQE_F_MORE`: the kernel ended the
+    /// multishot on its own, as it may when the completion queue overflows.
+    Ended,
+}
+
 impl ReadEvent {
     /// [`Data`](Self::Data) without spelling out the conversion.
     pub fn data(bytes: impl Into<Vec<u8>>) -> Self {
@@ -96,35 +111,56 @@ impl ReadEvent {
             bytes,
             gap: None,
             cut: None,
+            hiccups: Vec::new(),
+        }
+    }
+
+    /// The flow this event declares, for the builders below to refine.
+    fn as_flow(
+        &mut self,
+        builder: &str,
+    ) -> (&mut Option<Delay>, &mut Option<Cut>, &mut Vec<Hiccup>) {
+        match self {
+            Self::Flow {
+                gap, cut, hiccups, ..
+            } => (gap, cut, hiccups),
+            _ => panic!("{builder} applies to a flow"),
         }
     }
 
     /// Hold each later drain of this flow back by a delay drawn from
     /// `min..=max`. Chunks drawn into the same drain still land together.
-    pub fn spaced(self, min: Duration, max: Duration) -> Self {
+    pub fn spaced(mut self, min: Duration, max: Duration) -> Self {
         assert!(min <= max, "spaced({min:?}, {max:?}) is an empty range");
-        match self {
-            Self::Flow { bytes, cut, .. } => Self::Flow {
-                bytes,
-                gap: Some(Delay::Between(min, max)),
-                cut,
-            },
-            _ => panic!("spaced applies to a flow"),
-        }
+        *self.as_flow("spaced").0 = Some(Delay::Between(min, max));
+        self
     }
 
     /// Kill the connection partway through this flow, at an offset drawn from
     /// `0..=len`: zero cuts before the first byte, `len` after the last.
-    pub fn cut(self, cut: Cut) -> Self {
-        match self {
-            Self::Flow { bytes, gap, .. } => Self::Flow {
-                bytes,
-                gap,
-                cut: Some(cut),
-            },
-            _ => panic!("cut applies to a flow"),
-        }
+    pub fn cut(mut self, cut: Cut) -> Self {
+        *self.as_flow("cut").1 = Some(cut);
+        self
     }
+
+    /// Stumble once at an offset drawn from `0..len`; call again for more.
+    /// A hiccup past a cut never happens.
+    pub fn hiccup(mut self, hiccup: Hiccup) -> Self {
+        self.as_flow("hiccup").2.push(hiccup);
+        self
+    }
+}
+
+/// What a flow's next completion is.
+pub(crate) enum Step {
+    /// The next chunk, carrying `F_MORE` as usual.
+    Chunk,
+    /// The next chunk, ending the multishot.
+    Ended,
+    /// This errno instead of data, ending the multishot.
+    Fails(i32),
+    /// This errno, and the connection is gone: nothing follows.
+    Cut(i32),
 }
 
 /// The unread part of a [`ReadEvent::Flow`], handing out one chunk per
@@ -135,32 +171,72 @@ pub struct Flow {
     at: usize,
     gap: Option<Delay>,
     cut: Option<Cut>,
-    /// Where the cut falls, drawn by the first completion.
+    /// Hiccups whose offsets are still to be drawn.
+    hiccups: Vec<Hiccup>,
+    /// Drawn by the first completion: where the cut falls, and the hiccups by
+    /// offset, nearest first.
     cut_at: Option<usize>,
+    stumbles: VecDeque<(usize, Hiccup)>,
+    drawn: bool,
 }
 
 impl Flow {
-    fn new(bytes: Vec<u8>, gap: Option<Delay>, cut: Option<Cut>) -> Self {
+    fn new(bytes: Vec<u8>, gap: Option<Delay>, cut: Option<Cut>, hiccups: Vec<Hiccup>) -> Self {
         Self {
             bytes,
             at: 0,
             gap,
             cut,
+            hiccups,
             cut_at: None,
+            stumbles: VecDeque::new(),
+            drawn: false,
         }
     }
 
-    /// The errno the next completion reports instead of data, once the flow
-    /// has reached its cut. Draws the cut's offset the first time.
-    pub(crate) fn cut_now(&mut self, scenario: &mut Scenario) -> Option<i32> {
-        let cut = self.cut?;
-        let at = *self
-            .cut_at
-            .get_or_insert_with(|| scenario.offset(self.bytes.len()));
-        (self.at == at).then(|| {
-            self.cut = None;
-            -cut.errno()
-        })
+    /// Settle where the cut and every hiccup fall, once.
+    fn draw(&mut self, scenario: &mut Scenario) {
+        if std::mem::replace(&mut self.drawn, true) {
+            return;
+        }
+        let len = self.bytes.len();
+        if self.cut.is_some() {
+            self.cut_at = Some(scenario.offset(len));
+        }
+        let mut stumbles: Vec<_> = std::mem::take(&mut self.hiccups)
+            .into_iter()
+            .map(|hiccup| (scenario.offset(len - 1), hiccup))
+            .collect();
+        stumbles.sort_by_key(|&(at, _)| at);
+        self.stumbles = stumbles.into();
+    }
+
+    /// What the next completion is: a stumble due here, the cut, or a chunk.
+    pub(crate) fn step(&mut self, scenario: &mut Scenario) -> Step {
+        self.draw(scenario);
+        // A stumble a chunk ran past, behind another at the same offset.
+        while self.stumbles.front().is_some_and(|&(at, _)| at < self.at) {
+            self.stumbles.pop_front();
+        }
+        while let Some(&(at, hiccup)) = self.stumbles.front() {
+            if at != self.at {
+                break;
+            }
+            self.stumbles.pop_front();
+            match hiccup {
+                Hiccup::Interrupted => return Step::Fails(-libc::EINTR),
+                // Needs a chunk to end on; at the cut there is none.
+                Hiccup::Ended if self.at < self.end() => return Step::Ended,
+                Hiccup::Ended => {}
+            }
+        }
+        match self.cut {
+            Some(cut) if self.cut_at == Some(self.at) => {
+                self.cut = None;
+                Step::Cut(-cut.errno())
+            }
+            _ => Step::Chunk,
+        }
     }
 
     /// Where delivery stops: the cut, or the end of the bytes.
@@ -181,10 +257,14 @@ impl Flow {
         self.cut.is_none() && self.at == self.bytes.len()
     }
 
-    /// The next chunk, at most `max` bytes and never past the cut, its length
-    /// drawn from `scenario`.
+    /// The next chunk, at most `max` bytes, never past the cut or the next
+    /// stumble, its length drawn from `scenario`.
     pub(crate) fn next_chunk(&mut self, max: usize, scenario: &mut Scenario) -> Vec<u8> {
-        let n = scenario.chunk_len(max.min(self.end() - self.at));
+        let stop = match self.stumbles.front() {
+            Some(&(at, _)) if at > self.at => at.min(self.end()),
+            _ => self.end(),
+        };
+        let n = scenario.chunk_len(max.min(stop - self.at));
         let chunk = self.bytes[self.at..self.at + n].to_vec();
         self.at += n;
         chunk
@@ -246,10 +326,14 @@ pub struct Scripted {
 /// The scenario is the only thing that draws, and only for what a test asked to
 /// have drawn — a delay range, a flow's split — so a test that asks for
 /// neither never meets a random number.
-struct SplitMix64(u64);
+pub(crate) struct SplitMix64(u64);
 
 impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -326,7 +410,12 @@ impl From<ReadEvent> for Outcome {
             ReadEvent::Eof => Outcome::result(0),
             ReadEvent::Bytes(n) => Outcome::Data(vec![0; n as usize]),
             ReadEvent::Error(errno) => Outcome::result(as_errno(errno)),
-            ReadEvent::Flow { bytes, gap, cut } => Outcome::Flow(Flow::new(bytes, gap, cut)),
+            ReadEvent::Flow {
+                bytes,
+                gap,
+                cut,
+                hiccups,
+            } => Outcome::Flow(Flow::new(bytes, gap, cut, hiccups)),
         }
     }
 }
@@ -371,6 +460,10 @@ pub struct Batch(pub Vec<Scripted>);
 impl Batch {
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -507,6 +600,11 @@ impl Scenario {
         self.queued
             .remove(&trigger)
             .map_or(0, |entries| entries.iter().map(Entry::len).sum())
+    }
+
+    /// Whether anything is still declared for `trigger`.
+    pub fn declares(&self, trigger: Trigger) -> bool {
+        self.queued.get(&trigger).is_some_and(|q| !q.is_empty())
     }
 
     /// Take the next declaration for `trigger`.

@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use runtime_core::deterministic_testing::{
-    Cut, FakeRing, FakeRingHandle, Peer, ReadEvent, WriteEvent, is_open, simulated_socket,
+    Cut, FakeRing, FakeRingHandle, Hiccup, Peer, ReadEvent, WriteEvent, is_open, simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
 use runtime_core::io_driver::operations::sockets::recv::{socket_peek, socket_recv};
@@ -971,6 +971,41 @@ fn a_timed_out_flow_ends_on_etimedout() {
         matches!(end, CompletionError::Other(code) if code == -libc::ETIMEDOUT),
         "ended on {end:?}",
     );
+}
+
+#[test]
+fn a_flow_reaches_the_task_whole_through_hiccups() {
+    // MultiRecv re-arms on its own, so the task never sees the stumbles.
+    let payload = marked(200);
+    for seed in 0..32 {
+        let (fake, handle) = FakeRing::builder().seed(seed).virtual_time().build();
+        let socket = simulated_socket();
+        let flow = ReadEvent::flow(&payload[..])
+            .hiccup(Hiccup::Interrupted)
+            .hiccup(Hiccup::Ended)
+            .hiccup(Hiccup::Interrupted);
+        handle.on_multishot_read(socket.fd(), [flow, ReadEvent::Eof]);
+
+        let got = RuntimeInner::simulated(fake).block_on::<FlowRing, _>(
+            async move {
+                let mut recv = MultiRecv::<FlowRing>::new(socket);
+                let mut got = Vec::new();
+                while let Some(chunk) = recv.next().await {
+                    match chunk {
+                        Ok(buffer) => got.extend_from_slice(buffer.as_ref()),
+                        Err(CompletionError::Other(code)) if code == -libc::ENOBUFS => {}
+                        Err(other) => panic!("seed {seed}: {other:?}"),
+                    }
+                }
+                got
+            },
+            None,
+            |run| run(),
+        );
+
+        assert_eq!(got, payload, "seed {seed}");
+        assert_eq!(handle.scenario_remaining(), 0, "seed {seed}");
+    }
 }
 
 #[test]

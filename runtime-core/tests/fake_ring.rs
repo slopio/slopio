@@ -13,8 +13,8 @@ use std::time::Duration;
 use io_uring::types::Timespec;
 use io_uring::{cqueue, opcode, types::Fd};
 use runtime_core::deterministic_testing::{
-    AcceptEvent, FIRST_SIMULATED_FD, FakeRing, FakeRingHandle, FdKind, IOSQE_BUFFER_SELECT, Peer,
-    ReadEvent, WriteEvent, is_open, mint, open_fds, simulated_socket,
+    AcceptEvent, FIRST_SIMULATED_FD, FakeRing, FakeRingHandle, FdKind, Hiccup, IOSQE_BUFFER_SELECT,
+    Peer, ReadEvent, WriteEvent, is_open, mint, open_fds, simulated_socket,
 };
 use runtime_core::io_driver::operations::sockets::SocketWrapper;
 use runtime_core::io_driver::{BufRingSpec, RingHandle};
@@ -1718,4 +1718,90 @@ fn a_file_has_no_far_end() {
     ring.add(&recv(fd, &mut buf, 2));
     ring.submit();
     assert_eq!(handle.parked(), 1);
+}
+
+// --------------------------------------------------------------- hiccups
+
+/// Read a multishot stream on `fd` to EOF from `TestRing`, re-arming each time
+/// an op ends early, as `MultiRecv` would. The bytes, and the result of every
+/// completion that ended an op before EOF.
+fn read_rearming(ring: &mut FakeRing, fd: i32) -> (Vec<u8>, Vec<i32>) {
+    let (mut got, mut early) = (Vec::new(), Vec::new());
+    for token in 0.. {
+        ring.add(&recv_multi(fd, 0, token));
+        let over = loop {
+            ring.submit_and_wait();
+            let mut over = None;
+            while let Some(c) = ring.pop_completion() {
+                if c.result > 0 {
+                    let bid = cqueue::buffer_select(c.flags).expect("F_BUFFER");
+                    // No driver here to account the consumption.
+                    TestRing::note_consumed();
+                    got.extend_from_slice(TestRing::make_buffer(bid, c.result as usize).as_ref());
+                }
+                if !cqueue::more(c.flags) {
+                    over = Some(c.result);
+                }
+            }
+            if let Some(result) = over {
+                break result;
+            }
+        };
+        if over == 0 {
+            break;
+        }
+        early.push(over);
+    }
+    (got, early)
+}
+
+#[test]
+fn an_interrupted_flow_ends_its_op_and_resumes_on_the_next() {
+    let payload: Vec<u8> = (0..40).collect();
+    for seed in 0..16 {
+        let (mut ring, handle) = FakeRing::builder().seed(seed).virtual_time().build();
+        TestRing::init(RingHandle::Simulated(&handle));
+        handle.on_multishot_read(
+            11,
+            [
+                ReadEvent::flow(&payload[..]).hiccup(Hiccup::Interrupted),
+                ReadEvent::Eof,
+            ],
+        );
+
+        let (got, early) = read_rearming(&mut ring, 11);
+        assert_eq!(
+            got, payload,
+            "seed {seed}: the re-armed op lost or repeated bytes"
+        );
+        assert_eq!(early, vec![-libc::EINTR], "seed {seed}");
+        assert_eq!(handle.scenario_remaining(), 0, "seed {seed}");
+    }
+}
+
+#[test]
+fn an_ended_flow_delivers_a_chunk_without_f_more_and_resumes() {
+    let payload: Vec<u8> = (0..40).collect();
+    for seed in 0..16 {
+        let (mut ring, handle) = FakeRing::builder().seed(seed).virtual_time().build();
+        TestRing::init(RingHandle::Simulated(&handle));
+        handle.on_multishot_read(
+            11,
+            [
+                ReadEvent::flow(&payload[..]).hiccup(Hiccup::Ended),
+                ReadEvent::Eof,
+            ],
+        );
+
+        let (got, early) = read_rearming(&mut ring, 11);
+        assert_eq!(
+            got, payload,
+            "seed {seed}: the re-armed op lost or repeated bytes"
+        );
+        assert!(
+            matches!(early[..], [n] if n > 0),
+            "seed {seed}: one op should end on a chunk, got {early:?}",
+        );
+        assert_eq!(handle.scenario_remaining(), 0, "seed {seed}");
+    }
 }

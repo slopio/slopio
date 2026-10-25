@@ -38,7 +38,7 @@ pub fn install_buf_ring<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL
         // the ring, since no kernel will.
         #[cfg(feature = "simulation")]
         RingHandle::Simulated(handle) => {
-            handle.register_buf_ring(bgid, take);
+            handle.register_buf_ring(bgid, take, BUFFER_SIZE);
             io_uring_rb::RingBuffer::new_unregistered(bgid)
         }
     }
@@ -49,12 +49,18 @@ pub fn install_buf_ring<const BUFFER_SIZE: u32, const RING_SIZE: u16, const POOL
 /// Only a simulated run may: its ring was reset when the previous run ended,
 /// and the new simulator needs `take` to consume it. A real ring is never
 /// installed twice.
-pub fn reinstall_buf_ring(ring: RingHandle<'_>, bgid: u16, take: BufRingTake, name: &str) {
-    let _ = (bgid, take);
+pub fn reinstall_buf_ring(
+    ring: RingHandle<'_>,
+    bgid: u16,
+    take: BufRingTake,
+    capacity: u32,
+    name: &str,
+) {
+    let _ = (bgid, take, capacity);
     match ring {
         RingHandle::Uring(_) => panic!("buf ring `{name}` already initialized on this thread"),
         #[cfg(feature = "simulation")]
-        RingHandle::Simulated(handle) => handle.register_buf_ring(bgid, take),
+        RingHandle::Simulated(handle) => handle.register_buf_ring(bgid, take, capacity),
     }
 }
 
@@ -372,7 +378,7 @@ macro_rules! define_buf_ring {
                     RING.with(|cell| {
                         if cell.get().is_some() {
                             $crate::io_driver::reinstall_buf_ring(
-                                ring, $bgid, take, stringify!($name),
+                                ring, $bgid, take, $bsize, stringify!($name),
                             );
                             return;
                         }

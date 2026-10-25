@@ -39,11 +39,86 @@ Scripts are keyed by what an operation is, not by when it is submitted: a read o
 - **Accepts**: `AcceptEvent::Connection` mints a new socket, `On(fd)` hands back one you created in advance so you can script what it then does, `Error(errno)`.
 - **Connects**: `ConnectEvent::Ok` or `Error(errno)`.
 - **Multishot streams** are declared whole with `on_multishot_read` and `on_multishot_accept`: the full sequence the operation will produce, in order. A sequence ending on EOF or an error closes the stream; an open one leaves it armed.
-- **Flows**: inside a multishot read, `ReadEvent::flow(bytes)` delivers bytes in order, split across as many completions as the seed draws, each no larger than the buffer it lands in, sometimes several in one drain. `.spaced(min, max)` holds each later drain back by a delay drawn from that range, while chunks drawn into the same drain still land together. A single byte and a full buffer come up often, since that is where readers get lengths wrong. If the ring runs out of buffers partway, the bytes not yet delivered wait for the re-armed read, as a socket would keep them. `.cut(Cut::Reset)` or `.cut(Cut::Timeout)` kills the connection partway through: the bytes up to an offset drawn by the seed arrive, the next read fails with `ECONNRESET` or `ETIMEDOUT`, and the connection is reset from then on. A flow on a single-shot read is refused.
+- **Flows**: inside a multishot read, `ReadEvent::flow(bytes)` delivers bytes in order, split across as many completions as the seed draws, each no larger than the buffer it lands in, sometimes several in one drain. `.spaced(min, max)` holds each later drain back by a delay drawn from that range, while chunks drawn into the same drain still land together. A single byte and a full buffer come up often, since that is where readers get lengths wrong. If the ring runs out of buffers partway, the bytes not yet delivered wait for the re-armed read, as a socket would keep them. `.cut(Cut::Reset)` or `.cut(Cut::Timeout)` kills the connection partway through: the bytes up to an offset drawn by the seed arrive, the next read fails with `ECONNRESET` or `ETIMEDOUT`, and the connection is reset from then on. `.hiccup(Hiccup::Interrupted)` or `.hiccup(Hiccup::Ended)` makes the read stumble at a drawn offset without hurting the connection, with either an `EINTR` or a chunk that arrives without `IORING_CQE_F_MORE`, as when the kernel ends a multishot on its own. Either way the multishot is over, and the rest of the flow waits for the read that re-arms. Call it more than once for more stumbles. A flow on a single-shot read is refused.
 
 Errnos are given positive. Operations the kernel finishes on its own, such as sends, writes and opens, complete without being scripted. Operations that wait on the outside world, such as reads, accepts and connects, never complete unless scripted.
 
 A simulated socket also remembers what its far end did, so a connection that ended stays ended. Once a read on it reports EOF, the peer has closed its side: every later read sees EOF, while writes still go through. Once a read or a write reports `ECONNRESET`, `ETIMEDOUT` or `EPIPE`, the connection is reset: later reads see EOF and later writes `EPIPE`. This matches what Linux does after the reset has been reported once. Either way, operations already waiting complete from that state, and whatever the script still said about the dead side is dropped and counted by `handle.voided()` rather than left owed. `handle.peer(fd)` tells you the state. Files have no far end: a read of zero bytes is just the end of the file.
+
+## Peers written as code
+
+A script is fixed before the run, so it cannot answer what the program does. An actor can. Attach one to a simulated socket and every read and write on that descriptor is asked of it at the moment the completion is posted:
+
+```rust
+use runtime_core::deterministic_testing::{Actor, ActorCx, ReadReply, WriteReply};
+
+struct Echoed { pending: Vec<u8> }
+
+impl Actor for Echoed {
+    fn read(&mut self, max: usize, _cx: &mut ActorCx) -> ReadReply {
+        if self.pending.is_empty() { return ReadReply::Pending; }
+        let n = max.min(self.pending.len());
+        ReadReply::Data(self.pending.drain(..n).collect())
+    }
+
+    fn write(&mut self, bytes: &[u8], _cx: &mut ActorCx) -> WriteReply {
+        self.pending.extend_from_slice(bytes);
+        WriteReply::Accepted(bytes.len())
+    }
+}
+
+handle.attach(socket.fd(), Echoed { pending: Vec::new() });
+```
+
+- **`read(max)`** returns `Data` (one byte up to `max`, which is the size of the buffer the read lands in), `Eof`, `Error(errno)`, or `Pending` to make the read wait.
+- **`write(bytes)`** returns `Accepted(n)`, where fewer than offered is a short write, `AcceptedAfter(n, delay)` to take the bytes now but report the send only later, `Error(errno)`, or `Pending` to hold the write as a full send buffer would. Sends on one descriptor complete in order whatever their delays, and a send already taken cannot be cancelled: the cancel gets `EALREADY` and the send completes as it was going to.
+- **`on_open`** runs when an accept hands the descriptor out, or at its first operation otherwise. **`on_closed`** runs when the program closes it, and nothing the actor does reaches the program after that.
+- **Timers**: `cx.timer(after, tag)` calls `on_timer(tag)` later in virtual time; arming a tag again replaces it, and `cx.cancel(tag)` disarms it. `cx.wake_at(at)` asks again for the operations waiting on the actor without a callback, for state that becomes ready on its own.
+- **`cx.now()`** is virtual time since the ring was built, and **`cx.random()`** and **`cx.between(lo, hi)`** draw from a stream of the actor's own, settled by the seed.
+
+An operation that got `Pending` waits, and is asked again after the actor's next timer, wake-up or write, so an actor never has to say it is ready. Bytes an actor hands over that no buffer could take, because the ring was dry, are kept and served to the next read, as a socket keeps them. A descriptor is answered either by an actor or by a script, never both: mixing them panics.
+
+Because the run stops on a program that blocks for good, a peer that waits for an answer turns a server that never gives one into a failing test, with no assertion to write.
+
+For the common case of a peer that plays a conversation, `Dialogue` is an actor built from steps:
+
+```rust
+use runtime_core::deterministic_testing::{Check, Dialogue};
+
+let (peer, report) = Dialogue::new()
+    .send(b"PING\r\n".to_vec())
+    .expect_bytes(b"+PONG\r\n".to_vec())
+    .wait(Duration::from_millis(5))
+    .send(request)
+    .expect("a framed reply", |got: &[u8]| {
+        // Everything the program wrote and no step consumed yet, called
+        // again each time more arrives.
+        match parse_frame(got) {
+            None => Check::More,
+            Some((frame, len)) if frame.is_ok() => Check::Pass(len),
+            Some((frame, _)) => Check::Fail(format!("{frame:?}")),
+        }
+    })
+    .close()
+    .build();
+handle.attach(socket.fd(), peer);
+// … run …
+report.borrow().assert_finished();
+```
+
+An `expect` step is a closure over the bytes received so far. It returns `Check::More` to wait for more, `Check::Pass(n)` to consume the first `n` and move on (the rest goes to the next step), or `Check::Fail(reason)`. Because it always sees everything not yet consumed, it checks a reply that arrived split across writes, or glued to the next one, without reassembling it. `expect_bytes`, `expect_len` and `expect_until` cover the simple cases. `send` makes bytes readable, delivered in pieces the seed decides; `wait` pauses; `close` and `reset` end the connection with a FIN or an RST. `write_latency(min, max)` holds each of the program's sends for a drawn delay before it completes.
+
+A failed check resets the connection, so the program sees the peer go away and the run ends normally; the report then names the step and the reason. `assert_finished` also fails when the program stopped before the last step, or wrote bytes no step expected.
+
+The runs worth having are the ones where the peer misbehaves, so a dialogue can misbehave on purpose:
+
+- **`cut_send(bytes)`** sends the bytes up to a byte the seed picks, then resets. As on Linux, what got out is still read before the reset is reported.
+- **`vanish()`** makes the peer go silent: no FIN and no RST. Reads wait for ever; sends go into a buffer nobody drains until it is full, then wait too. A program with no idle timeout stays stuck on such a peer, and the simulator reports it as a run that would never wake up.
+- **`reset_after(delay)`** resets the connection at that time, whatever step the dialogue is on.
+- **`fail_write(errno)`** makes the program's next send fail, and ends the connection.
+- **`faults(Faults { send_error, cut_in_send, vanish })`** draws those faults from the seed instead, at the given odds per send or per step. At most one strikes a dialogue.
+
+The report names the fault that struck in `fault`. `assert_ok` accepts a dialogue that either finished or was cut short by a fault, but never one that saw a wrong reply, so a test can hold healthy connections to the whole conversation and faulted ones to ending cleanly.
 
 ## Choosing when things happen
 
@@ -72,5 +147,5 @@ It also makes the runtime runnable under Miri, which a real io_uring never can b
 ## Limits
 
 - Sends never block and never see backpressure. The simulator models the completion, not the network.
-- The far end is only a state, closed or reset, not a simulated program. Data appears because you scripted it, not because someone sent it.
+- A scripted descriptor's far end is only a state, closed or reset; for a peer that answers, attach an actor.
 - The simulator is reachable from `runtime_core` only. The `runtime` facade's entry points always build a real ring.

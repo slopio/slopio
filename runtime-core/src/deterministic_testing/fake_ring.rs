@@ -14,14 +14,15 @@ use io_uring::{opcode, squeue};
 
 use crate::io_driver::BufRingTake;
 
+use super::actor::{Actor, ActorCx, Effect, ReadReply, WriteReply};
 use super::clock::{self, Nanos};
 use super::fds::{self, FdKind};
-use super::scenario::{Batch, Delay, Entry, Flow, Scenario, Scripted, Trigger};
+use super::scenario::{Batch, Delay, Entry, Flow, Scenario, Scripted, SplitMix64, Step, Trigger};
 use super::sqe::{
     IORING_ACCEPT_MULTISHOT, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE,
     IORING_RECV_MULTISHOT, Sqe,
 };
-use super::timeline::{Outcome, Pending, Source, Timeline};
+use super::timeline::{Item, Outcome, Pending, Source, Timeline};
 use super::virtual_clock::VirtualClock;
 
 /// Where the simulated ring gets time, and what it does to wait.
@@ -191,6 +192,16 @@ fn peer_outcome(state: &FakeRingState, sqe: &Sqe) -> Option<Outcome> {
     }
 }
 
+/// Whether the side of a connection `trigger` names has ended, so nothing
+/// scripted for it can happen any more.
+fn dead(state: &FakeRingState, trigger: Trigger) -> bool {
+    match trigger {
+        Trigger::Read(fd) => state.peers.contains_key(&fd),
+        Trigger::Write(fd) => state.peers.get(&fd) == Some(&Peer::Reset),
+        Trigger::Accept(_) | Trigger::Connect(_) => false,
+    }
+}
+
 /// Scripted completions an op still carries, delivered or not.
 fn owed(source: &Source) -> usize {
     match source {
@@ -225,10 +236,258 @@ fn enter(state: &mut FakeRingState, fd: RawFd, peer: Peer, now: Nanos) {
     }
 }
 
+/// An actor and what the ring keeps for it.
+struct ActorSlot {
+    actor: Box<dyn Actor>,
+    rng: SplitMix64,
+    /// The generation each timer tag is at; a fired timer of an older one was
+    /// replaced or cancelled, and does nothing.
+    generations: HashMap<u64, u64>,
+    opened: bool,
+}
+
+impl ActorSlot {
+    fn bump(&mut self, tag: u64) -> u64 {
+        let generation = self.generations.entry(tag).or_default();
+        *generation += 1;
+        *generation
+    }
+}
+
+fn nanos(d: std::time::Duration) -> Nanos {
+    Nanos::try_from(d.as_nanos()).unwrap_or(Nanos::MAX)
+}
+
+/// Call `fd`'s actor, then apply what it asked for. `None` if `fd` has none.
+fn call_actor<R>(
+    state: &mut FakeRingState,
+    fd: RawFd,
+    now: Nanos,
+    f: impl FnOnce(&mut dyn Actor, &mut ActorCx) -> R,
+) -> Option<R> {
+    let since = std::time::Duration::from_nanos(now.saturating_sub(state.start));
+    let slot = state.actors.get_mut(&fd)?;
+    let mut cx = ActorCx {
+        now: since,
+        rng: &mut slot.rng,
+        effects: Vec::new(),
+    };
+    let reply = f(slot.actor.as_mut(), &mut cx);
+    let effects = cx.effects;
+    for effect in effects {
+        apply(state, fd, effect, now);
+    }
+    Some(reply)
+}
+
+fn apply(state: &mut FakeRingState, fd: RawFd, effect: Effect, now: Nanos) {
+    let Some(slot) = state.actors.get_mut(&fd) else {
+        return;
+    };
+    let (item, due) = match effect {
+        Effect::Timer { after, tag } => {
+            let generation = slot.bump(tag);
+            let item = Item::Timer {
+                fd,
+                tag,
+                generation,
+            };
+            (item, now.saturating_add(nanos(after)))
+        }
+        Effect::Cancel { tag } => {
+            slot.bump(tag);
+            return;
+        }
+        Effect::WakeAt(at) => (
+            Item::Wake { fd },
+            state.start.saturating_add(nanos(at)).max(now),
+        ),
+    };
+    let seq = state.next_seq;
+    state.next_seq += 1;
+    state.timeline.schedule_at(item, due, seq);
+}
+
+/// Ask `fd`'s actor again for every op waiting on it.
+fn repull(state: &mut FakeRingState, fd: RawFd, now: Nanos) {
+    let (woken, still): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut state.waiting)
+        .into_iter()
+        .partition(|p| p.sqe.fd == fd && matches!(p.outcome, Outcome::Actor));
+    state.waiting = still;
+    for pending in woken {
+        state.timeline.schedule(pending, None, now);
+    }
+}
+
+/// Tell `fd`'s actor its connection exists, the first time only.
+fn open_actor(state: &mut FakeRingState, fd: RawFd, now: Nanos) {
+    let Some(slot) = state.actors.get_mut(&fd) else {
+        return;
+    };
+    if std::mem::replace(&mut slot.opened, true) {
+        return;
+    }
+    call_actor(state, fd, now, |actor, cx| actor.on_open(cx));
+    repull(state, fd, now);
+}
+
+/// Complete a read or a write on a descriptor with an actor, as the actor
+/// answers now.
+fn serve_actor(
+    state: &mut FakeRingState,
+    pending: Pending,
+    group: Option<(BufRingTake, u32)>,
+    now: Nanos,
+) {
+    open_actor(state, pending.sqe.fd, now);
+    match trigger_for(&pending.sqe) {
+        Some(Trigger::Write(_)) => serve_write(state, pending, now),
+        Some(Trigger::Read(_)) => serve_read(state, pending, group, now),
+        _ => unreachable!("only reads and writes are routed to an actor"),
+    }
+}
+
+fn serve_write(state: &mut FakeRingState, pending: Pending, now: Nanos) {
+    let sqe = pending.sqe;
+    let bytes = offered(&sqe);
+    let reply = call_actor(state, sqe.fd, now, |actor, cx| actor.write(&bytes, cx))
+        .expect("routed here because the fd has an actor");
+    let (result, after) = match reply {
+        WriteReply::Pending => {
+            state.waiting.push(pending);
+            return;
+        }
+        WriteReply::Accepted(n) | WriteReply::AcceptedAfter(n, _) => {
+            assert!(
+                n <= bytes.len(),
+                "the actor on fd {} took {n} of {} bytes offered",
+                sqe.fd,
+                bytes.len(),
+            );
+            state
+                .written
+                .entry(sqe.fd)
+                .or_default()
+                .push(bytes[..n].to_vec());
+            let after = match reply {
+                WriteReply::AcceptedAfter(_, after) => nanos(after),
+                _ => 0,
+            };
+            (n as i32, after)
+        }
+        WriteReply::Error(errno) => (-errno.abs(), 0),
+    };
+    // Sends on one socket complete in order: none overtakes one still held.
+    let due = now
+        .saturating_add(after)
+        .max(state.writes_due.get(&sqe.fd).copied().unwrap_or(0));
+    if due > now {
+        state.writes_due.insert(sqe.fd, due);
+        let seq = pending.seq;
+        let committed = Pending {
+            outcome: Outcome::Committed(result),
+            source: Source::Default,
+            ..pending
+        };
+        state.timeline.schedule_at(Item::Op(committed), due, seq);
+    } else {
+        state.cq.push_back(Completion {
+            user_data: sqe.user_data,
+            result,
+            flags: 0,
+        });
+    }
+    // What the program wrote may be what the actor waited for to answer.
+    repull(state, sqe.fd, now);
+}
+
+fn serve_read(
+    state: &mut FakeRingState,
+    pending: Pending,
+    group: Option<(BufRingTake, u32)>,
+    now: Nanos,
+) {
+    let sqe = pending.sqe;
+    let fd = sqe.fd;
+    let multishot = is_multishot(&sqe);
+    let peek = is_peek(&sqe) && !multishot;
+    let max = match group {
+        Some((_, capacity)) if sqe.uses_buffer_select() => capacity as usize,
+        _ => sqe.len as usize,
+    };
+    loop {
+        // Bytes the actor handed over that no buffer could take come first.
+        let reply = match state.unread.get_mut(&fd).filter(|u| !u.is_empty()) {
+            Some(unread) => ReadReply::Data(unread.drain(..max.min(unread.len())).collect()),
+            None => call_actor(state, fd, now, |actor, cx| actor.read(max, cx))
+                .expect("routed here because the fd has an actor"),
+        };
+        let completion = match reply {
+            ReadReply::Pending => {
+                state.waiting.push(pending);
+                return;
+            }
+            ReadReply::Eof => Completion {
+                user_data: sqe.user_data,
+                result: 0,
+                flags: 0,
+            },
+            ReadReply::Error(errno) => Completion {
+                user_data: sqe.user_data,
+                result: -errno.abs(),
+                flags: 0,
+            },
+            ReadReply::Data(bytes) => {
+                assert!(
+                    !bytes.is_empty() && bytes.len() <= max,
+                    "the actor on fd {fd} answered a read of at most {max} bytes with {}",
+                    bytes.len(),
+                );
+                // A peek leaves the bytes where they were: not delivered, so not recorded.
+                let mut seen = HashMap::new();
+                let record = if peek { &mut seen } else { &mut state.read };
+                let provider = group.map(|(take, _)| take);
+                match deliver(sqe, provider, record, |_| bytes.clone()) {
+                    None => {
+                        // The socket keeps what no buffer could take.
+                        state.unread.entry(fd).or_default().splice(0..0, bytes);
+                        dry(sqe)
+                    }
+                    Some(mut completion) => {
+                        if peek {
+                            state.unread.entry(fd).or_default().splice(0..0, bytes);
+                        }
+                        if multishot {
+                            completion.flags |= IORING_CQE_F_MORE;
+                            state.cq.push_back(completion);
+                            if state.scenario.same_drain() {
+                                continue;
+                            }
+                            state.timeline.schedule(pending, None, now);
+                            return;
+                        }
+                        completion
+                    }
+                }
+            }
+        };
+        state.cq.push_back(completion);
+        return;
+    }
+}
+
 /// Put an op where it belongs: on the timeline if the scenario already says
 /// what happens to it, parked otherwise — unless it is one the kernel finishes
 /// alone, which then completes with its default.
 fn arm(state: &mut FakeRingState, mut pending: Pending, now: Nanos) {
+    // A descriptor with an actor answers through it, when the op completes.
+    if let Some(Trigger::Read(fd) | Trigger::Write(fd)) = trigger_for(&pending.sqe)
+        && state.actors.contains_key(&fd)
+    {
+        pending.outcome = Outcome::Actor;
+        state.timeline.schedule(pending, None, now);
+        return;
+    }
     if let Some(outcome) = peer_outcome(state, &pending.sqe) {
         pending.outcome = outcome;
         state.timeline.schedule(pending, None, now);
@@ -381,7 +640,8 @@ unsafe fn gather(iov: *const libc::iovec, count: usize) -> Vec<u8> {
 /// payload, so data goes into the op's buffer and only the count is reported.
 /// Data each way is recorded, in `read` and `written`.
 ///
-/// Also returns what a flow has left unread, for the completions after this one.
+/// Also returns what a flow has left unread, for the completions after this
+/// one, and whether the flow ends the op here whatever the result.
 fn complete_outcome(
     sqe: Sqe,
     outcome: Outcome,
@@ -389,7 +649,7 @@ fn complete_outcome(
     read: &mut HashMap<RawFd, Vec<Vec<u8>>>,
     written: &mut HashMap<RawFd, Vec<Vec<u8>>>,
     scenario: &mut Scenario,
-) -> (Completion, Option<Flow>) {
+) -> (Completion, Option<Flow>, bool) {
     let completion = match outcome {
         Outcome::Result { result, flags } => Completion {
             user_data: sqe.user_data,
@@ -415,23 +675,33 @@ fn complete_outcome(
             flags: 0,
         },
         Outcome::Data(bytes) => deliver(sqe, provider, read, |_| bytes).unwrap_or_else(|| dry(sqe)),
+        Outcome::Actor => unreachable!("an actor's op is served by serve_actor"),
+        Outcome::Committed(result) => Completion {
+            user_data: sqe.user_data,
+            result,
+            flags: 0,
+        },
         Outcome::Flow(mut flow) => {
-            // The connection dies here: no buffer is taken, nothing more follows.
-            if let Some(result) = flow.cut_now(scenario) {
-                let completion = Completion {
-                    user_data: sqe.user_data,
-                    result,
-                    flags: 0,
-                };
-                return (completion, None);
-            }
-            // A dry ring takes nothing, so the whole flow is still unread.
-            let completion = deliver(sqe, provider, read, |max| flow.next_chunk(max, scenario))
-                .unwrap_or_else(|| dry(sqe));
-            return (completion, (!flow.is_empty()).then_some(flow));
+            let fails = |result| Completion {
+                user_data: sqe.user_data,
+                result,
+                flags: 0,
+            };
+            let (completion, ends) = match flow.step(scenario) {
+                // The connection dies here: no buffer is taken, nothing more follows.
+                Step::Cut(result) => return (fails(result), None, false),
+                Step::Fails(result) => (fails(result), false),
+                // A dry ring takes nothing, so the whole flow is still unread.
+                step @ (Step::Chunk | Step::Ended) => (
+                    deliver(sqe, provider, read, |max| flow.next_chunk(max, scenario))
+                        .unwrap_or_else(|| dry(sqe)),
+                    matches!(step, Step::Ended),
+                ),
+            };
+            return (completion, (!flow.is_empty()).then_some(flow), ends);
         }
     };
-    (completion, None)
+    (completion, None, false)
 }
 
 /// The `-ENOBUFS` a ring with every buffer handed out reports.
@@ -534,15 +804,19 @@ fn deliver(
 
 /// A flow's unread bytes and whatever was declared after them in the same
 /// drain, as the batch that now lands next, `delay` after this one.
-fn carry(flow: Flow, batch: &mut VecDeque<Outcome>, delay: Option<Delay>) -> Batch {
-    let mut carried: Vec<Scripted> = std::iter::once(Outcome::Flow(flow))
+fn carry(flow: Option<Flow>, batch: &mut VecDeque<Outcome>, delay: Option<Delay>) -> Batch {
+    let mut carried: Vec<Scripted> = flow
+        .map(Outcome::Flow)
+        .into_iter()
         .chain(batch.drain(..))
         .map(|outcome| Scripted {
             outcome,
             delay: None,
         })
         .collect();
-    carried[0].delay = delay;
+    if let Some(head) = carried.first_mut() {
+        head.delay = delay;
+    }
     Batch(carried)
 }
 
@@ -592,6 +866,14 @@ fn give_back(source: Source, outcome: Outcome) -> Option<Entry> {
 /// multishot is finally done. Both are queued here, target first, matching the
 /// order a real ring reports them in.
 fn apply_cancel(state: &mut FakeRingState, target: u64, now: Nanos) -> i32 {
+    // Done already, only not reported yet: it completes as it would have.
+    if state
+        .timeline
+        .iter()
+        .any(|p| p.sqe.user_data == target && matches!(p.outcome, Outcome::Committed(_)))
+    {
+        return -libc::EALREADY;
+    }
     let cancelled = state.timeline.take_by_user_data(target).or_else(|| {
         let i = state
             .waiting
@@ -630,6 +912,11 @@ fn apply_cancel(state: &mut FakeRingState, target: u64, now: Nanos) -> i32 {
 /// sit there while a read that wants it waits forever — which is exactly the
 /// shape of a read that timed out and was retried.
 fn restore(state: &mut FakeRingState, trigger: Trigger, entry: Entry, now: Nanos) {
+    // A cancel after the connection ended gives back what can no longer arrive.
+    if dead(state, trigger) {
+        state.voided += entry.len();
+        return;
+    }
     state.scenario.unshift(trigger, entry);
     if let Some(i) = state
         .waiting
@@ -664,8 +951,20 @@ struct FakeRingState {
     /// What the runtime wrote and the simulation accepted, per descriptor, one
     /// entry per completed op in completion order.
     written: HashMap<RawFd, Vec<Vec<u8>>>,
-    /// Registered buffer rings, by group id.
-    buf_rings: Vec<(u16, BufRingTake)>,
+    /// Registered buffer rings, by group id, with the size of their buffers.
+    buf_rings: Vec<(u16, BufRingTake, u32)>,
+    /// Descriptors whose far end is an actor.
+    actors: HashMap<RawFd, ActorSlot>,
+    /// Bytes an actor handed over for a read that no buffer could take, served
+    /// before asking it again.
+    unread: HashMap<RawFd, Vec<u8>>,
+    /// When the last held send on each actor descriptor completes, so the next
+    /// one does not overtake it.
+    writes_due: HashMap<RawFd, Nanos>,
+    /// The builder's seed, from which each actor's stream is drawn.
+    seed: u64,
+    /// When the ring was built, which actors count time from.
+    start: Nanos,
     pace: Pace,
     /// When the ring was last waited on, and how many waits in a row found
     /// time standing there. Virtual time only moves when the program blocks.
@@ -854,6 +1153,7 @@ impl FakeRingHandle {
     }
 
     fn script(&self, trigger: Trigger, scripted: Scripted) {
+        self.refuse_actor(trigger);
         self.0
             .borrow_mut()
             .scenario
@@ -861,11 +1161,48 @@ impl FakeRingHandle {
     }
 
     fn stream<B: Into<Batch>>(&self, trigger: Trigger, batches: impl IntoIterator<Item = B>) {
+        self.refuse_actor(trigger);
         let sequence = batches.into_iter().map(Into::into).collect();
         self.0
             .borrow_mut()
             .scenario
             .push(trigger, Entry::Stream(sequence));
+    }
+
+    fn refuse_actor(&self, trigger: Trigger) {
+        if let Trigger::Read(fd) | Trigger::Write(fd) = trigger {
+            assert!(
+                !self.0.borrow().actors.contains_key(&fd),
+                "fd {fd} has an actor, so its reads and writes are the actor's to answer",
+            );
+        }
+    }
+
+    /// Make `actor` the far end of `fd`: every read and write on it is asked
+    /// of the actor as it completes, instead of the script.
+    ///
+    /// Its [`on_open`](Actor::on_open) runs when an accept hands `fd` out, or
+    /// at the first op on it otherwise.
+    pub fn attach(&self, fd: RawFd, actor: impl Actor + 'static) {
+        let mut state = self.0.borrow_mut();
+        assert!(
+            !state.scenario.declares(Trigger::Read(fd))
+                && !state.scenario.declares(Trigger::Write(fd)),
+            "fd {fd} already has reads or writes scripted; an actor answers them all",
+        );
+        // Each actor its own stream, so one drawing more leaves the others alone.
+        let rng = SplitMix64::new(
+            SplitMix64::new(state.seed ^ (fd as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .next_u64(),
+        );
+        let slot = ActorSlot {
+            actor: Box::new(actor),
+            rng,
+            generations: HashMap::new(),
+            opened: false,
+        };
+        let replaced = state.actors.insert(fd, slot);
+        assert!(replaced.is_none(), "fd {fd} already has an actor");
     }
 
     /// Scripted completions never delivered — three reads declared against code
@@ -889,8 +1226,8 @@ impl FakeRingHandle {
     /// Called from a spec's `init` when the runtime starts on a simulated ring.
     /// Without it the simulator has no way to reach the buffers a
     /// `BUFFER_SELECT` op draws from.
-    pub fn register_buf_ring(&self, bgid: u16, take: BufRingTake) {
-        self.0.borrow_mut().buf_rings.push((bgid, take));
+    pub fn register_buf_ring(&self, bgid: u16, take: BufRingTake, capacity: u32) {
+        self.0.borrow_mut().buf_rings.push((bgid, take, capacity));
     }
 
     /// The clock this ring advances, if it was built with
@@ -1003,6 +1340,11 @@ impl FakeRingBuilder {
             read: HashMap::new(),
             written: HashMap::new(),
             buf_rings: Vec::new(),
+            actors: HashMap::new(),
+            unread: HashMap::new(),
+            writes_due: HashMap::new(),
+            seed: self.seed,
+            start: pace.now(),
             pace,
             stalled_at: 0,
             stalled_waits: 0,
@@ -1082,6 +1424,11 @@ impl FakeRing {
                 if fds::is_simulated(sqe.fd) {
                     fds::close(sqe.fd).expect("checked open just above");
                 }
+                // Its last word; nothing it asks for can reach the program now.
+                call_actor(state, sqe.fd, now, |actor, cx| actor.on_closed(cx));
+                state.actors.remove(&sqe.fd);
+                state.unread.remove(&sqe.fd);
+                state.writes_due.remove(&sqe.fd);
                 state.cq.push_back(Completion {
                     user_data: sqe.user_data,
                     result: 0,
@@ -1121,7 +1468,14 @@ impl FakeRing {
     /// hang.
     pub fn submit_and_wait(&mut self) {
         self.submit();
+        // An actor's timer can fire and post nothing; keep waiting until
+        // something does, or the runtime's own deadline comes.
+        while self.state().cq.is_empty() {
+            self.wait_once();
+        }
+    }
 
+    fn wait_once(&mut self) {
         let (wait, pace) = {
             let mut state = self.state();
             let now = state.pace.now();
@@ -1172,7 +1526,30 @@ impl FakeRing {
                 let mut state = self.state();
                 let fired_at = pace.now();
                 let fired = state.timeline.take_due(fired_at);
-                for mut pending in fired {
+                for item in fired {
+                    let mut pending = match item {
+                        Item::Op(pending) => pending,
+                        Item::Timer {
+                            fd,
+                            tag,
+                            generation,
+                        } => {
+                            let current = state.actors.get(&fd).is_some_and(|slot| {
+                                slot.generations.get(&tag) == Some(&generation)
+                            });
+                            if current {
+                                call_actor(&mut state, fd, fired_at, |actor, cx| {
+                                    actor.on_timer(tag, cx)
+                                });
+                                repull(&mut state, fd, fired_at);
+                            }
+                            continue;
+                        }
+                        Item::Wake { fd } => {
+                            repull(&mut state, fd, fired_at);
+                            continue;
+                        }
+                    };
                     let sqe = pending.sqe;
 
                     // A cancel reports nothing of its own — it acts on another
@@ -1185,6 +1562,23 @@ impl FakeRing {
                             result,
                             flags: 0,
                         });
+                        continue;
+                    }
+
+                    // Resolved before the calls below so no borrow of `state` is
+                    // held across them.
+                    let group = sqe
+                        .uses_buffer_select()
+                        .then(|| {
+                            state
+                                .buf_rings
+                                .iter()
+                                .find(|(bgid, ..)| *bgid == sqe.buf_group)
+                                .map(|&(_, take, capacity)| (take, capacity))
+                        })
+                        .flatten();
+                    if matches!(pending.outcome, Outcome::Actor) {
+                        serve_actor(&mut state, pending, group, fired_at);
                         continue;
                     }
 
@@ -1201,16 +1595,7 @@ impl FakeRing {
                     let source = std::mem::replace(&mut pending.source, Source::Default);
                     // Resolved before the calls below so no borrow of `state` is
                     // held across them.
-                    let provider = sqe
-                        .uses_buffer_select()
-                        .then(|| {
-                            state
-                                .buf_rings
-                                .iter()
-                                .find(|(bgid, _)| *bgid == sqe.buf_group)
-                                .map(|(_, take)| *take)
-                        })
-                        .flatten();
+                    let provider = group.map(|(take, _)| take);
 
                     // Everything the scenario declared to land in this drain,
                     // and what the op has left afterwards.
@@ -1232,7 +1617,7 @@ impl FakeRing {
                     while let Some(outcome) = batch.pop_front() {
                         let minted = matches!(outcome, Outcome::NewFd(_));
                         let st = &mut *state;
-                        let (mut completion, unread) = complete_outcome(
+                        let (mut completion, unread, ends) = complete_outcome(
                             sqe,
                             outcome,
                             provider,
@@ -1243,9 +1628,12 @@ impl FakeRing {
                         if minted && completion.result >= 0 {
                             state.opened.push(completion.result);
                         }
+                        if sqe.opcode == OP_ACCEPT && completion.result >= 0 {
+                            open_actor(&mut state, completion.result, fired_at);
+                        }
                         // `F_MORE` is per completion: the last of a batch that
                         // closes the op does not carry it, the others do.
-                        if multishot && !ends_multishot(&sqe, completion.result) {
+                        if multishot && !ends && !ends_multishot(&sqe, completion.result) {
                             completion.flags |= IORING_CQE_F_MORE;
                         } else if multishot {
                             ended = true;
@@ -1271,21 +1659,30 @@ impl FakeRing {
                         }
                         state.cq.push_back(completion);
 
-                        // The unread bytes go to this drain, the next one, or — once
-                        // the ring ran dry — the op that re-arms, as a socket keeps them.
-                        if let Some(flow) = unread {
-                            if ended {
-                                let mut stream = rest.take().unwrap_or_default();
-                                // Already in the socket, so no gap for the re-armed op.
-                                stream.push_front(carry(flow, &mut batch, None));
+                        // The unread bytes go to this drain, the next one, or — once the
+                        // op is over with the connection alive — the op that re-arms,
+                        // with everything declared after them, as a socket keeps them.
+                        if ended && (unread.is_some() || ends) {
+                            let mut stream = rest.take().unwrap_or_default();
+                            // Already in the socket, so no gap for the re-armed op.
+                            let carried = carry(unread, &mut batch, None);
+                            if !carried.is_empty() {
+                                stream.push_front(carried);
+                            }
+                            if !stream.is_empty() {
                                 let entry = Entry::Stream(stream);
                                 restore(&mut state, Trigger::Read(sqe.fd), entry, fired_at);
-                            } else if state.scenario.same_drain() {
+                            }
+                        } else if let Some(flow) = unread {
+                            if state.scenario.same_drain() {
                                 batch.push_front(Outcome::Flow(flow));
                             } else {
                                 let gap = flow.gap();
-                                rest.get_or_insert_default()
-                                    .push_front(carry(flow, &mut batch, gap));
+                                rest.get_or_insert_default().push_front(carry(
+                                    Some(flow),
+                                    &mut batch,
+                                    gap,
+                                ));
                             }
                         }
                     }
@@ -1310,8 +1707,11 @@ impl FakeRing {
                     }
                 }
                 // Armed with `.count(1)`, so it completes as soon as one
-                // completion event lands — not only on elapse.
-                if let Some(w) = state.wakeup.take() {
+                // completion event lands — not only on elapse. An actor's
+                // timer that posted nothing lands none.
+                if !state.cq.is_empty()
+                    && let Some(w) = state.wakeup.take()
+                {
                     state.cq.push_back(Completion {
                         user_data: w.user_data,
                         result: 0,

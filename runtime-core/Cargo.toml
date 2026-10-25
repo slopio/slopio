@@ -61,6 +61,10 @@ name = "dst_echo"
 required-features = ["simulation"]
 
 [[test]]
+name = "actors"
+required-features = ["simulation"]
+
+[[test]]
 name = "cancellation"
 required-features = ["simulation"]
 

@@ -18,7 +18,9 @@
 //!
 //! [`Timeline`]: timeline::Timeline
 
+pub mod actor;
 pub(crate) mod clock;
+pub mod dialogue;
 pub mod fake_ring;
 pub mod fds;
 pub mod scenario;
@@ -26,6 +28,8 @@ pub mod sqe;
 pub mod timeline;
 pub mod virtual_clock;
 
+pub use actor::{Actor, ActorCx, ReadReply, WriteReply};
+pub use dialogue::{Check, Dialogue, DialogueReport, Fault, Faults};
 pub use fake_ring::{
     Completion, FakeRing, FakeRingBuilder, FakeRingHandle, Peer, SIMULATED_RING_FD, trigger_for,
 };
@@ -33,7 +37,7 @@ pub use fds::{
     FIRST_SIMULATED_FD, FdKind, is_open, is_simulated, mint, open_fds, simulated_socket,
 };
 pub use scenario::{
-    AcceptEvent, ConnectEvent, Cut, Delay, ReadEvent, Scripted, Trigger, WriteEvent,
+    AcceptEvent, ConnectEvent, Cut, Delay, Hiccup, ReadEvent, Scripted, Trigger, WriteEvent,
 };
 pub use sqe::{IOSQE_BUFFER_SELECT, Sqe};
 pub use timeline::Outcome;
