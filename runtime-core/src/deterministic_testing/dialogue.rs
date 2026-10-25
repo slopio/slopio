@@ -144,6 +144,8 @@ pub struct Dialogue {
     faults: Faults,
     /// How long the program waits to learn each of its sends went through.
     write_latency: Option<(Duration, Duration)>,
+    /// Odds that a send of the program's is only partly taken.
+    short_writes: f64,
     report: Rc<RefCell<DialogueReport>>,
 }
 
@@ -167,6 +169,7 @@ impl Dialogue {
             fail_next_write: None,
             faults: Faults::default(),
             write_latency: None,
+            short_writes: 0.0,
             report: Rc::default(),
         }
     }
@@ -203,7 +206,7 @@ impl Dialogue {
     /// Expect exactly these bytes next.
     pub fn expect_bytes(self, want: impl Into<Vec<u8>>) -> Self {
         let want = want.into();
-        let what = format!("{:?}", String::from_utf8_lossy(&want));
+        let what = describe(&want);
         self.expect(what, move |got| {
             let n = got.len().min(want.len());
             match got[..n].iter().zip(&want).position(|(a, b)| a != b) {
@@ -231,7 +234,7 @@ impl Dialogue {
     /// Expect anything up to and including `delimiter`.
     pub fn expect_until(self, delimiter: impl Into<Vec<u8>>) -> Self {
         let delimiter = delimiter.into();
-        let what = format!("up to {:?}", String::from_utf8_lossy(&delimiter));
+        let what = format!("up to {}", describe(&delimiter));
         self.expect(what, move |got| {
             match got.windows(delimiter.len()).position(|w| w == delimiter) {
                 Some(at) => Check::Pass(at + delimiter.len()),
@@ -284,6 +287,13 @@ impl Dialogue {
             "write_latency({min:?}, {max:?}) is an empty range"
         );
         self.write_latency = Some((min, max));
+        self
+    }
+
+    /// Take only a drawn part of a send of the program's, at these odds, so it
+    /// has to send the rest again.
+    pub fn short_writes(mut self, odds: f64) -> Self {
+        self.short_writes = odds;
         self
     }
 
@@ -407,6 +417,14 @@ impl Dialogue {
     }
 }
 
+/// Bytes as a step's name: short text quoted, anything else by its length.
+fn describe(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if text.len() <= 32 && !text.chars().any(char::is_control) => format!("{text:?}"),
+        _ => format!("{} bytes", bytes.len()),
+    }
+}
+
 /// True with probability `odds`, drawing nothing when it is zero.
 fn chance(cx: &mut ActorCx, odds: f64) -> bool {
     let unit = (cx.random() >> 11) as f64 / (1u64 << 53) as f64;
@@ -468,14 +486,19 @@ impl Actor for Dialogue {
             };
             return self.fail(errno);
         }
-        self.received.extend_from_slice(bytes);
+        let taken = if bytes.len() > 1 && chance(cx, self.short_writes) {
+            cx.between(1, bytes.len() as u64 - 1) as usize
+        } else {
+            bytes.len()
+        };
+        self.received.extend_from_slice(&bytes[..taken]);
         self.play(cx);
         match self.write_latency {
-            None => WriteReply::Accepted(bytes.len()),
+            None => WriteReply::Accepted(taken),
             Some((min, max)) => {
                 let span = (max - min).as_nanos() as u64;
                 let after = min + Duration::from_nanos(cx.between(0, span));
-                WriteReply::AcceptedAfter(bytes.len(), after)
+                WriteReply::AcceptedAfter(taken, after)
             }
         }
     }

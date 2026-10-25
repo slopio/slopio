@@ -106,7 +106,7 @@ handle.attach(socket.fd(), peer);
 report.borrow().assert_finished();
 ```
 
-An `expect` step is a closure over the bytes received so far. It returns `Check::More` to wait for more, `Check::Pass(n)` to consume the first `n` and move on (the rest goes to the next step), or `Check::Fail(reason)`. Because it always sees everything not yet consumed, it checks a reply that arrived split across writes, or glued to the next one, without reassembling it. `expect_bytes`, `expect_len` and `expect_until` cover the simple cases. `send` makes bytes readable, delivered in pieces the seed decides; `wait` pauses; `close` and `reset` end the connection with a FIN or an RST. `write_latency(min, max)` holds each of the program's sends for a drawn delay before it completes.
+An `expect` step is a closure over the bytes received so far. It returns `Check::More` to wait for more, `Check::Pass(n)` to consume the first `n` and move on (the rest goes to the next step), or `Check::Fail(reason)`. Because it always sees everything not yet consumed, it checks a reply that arrived split across writes, or glued to the next one, without reassembling it. `expect_bytes`, `expect_len` and `expect_until` cover the simple cases. `send` makes bytes readable, delivered in pieces the seed decides; `wait` pauses; `close` and `reset` end the connection with a FIN or an RST. `write_latency(min, max)` holds each of the program's sends for a drawn delay before it completes, and `short_writes(odds)` takes only part of some of them, so the program has to send the rest again.
 
 A failed check resets the connection, so the program sees the peer go away and the run ends normally; the report then names the step and the reason. `assert_finished` also fails when the program stopped before the last step, or wrote bytes no step expected.
 
@@ -117,6 +117,8 @@ The runs worth having are the ones where the peer misbehaves, so a dialogue can 
 - **`reset_after(delay)`** resets the connection at that time, whatever step the dialogue is on.
 - **`fail_write(errno)`** makes the program's next send fail, and ends the connection.
 - **`faults(Faults { send_error, cut_in_send, vanish })`** draws those faults from the seed instead, at the given odds per send or per step. At most one strikes a dialogue.
+
+Faults that come from the kernel rather than the peer are the ring's to draw: `FakeRing::builder().kernel_faults(KernelFaults { interrupted, ended })` makes multishot reads of descriptors with actors fail with `EINTR`, or end after a chunk without `IORING_CQE_F_MORE`, at those odds. Neither hurts the connection; the read that re-arms carries on where the last one stopped.
 
 The report names the fault that struck in `fault`. `assert_ok` accepts a dialogue that either finished or was cut short by a fault, but never one that saw a wrong reply, so a test can hold healthy connections to the whole conversation and faulted ones to ending cleanly.
 

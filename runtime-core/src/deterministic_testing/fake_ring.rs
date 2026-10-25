@@ -236,6 +236,18 @@ fn enter(state: &mut FakeRingState, fd: RawFd, peer: Peer, now: Nanos) {
     }
 }
 
+/// Odds of the kernel stumbling on a multishot read of a descriptor with an
+/// actor, drawn from the seed. Neither hurts the connection: the read that
+/// re-arms carries on where this one stopped.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KernelFaults {
+    /// Each time the read is served, it fails with `EINTR` instead.
+    pub interrupted: f64,
+    /// Each chunk it delivers ends it, without `IORING_CQE_F_MORE`, as the
+    /// kernel may when the completion queue overflows.
+    pub ended: f64,
+}
+
 /// An actor and what the ring keeps for it.
 struct ActorSlot {
     actor: Box<dyn Actor>,
@@ -416,6 +428,15 @@ fn serve_read(
         _ => sqe.len as usize,
     };
     loop {
+        // The kernel stumbles before taking anything from the socket.
+        if multishot && state.scenario.chance(state.kernel_faults.interrupted) {
+            state.cq.push_back(Completion {
+                user_data: sqe.user_data,
+                result: -libc::EINTR,
+                flags: 0,
+            });
+            return;
+        }
         // Bytes the actor handed over that no buffer could take come first.
         let reply = match state.unread.get_mut(&fd).filter(|u| !u.is_empty()) {
             Some(unread) => ReadReply::Data(unread.drain(..max.min(unread.len())).collect()),
@@ -457,7 +478,8 @@ fn serve_read(
                         if peek {
                             state.unread.entry(fd).or_default().splice(0..0, bytes);
                         }
-                        if multishot {
+                        // Ended by the kernel on its own: no F_MORE, the op is over.
+                        if multishot && !state.scenario.chance(state.kernel_faults.ended) {
                             completion.flags |= IORING_CQE_F_MORE;
                             state.cq.push_back(completion);
                             if state.scenario.same_drain() {
@@ -961,6 +983,7 @@ struct FakeRingState {
     /// When the last held send on each actor descriptor completes, so the next
     /// one does not overtake it.
     writes_due: HashMap<RawFd, Nanos>,
+    kernel_faults: KernelFaults,
     /// The builder's seed, from which each actor's stream is drawn.
     seed: u64,
     /// When the ring was built, which actors count time from.
@@ -1288,15 +1311,22 @@ impl FakeRingHandle {
 pub struct FakeRingBuilder {
     virtual_time: bool,
     seed: u64,
+    kernel_faults: KernelFaults,
 }
 
 impl FakeRingBuilder {
-    /// Seed for the ranges a scenario asks to have drawn.
-    ///
-    /// Nothing else in the simulator draws, so this changes only entries
-    /// written with `after_between`.
+    /// Seed for everything the simulator draws: delay ranges, how flows split,
+    /// each actor's own stream, kernel faults. A test that asks for none of
+    /// them is the same whatever the seed.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
+        self
+    }
+
+    /// Let the kernel stumble on multishot reads of descriptors with actors,
+    /// at these odds.
+    pub fn kernel_faults(mut self, faults: KernelFaults) -> Self {
+        self.kernel_faults = faults;
         self
     }
 
@@ -1343,6 +1373,7 @@ impl FakeRingBuilder {
             actors: HashMap::new(),
             unread: HashMap::new(),
             writes_due: HashMap::new(),
+            kernel_faults: self.kernel_faults,
             seed: self.seed,
             start: pace.now(),
             pace,

@@ -571,6 +571,15 @@ impl Scenario {
         (self.rng.next_u64() % (len as u64 + 1)) as usize
     }
 
+    /// True with probability `odds`, drawing nothing when it is zero.
+    pub(crate) fn chance(&mut self, odds: f64) -> bool {
+        if odds <= 0.0 {
+            return false;
+        }
+        let unit = (self.rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        unit < odds
+    }
+
     /// Whether the rest of a flow lands in the same drain as its last chunk.
     pub(crate) fn same_drain(&mut self) -> bool {
         self.rng.next_u64() & 1 == 0

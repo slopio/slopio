@@ -31,7 +31,8 @@ pub mod virtual_clock;
 pub use actor::{Actor, ActorCx, ReadReply, WriteReply};
 pub use dialogue::{Check, Dialogue, DialogueReport, Fault, Faults};
 pub use fake_ring::{
-    Completion, FakeRing, FakeRingBuilder, FakeRingHandle, Peer, SIMULATED_RING_FD, trigger_for,
+    Completion, FakeRing, FakeRingBuilder, FakeRingHandle, KernelFaults, Peer, SIMULATED_RING_FD,
+    trigger_for,
 };
 pub use fds::{
     FIRST_SIMULATED_FD, FdKind, is_open, is_simulated, mint, open_fds, simulated_socket,

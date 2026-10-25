@@ -1,33 +1,44 @@
 //! An echo server under a world drawn from a seed.
 //!
 //! No scenario here is written by hand. Each seed draws how many clients
-//! connect and when, what each sends, how the bytes split into completions and
-//! how far apart they land, and which sends come back short. It also draws
-//! which kinds of fault this run suffers — connections cut partway, reads that
-//! stumble, sends that fail — and which clients they hit. The server is written
-//! the way a program would be: it never panics, and an error ends only the
-//! connection it happened on.
+//! connect and when, and what each one says: a few rounds of "send a message,
+//! wait for exactly that message back", with pauses between them. The clients
+//! are [`Dialogue`] peers, so a round only starts once the last one came back,
+//! and every echo is checked byte for byte, in order, however it was split.
 //!
-//! Every run is judged by properties that hold whatever the seed: a healthy
-//! client gets back exactly what it sent; a faulted one gets back a prefix of
-//! what reached the server, and its connection ends on the fault; nothing is
-//! left open, owed or in flight. `DST_SEED=<n>` replays one seed.
+//! Each seed also draws how hostile the world is, one axis at a time: sends of
+//! the server's that drain slowly or are taken only in part, messages cut by a
+//! reset, clients that vanish without a word or make a send fail, and a kernel
+//! that interrupts or ends multishot reads on its own. Some seeds draw none.
+//!
+//! The server is written the way a program would be: it never panics, an
+//! error ends only the connection it happened on, and a peer quiet for too
+//! long is dropped. Every run is judged by what holds whatever the seed: a
+//! healthy client plays its whole dialogue; a faulted one is never answered
+//! wrong, and its connection ends on the fault; the server never echoes a
+//! byte it did not receive; nothing is left open, owed or in flight.
+//! `DST_SEED=<n>` replays one seed.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::rc::Rc;
 use std::time::Duration;
 
 use runtime_core::deterministic_testing::{
-    AcceptEvent, Cut, FakeRing, FakeRingHandle, FdKind, Hiccup, Peer, ReadEvent, Scripted,
-    WriteEvent, mint, open_fds,
+    AcceptEvent, Dialogue, DialogueReport, FakeRing, FakeRingHandle, Fault, Faults, FdKind,
+    KernelFaults, Scripted, mint, open_fds,
 };
+use runtime_core::io_driver::BufRingSpec;
 use runtime_core::io_driver::operations::sockets::SocketWrapper;
 use runtime_core::io_driver::operations::sockets::multi_accept::MultiAccept;
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
 use runtime_core::io_driver::operations::sockets::send::send_all;
+use runtime_core::runtime::select::{SelectResult, select};
 use runtime_core::runtime::{RuntimeInner, spawn, time::Sleep};
 use runtime_streams::StreamExt;
 
-// Small buffers so payloads split into many completions, and a pool past the
+// Small buffers so messages split into many completions, and a pool past the
 // ring so the reserve is in play.
 runtime_core::define_buf_ring!(
     EchoRing,
@@ -36,17 +47,26 @@ runtime_core::define_buf_ring!(
     ring_size = 8,
     pool_size = 32
 );
-
-const BUFFER: usize = 16;
+// The same buffers, enough of them for hundreds of connections at once.
+runtime_core::define_buf_ring!(
+    CrowdRing,
+    bgid = 1,
+    buffer_size = 16,
+    ring_size = 64,
+    pool_size = 1024
+);
 
 /// How long the server waits for a buffer once the ring runs dry.
 const DRY_BACKOFF: Duration = Duration::from_millis(1);
 
+/// How long the server gives a quiet client, reading or sending.
+const IDLE: Duration = Duration::from_millis(50);
+
 /// Seeds per run. Miri interprets, so it gets a handful.
 const SEEDS: u64 = if cfg!(miri) { 4 } else { 1000 };
 
-/// SplitMix64, for drawing the workload. The simulator draws the world below
-/// it from the same seed, on its own stream.
+/// SplitMix64, for drawing the workload. The simulator and each client draw
+/// the world below it from the same seed, on streams of their own.
 struct Rng(u64);
 
 impl Rng {
@@ -65,207 +85,230 @@ impl Rng {
 
     /// True one time in `n`.
     fn one_in(&mut self, n: u64) -> bool {
-        self.next() % n == 0
+        self.next().is_multiple_of(n)
     }
 
     fn millis(&mut self, lo: u64, hi: u64) -> Duration {
         Duration::from_millis(self.between(lo, hi))
     }
+
+    /// `odds` on half the seeds, none on the others: one axis of hostility.
+    fn axis(&mut self, odds: f64) -> f64 {
+        if self.one_in(2) { odds } else { 0.0 }
+    }
 }
 
-/// Bytes that say which connection and which offset they belong to, so a
-/// chunk sent to the wrong peer or out of place cannot pass for the right one.
-fn marked(conn: usize, len: usize) -> Vec<u8> {
+/// Bytes that say which client, which round and which offset they belong to,
+/// so an echo sent to the wrong client or out of place cannot pass.
+fn marked(client: usize, round: usize, len: usize) -> Vec<u8> {
     (0..len)
         .map(|offset| {
-            let mut mix = Rng(((conn as u64) << 32) | offset as u64);
+            let mut mix = Rng(((client as u64) << 40) | ((round as u64) << 32) | offset as u64);
             mix.next() as u8
         })
         .collect()
 }
 
 /// How the server's side of a connection ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum End {
-    /// The client closed after sending everything.
+    /// The client closed after its last round.
     Eof,
     /// A read failed; the connection is over.
     ReadFailed,
     /// An echo send failed; the connection is over.
     SendFailed,
+    /// The client said nothing for `IDLE`; the server gave up on it.
+    Idle,
 }
 
-/// The program under test: echo every chunk back on the same connection, and
-/// end the connection, not the server, on an error.
-async fn echo(conn: SocketWrapper) -> Stats {
-    let mut stats = Stats {
-        fd: conn.fd(),
-        chunks: 0,
-        dry: 0,
-        end: End::Eof,
-    };
-    let mut recv = MultiRecv::<EchoRing>::new(conn);
-    while let Some(chunk) = recv.next().await {
-        match chunk {
-            Ok(buffer) => {
-                stats.chunks += 1;
-                // The ring's own buffer goes back out, no copy.
-                let (sent, _buffer) = send_all(recv.socket(), buffer).await;
-                if sent.is_err() {
-                    stats.end = End::SendFailed;
-                    break;
-                }
-            }
-            // The ring ran dry. Re-polling at once would spin until another
-            // holder recycles, so back off and let the sends finish.
-            Err(CompletionError::Other(code)) if code == -libc::ENOBUFS => {
-                stats.dry += 1;
-                Sleep::during(DRY_BACKOFF).await;
-            }
-            Err(_) => {
-                stats.end = End::ReadFailed;
-                break;
-            }
-        }
-    }
-    stats
-}
-
+/// What the server did on one connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stats {
+struct Served {
     fd: i32,
     chunks: usize,
     dry: usize,
     end: End,
 }
 
-/// Which kinds of fault a run suffers. Drawn per seed, so some runs are calm
-/// and others hostile along one axis, rather than every run a little of all.
-#[derive(Debug, Clone, Copy, Default)]
-struct Faults {
-    cuts: bool,
-    hiccups: bool,
-    send_errors: bool,
+/// The program under test: echo every chunk back on the same connection; end
+/// the connection, never the server, on an error or a client gone quiet.
+async fn echo<R: BufRingSpec>(conn: SocketWrapper) -> Served {
+    let mut served = Served {
+        fd: conn.fd(),
+        chunks: 0,
+        dry: 0,
+        end: End::Eof,
+    };
+    let mut recv = MultiRecv::<R>::new(conn);
+    served.end = loop {
+        match select(recv.next(), Sleep::during(IDLE)).await {
+            SelectResult::First(Some(Ok(buffer))) => {
+                served.chunks += 1;
+                // The ring's own buffer goes back out, no copy.
+                match select(send_all(recv.socket(), buffer), Sleep::during(IDLE)).await {
+                    SelectResult::First((Ok(()), _)) => {}
+                    SelectResult::First((Err(_), _)) => break End::SendFailed,
+                    SelectResult::Second(_) => break End::Idle,
+                }
+            }
+            // The ring ran dry. Re-polling at once would spin until another
+            // holder recycles, so back off and let the sends finish.
+            SelectResult::First(Some(Err(CompletionError::Other(code))))
+                if code == -libc::ENOBUFS =>
+            {
+                served.dry += 1;
+                Sleep::during(DRY_BACKOFF).await;
+            }
+            SelectResult::First(Some(Err(_))) => break End::ReadFailed,
+            SelectResult::First(None) => break End::Eof,
+            SelectResult::Second(_) => break End::Idle,
+        }
+    };
+    served
 }
 
-/// A fault that ends a client's connection.
+/// How hostile one run is, drawn per seed one axis at a time, so some runs
+/// are calm and others hostile along one axis rather than every run a little
+/// of all.
 #[derive(Debug, Clone, Copy)]
-enum Fatal {
-    /// The client's flow is cut.
-    Cut(Cut),
-    /// One of the server's sends to the client fails with this errno.
-    Send(i32),
+struct Profile {
+    faults: Faults,
+    write_latency: Option<Duration>,
+    short_writes: f64,
+    kernel: KernelFaults,
 }
 
-/// One client: its descriptor, what it sends, and what kills it, if anything.
+fn profile(rng: &mut Rng) -> Profile {
+    Profile {
+        // Each the chance a client meets that fault over its whole dialogue,
+        // however long: see `spread`.
+        faults: Faults {
+            send_error: rng.axis(0.15),
+            cut_in_send: rng.axis(0.15),
+            vanish: rng.axis(0.1),
+        },
+        write_latency: rng.one_in(2).then(|| rng.millis(1, 5)),
+        short_writes: rng.axis(0.3),
+        kernel: KernelFaults {
+            interrupted: rng.axis(0.05),
+            ended: rng.axis(0.1),
+        },
+    }
+}
+
+/// How big a world is: how many clients, how many rounds each, how long a
+/// message. Inclusive ranges.
+struct Scale {
+    clients: (u64, u64),
+    rounds: (u64, u64),
+    message: (u64, u64),
+}
+
+/// A handful of clients saying a few things: many seeds, each quick.
+const SMALL: Scale = Scale {
+    clients: (1, 6),
+    rounds: (1, 4),
+    message: (1, 100),
+};
+
+/// Hundreds of clients holding long conversations at once.
+const CROWD: Scale = Scale {
+    clients: (64, 256),
+    rounds: (20, 200),
+    message: (1, 200),
+};
+
+/// Turn odds over a whole dialogue into odds per occasion, so a long dialogue
+/// is no likelier to be struck than a short one — only later, at times.
+/// A cut can strike each message, a vanishing each step (a send and an
+/// expect per message), a failed send each of the server's sends (about one
+/// per eight bytes, chunks being up to sixteen).
+fn spread(faults: Faults, messages: &[Vec<u8>]) -> Faults {
+    let sends = (messages.iter().map(Vec::len).sum::<usize>() as f64 / 8.0).max(1.0);
+    Faults {
+        send_error: faults.send_error / sends,
+        cut_in_send: faults.cut_in_send / messages.len() as f64,
+        vanish: faults.vanish / (2 * messages.len()) as f64,
+    }
+}
+
+/// One client: its descriptor, and the report its dialogue fills in.
 struct Client {
     fd: i32,
-    payload: Vec<u8>,
-    fatal: Option<Fatal>,
-    hiccups: usize,
+    report: Rc<RefCell<DialogueReport>>,
 }
 
-/// Draw a workload and the world around it, and declare both on `handle`.
-/// The accept script needs the listener, which only exists once the run has
-/// started, so it is handed back to be declared then.
-fn draw(seed: u64, handle: &FakeRingHandle) -> (Vec<Client>, Vec<Scripted>, Faults) {
-    let mut rng = Rng(seed);
-    let faults = Faults {
-        cuts: rng.one_in(2),
-        hiccups: rng.one_in(2),
-        send_errors: rng.one_in(2),
-    };
-    let mut clients: Vec<Client> = (0..rng.between(1, 6) as usize)
-        .map(|conn| Client {
-            fd: mint(FdKind::Socket),
-            payload: marked(conn, rng.between(1, 300) as usize),
-            fatal: None,
-            hiccups: 0,
-        })
-        .collect();
-
-    for client in &mut clients {
-        let gap = (rng.millis(0, 1), rng.millis(1, 4));
-        let mut flow = ReadEvent::flow(&client.payload[..]).spaced(gap.0, gap.1);
-        if faults.cuts && rng.one_in(3) {
-            let cut = if rng.one_in(2) {
-                Cut::Reset
-            } else {
-                Cut::Timeout
-            };
-            flow = flow.cut(cut);
-            client.fatal = Some(Fatal::Cut(cut));
-        }
-        if faults.hiccups {
-            client.hiccups = rng.between(0, 3) as usize;
-            for _ in 0..client.hiccups {
-                let hiccup = if rng.one_in(2) {
-                    Hiccup::Interrupted
-                } else {
-                    Hiccup::Ended
-                };
-                flow = flow.hiccup(hiccup);
-            }
-        }
-        handle.on_multishot_read(
-            client.fd,
-            [
-                flow.after_between(Duration::ZERO, rng.millis(0, 10)),
-                ReadEvent::Eof.after_between(Duration::ZERO, rng.millis(0, 5)),
-            ],
-        );
-
-        // Each chunk is at least one send, so this many are always reached
-        // unless the connection dies first.
-        let sends = client.payload.len().div_ceil(BUFFER) as u64;
-        let mut writes: Vec<WriteEvent> = (0..rng.between(0, sends))
-            .map(|_| WriteEvent::Short(rng.between(1, BUFFER as u64) as u32))
+/// Draw the clients and their dialogues, and attach them. The accept script
+/// needs the listener, which only exists once the run has started, so it is
+/// handed back to be declared then.
+fn draw(
+    rng: &mut Rng,
+    scale: &Scale,
+    profile: Profile,
+    handle: &FakeRingHandle,
+) -> (Vec<Client>, Vec<Scripted>) {
+    let mut clients = Vec::new();
+    let mut arrivals = Vec::new();
+    for client in 0..rng.between(scale.clients.0, scale.clients.1) as usize {
+        let rounds = rng.between(scale.rounds.0, scale.rounds.1) as usize;
+        let messages: Vec<Vec<u8>> = (0..rounds)
+            .map(|round| {
+                let len = rng.between(scale.message.0, scale.message.1) as usize;
+                marked(client, round, len)
+            })
             .collect();
-        if faults.send_errors && client.fatal.is_none() && rng.one_in(4) {
-            let at = rng.between(0, sends - 1) as usize;
-            let errno = if rng.one_in(2) {
-                libc::EPIPE
-            } else {
-                libc::ECONNRESET
-            };
-            while writes.len() <= at {
-                writes.push(WriteEvent::All);
+        let mut dialogue = Dialogue::new()
+            .faults(spread(profile.faults, &messages))
+            .short_writes(profile.short_writes);
+        if let Some(max) = profile.write_latency {
+            dialogue = dialogue.write_latency(Duration::ZERO, max);
+        }
+        for message in messages {
+            dialogue = dialogue.send(message.clone()).expect_bytes(message);
+            if rng.one_in(2) {
+                dialogue = dialogue.wait(rng.millis(0, 5));
             }
-            writes[at] = WriteEvent::Error(errno);
-            client.fatal = Some(Fatal::Send(errno));
         }
-        for write in writes {
-            handle.on_write(
-                client.fd,
-                write.after_between(Duration::ZERO, rng.millis(0, 3)),
-            );
-        }
-    }
+        let (peer, report) = dialogue.close().build();
 
-    let arrivals = clients
-        .iter()
-        .map(|client| AcceptEvent::On(client.fd).after_between(Duration::ZERO, rng.millis(0, 20)))
-        .collect();
-    (clients, arrivals, faults)
+        let fd = mint(FdKind::Socket);
+        handle.attach(fd, peer);
+        arrivals.push(AcceptEvent::On(fd).after_between(Duration::ZERO, rng.millis(0, 20)));
+        clients.push(Client { fd, report });
+    }
+    (clients, arrivals)
 }
 
 /// What one run produced, for the counters and the replay check.
 #[derive(Debug, PartialEq, Eq)]
 struct Report {
-    stats: Vec<Stats>,
-    cuts: usize,
-    send_errors: usize,
-    hiccups: usize,
+    served: Vec<Served>,
+    faults: Vec<Option<Fault>>,
+    /// Steps each client played, of how many.
+    progress: Vec<(usize, usize)>,
+    bytes: Vec<(usize, usize)>,
+    elapsed: Duration,
 }
 
 /// Run the echo server once against the world `seed` draws, and check it.
 fn run(seed: u64) -> Result<Report, String> {
-    let (fake, handle) = FakeRing::builder().seed(seed).virtual_time().build();
-    let (clients, arrivals, _faults) = draw(seed, &handle);
+    run_at::<EchoRing>(seed, &SMALL)
+}
+
+fn run_at<R: BufRingSpec>(seed: u64, scale: &Scale) -> Result<Report, String> {
+    let mut rng = Rng(seed);
+    let profile = profile(&mut rng);
+    let (fake, handle) = FakeRing::builder()
+        .seed(seed)
+        .virtual_time()
+        .kernel_faults(profile.kernel)
+        .build();
+    let (clients, arrivals) = draw(&mut rng, scale, profile, &handle);
     let count = clients.len();
 
     let script = handle.clone();
-    let stats = RuntimeInner::simulated(fake).block_on::<EchoRing, _>(
+    let served = RuntimeInner::simulated(fake).block_on::<R, _>(
         async move {
             let mut listener = MultiAccept::new(0).expect("bind");
             // Declared before the first poll of the accept, so it is part of
@@ -273,10 +316,10 @@ fn run(seed: u64) -> Result<Report, String> {
             let arrivals = arrivals.into_iter().map(|arrival| vec![arrival]);
             script.on_multishot_accept(listener.socket().fd(), arrivals);
 
-            let mut handles = Vec::with_capacity(count);
-            while handles.len() < count {
+            let mut servers = Vec::with_capacity(count);
+            while servers.len() < count {
                 match listener.next().await {
-                    Some(Ok(conn)) => handles.push(spawn(echo(conn))),
+                    Some(Ok(conn)) => servers.push(spawn(echo::<R>(conn))),
                     // A failed accept costs one connection, not the server.
                     Some(Err(_)) => continue,
                     None => break,
@@ -284,99 +327,84 @@ fn run(seed: u64) -> Result<Report, String> {
             }
             drop(listener);
 
-            let mut stats = Vec::with_capacity(handles.len());
-            for handle in handles {
-                stats.push(handle.await);
+            let mut served = Vec::with_capacity(servers.len());
+            for server in servers {
+                served.push(server.await);
             }
-            stats
+            served
         },
         None,
         |run| run(),
     );
 
-    check(&handle, &clients, &stats)?;
-    let fatal = |want: fn(&Fatal) -> bool| {
-        clients
-            .iter()
-            .filter(|c| c.fatal.as_ref().is_some_and(want))
-            .count()
-    };
+    check(&handle, &clients, &served)?;
     Ok(Report {
-        cuts: fatal(|f| matches!(f, Fatal::Cut(_))),
-        send_errors: fatal(|f| matches!(f, Fatal::Send(_))),
-        hiccups: clients.iter().map(|c| c.hiccups).sum(),
-        stats,
+        faults: clients.iter().map(|c| c.report.borrow().fault).collect(),
+        progress: clients
+            .iter()
+            .map(|c| (c.report.borrow().done, c.report.borrow().total))
+            .collect(),
+        bytes: clients
+            .iter()
+            .map(|c| {
+                (
+                    handle.reads(c.fd).concat().len(),
+                    handle.writes(c.fd).concat().len(),
+                )
+            })
+            .collect(),
+        elapsed: handle.clock().expect("virtual time").elapsed(),
+        served,
     })
 }
 
 /// What must hold whatever the seed drew.
-fn check(handle: &FakeRingHandle, clients: &[Client], stats: &[Stats]) -> Result<(), String> {
+fn check(handle: &FakeRingHandle, clients: &[Client], served: &[Served]) -> Result<(), String> {
     let mut failures = String::new();
 
     for client in clients {
         let fd = client.fd;
-        let received = handle.reads(fd).concat();
-        let echoed = handle.writes(fd).concat();
-        let Some(served) = stats.iter().find(|s| s.fd == fd) else {
+        let report = client.report.borrow();
+        let Some(served) = served.iter().find(|s| s.fd == fd) else {
             let _ = writeln!(failures, "fd {fd}: never served");
             continue;
         };
 
-        match client.fatal {
-            None => {
-                if received != client.payload {
-                    let _ = writeln!(
-                        failures,
-                        "fd {fd}: delivered {} of {} bytes{}",
-                        received.len(),
-                        client.payload.len(),
-                        divergence(&received, &client.payload),
-                    );
-                }
-                if echoed != received {
-                    let _ = writeln!(
-                        failures,
-                        "fd {fd}: echoed {} of {} bytes{}",
-                        echoed.len(),
-                        received.len(),
-                        divergence(&echoed, &received),
-                    );
-                }
-                if served.end != End::Eof || handle.peer(fd) != Some(Peer::Closed) {
-                    let _ = writeln!(
-                        failures,
-                        "fd {fd}: healthy, yet ended on {:?} with the peer {:?}",
-                        served.end,
-                        handle.peer(fd),
-                    );
-                }
-            }
-            Some(fatal) => {
-                // Whatever reached the server is what the client sent, and
-                // whatever came back is what reached the server, in order.
-                if !client.payload.starts_with(&received) {
-                    let _ = writeln!(
-                        failures,
-                        "fd {fd}: delivered bytes the client never sent{}",
-                        divergence(&received, &client.payload),
-                    );
-                }
-                if !received.starts_with(&echoed) {
-                    let _ = writeln!(
-                        failures,
-                        "fd {fd}: echoed bytes that never arrived{}",
-                        divergence(&echoed, &received),
-                    );
-                }
-                if served.end == End::Eof || handle.peer(fd) != Some(Peer::Reset) {
-                    let _ = writeln!(
-                        failures,
-                        "fd {fd}: {fatal:?}, yet ended on {:?} with the peer {:?}",
-                        served.end,
-                        handle.peer(fd),
-                    );
-                }
-            }
+        // A wrong echo is a wrong echo, fault or not.
+        if !report.ok() {
+            let _ = writeln!(failures, "fd {fd}: {report:?}");
+        }
+        let fits = match report.fault {
+            None => report.finished() && served.end == End::Eof,
+            // Silent, so only the idle timeout can end it.
+            Some(Fault::Vanished) => served.end == End::Idle,
+            Some(_) => matches!(served.end, End::ReadFailed | End::SendFailed),
+        };
+        if !fits {
+            let _ = writeln!(
+                failures,
+                "fd {fd}: fault {:?}, but the server ended on {:?} after {} of {} steps",
+                report.fault, served.end, report.done, report.total,
+            );
+        }
+
+        // The server echoes nothing it did not receive, and in order.
+        let received = handle.reads(fd).concat();
+        let echoed = handle.writes(fd).concat();
+        if !received.starts_with(&echoed) {
+            let _ = writeln!(
+                failures,
+                "fd {fd}: echoed bytes that never arrived{}",
+                divergence(&echoed, &received),
+            );
+        }
+        if report.fault.is_none() && echoed != received {
+            let _ = writeln!(
+                failures,
+                "fd {fd}: healthy, yet echoed {} of {} bytes",
+                echoed.len(),
+                received.len(),
+            );
         }
     }
 
@@ -410,7 +438,14 @@ fn divergence(got: &[u8], want: &[u8]) -> String {
 
 /// [`run`], with a panic inside the run reported as that seed's failure.
 fn judged(seed: u64) -> Result<Report, String> {
-    std::panic::catch_unwind(|| run(seed)).unwrap_or_else(|panic| {
+    judge(seed, || run(seed))
+}
+
+fn judge(
+    seed: u64,
+    run: impl FnOnce() -> Result<Report, String> + std::panic::UnwindSafe,
+) -> Result<Report, String> {
+    std::panic::catch_unwind(run).unwrap_or_else(|panic| {
         let message = panic
             .downcast_ref::<String>()
             .map(String::as_str)
@@ -432,42 +467,92 @@ fn seeds() -> std::ops::Range<u64> {
 }
 
 #[test]
-fn every_client_gets_back_what_reached_the_server() {
+fn every_client_is_answered_right_or_let_go_cleanly() {
     let (mut runs, mut clients, mut chunks, mut dry) = (0, 0, 0, 0);
-    let (mut cuts, mut send_errors, mut hiccups) = (0, 0, 0);
-    let (mut read_failed, mut send_failed) = (0, 0);
+    let mut faults: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ends: BTreeMap<End, usize> = BTreeMap::new();
     for seed in seeds() {
         runs += 1;
         let report = judged(seed).unwrap_or_else(|failure| panic!("seed {seed}:\n{failure}"));
-        clients += report.stats.len();
-        chunks += report.stats.iter().map(|s| s.chunks).sum::<usize>();
-        dry += report.stats.iter().map(|s| s.dry).sum::<usize>();
-        read_failed += report
-            .stats
-            .iter()
-            .filter(|s| s.end == End::ReadFailed)
-            .count();
-        send_failed += report
-            .stats
-            .iter()
-            .filter(|s| s.end == End::SendFailed)
-            .count();
-        (cuts, send_errors, hiccups) = (
-            cuts + report.cuts,
-            send_errors + report.send_errors,
-            hiccups + report.hiccups,
-        );
+        clients += report.served.len();
+        chunks += report.served.iter().map(|s| s.chunks).sum::<usize>();
+        dry += report.served.iter().map(|s| s.dry).sum::<usize>();
+        for fault in &report.faults {
+            let kind = match fault {
+                None => "healthy".to_string(),
+                Some(Fault::CutInSend { .. }) => "cut in send".to_string(),
+                Some(other) => format!("{other:?}").split('(').next().unwrap().to_string(),
+            };
+            *faults.entry(kind).or_default() += 1;
+        }
+        for served in &report.served {
+            *ends.entry(served.end).or_default() += 1;
+        }
     }
     eprintln!(
-        "{runs} seed(s): {clients} clients, {chunks} chunks echoed, ring dry {dry} times; \
-         {cuts} cut, {send_errors} send error(s), {hiccups} hiccup(s) drawn; \
-         the server saw {read_failed} read and {send_failed} send failure(s)",
+        "{runs} seed(s): {clients} clients, {chunks} chunks echoed, ring dry {dry} times\n\
+         clients: {faults:?}\nserver ends: {ends:?}",
     );
+    // Seeds that explore nothing would pass all the same: say so.
+    if runs == SEEDS && !cfg!(miri) {
+        for kind in ["healthy", "cut in send", "SendError", "Vanished"] {
+            assert!(
+                faults.contains_key(kind),
+                "no client was {kind}: {faults:?}"
+            );
+        }
+        for end in [End::Eof, End::ReadFailed, End::SendFailed, End::Idle] {
+            assert!(
+                ends.contains_key(&end),
+                "no connection ended {end:?}: {ends:?}"
+            );
+        }
+    }
 }
 
 #[test]
 fn a_seed_replays_the_same_run() {
     for seed in 0..SEEDS.min(8) {
         assert_eq!(run(seed), run(seed), "seed {seed}");
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "hundreds of clients, interpreted, would take hours")]
+fn a_crowd_of_clients_holding_long_dialogues() {
+    let seeds = match std::env::var("DST_SEED") {
+        Ok(_) => seeds(),
+        Err(_) => 0..8,
+    };
+    for seed in seeds {
+        let started = std::time::Instant::now();
+        let report = judge(seed, || run_at::<CrowdRing>(seed, &CROWD))
+            .unwrap_or_else(|failure| panic!("seed {seed}:\n{failure}"));
+        let echoed: usize = report.bytes.iter().map(|&(_, written)| written).sum();
+        let healthy = report.faults.iter().filter(|f| f.is_none()).count();
+        // How far into its dialogue each fault struck, in percent.
+        let mut struck: Vec<usize> = report
+            .faults
+            .iter()
+            .zip(&report.progress)
+            .filter(|(fault, _)| fault.is_some())
+            .map(|(_, &(done, total))| 100 * done / total)
+            .collect();
+        struck.sort_unstable();
+        let struck = match (struck.first(), struck.last()) {
+            (Some(first), Some(last)) => format!(
+                "faults struck at {first}% / {}% / {last}% of their dialogue (first, median, last)",
+                struck[struck.len() / 2],
+            ),
+            _ => "no fault drawn".to_string(),
+        };
+        eprintln!(
+            "seed {seed}: {} clients ({healthy} healthy), {echoed} bytes echoed in {} chunks, \
+             {:?} simulated, {:?} real; {struck}",
+            report.served.len(),
+            report.served.iter().map(|s| s.chunks).sum::<usize>(),
+            report.elapsed,
+            started.elapsed(),
+        );
     }
 }
