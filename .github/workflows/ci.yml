@@ -3,6 +3,11 @@ name: CI
 on:
   push:
   workflow_dispatch:
+    inputs:
+      miri:
+        description: Also run every simulated suite under Miri (long)
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,7 +31,9 @@ jobs:
       - name: Test simulated suites
         run: just test-sim --no-fail-fast
 
+  # Minutes of interpretation per suite: only when asked for, from the Actions tab.
   miri:
+    if: github.event_name == 'workflow_dispatch' && inputs.miri
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
