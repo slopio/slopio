@@ -31,6 +31,8 @@ pub struct MultiRecv<
     /// `Some` until `into_inner` moves the socket handle out.
     socket: Option<O>,
     reads: MultiOpQueue,
+    /// Completions that may wait to be polled before the multishot pauses.
+    queue_limit: usize,
     /// EOF was yielded: every later poll answers `None` without re-arming.
     ended: bool,
     _spec: PhantomData<S>,
@@ -82,14 +84,33 @@ impl<S: BufRingSpec, O: SocketOwner> MultiRecv<S, O, DEFAULT_QUEUE_SIZE> {
     pub fn new(socket: O) -> Self {
         Self::with_queue_size(socket)
     }
+
+    /// [`with_queue_size`](Self::with_queue_size), with the bound chosen at
+    /// run time. Each completion waiting to be polled holds a buffer of the
+    /// ring every stream on the worker shares, however few bytes it carries;
+    /// past `limit` of them the multishot pauses until the stream is polled
+    /// again, and the peer's bytes wait in the socket, for TCP to push back
+    /// with. So a consumer that stops polling holds about `limit` buffers.
+    pub fn with_queue_limit(socket: O, limit: usize) -> Self {
+        assert!(
+            limit > 0,
+            "a queue limit of zero would pause on every completion"
+        );
+        Self::bounded(socket, limit)
+    }
 }
 
 impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QUEUE_SIZE> {
     pub fn with_queue_size(socket: O) -> Self {
+        Self::bounded(socket, QUEUE_SIZE)
+    }
+
+    fn bounded(socket: O, queue_limit: usize) -> Self {
         Self {
             id: None,
             socket: Some(socket),
-            reads: MultiOpQueue::new(QUEUE_SIZE),
+            reads: MultiOpQueue::new(queue_limit),
+            queue_limit,
             ended: false,
             _spec: PhantomData,
         }
@@ -236,8 +257,9 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream
 impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> IoOP for MultiRecv<S, O, QUEUE_SIZE> {
     fn register_to_driver(&mut self) {
         let entry = self.to_entry();
-        let token = IO_DRIVER
-            .with(|d| d.push_buffered_multishot_op(entry, self.socket().fd(), QUEUE_SIZE, S::BGID));
+        let token = IO_DRIVER.with(|d| {
+            d.push_buffered_multishot_op(entry, self.socket().fd(), self.queue_limit, S::BGID)
+        });
         self.id = Some(token);
     }
 

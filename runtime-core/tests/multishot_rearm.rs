@@ -8,7 +8,10 @@
 use runtime_core::deterministic_testing::{AcceptEvent, FakeRing, ReadEvent, simulated_socket};
 use runtime_core::io_driver::operations::sockets::multi_accept::{AcceptError, MultiAccept};
 use runtime_core::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
+use std::time::Duration;
+
 use runtime_core::runtime::RuntimeInner;
+use runtime_core::runtime::time::Sleep;
 use runtime_streams::StreamExt;
 
 runtime_core::define_buf_ring!(ReArmRing, bgid = 0, buffer_size = 64, ring_size = 4);
@@ -163,6 +166,69 @@ fn a_burst_past_the_queue_bound_pauses_and_resumes_in_order() {
         |run| run(),
     );
 
+    assert_eq!(got, chunks);
+}
+
+/// Chunks landing one at a time while nobody polls: `limit` past the first,
+/// then the pause, which leaves the rest with the peer.
+fn held_while_unpolled(limit: Option<usize>) -> (usize, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+
+    let chunks: Vec<Vec<u8>> = (0..12u8).map(|i| vec![i]).collect();
+    // A batch each, a millisecond apart: each lands in its own CQ pass.
+    let spaced = chunks
+        .iter()
+        .map(|c| vec![ReadEvent::data(c.clone()).after(Duration::from_millis(1))]);
+    let eof = std::iter::once(vec![ReadEvent::Eof.after(Duration::from_millis(1))]);
+    handle.on_multishot_read(fd, spaced.chain(eof));
+
+    let script = handle.clone();
+    let (held, got) = RuntimeInner::simulated(fake).block_on::<BurstRing, _>(
+        async move {
+            runtime_core::runtime::spawn(async move {
+                let mut recv = match limit {
+                    Some(limit) => MultiRecv::<BurstRing>::with_queue_limit(socket, limit),
+                    None => MultiRecv::<BurstRing>::new(socket),
+                };
+                let mut got = vec![
+                    recv.next()
+                        .await
+                        .expect("a chunk")
+                        .expect("no error")
+                        .as_ref()
+                        .to_vec(),
+                ];
+                // Every chunk is due by now, were the stream still reading.
+                Sleep::during(Duration::from_millis(50)).await;
+                let held = script.reads(fd).len() - 1;
+                while let Some(chunk) = recv.next().await {
+                    got.push(chunk.expect("no error").as_ref().to_vec());
+                }
+                (held, got)
+            })
+            .await
+        },
+        None,
+        |run| run(),
+    );
+    (held, got, chunks)
+}
+
+/// A consumer that stops polling holds no more than its queue limit of the
+/// shared ring; the default bound lets the whole burst in.
+#[test]
+fn a_stream_nobody_polls_holds_no_more_than_its_queue_limit() {
+    let (held, got, chunks) = held_while_unpolled(Some(2));
+    assert!(held <= 3, "{held} chunks held past a limit of 2");
+    assert_eq!(
+        got, chunks,
+        "and the rest arrives, in order, once it polls again"
+    );
+
+    let (held, got, chunks) = held_while_unpolled(None);
+    assert_eq!(held, 11, "the default bound of 32 holds all of them");
     assert_eq!(got, chunks);
 }
 
