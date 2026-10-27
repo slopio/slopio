@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::IntoRawFd,
     pin::Pin,
@@ -15,6 +16,34 @@ use crate::io_driver::{
     operations::{Continuation, IoOP, MultishotToken, sockets::SocketWrapper},
     sys,
 };
+
+thread_local! {
+    /// What this thread's listeners put in `SO_INCOMING_CPU`: see
+    /// [`set_incoming_cpu`].
+    static INCOMING_CPU: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Has every [`MultiAccept`] bound on this thread from now on ask the kernel
+/// for the connections `cpu` receives: `SO_INCOMING_CPU` on the listener.
+/// In a `SO_REUSEPORT` group the kernel then hands a connection to the
+/// listener whose CPU took its SYN, the CPU its NIC queue interrupts, and
+/// falls back to its hash when none matches. The kernel's work on a
+/// connection's packets and the worker serving it then share a core: no
+/// cross-core wakeup, nothing to fetch from another core's cache.
+///
+/// The runtime sets it to the CPU it pins each thread of a topology to,
+/// unless the topology was built with `steer_connections(false)`. It pays
+/// once the NIC's queues are on the workers' CPUs, one queue per CPU:
+/// interrupt affinity and XPS, which are the system's to configure. `None`
+/// leaves the kernel's hash alone.
+pub fn set_incoming_cpu(cpu: Option<usize>) {
+    INCOMING_CPU.with(|c| c.set(cpu));
+}
+
+/// What [`set_incoming_cpu`] last set on this thread.
+pub fn incoming_cpu() -> Option<usize> {
+    INCOMING_CPU.with(Cell::get)
+}
 
 pub struct MultiAccept<const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
     id: Option<MultishotToken>,
@@ -125,6 +154,10 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
                 // Rebind over TIME_WAIT even when the previous owner ran under another UID.
                 socket.set_reuse_address(true)?;
                 socket.set_reuse_port(true)?;
+                // Before listen, when the socket joins its reuseport group.
+                if let Some(cpu) = incoming_cpu() {
+                    socket.set_cpu_affinity(cpu)?;
+                }
                 socket.set_nonblocking(true)?;
                 socket.bind(&addr.into())?;
                 socket.listen(1024)?;

@@ -42,7 +42,9 @@ pub use crate::io_driver::operations::sockets::managed_recv::socket_managed_recv
 pub use crate::io_driver::operations::sockets::recv::{ClassicRecv, socket_peek, socket_recv};
 
 // streaming (multishot)
-pub use crate::io_driver::operations::sockets::multi_accept::MultiAccept;
+pub use crate::io_driver::operations::sockets::multi_accept::{
+    MultiAccept, incoming_cpu, set_incoming_cpu,
+};
 pub use crate::io_driver::operations::sockets::multi_recv::MultiRecv;
 
 // ── UDP ──

@@ -10,7 +10,7 @@ The option would make three links line up:
 
 - **Queue to core.** Interrupt affinity, one queue's IRQ per CPU, and XPS for the transmit side. System configuration rather than runtime code, but the runtime can verify it and refuse to enable the option when it is absent.
 - **Core to worker.** Already done by `thread_per_core`.
-- **Connection to worker.** For TCP, the reuseport eBPF program selects the listener of the current CPU at SYN time, hash as fallback. For QUIC, the worker index encoded in the connection ID is chosen from the CPU that received the Initial, so the CID keeps every later datagram on the same core, migration included.
+- **Connection to worker.** For TCP, done: each worker's listener carries `SO_INCOMING_CPU`, and the kernel hands a connection to the listener of the CPU that received its SYN, hash as fallback (see [topology](topology.md)). For QUIC, the worker index encoded in the connection ID is chosen from the CPU that received the Initial, so the CID keeps every later datagram on the same core, migration included.
 
 A per-worker counter of misplaced connections, from `SO_INCOMING_CPU` on each accepted socket, would report in telemetry whether the alignment holds or whether `irqbalance` has undone it.
 

@@ -47,6 +47,14 @@ Only the CPUs the process may run on count. In a container restricted to `4-7`, 
 
 The placement is checked before any thread starts, and `run` panics with the reason if it cannot be satisfied: a CPU the process may not use, the same CPU asked for twice, more threads than CPUs, or no CPU left for `per_core`.
 
+## Connections to the CPU that receives them
+
+Every thread of a topology binds its listeners with `SO_INCOMING_CPU` set to its own CPU. Several threads listening on one port share it through `SO_REUSEPORT`, and the kernel then hands each new connection to the listener of the CPU that received its first packet, rather than to one its hash picks. When no listener's CPU matches, the hash decides, as without the option.
+
+The CPU that receives a connection's packets is the one its NIC queue interrupts. With one queue per CPU, each queue's interrupt on the CPU of a thread, and XPS sending from each CPU through that same queue, a connection's packets are decoded by the kernel on the core whose thread serves it: no wakeup from another core, nothing to fetch from another core's cache.
+
+Interrupt affinity and XPS are the system's to configure, and `irqbalance` undoes them; without them the option changes nothing. It is on by default; `topology.steer_connections(false)` turns it off. A thread outside a topology can set it for its own listeners with `runtime::net::set_incoming_cpu`.
+
 ## Ring options
 
 Each group, and `per_core`, gets a `RingOptions`. The fields are plain switches over the io_uring setup flags:

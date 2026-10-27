@@ -70,6 +70,7 @@ pub struct Topology<T> {
     telemetry: T,
     groups: Vec<Group<T>>,
     per_core: Option<PerCore<T>>,
+    steer_connections: bool,
 }
 
 impl Topology<DefaultTelemetry> {
@@ -117,6 +118,7 @@ impl<T: Telemetry + Send + Sync + 'static> Topology<T> {
             telemetry,
             groups: Vec::new(),
             per_core: None,
+            steer_connections: true,
         }
     }
 
@@ -167,6 +169,15 @@ impl<T: Telemetry + Send + Sync + 'static> Topology<T> {
         self
     }
 
+    /// Whether each thread's listeners ask the kernel for the connections its
+    /// own CPU receives, `SO_INCOMING_CPU`: see
+    /// [`runtime_core::net::set_incoming_cpu`]. On by default; without the
+    /// NIC's queues on the threads' CPUs it changes nothing.
+    pub fn steer_connections(&mut self, on: bool) -> &mut Self {
+        self.steer_connections = on;
+        self
+    }
+
     /// Starts every thread and blocks until all of them return.
     pub fn run(self) {
         crate::ignore_sigpipe();
@@ -212,6 +223,7 @@ impl<T: Telemetry + Send + Sync + 'static> Topology<T> {
         // Ring fds are published by each thread once it has created its ring.
         let peers = Arc::new(PeerTable::new(&fds));
         let telemetry = Arc::new(self.telemetry);
+        let steer = self.steer_connections;
         let start =
             |thread_id: usize, group: Range<usize>, cpu: usize, ring: RingOptions, sq_cpu| Start {
                 ctx: WorkerContext {
@@ -221,6 +233,7 @@ impl<T: Telemetry + Send + Sync + 'static> Topology<T> {
                     workers: workers.clone(),
                 },
                 cpu,
+                incoming_cpu: steer.then_some(cpu),
                 ring,
                 sq_cpu,
                 telemetry: telemetry.clone(),

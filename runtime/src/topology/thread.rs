@@ -14,6 +14,8 @@ use crate::telemetry::Telemetry;
 pub(super) struct Start<T> {
     pub ctx: WorkerContext,
     pub cpu: usize,
+    /// For the thread's listeners: `cpu`, unless the topology does not steer.
+    pub incoming_cpu: Option<usize>,
     pub ring: RingOptions,
     pub sq_cpu: Option<usize>,
     pub telemetry: Arc<T>,
@@ -70,6 +72,7 @@ where
     let Start {
         ctx,
         cpu,
+        incoming_cpu,
         ring,
         sq_cpu,
         telemetry,
@@ -78,6 +81,7 @@ where
     } = start;
     let n = ctx.thread_id;
     pin_core(cpu);
+    runtime_core::net::set_incoming_cpu(incoming_cpu);
     let fut = make(ctx);
     // First polled once the ring is up and every peer has published: startup is over.
     let fut = async move {
