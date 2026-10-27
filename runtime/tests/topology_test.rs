@@ -101,6 +101,7 @@ fn sqpoll() -> RingOptions {
         defer_taskrun: false,
         coop_taskrun: false,
         sqpoll_idle: Duration::from_millis(10),
+        ..Default::default()
     }
 }
 

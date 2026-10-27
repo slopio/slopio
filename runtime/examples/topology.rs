@@ -35,6 +35,7 @@ fn main() {
             defer_taskrun: false,
             coop_taskrun: false,
             sqpoll_idle: Duration::from_millis(50),
+            ..Default::default()
         },
         |ctx| async move {
             eprintln!("counter on peer {}", ctx.thread_id);

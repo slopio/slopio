@@ -26,7 +26,7 @@ use crate::{
 };
 use io_uring::{
     IoUring, opcode, squeue,
-    types::{Fd, SubmitArgs, Timespec},
+    types::{Fd, Napi, SubmitArgs, Timespec},
 };
 use slab::Slab;
 mod buf_ring;
@@ -385,6 +385,19 @@ impl Ring {
         let ring = builder
             .build(4096)
             .unwrap_or_else(|e| panic!("io_uring setup failed for {options:?}: {e}"));
+        // Dynamic tracking: the kernel polls the queues of the sockets the
+        // ring uses, learnt as it uses them.
+        if let Some(busy_poll) = options.napi_busy_poll {
+            let micros = u32::try_from(busy_poll.as_micros()).unwrap_or(u32::MAX);
+            let mut napi = Napi::new()
+                .set_busy_poll_timeout(micros)
+                .set_prefer_busy_poll(options.napi_prefer_busy_poll);
+            ring.submitter()
+                .register_napi(&mut napi)
+                .unwrap_or_else(|e| {
+                    panic!("NAPI busy polling, Linux 6.9 or later, failed for {options:?}: {e}")
+                });
+        }
 
         Self {
             inner: RingBackend::Uring(ring),
@@ -1944,5 +1957,26 @@ mod ring_tests {
         {}
         let order: Vec<u64> = uring.completion().map(|cqe| cqe.user_data()).collect();
         assert_eq!(order, (0..5_000).collect::<Vec<_>>());
+    }
+
+    /// The ring is registered for NAPI busy polling with what was asked:
+    /// unregistering hands back the settings in force.
+    #[test]
+    fn napi_options_reach_the_kernel() {
+        let mut ring = Ring::new(
+            RingOptions {
+                napi_busy_poll: Some(std::time::Duration::from_micros(50)),
+                napi_prefer_busy_poll: true,
+                ..RingOptions::default()
+            },
+            None,
+        );
+        let RingBackend::Uring(uring) = &mut ring.inner else {
+            unreachable!()
+        };
+        let mut napi = Napi::new();
+        uring.submitter().unregister_napi(&mut napi).unwrap();
+        assert_eq!(napi.busy_poll_timeout(), 50);
+        assert!(napi.prefer_busy_poll());
     }
 }

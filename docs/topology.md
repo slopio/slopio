@@ -57,6 +57,8 @@ Each group, and `per_core`, gets a `RingOptions`. The fields are plain switches 
 | `coop_taskrun` | `true` | The kernel does not interrupt the thread to finish an operation. It waits for the thread's next system call of any kind. |
 | `sqpoll` | `false` | A kernel thread picks up submissions by itself, so submitting I/O needs no system call while it is awake. |
 | `sqpoll_idle` | 1 s | How long that kernel thread keeps polling after the last submission before it goes to sleep. Only read with `sqpoll`. |
+| `napi_busy_poll` | `None` | NAPI busy polling (Linux 6.9): while the thread waits for completions, it polls the NIC queues its sockets' packets arrive on for up to this long, instead of sleeping until an interrupt. |
+| `napi_prefer_busy_poll` | `false` | With `napi_busy_poll`, the kernel defers the queue's interrupts while the thread polls it. Needs the interface's `napi_defer_hard_irqs` and `gro_flush_timeout` set. |
 
 The defaults suit almost every thread: completions are handled in batches, at the moment the thread is ready for them. Turn `defer_taskrun` off and operations are finished at any system call the thread makes. Turn both off and the kernel interrupts the thread whenever an operation completes.
 
@@ -65,6 +67,8 @@ The defaults suit almost every thread: completions are handled in batches, at th
 - **It takes a second CPU.** The kernel's polling thread is pinned to a CPU of its own, chosen like an `Auto` thread. A group of 2 threads with `sqpoll` takes 4 CPUs. Under `per_core`, each worker takes two CPUs, so there are half as many workers.
 - **That CPU spins.** It stays at 100% for `sqpoll_idle` after every submission. On a quota-bound or burstable machine, keep `sqpoll_idle` short or leave `sqpoll` off.
 - **The first submission after a sleep pays a wakeup**, which costs a system call.
+
+`napi_busy_poll` turns waiting into spinning: a thread with nothing to do keeps its core busy for up to the budget each time it waits. It pays on cores given to the workers, under sustained network load, and costs on shared cores, under a CPU quota or on a burstable instance. It is worth most with one NIC queue per CPU and each connection served on the CPU that receives it, so that each thread polls its own core's queue.
 
 `sqpoll` excludes the other two flags; the kernel refuses the combination. Set `defer_taskrun` and `coop_taskrun` to `false` along with it. Declaring a group or `per_core` with both panics on the spot, before anything starts.
 
