@@ -16,7 +16,9 @@ libc = "0.2.178"
 
 # Miri cannot call into mimalloc's C; it runs on its own allocator instead.
 [target.'cfg(not(miri))'.dependencies]
-mimalloc = { version = "0.1.48", features = ["local_dynamic_tls", "v3"] }
+# Not the `mimalloc` crate: its allocator sends every size through the aligned
+# call, which misses mimalloc's fast path (see `src/allocator.rs`).
+libmimalloc-sys = { version = "0.1.44", default-features = false, features = ["local_dynamic_tls", "v3"] }
 
 [dev-dependencies]
 runtime-streams = { path = "../runtime-streams" }

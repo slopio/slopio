@@ -23,8 +23,11 @@ use telemetry::{DEFAULT_TELEMETRY, Telemetry};
 pub use topology::{Threads, Topology, WorkerContext};
 
 #[cfg(not(miri))]
+mod allocator;
+
+#[cfg(not(miri))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: allocator::Mimalloc = allocator::Mimalloc;
 
 pub fn main_thread<F: Future>(f: F) -> F::Output {
     main_thread_with::<(), F>(f)
