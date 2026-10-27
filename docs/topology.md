@@ -76,7 +76,7 @@ The defaults suit almost every thread: completions are handled in batches, at th
 - **That CPU spins.** It stays at 100% for `sqpoll_idle` after every submission. On a quota-bound or burstable machine, keep `sqpoll_idle` short or leave `sqpoll` off.
 - **The first submission after a sleep pays a wakeup**, which costs a system call.
 
-`napi_busy_poll` turns waiting into spinning: a thread with nothing to do keeps its core busy for up to the budget each time it waits. It pays on cores given to the workers, under sustained network load, and costs on shared cores, under a CPU quota or on a burstable instance. It is worth most with one NIC queue per CPU and each connection served on the CPU that receives it, so that each thread polls its own core's queue.
+`napi_busy_poll` turns waiting into spinning: a thread with nothing to do keeps its core busy for up to the budget each time it waits. It pays on cores given to the workers, under sustained network load, and costs on shared cores, under a CPU quota or on a burstable instance. It is worth most with one NIC queue per CPU and connections steered to the CPU that receives them (below), so that each thread polls its own core's queue.
 
 `sqpoll` excludes the other two flags; the kernel refuses the combination. Set `defer_taskrun` and `coop_taskrun` to `false` along with it. Declaring a group or `per_core` with both panics on the spot, before anything starts.
 
