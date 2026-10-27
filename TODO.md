@@ -111,6 +111,14 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   AsyncCancel that can only return `ENOENT`.
 - [ ] **D15** `send_all_zc` waits for the notification before each short-write
   retry: about one RTT per retry (rare with `MSG_WAITALL`).
+- [ ] **`HeaderMap` is quadratic on many distinct names**
+  (`runtime-http/src/header/map.rs`). It is a flat `Vec` scanned per lookup and
+  per append, so a peer sending many names makes decoding O(n²). Measured in
+  release: 2000 distinct appends 3.6 ms, 2000 lookups in a 2000-entry map
+  7.3 ms. Under h2's default 16 KiB header list (≤ ~480 fields) the worst case
+  is ~0.2 ms per request; a server raising the limit to 64 KiB gets ~3-4 ms.
+  Fix: keep the `Vec` and its runs, add a hash index (name → positions) built
+  only past ~32 entries, so small maps keep the scan.
 
 ## Outside this repository
 

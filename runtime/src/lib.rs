@@ -22,8 +22,6 @@ pub use runtime_core::io_driver::RingOptions;
 use telemetry::{DEFAULT_TELEMETRY, Telemetry};
 pub use topology::{Threads, Topology, WorkerContext};
 
-pub mod http;
-
 #[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
