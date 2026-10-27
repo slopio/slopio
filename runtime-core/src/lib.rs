@@ -1,3 +1,4 @@
+pub mod bytes;
 pub mod channels;
 #[cfg(feature = "simulation")]
 pub mod deterministic_testing;

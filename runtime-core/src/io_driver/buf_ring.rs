@@ -169,6 +169,13 @@ impl<S: BufRingSpec> BorrowedBuffer<S> {
         self.bid
     }
 
+    /// Give up the slot without recycling it; the caller recycles `bid` later.
+    pub(crate) fn into_raw_parts(self) -> (NonNull<u8>, usize, u16) {
+        let parts = (self.ptr, self.len, self.bid);
+        std::mem::forget(self);
+        parts
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
