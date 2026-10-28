@@ -220,6 +220,12 @@ impl SocketWrapper {
         self.set_opt(libc::SOL_SOCKET, libc::SO_LINGER, &l)
     }
 
+    /// Send FIN (`shutdown(SHUT_WR)`): the peer reads to the end of what was
+    /// sent before it, and receiving goes on until the descriptor closes.
+    pub fn shutdown_write(&self) -> io::Result<()> {
+        sys::shutdown(self.fd(), libc::SHUT_WR)
+    }
+
     /// Local end of the connection (`getsockname`). One syscall per call.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         sys::local_addr(self.fd())
