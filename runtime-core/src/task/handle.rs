@@ -18,7 +18,7 @@ impl<T> Handle<T> {
         }
     }
 
-    /// Kills the task: its future is dropped by the scheduler on the next pass,
+    /// Kills the task: its future is dropped by the scheduler when it next pops it,
     /// running cancellation for anything it had in flight. An output already
     /// produced but not yet awaited is dropped too.
     #[cold]

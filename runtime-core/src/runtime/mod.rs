@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::pin::pin;
@@ -652,15 +652,42 @@ pub fn spawn<F: Future + 'static>(f: F) -> Handle<F::Output> {
     handle
 }
 
+/// Like [`spawn`], but the task goes to the head of the queue: it is the next task polled.
+///
+/// Past [`MAX_FRONT_CHAIN`] head-spawned tasks polled in a row, it falls back to [`spawn`].
+pub fn spawn_next<F: Future + 'static>(f: F) -> Handle<F::Output> {
+    let (task, handle) = new_task(f);
+    TASK_LIST.with(|ctx| {
+        ctx.push_front(task);
+    });
+    handle
+}
+
+/// Head-spawned tasks polled in a row before `spawn_next` queues at the back.
+pub const MAX_FRONT_CHAIN: u32 = 3;
+
 #[derive(Default)]
 pub struct TaskList {
     tasks: UnsafeCell<VecDeque<TypeAgnosticTask>>,
+    /// Head-spawned tasks still queued; always the first `front` entries.
+    front: Cell<u32>,
+    /// Head-spawned tasks popped since the last back-queued one.
+    chain: Cell<u32>,
 }
 
 impl TaskList {
     pub(crate) fn push(&self, task: TypeAgnosticTask) {
         let tasks_list = unsafe { &mut *self.tasks.get() };
         tasks_list.push_back(task);
+    }
+
+    pub(crate) fn push_front(&self, task: TypeAgnosticTask) {
+        if self.chain.get() >= MAX_FRONT_CHAIN {
+            return self.push(task);
+        }
+        let tasks_list = unsafe { &mut *self.tasks.get() };
+        tasks_list.push_front(task);
+        self.front.set(self.front.get() + 1);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -675,6 +702,13 @@ impl TaskList {
 
     pub(crate) fn pop(&self) -> Option<TypeAgnosticTask> {
         let task_list = unsafe { &mut *self.tasks.get() };
-        task_list.pop_front()
+        let task = task_list.pop_front()?;
+        if self.front.get() > 0 {
+            self.front.set(self.front.get() - 1);
+            self.chain.set(self.chain.get() + 1);
+        } else {
+            self.chain.set(0);
+        }
+        Some(task)
     }
 }
