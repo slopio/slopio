@@ -111,3 +111,7 @@ required-features = ["simulation"]
 [[test]]
 name = "bytes_ring"
 required-features = ["simulation"]
+
+[[test]]
+name = "spawn_next"
+required-features = ["simulation"]
