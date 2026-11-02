@@ -12,23 +12,29 @@
 //!     RingOptions { sqpoll: true, defer_taskrun: false, coop_taskrun: false, ..Default::default() },
 //!     |ctx| db_loop(ctx),
 //! );
-//! topology.per_core::<HttpRings, _, _>(RingOptions::default(), move |ctx| serve(ctx, db.clone()));
+//! let http = RuntimeOptions { net: NetOptions { steer_connections: true }, ..Default::default() };
+//! topology.per_core::<HttpRings, _, _>(http, move |ctx| serve(ctx, db.clone()));
 //! topology.run();
 //! ```
 
 mod cpus;
+mod nic;
+mod plan;
 mod thread;
 
 use std::ops::Range;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use runtime_core::io_driver::{BufRingSet, RingOptions};
+use runtime_core::io_driver::BufRingSet;
+use runtime_core::runtime::RuntimeOptions;
 use runtime_core::runtime::eventfd;
 use runtime_core::runtime::peers::PeerTable;
 
 use crate::telemetry::{DEFAULT_TELEMETRY, DefaultTelemetry, Telemetry};
 use cpus::Cpu;
+use plan::{Placed, Plan};
+pub use runtime_machine::{Machine, Nic, PacketCpusError, RxQueue};
 use thread::Start;
 
 /// How many threads a group runs, and where.
@@ -57,12 +63,12 @@ type LaunchEach<T> = Box<dyn Fn(Start<T>) -> JoinHandle<()> + Send>;
 
 struct Group<T> {
     cpus: Vec<Cpu>,
-    ring: RingOptions,
+    options: RuntimeOptions,
     launch: LaunchEach<T>,
 }
 
 struct PerCore<T> {
-    ring: RingOptions,
+    options: RuntimeOptions,
     launch: LaunchEach<T>,
 }
 
@@ -70,7 +76,6 @@ pub struct Topology<T> {
     telemetry: T,
     groups: Vec<Group<T>>,
     per_core: Option<PerCore<T>>,
-    steer_connections: bool,
 }
 
 impl Topology<DefaultTelemetry> {
@@ -98,6 +103,13 @@ where
     }
 }
 
+fn checked(options: RuntimeOptions) -> RuntimeOptions {
+    if let Err(e) = options.ring.check() {
+        panic!("invalid ring options {:?}: {e}", options.ring);
+    }
+    options
+}
+
 fn launcher<R, T, F, Fut>(f: F) -> LaunchEach<T>
 where
     R: BufRingSet + 'static,
@@ -118,14 +130,18 @@ impl<T: Telemetry + Send + Sync + 'static> Topology<T> {
             telemetry,
             groups: Vec::new(),
             per_core: None,
-            steer_connections: true,
         }
     }
 
     /// Adds a group of `threads` running the future `f` builds, with the
-    /// provided-buffer rings `R`, built with `ring`. Under `sqpoll` each
+    /// provided-buffer rings `R`, built with `options`. Under `sqpoll` each
     /// thread's SQ thread gets a CPU of its own. Returns their peer ids.
-    pub fn group<R, F, Fut>(&mut self, threads: Threads, ring: RingOptions, f: F) -> Range<usize>
+    pub fn group<R, F, Fut>(
+        &mut self,
+        threads: Threads,
+        options: impl Into<RuntimeOptions>,
+        f: F,
+    ) -> Range<usize>
     where
         R: BufRingSet + 'static,
         F: Fn(WorkerContext) -> Fut + Send + Sync + 'static,
@@ -136,45 +152,32 @@ impl<T: Telemetry + Send + Sync + 'static> Topology<T> {
             Threads::Fixed(cpus) => cpus.into_iter().map(Cpu::Fixed).collect(),
         };
         assert!(!cpus.is_empty(), "a group needs at least one thread");
-        if let Err(e) = ring.check() {
-            panic!("invalid ring options {ring:?}: {e}");
-        }
+        let options = checked(options.into());
         let start = self.groups.iter().map(|g| g.cpus.len()).sum::<usize>();
         let ids = start..start + cpus.len();
         self.groups.push(Group {
             cpus,
-            ring,
+            options,
             launch: launcher::<R, T, F, Fut>(f),
         });
         ids
     }
 
     /// Runs one worker per CPU left once the groups are placed, each with the
-    /// provided-buffer rings `R`, built with `ring`, and the future `f` builds.
-    /// Under `sqpoll` each worker takes two CPUs, its own and its SQ thread's.
-    pub fn per_core<R, F, Fut>(&mut self, ring: RingOptions, f: F) -> &mut Self
+    /// provided-buffer rings `R`, built with `options`, and the future `f`
+    /// builds. Under `sqpoll` each worker takes two CPUs, its own and its SQ
+    /// thread's.
+    pub fn per_core<R, F, Fut>(&mut self, options: impl Into<RuntimeOptions>, f: F) -> &mut Self
     where
         R: BufRingSet + 'static,
         F: Fn(WorkerContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         assert!(self.per_core.is_none(), "per_core set twice");
-        if let Err(e) = ring.check() {
-            panic!("invalid ring options {ring:?}: {e}");
-        }
         self.per_core = Some(PerCore {
-            ring,
+            options: checked(options.into()),
             launch: launcher::<R, T, F, Fut>(f),
         });
-        self
-    }
-
-    /// Whether each thread's listeners ask the kernel for the connections its
-    /// own CPU receives, `SO_INCOMING_CPU`: see
-    /// [`runtime_core::net::set_incoming_cpu`]. On by default; without the
-    /// NIC's queues on the threads' CPUs it changes nothing.
-    pub fn steer_connections(&mut self, on: bool) -> &mut Self {
-        self.steer_connections = on;
         self
     }
 
@@ -186,34 +189,79 @@ impl<T: Telemetry + Send + Sync + 'static> Topology<T> {
         let mut requests = Vec::new();
         for group in &self.groups {
             requests.extend(&group.cpus);
-            if group.ring.sqpoll {
+            if group.options.ring.sqpoll {
                 requests.extend(vec![Cpu::Auto; group.cpus.len()]);
             }
         }
-        let placed = cpus::place(&cpus::allowed_cpus(), &requests)
+        let allowed = cpus::allowed_cpus();
+        let placed = cpus::place(&allowed, &requests)
             .unwrap_or_else(|e| panic!("cannot place the topology: {e}"));
+        // Under a cgroup CPU quota the budget is below the cpuset; reserved CPUs count against it.
+        let parallelism = std::thread::available_parallelism().unwrap().get();
 
-        let num_workers = match &self.per_core {
-            None => 0,
-            Some(per_core) => {
-                // Under a cgroup CPU quota the budget is below the cpuset; reserved CPUs count against it.
-                let budget = std::thread::available_parallelism()
-                    .unwrap()
-                    .get()
-                    .saturating_sub(placed.reserved.len());
-                let cpus_each = if per_core.ring.sqpoll { 2 } else { 1 };
-                let n = cpus::per_core_count(budget, placed.free.len(), cpus_each);
-                assert!(
-                    n > 0,
-                    "no CPU left for the per-core workers once {:?} are reserved",
-                    placed.reserved
-                );
-                n
-            }
+        let mut plan = Plan {
+            allowed,
+            parallelism,
+            groups: Vec::new(),
         };
+        let mut launches = Vec::new();
+        let mut reserved = placed.reserved.iter().copied();
+        let mut first = 0;
+        for (n, group) in self.groups.iter().enumerate() {
+            let count = group.cpus.len();
+            let cpus: Vec<usize> = reserved.by_ref().take(count).collect();
+            let sq_take = if group.options.ring.sqpoll { count } else { 0 };
+            plan.groups.push(Placed {
+                label: format!("group {n}"),
+                ids: first..first + count,
+                cpus,
+                sq_cpus: reserved.by_ref().take(sq_take).collect(),
+                options: group.options,
+            });
+            launches.push(&group.launch);
+            first += count;
+        }
+        let first_worker = first;
+        if let Some(per_core) = &self.per_core {
+            let budget = parallelism.saturating_sub(placed.reserved.len());
+            let cpus_each = if per_core.options.ring.sqpoll { 2 } else { 1 };
+            let n = cpus::per_core_count(budget, placed.free.len(), cpus_each);
+            assert!(
+                n > 0,
+                "no CPU left for the per-core workers once {:?} are reserved",
+                placed.reserved
+            );
+            let (cpus, rest) = placed.free.split_at(n);
+            let sq_cpus = if per_core.options.ring.sqpoll {
+                &rest[..n]
+            } else {
+                &[][..]
+            };
+            plan.groups.push(Placed {
+                label: "per_core".to_owned(),
+                ids: first..first + n,
+                cpus: cpus.to_vec(),
+                sq_cpus: sq_cpus.to_vec(),
+                options: per_core.options,
+            });
+            launches.push(&per_core.launch);
+        }
 
-        let first_worker = self.groups.iter().map(|g| g.cpus.len()).sum::<usize>();
-        let num_threads = first_worker + num_workers;
+        let machine = Machine::read();
+        let packets = match machine.packet_cpus() {
+            Ok(cpus) => format!("NIC packets processed on {}", plan::cpus(&cpus)),
+            Err(e) => format!("NIC packets processed on unknown CPUs: {e}"),
+        };
+        let steering = plan.steering();
+        let steered = if steering.is_empty() {
+            String::new()
+        } else {
+            format!("\nruntime:   {}", nic::report(&machine, &steering))
+        };
+        // One write, so that nothing the threads print lands in the middle of it.
+        println!("{plan}\nruntime:   {packets}{steered}");
+
+        let num_threads = plan.groups.iter().map(|g| g.ids.len()).sum();
         let workers = first_worker..num_threads;
         let fds = (0..num_threads)
             .map(|_| eventfd::create_eventfd())
@@ -223,63 +271,24 @@ impl<T: Telemetry + Send + Sync + 'static> Topology<T> {
         // Ring fds are published by each thread once it has created its ring.
         let peers = Arc::new(PeerTable::new(&fds));
         let telemetry = Arc::new(self.telemetry);
-        let steer = self.steer_connections;
-        let start =
-            |thread_id: usize, group: Range<usize>, cpu: usize, ring: RingOptions, sq_cpu| Start {
-                ctx: WorkerContext {
-                    thread_id,
-                    num_threads,
-                    group,
-                    workers: workers.clone(),
-                },
-                cpu,
-                incoming_cpu: steer.then_some(cpu),
-                ring,
-                sq_cpu,
-                telemetry: telemetry.clone(),
-                event_fd: fds[thread_id],
-                peers: peers.clone(),
-            };
-
         let mut handles = Vec::with_capacity(num_threads);
-        let mut reserved = placed.reserved.into_iter();
-        let mut first = 0;
-        for group in &self.groups {
-            let n = group.cpus.len();
-            let cpus: Vec<usize> = reserved.by_ref().take(n).collect();
-            let sq: Vec<usize> = reserved
-                .by_ref()
-                .take(if group.ring.sqpoll { n } else { 0 })
-                .collect();
-            let ids = first..first + n;
-            for (i, &cpu) in cpus.iter().enumerate() {
-                let sq_cpu = sq.get(i).copied();
-                handles.push((group.launch)(start(
-                    first + i,
-                    ids.clone(),
+        for (group, launch) in plan.groups.iter().zip(launches) {
+            for (i, &cpu) in group.cpus.iter().enumerate() {
+                let thread_id = group.ids.start + i;
+                handles.push(launch(Start {
+                    ctx: WorkerContext {
+                        thread_id,
+                        num_threads,
+                        group: group.ids.clone(),
+                        workers: workers.clone(),
+                    },
                     cpu,
-                    group.ring,
-                    sq_cpu,
-                )));
-            }
-            first += n;
-        }
-        if let Some(per_core) = &self.per_core {
-            let (cpus, rest) = placed.free.split_at(num_workers);
-            let sq = if per_core.ring.sqpoll {
-                &rest[..num_workers]
-            } else {
-                &[][..]
-            };
-            for (i, &cpu) in cpus.iter().enumerate() {
-                let sq_cpu = sq.get(i).copied();
-                handles.push((per_core.launch)(start(
-                    first_worker + i,
-                    workers.clone(),
-                    cpu,
-                    per_core.ring,
-                    sq_cpu,
-                )));
+                    options: group.options,
+                    sq_cpu: group.sq_cpus.get(i).copied(),
+                    telemetry: telemetry.clone(),
+                    event_fd: fds[thread_id],
+                    peers: peers.clone(),
+                }));
             }
         }
 

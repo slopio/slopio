@@ -99,16 +99,11 @@ pub const fn level_enabled(level: Level) -> bool {
 thread_local!(
     static CURRENT_TASK_TRACING: Cell<*mut TaskTelemetry> =
         const { Cell::new(std::ptr::null_mut()) };
-    static THREAD_ID: Cell<Option<usize>> = const { Cell::new(None) };
 );
-
-pub fn set_thread_id(n: usize) {
-    THREAD_ID.with(|c| c.set(Some(n)));
-}
 
 /// The worker this thread runs, `None` under `main_thread`.
 pub fn thread_id() -> Option<usize> {
-    THREAD_ID.with(|c| c.get())
+    crate::runtime::thread_options().and_then(|o| o.thread_id)
 }
 
 // ─── TaskTelemetry ───────────────────────────────────────────────────────────

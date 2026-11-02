@@ -285,6 +285,7 @@ dependencies = [
  "libmimalloc-sys",
  "rand 0.8.8",
  "runtime-core",
+ "runtime-machine",
  "runtime-streams",
  "socket2 0.5.10",
 ]
@@ -313,6 +314,13 @@ name = "runtime-http"
 version = "0.1.0"
 dependencies = [
  "runtime-core",
+]
+
+[[package]]
+name = "runtime-machine"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -3,10 +3,13 @@ use std::pin::Pin;
 use runtime_core::runtime::eventfd;
 
 // Re-export core
-pub use runtime_core::io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec};
-pub use runtime_core::runtime::{RuntimeInner, spawn, spawn_next, yield_now};
-pub use runtime_core::task::Handle;
 pub use runtime_core::bytes::{Bytes, BytesMut};
+pub use runtime_core::io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec};
+pub use runtime_core::runtime::{
+    NetOptions, RuntimeInner, RuntimeOptions, ThreadOptions, spawn, spawn_next, thread_options,
+    yield_now,
+};
+pub use runtime_core::task::Handle;
 pub use runtime_core::{bytes, channels, io_driver, net, runtime, task};
 // Re-export the buf-ring declaration macro so downstream crates can do
 // `runtime::define_buf_ring!(...)` without naming `runtime_core`.
@@ -37,7 +40,7 @@ pub fn main_thread<F: Future>(f: F) -> F::Output {
 /// worker thread before running `f`. `R` may be `()`, a single
 /// `BufRingSpec`, or a tuple of `BufRingSpec`s.
 pub fn main_thread_with<R: BufRingSet, F: Future>(f: F) -> F::Output {
-    main_thread_on::<R, _, F>(DEFAULT_TELEMETRY, f)
+    main_thread_on::<R, _, F>(RuntimeOptions::default(), DEFAULT_TELEMETRY, f)
 }
 
 /// Like [`main_thread_with`], but exports spans through the collector
@@ -47,12 +50,25 @@ pub fn main_thread_traced<R: BufRingSet, C: tracing::Collector + 'static, F: Fut
     collector: impl Fn() -> C,
     f: F,
 ) -> F::Output {
-    main_thread_on::<R, _, F>(collector, f)
+    main_thread_on::<R, _, F>(RuntimeOptions::default(), collector, f)
 }
 
-fn main_thread_on<R: BufRingSet, T: Telemetry, F: Future>(telemetry: T, f: F) -> F::Output {
+/// Like [`main_thread_with`], built with `options`. The thread is pinned to
+/// no CPU, so `options.net.steer_connections` is refused.
+pub fn main_thread_with_options<R: BufRingSet, F: Future>(
+    options: RuntimeOptions,
+    f: F,
+) -> F::Output {
+    main_thread_on::<R, _, F>(options, DEFAULT_TELEMETRY, f)
+}
+
+fn main_thread_on<R: BufRingSet, T: Telemetry, F: Future>(
+    options: RuntimeOptions,
+    telemetry: T,
+    f: F,
+) -> F::Output {
     ignore_sigpipe();
-    RuntimeInner::default().block_on::<R, F>(f, None, |run| telemetry.install(None, run))
+    RuntimeInner::with_options(options).block_on::<R, F>(f, None, |run| telemetry.install(run))
 }
 
 /// Set `SIGPIPE`'s disposition to `SIG_IGN` for the whole process.
@@ -153,7 +169,7 @@ where
     F: Fn(WorkerContext) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static,
 {
     let mut topology = Topology::with_telemetry(telemetry);
-    topology.per_core::<R, _, _>(RingOptions::default(), f);
+    topology.per_core::<R, _, _>(RuntimeOptions::default(), f);
     topology.run();
 }
 

@@ -2,9 +2,9 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use runtime_core::io_driver::{BufRingSet, RingOptions};
-use runtime_core::runtime::RuntimeInner;
+use runtime_core::io_driver::BufRingSet;
 use runtime_core::runtime::peers::PeerTable;
+use runtime_core::runtime::{RuntimeInner, RuntimeOptions};
 
 use super::WorkerContext;
 use super::cpus::pin_core;
@@ -14,9 +14,7 @@ use crate::telemetry::Telemetry;
 pub(super) struct Start<T> {
     pub ctx: WorkerContext,
     pub cpu: usize,
-    /// For the thread's listeners: `cpu`, unless the topology does not steer.
-    pub incoming_cpu: Option<usize>,
-    pub ring: RingOptions,
+    pub options: RuntimeOptions,
     pub sq_cpu: Option<usize>,
     pub telemetry: Arc<T>,
     pub event_fd: RawFd,
@@ -72,8 +70,7 @@ where
     let Start {
         ctx,
         cpu,
-        incoming_cpu,
-        ring,
+        options,
         sq_cpu,
         telemetry,
         event_fd,
@@ -81,16 +78,16 @@ where
     } = start;
     let n = ctx.thread_id;
     pin_core(cpu);
-    runtime_core::net::set_incoming_cpu(incoming_cpu);
-    let fut = make(ctx);
-    // First polled once the ring is up and every peer has published: startup is over.
+    // Built on the first poll, once the ring is up, every peer has published and the thread's options are readable.
     let fut = async move {
+        let fut = make(ctx);
         started.set(true);
         fut.await
     };
-    RuntimeInner::with_peers(n, peers, ring, sq_cpu.map(|cpu| cpu as u32)).block_on::<R, _>(
+    let sq_cpu = sq_cpu.map(|cpu| cpu as u32);
+    RuntimeInner::with_peers(n, cpu, peers, options, sq_cpu).block_on::<R, _>(
         fut,
         Some(event_fd),
-        |run| telemetry.install(Some(n), run),
+        |run| telemetry.install(run),
     )
 }

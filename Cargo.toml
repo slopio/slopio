@@ -4,6 +4,7 @@ members = [
     "io_uring_rb",
     "runtime_ebpf_balancer",
     "runtime-core",
+    "runtime-machine",
     "runtime-streams",
     "runtime",
     "runtime-http",

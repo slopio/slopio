@@ -1,7 +1,7 @@
 use std::{
     cell::Cell,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    os::fd::IntoRawFd,
+    os::fd::{IntoRawFd, RawFd},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -16,34 +16,6 @@ use crate::io_driver::{
     operations::{Continuation, IoOP, MultishotToken, sockets::SocketWrapper},
     sys,
 };
-
-thread_local! {
-    /// What this thread's listeners put in `SO_INCOMING_CPU`: see
-    /// [`set_incoming_cpu`].
-    static INCOMING_CPU: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-/// Has every [`MultiAccept`] bound on this thread from now on ask the kernel
-/// for the connections `cpu` receives: `SO_INCOMING_CPU` on the listener.
-/// In a `SO_REUSEPORT` group the kernel then hands a connection to the
-/// listener whose CPU took its SYN, the CPU its NIC queue interrupts, and
-/// falls back to its hash when none matches. The kernel's work on a
-/// connection's packets and the worker serving it then share a core: no
-/// cross-core wakeup, nothing to fetch from another core's cache.
-///
-/// The runtime sets it to the CPU it pins each thread of a topology to,
-/// unless the topology was built with `steer_connections(false)`. It pays
-/// once the NIC's queues are on the workers' CPUs, one queue per CPU:
-/// interrupt affinity and XPS, which are the system's to configure. `None`
-/// leaves the kernel's hash alone.
-pub fn set_incoming_cpu(cpu: Option<usize>) {
-    INCOMING_CPU.with(|c| c.set(cpu));
-}
-
-/// What [`set_incoming_cpu`] last set on this thread.
-pub fn incoming_cpu() -> Option<usize> {
-    INCOMING_CPU.with(Cell::get)
-}
 
 pub struct MultiAccept<const QUEUE_SIZE: usize = DEFAULT_QUEUE_SIZE> {
     id: Option<MultishotToken>,
@@ -92,6 +64,33 @@ impl AcceptError {
     }
 }
 
+/// Connections a steering thread accepted, and how many of them the kernel
+/// received on the thread's own CPU: the share the steering got right.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SteeringStats {
+    pub accepted: u64,
+    pub on_cpu: u64,
+}
+
+thread_local!(static STEERING: Cell<SteeringStats> = const { Cell::new(SteeringStats { accepted: 0, on_cpu: 0 }) });
+
+/// This thread's [`SteeringStats`] since it started; zero unless it steers.
+pub fn steering_stats() -> SteeringStats {
+    STEERING.get()
+}
+
+fn count_steered(fd: RawFd) {
+    let Some(cpu) = crate::runtime::thread_options().and_then(|o| o.incoming_cpu()) else {
+        return;
+    };
+    // Set when the handshake's last packet created the socket: the CPU that received it.
+    let on_cpu = sys::incoming_cpu(fd).is_ok_and(|got| got == cpu);
+    let mut stats = STEERING.get();
+    stats.accepted += 1;
+    stats.on_cpu += u64::from(on_cpu);
+    STEERING.set(stats);
+}
+
 impl TryFrom<MultishotCompletionEvent> for SocketWrapper {
     type Error = AcceptError;
 
@@ -99,6 +98,7 @@ impl TryFrom<MultishotCompletionEvent> for SocketWrapper {
         if value.result < 0 {
             Err(AcceptError::from_result(value.result))
         } else {
+            count_steered(value.result);
             let socket = SocketWrapper::from_fd(value.result);
             let _ = socket.set_nodelay(true);
             Ok(socket)
@@ -155,7 +155,7 @@ impl<const QUEUE_SIZE: usize> MultiAccept<QUEUE_SIZE> {
                 socket.set_reuse_address(true)?;
                 socket.set_reuse_port(true)?;
                 // Before listen, when the socket joins its reuseport group.
-                if let Some(cpu) = incoming_cpu() {
+                if let Some(cpu) = crate::runtime::thread_options().and_then(|o| o.incoming_cpu()) {
                     socket.set_cpu_affinity(cpu)?;
                 }
                 socket.set_nonblocking(true)?;

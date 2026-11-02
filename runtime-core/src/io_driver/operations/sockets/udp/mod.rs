@@ -43,6 +43,10 @@ impl UdpSocket {
                 };
                 let socket = S::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
                 socket.set_reuse_port(true)?;
+                // Before bind, when the socket joins its reuseport group.
+                if let Some(cpu) = crate::runtime::thread_options().and_then(|o| o.incoming_cpu()) {
+                    socket.set_cpu_affinity(cpu)?;
+                }
                 socket.set_nonblocking(true)?;
                 socket.bind(&addr.into())?;
                 socket.into_raw_fd()

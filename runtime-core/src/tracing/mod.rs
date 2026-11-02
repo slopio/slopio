@@ -23,7 +23,7 @@ pub use span::{
     new_trace_with_parent, span_set_attribute, span_set_error, span_set_kind, span_set_status,
 };
 pub use task::{
-    Level, STATIC_MAX_LEVEL, TaskTelemetry, level_enabled, set_current_task_tracing, set_thread_id,
+    Level, STATIC_MAX_LEVEL, TaskTelemetry, level_enabled, set_current_task_tracing,
     swap_current_task_tracing, thread_id, with_current_task_tracing,
 };
 pub use types::{KeyValue, SpanKind, SpanLink, Status};

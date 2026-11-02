@@ -43,7 +43,7 @@ pub use crate::io_driver::operations::sockets::recv::{ClassicRecv, socket_peek, 
 
 // streaming (multishot)
 pub use crate::io_driver::operations::sockets::multi_accept::{
-    MultiAccept, incoming_cpu, set_incoming_cpu,
+    MultiAccept, SteeringStats, steering_stats,
 };
 pub use crate::io_driver::operations::sockets::multi_recv::MultiRecv;
 

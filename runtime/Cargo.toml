@@ -12,6 +12,7 @@ ebpf_balancer         = ["runtime-core/ebpf_balancer"]
 
 [dependencies]
 runtime-core = { path = "../runtime-core" }
+runtime-machine = { path = "../runtime-machine" }
 libc = "0.2.178"
 
 # Miri cannot call into mimalloc's C; it runs on its own allocator instead.

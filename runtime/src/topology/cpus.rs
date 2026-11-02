@@ -9,23 +9,7 @@ pub(super) enum Cpu {
     Fixed(usize),
 }
 
-/// The CPUs the calling thread may run on, in ascending order. Not `0..n`: a
-/// cpuset such as `0-2,4` leaves holes.
-pub(super) fn allowed_cpus() -> Vec<usize> {
-    unsafe {
-        let mut cpu_set: cpu_set_t = std::mem::zeroed();
-        let result = libc::sched_getaffinity(0, std::mem::size_of::<cpu_set_t>(), &mut cpu_set);
-        if result != 0 {
-            panic!(
-                "sched_getaffinity failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        (0..libc::CPU_SETSIZE as usize)
-            .filter(|&cpu| libc::CPU_ISSET(cpu, &cpu_set))
-            .collect()
-    }
-}
+pub(super) use runtime_machine::allowed_cpus;
 
 pub(super) fn pin_core(core_id: usize) {
     unsafe {

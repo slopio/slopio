@@ -7,14 +7,17 @@ use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
 use crate::io_driver::{
-    BufRingSet, Endpoint, ErasedMessage, Header, IODriver, Message, PeerMessage, RingOptions,
+    BufRingSet, Endpoint, ErasedMessage, Header, IODriver, Message, PeerMessage,
 };
 use crate::runtime::time::TimeDriver;
 use crate::task::{Handle, TypeAgnosticTask, new_task};
 use crate::{runtime, scoped_thread_local};
 
+pub use options::{NetOptions, RuntimeOptions, ThreadOptions, thread_options};
+
 pub mod eventfd;
 pub mod join;
+mod options;
 pub mod peers;
 pub mod processes;
 pub mod repeat;
@@ -59,7 +62,6 @@ pub async fn yield_now() {
 
 scoped_thread_local!(pub(crate) static TASK_LIST: TaskList);
 scoped_thread_local!(pub(crate) static TIME_DRIVER: TimeDriver);
-thread_local!(static THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
 thread_local!(static ROOT_WOKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
 
 /// The root future's waker: no data, no allocation, it only flags the thread.
@@ -81,14 +83,28 @@ pub struct RuntimeInner {
     tasks: TaskList,
     io_driver: IODriver,
     time_driver: TimeDriver,
-    thread_id: usize,
+    options: ThreadOptions,
 }
 
 impl RuntimeInner {
     pub fn with_thread_id(thread_id: usize) -> Self {
         Self {
-            thread_id,
+            options: ThreadOptions {
+                thread_id: Some(thread_id),
+                ..Default::default()
+            },
             ..Default::default()
+        }
+    }
+
+    /// A runtime outside a topology, built with `options`.
+    pub fn with_options(options: RuntimeOptions) -> Self {
+        // Field by field: `..Default::default()` would build a default ring only to drop it.
+        Self {
+            tasks: TaskList::default(),
+            io_driver: IODriver::new(options.ring, None),
+            time_driver: TimeDriver::default(),
+            options: ThreadOptions::new(None, None, options),
         }
     }
 
@@ -111,25 +127,27 @@ impl RuntimeInner {
             tasks: TaskList::default(),
             io_driver: IODriver::simulated(fake),
             time_driver,
-            thread_id: 0,
+            options: ThreadOptions::default(),
         }
     }
 
     /// Like [`with_thread_id`](Self::with_thread_id), but attaches the shared
     /// peer table to this worker's io_driver so it can MSG_RING its peers, and
-    /// builds its ring with `ring`, its SQ thread on `sq_cpu` under `sqpoll`.
+    /// builds it with `options` for a thread pinned to `cpu`, its SQ thread on
+    /// `sq_cpu` under `sqpoll`.
     pub fn with_peers(
         thread_id: usize,
+        cpu: usize,
         peers: std::sync::Arc<peers::PeerTable>,
-        ring: RingOptions,
+        options: RuntimeOptions,
         sq_cpu: Option<u32>,
     ) -> Self {
         // Field by field: `..Default::default()` would build a default ring only to drop it.
         let mut rt = Self {
             tasks: TaskList::default(),
-            io_driver: IODriver::new(ring, sq_cpu),
+            io_driver: IODriver::new(options.ring, sq_cpu),
             time_driver: TimeDriver::default(),
-            thread_id,
+            options: ThreadOptions::new(Some(thread_id), Some(cpu), options),
         };
         rt.io_driver.attach_peers(peers);
         rt
@@ -144,7 +162,8 @@ impl RuntimeInner {
         // SAFETY: the vtable ignores the data pointer, so any clone stays valid.
         let waker = unsafe { Waker::from_raw(root_waker_clone(std::ptr::null())) };
         let mut context = Context::from_waker(&waker);
-        set_thread_id(self.thread_id);
+        let thread_id = self.options.thread_id.unwrap_or(0);
+        let installed = options::install(self.options);
         let output = self.io_driver.with(|| {
             self.io_driver.init_buf_rings::<R>();
             TASK_LIST.set(&self.tasks, || {
@@ -153,7 +172,7 @@ impl RuntimeInner {
                         // Publish our ring fd into the shared peer table and
                         // rendezvous, so every worker's fd is visible before
                         // any task runs. No-op under `main_thread` (no peers).
-                        self.io_driver.publish_self(self.thread_id);
+                        self.io_driver.publish_self(thread_id);
                         if let Some(fd) = event_fd {
                             runtime::eventfd::register_eventfd_read(fd);
                         }
@@ -246,16 +265,14 @@ impl RuntimeInner {
                 R::reset_all();
             }
         }
+        drop(installed);
         output
     }
 }
 
-pub(crate) fn set_thread_id(id: usize) {
-    THREAD_ID.with(|cell| cell.set(id));
-}
-
+/// This thread's peer id, 0 outside a topology.
 pub fn thread_id() -> usize {
-    THREAD_ID.with(|cell| cell.get())
+    thread_options().and_then(|o| o.thread_id).unwrap_or(0)
 }
 
 pub fn main_thread<F: Future>(f: F) -> F::Output {

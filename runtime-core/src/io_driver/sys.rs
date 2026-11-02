@@ -56,6 +56,26 @@ pub(crate) fn setsockopt<T>(fd: RawFd, level: c_int, name: c_int, value: &T) -> 
     })
 }
 
+/// The CPU that last processed the socket's packets, `SO_INCOMING_CPU`.
+pub(crate) fn incoming_cpu(fd: RawFd) -> io::Result<usize> {
+    #[cfg(feature = "simulation")]
+    if fds::is_simulated(fd) {
+        return Err(io::ErrorKind::Unsupported.into());
+    }
+    let mut cpu: c_int = -1;
+    let mut len = std::mem::size_of::<c_int>() as libc::socklen_t;
+    cvt(unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_INCOMING_CPU,
+            (&mut cpu as *mut c_int).cast(),
+            &mut len,
+        )
+    })?;
+    usize::try_from(cpu).map_err(|_| io::ErrorKind::NotFound.into())
+}
+
 pub(crate) fn shutdown(fd: RawFd, how: c_int) -> io::Result<()> {
     #[cfg(feature = "simulation")]
     if fds::is_simulated(fd) {
