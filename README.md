@@ -43,7 +43,7 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 | `runtime-machine` | Reads CPUs, cores, NUMA nodes and NIC queues from `/sys` and `/proc`, without privilege. |
 | `runtime-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
 | `runtime-http` | The `http` crate's types on the runtime's `Bytes`. |
-| `async_timers` | The two timer stores: a one-minute timing wheel, and the fixed-duration deadline queues. |
+| `async_timers` | The two timer stores: a timing wheel for any duration up to one hour, in three levels of milliseconds, seconds and minutes, and a queue for a fixed duration, five seconds. |
 | `io_uring_rb` | Provided buffer ring memory management. |
 | `runtime_ebpf_balancer` | Optional eBPF program steering QUIC connections to the right core under `SO_REUSEPORT`. |
 

@@ -11,7 +11,7 @@ How the runtime is put together, the rules its design follows, and the conventio
 | `runtime-machine` | Reads the machine from `/sys` and `/proc` without privilege: CPUs, cores, NUMA nodes, NIC queues and where their packets are processed. Depends on `libc` only, so that a tool tuning the machine reads it the same way. |
 | `runtime-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
 | `runtime-http` | The `http` crate's types on the runtime's `Bytes`, not `Send`. |
-| `async_timers` | The timer stores the event loop drives. |
+| `async_timers` | The two timer stores the event loop drives: a timing wheel for any duration up to one hour, and a queue for a fixed duration, five seconds, see [time](time.md). |
 | `io_uring_rb` | Provided buffer ring memory. |
 | `runtime_ebpf_balancer` | Optional eBPF program steering QUIC connections under `SO_REUSEPORT`; needs `CAP_BPF`. |
 
