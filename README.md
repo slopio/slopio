@@ -31,6 +31,7 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 - [Topology](docs/topology.md). Groups of threads with their own CPUs and ring options, `SQPOLL` included, next to the per-core workers.
 - [Telemetry](docs/telemetry.md). Spans, events, propagation and export, all behind features.
 - [Deterministic simulation testing](docs/deterministic-testing.md). Running the runtime against a scripted kernel.
+- [Architecture and code style](docs/architecture.md). How the crates and a worker fit together, the design rules, and the conventions the code is written in.
 - [Potential improvements](docs/future-work.md). Queue-to-core alignment, NAPI busy polling, NUMA and SMT awareness, and when each pays.
 
 ## Crates
@@ -39,7 +40,9 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 |-------|------|
 | `runtime` | The facade to depend on: entry points, buffer ring declarations, telemetry wiring, global allocator. |
 | `runtime-core` | The runtime itself: tasks, I/O driver, timers, channels, tracing, simulator. |
+| `runtime-machine` | Reads CPUs, cores, NUMA nodes and NIC queues from `/sys` and `/proc`, without privilege. |
 | `runtime-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
+| `runtime-http` | The `http` crate's types on the runtime's `Bytes`. |
 | `async_timers` | The two timer stores: a one-minute timing wheel, and the fixed-duration deadline queues. |
 | `io_uring_rb` | Provided buffer ring memory management. |
 | `runtime_ebpf_balancer` | Optional eBPF program steering QUIC connections to the right core under `SO_REUSEPORT`. |
