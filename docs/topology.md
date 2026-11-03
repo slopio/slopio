@@ -48,6 +48,19 @@ Only the CPUs the process may run on count. In a container restricted to `4-7`, 
 
 The placement is checked before any thread starts, and `run` panics with the reason if it cannot be satisfied: a CPU the process may not use, the same CPU asked for twice, more threads than CPUs, or no CPU left for `per_core`.
 
+## What `run` prints
+
+Before any thread starts, `run` prints what it resolved to stdout, in one block:
+
+```text
+runtime: topology of 9 threads, allowed CPUs 0-9, parallelism 10
+runtime:   group 0   threads 0       CPU 9, SQ threads on CPU 8; ring sqpoll idle 50ms; net plain
+runtime:   per_core  threads 1-8     CPUs 0-7; ring defer_taskrun coop_taskrun; net plain
+runtime:   NIC packets processed on CPU 4
+```
+
+Each group and the per-core workers get a line: their thread ids, the CPU of each thread in thread order, the CPU of each SQ thread, and the ring and net options they were built with. `parallelism` is what the process may use at once, below the allowed CPUs under a cgroup CPU quota. The last line says where the NICs' packets are processed, or why that cannot be told, and when some group steers connections a line follows on whether its CPUs are those (see below). Reading the machine needs no privilege and changes nothing: the block is for whoever reads the logs.
+
 ## Connections to the CPU that receives them
 
 A group built with `net.steer_connections` binds its listeners with `SO_INCOMING_CPU` set to each thread's own CPU. Several threads listening on one port share it through `SO_REUSEPORT`, and the kernel then hands each new connection to the listener of the CPU that received its first packet, rather than to one its hash picks. When no listener's CPU matches, the hash decides, as without the option. UDP sockets bound by the same threads carry it too, and the kernel picks among them the same way for each datagram.
@@ -56,9 +69,31 @@ The CPU that receives a connection's packets is the one its NIC queue interrupts
 
 Interrupt affinity and XPS are the system's to configure, and `irqbalance` undoes them. With the queues' interrupts away from the threads, the option changes nothing. With fewer queues than threads, it is worse than nothing: the threads whose CPU takes no interrupt get almost no connections. It is therefore off by default, and decided when the group is declared, by whoever knows where the machine's queues are. It needs a thread pinned to a CPU: `main_thread_with_options` refuses it.
 
-When it starts, `run` prints what it resolved to stdout, in one block before any thread starts: each group and the per-core workers with their thread ids, the CPU of each thread and of each SQ thread, and their ring and net options. It adds where the NICs' packets are processed, read from `/sys` and `/proc`, and, when some group steers, whether each steering CPU processes packets or what is in the way. That can be a CPU with no queue, a queue on a CPU outside the steering threads, an interrupt allowed on several CPUs, RPS, RFS, threaded NAPI, or `irqbalance` running. It needs no privilege and changes nothing: the block is for whoever reads the logs.
+The steering line of the startup block compares the steering threads' CPUs with the CPUs where packets are processed, and names what is in the way: a steering CPU that processes no packets, packets processed on a CPU outside the steering threads, an interrupt allowed on several CPUs, queues that cannot be told apart, no NIC in sight, RFS, threaded NAPI, or `irqbalance` running.
 
-`runtime::topology::Machine::read()` gives the same reading to the application, to decide where to put its threads: the CPUs the process may use, the isolated and `nohz_full` ones, the cores with their SMT siblings, the NUMA nodes, each NIC with its receive queues, the CPU of each queue's interrupt and its RPS CPUs, and whether RFS or `irqbalance` are in the way. `packet_cpus()` sums it up as the CPUs where the NICs' packets are processed: a queue's RPS CPUs when RPS is on, its interrupt's CPU otherwise. It only reads; nothing in the topology uses it to place a thread. `cargo run --example machine` prints it.
+### Placing threads where the packets are
+
+`runtime::topology::Machine::read()` gives the application the same reading, from the `runtime-machine` crate: the CPUs the process may use, the isolated and `nohz_full` ones, the cores with their SMT siblings, the NUMA nodes, each NIC with its receive queues, the CPU of each queue's interrupt and its RPS CPUs, and whether RFS or `irqbalance` are in the way. `packet_cpus()` sums it up as the CPUs where the NICs' packets are processed: a queue's RPS CPUs when RPS is on, its interrupt's CPU otherwise. `cargo run --example machine` prints all of it.
+
+It only reads, and the topology never uses it on its own. To put steering workers on the CPUs that process packets, declare them as a group on those CPUs:
+
+```rust
+let machine = Machine::read();
+let aligned = machine.packet_cpus().ok().filter(|cpus| {
+    !machine.irqbalance && cpus.iter().all(|c| machine.allowed.contains(c))
+});
+match aligned {
+    Some(cpus) => {
+        let steered = RuntimeOptions { net: NetOptions { steer_connections: true }, ..Default::default() };
+        topology.group::<Rings, _, _>(Threads::Fixed(cpus), steered, serve);
+    }
+    None => {
+        topology.per_core::<Rings, _, _>(RuntimeOptions::default(), serve);
+    }
+}
+```
+
+A group differs from `per_core` in two ways. Its threads find each other in `ctx.group`, while `ctx.workers` stays empty. And it is not cut down to a cgroup CPU quota: compare the number of CPUs with `std::thread::available_parallelism()` before declaring it.
 
 While it runs, each steering thread counts the connections it accepts, and how many of them the kernel received on the thread's own CPU. `runtime::net::steering_stats()` returns the thread's two counts; export them the way the application exports its other metrics. A share well below one means the alignment does not hold, or no longer holds.
 
@@ -91,7 +126,7 @@ The defaults suit almost every thread: completions are handled in batches, at th
 - **That CPU spins.** It stays at 100% for `sqpoll_idle` after every submission. On a quota-bound or burstable machine, keep `sqpoll_idle` short or leave `sqpoll` off.
 - **The first submission after a sleep pays a wakeup**, which costs a system call.
 
-`napi_busy_poll` turns waiting into spinning: a thread with nothing to do keeps its core busy for up to the budget each time it waits. It pays on cores given to the workers, under sustained network load, and costs on shared cores, under a CPU quota or on a burstable instance. It is worth most with one NIC queue per CPU and connections steered to the CPU that receives them (below), so that each thread polls its own core's queue.
+`napi_busy_poll` turns waiting into spinning: a thread with nothing to do keeps its core busy for up to the budget each time it waits. It pays on cores given to the workers, under sustained network load, and costs on shared cores, under a CPU quota or on a burstable instance. It is worth most with one NIC queue per CPU and connections steered to the CPU that receives them (above), so that each thread polls its own core's queue.
 
 `sqpoll` excludes the other two flags; the kernel refuses the combination. Set `defer_taskrun` and `coop_taskrun` to `false` along with it. Declaring a group or `per_core` with both panics on the spot, before anything starts.
 

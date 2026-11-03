@@ -4,29 +4,29 @@ Ideas that are worked out but not implemented. They share one theme: making the 
 
 ## Aligning NIC queues, cores and rings
 
-The runtime pins one worker and one ring per core. A modern NIC has one receive queue per core, each with its own interrupt. Nothing today ensures that the connections a worker serves are the ones whose packets arrive on that worker's core: they land on a worker chosen by the kernel's reuseport hash, which has no relation to the queue that received them. Every packet then crosses cores, decoded on one CPU and consumed on another, with a cross-CPU wakeup in between.
+The runtime pins one worker and one ring per core. A modern NIC has one receive queue per core, each with its own interrupt. By default the connections a worker serves land on a worker chosen by the kernel's reuseport hash, which has no relation to the queue that received them. Every packet then crosses cores, decoded on one CPU and consumed on another, with a cross-CPU wakeup in between. Steering, an option set per group, makes them line up once the queues are on the workers' cores.
 
 The option would make three links line up:
 
-- **Queue to core.** Interrupt affinity, one queue's IRQ per CPU, and XPS for the transmit side. System configuration rather than runtime code, but the runtime can verify it and refuse to enable the option when it is absent.
+- **Queue to core.** Interrupt affinity, one queue's IRQ per CPU, and XPS for the transmit side. System configuration rather than runtime code. The runtime reads it without privilege and reports at startup whether the steering threads' CPUs are where packets are processed (see [topology](topology.md)); it does not refuse to start. Setting it is left to a separate tool run as root, still to write.
 - **Core to worker.** Already done by `thread_per_core`.
-- **Connection to worker.** For TCP, done: each worker's listener carries `SO_INCOMING_CPU`, and the kernel hands a connection to the listener of the CPU that received its SYN, hash as fallback (see [topology](topology.md)). For QUIC, the worker index encoded in the connection ID is chosen from the CPU that received the Initial, so the CID keeps every later datagram on the same core, migration included.
+- **Connection to worker.** For TCP and UDP, done, for the groups built with `net.steer_connections`: each thread's listeners and UDP sockets carry `SO_INCOMING_CPU`, and the kernel hands a connection or a datagram to the socket of the CPU that received it, hash as fallback (see [topology](topology.md)). Outgoing connections are not covered: their replies arrive on whichever queue the NIC's hash picks. For QUIC, the worker index encoded in the connection ID is chosen from the CPU that received the Initial, so the CID keeps every later datagram on the same core, migration included.
 
-A per-worker counter of misplaced connections, from `SO_INCOMING_CPU` on each accepted socket, would report in telemetry whether the alignment holds or whether `irqbalance` has undone it.
+Done: `runtime::net::steering_stats()` counts, per steering thread, the connections it accepted and how many arrived on its own CPU, read from `SO_INCOMING_CPU` on each accepted socket. The application exports it with its other metrics; a falling share shows `irqbalance` or a NIC reconfiguration undoing the alignment. There is no such count for UDP: the kernel does not record the receiving CPU on an unconnected socket.
 
-**Pays when:** eight or more cores, many connections with small messages, tail latency matters. **Does not pay when:** few cores, few long-lived bulk connections, or when the instance's network allowance saturates first, which is the case on small cloud instances. With fewer queues than cores, only the cores that own a queue should run workers.
+**Pays when:** eight or more cores, many connections with small messages, tail latency matters. **Does not pay when:** few cores, few long-lived bulk connections, or when the instance's network allowance saturates first, which is the case on small cloud instances. With fewer queues than cores, only the cores that own a queue should run workers: `Machine::packet_cpus()` names them, and a group on `Threads::Fixed` puts the workers there.
 
 ## NAPI busy polling on the ring
 
 With the alignment in place, one seam remains: the kernel's softirq, triggered by the interrupt, drains the queue and preempts the worker to do so. `IORING_REGISTER_NAPI` (kernel 6.7, static tracking in 6.13) lets the ring poll its queue itself for a bounded time before sleeping. The worker becomes the thread that empties its NIC queue: no interrupt, no softirq, no wakeup on the hot path, receive latency down to a few microseconds.
 
-Available, off by default: `RingOptions::napi_busy_poll` registers NAPI on the ring at startup with that budget, in dynamic mode, where the kernel learns the queues from the sockets the ring uses; with connections steered to the CPU that receives them, on by default (see [topology](topology.md)), that is the core's own queue. `napi_prefer_busy_poll` asks the kernel to defer the queue's interrupts while the ring polls it; it needs two per-interface sysfs settings, `napi_defer_hard_irqs` and `gro_flush_timeout`, which the runtime documents but does not set. Static mode, with the NAPI id of the core's queue given explicitly, is still to do.
+Available, off by default: `RingOptions::napi_busy_poll` registers NAPI on the ring at startup with that budget, in dynamic mode, where the kernel learns the queues from the sockets the ring uses; with connections steered to the CPU that receives them (`net.steer_connections`, see [topology](topology.md)), that is the core's own queue. `napi_prefer_busy_poll` asks the kernel to defer the queue's interrupts while the ring polls it; it needs two per-interface sysfs settings, `napi_defer_hard_irqs` and `gro_flush_timeout`, which the runtime documents but does not set. Static mode, with the NAPI id of the core's queue given explicitly, is still to do.
 
 **Pays when:** cores are dedicated to workers, load is sustained at tens of thousands of packets per second per core, and the target is tail latency. **Does not pay when:** traffic is idle or bursty, cores are shared, or the process runs under a CPU quota or on a burstable instance, where spinning burns credits and triggers throttling that costs far more latency than it saves. Never on `t4g`, never under a Kubernetes CPU limit.
 
 ## Hardware layout: cpuset and SMT
 
-A small module reading sysfs at startup, no libnuma, no hwloc: the allowed CPU mask from `sched_getaffinity`, SMT siblings from `thread_siblings_list`, node per CPU from `/sys/devices/system/node`, the NIC's node from its device entry.
+Done as reading only: the `runtime-machine` crate reads sysfs, no libnuma, no hwloc: the allowed CPU mask from `sched_getaffinity`, SMT siblings from `thread_siblings_list`, node per CPU from `/sys/devices/system/node`, the NIC's node from its device entry. Nothing places a thread from it yet; the application can.
 
 Workers and [topology](topology.md) threads are already placed on the allowed CPU mask, so a container restricted to CPUs `4-7` works. One use left that does not depend on NUMA:
 
