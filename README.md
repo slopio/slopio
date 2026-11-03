@@ -1,7 +1,8 @@
 # slopio
 
 A thread-per-core async runtime for Rust, built directly on io_uring. Linux only, no tokio, no epoll fallback.
-This runtime was the opportunity for me to try a lot of things
+
+slopio exposes what io_uring does differently instead of hiding it behind `AsyncRead` and `AsyncWrite`, and it is built to be checked. Every operation's lifecycle is an explicit state machine, exercised against a scripted kernel in deterministic simulation and run under Miri, and the core ones are specified in [Quint](specifications/). It is a personal project, used to try ideas properly rather than to ship them fast.
 
 
 ## Why
