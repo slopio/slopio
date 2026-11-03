@@ -69,3 +69,7 @@ curl --http3 -k https://localhost:4433/{1,2,3} --parallel
 ```
 
 Optional features on the `runtime` crate: `tracing`, `local_debug_collector`, `ebpf_balancer` (needs `clang`), `simulation`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

@@ -2,6 +2,7 @@
 name = "runtime-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [features]
 # The simulated ring and its virtual clock. Off in production: with it off the

@@ -53,4 +53,4 @@ int quic_select_reuseport(struct sk_reuseport_md *ctx)
 	return SK_PASS;
 }
 
-char LICENSE[] SEC("license") = "GPL";
+char LICENSE[] SEC("license") = "Dual MIT/GPL";

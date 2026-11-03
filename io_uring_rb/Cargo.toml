@@ -2,6 +2,7 @@
 name = "io_uring_rb"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [features]
 # Trade away mapping hints the kernel is free to ignore, so a ring can be built
