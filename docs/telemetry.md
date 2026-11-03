@@ -49,4 +49,4 @@ Telemetry is designed so that you can leave it on in production at the `info` le
 
 ## What is not there yet
 
-The OTLP exporter has one setting, the endpoint, over plaintext HTTP/2. A batch that fails or is unanswered after ten seconds is dropped. There is no sampling, no bounded queue, no compression, no TLS, no authentication headers, and no reading of the standard `OTEL_*` environment variables. In a busy service you will want at least a bounded queue and sampling before pointing this at a shared collector. `telemetry_options.md` in the repository root lists what is planned.
+The OTLP exporter has one setting, the endpoint, over plaintext HTTP/2. A batch that fails or is unanswered after ten seconds is dropped. There is no sampling, no bounded queue, no compression, no TLS, no authentication headers, and no reading of the standard `OTEL_*` environment variables. In a busy service you will want at least a bounded queue and sampling before pointing this at a shared collector.

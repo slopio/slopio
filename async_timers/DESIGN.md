@@ -266,4 +266,4 @@ the fixed store keeps it until the clock reaches it. Before the linked-list
 rewrite the wheel lost on every axis, peak included (312283 at 500/tick).
 
 Measured numbers for the runtime side of this — the allocation cost of the
-`timeout()` idiom on the TCP hot path — and the open items are in `notes.md`.
+`timeout()` idiom on the TCP hot path — and the open items are in `TODO.md`.

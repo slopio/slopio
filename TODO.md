@@ -120,6 +120,39 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   Fix: keep the `Vec` and its runs, add a hash index (name → positions) built
   only past ~32 entries, so small maps keep the scan.
 
+## Performance notes
+
+TCP hot path allocations, measured 2026-09-11 with a counting global
+allocator on the runtime thread only (harness not kept). Steady-state echo on
+an established connection is 0 alloc / 0 B per round-trip. What is left costs
+per connection or per timeout:
+
+- [ ] **Two `MultiOpQueue` allocations per multishot op**, 336 B each
+  (`VecDeque::with_capacity(pause_threshold + 10)` × 8 B/event): one in
+  `MultiRecv`, one built driver-side at the `Init -> Sent` transition. A full
+  connection is 4 allocs / 896 B, `[24, 200, 336, 336]` = `Rc<SocketInner>`,
+  task box, then the two queues: 75% of the bytes and half the allocations of
+  a short-lived connection. `QUEUE_SIZE` is already a const generic on
+  `MultiRecv`, so its queue can be an inline ring; the driver-side one needs
+  `MultiOpState` to carry a fixed capacity (or a `SmallVec`). Tradeoff: inline
+  in the multishot slab, the memory stays sized to the peak.
+- [ ] **A cancelled five-second sleep keeps its entry until its deadline.**
+  `Timers::cancel` only clears a bit unless the entry is at the head, so the
+  live set is `rate × 5 s`, not the timeouts in flight: a `timeout(5s, ..)`
+  per request at 100k req/s is ~500k dead entries. The wheel frees a
+  cancelled timer at once since the linked-list rewrite. Fix, if that profile
+  matters: sweep dead entries without waiting for the clock. See
+  `async_timers/DESIGN.md`.
+- [ ] **`socket_send_vectored` allocates a `Vec<libc::iovec>` per call**
+  (16 B per chunk) on top of the caller's `Vec<B>`, the only send path that
+  allocates on the hot path; `send_vectored_fixed_zc` does the same. Fix: a
+  reusable per-socket iovec scratch buffer.
+- [ ] **A formatted tracing event allocates twice** when its level is
+  enabled: `info!("x = {}", val)` builds a `String` with `format!`, then
+  `event()` copies it into the span's arena. Fix: an `event_fmt(level,
+  fmt::Arguments)` that `write!`s straight into the arena, called by the
+  macros.
+
 ## Outside this repository
 
 - [ ] popple-h2 and popple-tls must adapt to the API changes: `MultiAccept`
