@@ -11,6 +11,20 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/slopio/slopio"
+
+[workspace.dependencies]
+slopio-core = { path = "slopio-core", version = "0.1.0" }
+slopio-machine = { path = "slopio-machine", version = "0.1.0" }
+slopio-streams = { path = "slopio-streams", version = "0.1.0" }
+slopio-timers = { path = "slopio-timers", version = "0.1.0" }
+slopio-buf-ring = { path = "slopio-buf-ring", version = "0.1.0" }
+slopio-ebpf-balancer = { path = "slopio-ebpf-balancer", version = "0.1.0" }
+
 [profile.release]
 debug = true
 # Panics in spawned tasks unwind through the runtime's internal data

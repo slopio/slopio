@@ -1,8 +1,13 @@
 [package]
 name = "slopio-buf-ring"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+description = "io_uring provided buffer ring memory for the slopio runtime"
+keywords = ["io-uring", "buffer", "ring"]
+categories = ["os::linux-apis", "memory-management"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 # Trade away mapping hints the kernel is free to ignore, so a ring can be built

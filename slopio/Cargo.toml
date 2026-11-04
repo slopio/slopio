@@ -1,8 +1,13 @@
 [package]
 name = "slopio"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+description = "A thread-per-core async runtime for Linux, built directly on io_uring"
+keywords = ["io-uring", "async", "runtime", "thread-per-core", "linux"]
+categories = ["asynchronous", "network-programming", "os::linux-apis"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 # Forwarded so a test crate can build the simulated ring.
@@ -12,8 +17,8 @@ local_debug_collector = ["slopio-core/local_debug_collector"]
 ebpf_balancer         = ["slopio-core/ebpf_balancer"]
 
 [dependencies]
-slopio-core = { path = "../slopio-core" }
-slopio-machine = { path = "../slopio-machine" }
+slopio-core.workspace = true
+slopio-machine.workspace = true
 libc = "0.2.178"
 
 # Miri cannot call into mimalloc's C; it runs on its own allocator instead.
@@ -23,7 +28,7 @@ libc = "0.2.178"
 libmimalloc-sys = { version = "0.1.44", default-features = false, features = ["local_dynamic_tls", "v3"] }
 
 [dev-dependencies]
-slopio-streams = { path = "../slopio-streams" }
+slopio-streams.workspace = true
 bytes = "1"
 http = "1"
 rand = "0.8"

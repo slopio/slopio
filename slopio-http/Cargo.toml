@@ -1,8 +1,13 @@
 [package]
 name = "slopio-http"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+description = "The http crate's types on the slopio runtime's single-threaded Bytes"
+keywords = ["http", "bytes", "io-uring"]
+categories = ["web-programming::http-server", "network-programming"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-slopio-core = { path = "../slopio-core" }
+slopio-core.workspace = true

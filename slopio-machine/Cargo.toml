@@ -1,8 +1,13 @@
 [package]
 name = "slopio-machine"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+description = "Reads CPUs, cores, NUMA nodes and NIC receive queues from /sys and /proc, without privilege"
+keywords = ["numa", "nic", "irq", "cpu", "sysfs"]
+categories = ["os::linux-apis", "hardware-support"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 libc = "0.2.178"

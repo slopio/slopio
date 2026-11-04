@@ -1,7 +1,12 @@
 [package]
 name = "slopio-streams"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+description = "The minimal Stream and StreamExt traits of the slopio runtime"
+keywords = ["stream", "async"]
+categories = ["asynchronous"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]

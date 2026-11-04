@@ -1,8 +1,13 @@
 [package]
 name = "slopio-core"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+description = "The core of the slopio runtime: tasks, the io_uring driver, timers, channels, messaging and a simulated kernel"
+keywords = ["io-uring", "async", "runtime", "thread-per-core", "simulation"]
+categories = ["asynchronous", "network-programming", "os::linux-apis"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 # The simulated ring and its virtual clock. Off in production: with it off the
@@ -32,10 +37,10 @@ up_to_trace_in_release = []
 [dependencies]
 io-uring = "0.7.15"
 libc = "0.2.178"
-slopio-buf-ring = { path = "../slopio-buf-ring" }
-slopio-ebpf-balancer = { path = "../slopio-ebpf-balancer", optional = true }
-slopio-timers = { path = "../slopio-timers" }
-slopio-streams = { path = "../slopio-streams" }
+slopio-buf-ring.workspace = true
+slopio-ebpf-balancer = { workspace = true, optional = true }
+slopio-timers.workspace = true
+slopio-streams.workspace = true
 pin-project = "1.1.10"
 slab = "0.4.11"
 socket2 = { version = "0.6.1", features = ["all"] }

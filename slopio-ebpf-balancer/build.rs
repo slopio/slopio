@@ -8,6 +8,13 @@ fn main() {
     let out = out_dir.join("quic_reuseport.o");
 
     println!("cargo:rerun-if-changed={src}");
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+
+    // docs.rs builds without clang; an empty object is enough to render the docs.
+    if env::var_os("DOCS_RS").is_some() {
+        std::fs::write(&out, []).unwrap();
+        return;
+    }
 
     let arch = match env::consts::ARCH {
         "x86_64" => "x86",
