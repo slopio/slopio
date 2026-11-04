@@ -3,10 +3,6 @@
 version = 4
 
 [[package]]
-name = "async_timers"
-version = "0.1.0"
-
-[[package]]
 name = "bitfield-struct"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,15 +105,6 @@ dependencies = [
  "bitflags",
  "cfg-if",
  "libc",
-]
-
-[[package]]
-name = "io_uring_rb"
-version = "0.1.0"
-dependencies = [
- "io-uring",
- "rand 0.9.5",
- "rustix",
 ]
 
 [[package]]
@@ -276,66 +263,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runtime"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "http",
- "libc",
- "libmimalloc-sys",
- "rand 0.8.8",
- "runtime-core",
- "runtime-machine",
- "runtime-streams",
- "socket2 0.5.10",
-]
-
-[[package]]
-name = "runtime-core"
-version = "0.1.0"
-dependencies = [
- "async_timers",
- "bitfield-struct",
- "bumpalo",
- "io-uring",
- "io_uring_rb",
- "libc",
- "pin-project",
- "rand 0.8.8",
- "runtime-streams",
- "runtime_ebpf_balancer",
- "slab",
- "smallvec",
- "socket2 0.6.5",
-]
-
-[[package]]
-name = "runtime-http"
-version = "0.1.0"
-dependencies = [
- "runtime-core",
-]
-
-[[package]]
-name = "runtime-machine"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "runtime-streams"
-version = "0.1.0"
-
-[[package]]
-name = "runtime_ebpf_balancer"
-version = "0.1.0"
-dependencies = [
- "libc",
- "object",
-]
-
-[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -359,6 +286,79 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slopio"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "libc",
+ "libmimalloc-sys",
+ "rand 0.8.8",
+ "slopio-core",
+ "slopio-machine",
+ "slopio-streams",
+ "socket2 0.5.10",
+]
+
+[[package]]
+name = "slopio-buf-ring"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "rand 0.9.5",
+ "rustix",
+]
+
+[[package]]
+name = "slopio-core"
+version = "0.1.0"
+dependencies = [
+ "bitfield-struct",
+ "bumpalo",
+ "io-uring",
+ "libc",
+ "pin-project",
+ "rand 0.8.8",
+ "slab",
+ "slopio-buf-ring",
+ "slopio-ebpf-balancer",
+ "slopio-streams",
+ "slopio-timers",
+ "smallvec",
+ "socket2 0.6.5",
+]
+
+[[package]]
+name = "slopio-ebpf-balancer"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "object",
+]
+
+[[package]]
+name = "slopio-http"
+version = "0.1.0"
+dependencies = [
+ "slopio-core",
+]
+
+[[package]]
+name = "slopio-machine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "slopio-streams"
+version = "0.1.0"
+
+[[package]]
+name = "slopio-timers"
+version = "0.1.0"
 
 [[package]]
 name = "smallvec"

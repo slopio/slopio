@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "async_timers",
-    "io_uring_rb",
-    "runtime_ebpf_balancer",
-    "runtime-core",
-    "runtime-machine",
-    "runtime-streams",
-    "runtime",
-    "runtime-http",
+    "slopio-timers",
+    "slopio-buf-ring",
+    "slopio-ebpf-balancer",
+    "slopio-core",
+    "slopio-machine",
+    "slopio-streams",
+    "slopio",
+    "slopio-http",
 ]
 resolver = "2"
 

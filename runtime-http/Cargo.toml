@@ -1,8 +1,0 @@
-[package]
-name = "runtime-http"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[dependencies]
-runtime-core = { path = "../runtime-core" }

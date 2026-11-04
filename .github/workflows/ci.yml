@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # runtime_ebpf_balancer's build.rs compiles the BPF object unconditionally
+      # slopio_ebpf_balancer's build.rs compiles the BPF object unconditionally
       - name: Install eBPF build deps
         run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev
       - uses: dtolnay/rust-toolchain@stable

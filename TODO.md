@@ -8,7 +8,7 @@ Line numbers are as of commit 505fc55 (branch `timewheel-hlist`).
 Found by the review of commits a9a5d14..505fc55. None is high severity.
 
 - [ ] **Channel wait lists search linearly.** `WaitList::park` and `leave`
-  (`runtime-core/src/channels/wait_list.rs`) scan the whole list for an id, so
+  (`slopio-core/src/channels/wait_list.rs`) scan the whole list for an id, so
   with N parked futures every message costs O(N), O(N²) for a burst; the old
   single-waker code was O(1). Ids are handed out increasing and removals keep
   the order, so the list stays sorted: binary search, or answer `Woken` at once
@@ -18,7 +18,7 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   `&mut` over the future's bytes when a task drops its own `Handle` while it
   runs (or `reap` drops it). Stacked Borrows UB, Miri-visible. Reach the tail
   through a raw pointer (`addr_of_mut!`), like `wake_by_ref` does.
-- [ ] **`allowed_cpus` panics above 1024 CPUs.** `runtime/src/lib.rs`
+- [ ] **`allowed_cpus` panics above 1024 CPUs.** `slopio/src/lib.rs`
   passes a fixed `cpu_set_t` to `sched_getaffinity`, which returns `EINVAL` when
   the kernel has more possible CPUs than `CPU_SETSIZE`; `thread_per_core` then
   panics before any worker starts, where it used to work. Retry with a larger
@@ -112,7 +112,7 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
 - [ ] **D15** `send_all_zc` waits for the notification before each short-write
   retry: about one RTT per retry (rare with `MSG_WAITALL`).
 - [ ] **`HeaderMap` is quadratic on many distinct names**
-  (`runtime-http/src/header/map.rs`). It is a flat `Vec` scanned per lookup and
+  (`slopio-http/src/header/map.rs`). It is a flat `Vec` scanned per lookup and
   per append, so a peer sending many names makes decoding O(n²). Measured in
   release: 2000 distinct appends 3.6 ms, 2000 lookups in a 2000-entry map
   7.3 ms. Under h2's default 16 KiB header list (≤ ~480 fields) the worst case
@@ -142,7 +142,7 @@ per connection or per timeout:
   per request at 100k req/s is ~500k dead entries. The wheel frees a
   cancelled timer at once since the linked-list rewrite. Fix, if that profile
   matters: sweep dead entries without waiting for the clock. See
-  `async_timers/DESIGN.md`.
+  `slopio-timers/DESIGN.md`.
 - [ ] **`socket_send_vectored` allocates a `Vec<libc::iovec>` per call**
   (16 B per chunk) on top of the caller's `Vec<B>`, the only send path that
   allocates on the hot path; `send_vectored_fixed_zc` does the same. Fix: a

@@ -1,0 +1,30 @@
+[package]
+name = "slopio"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+# Forwarded so a test crate can build the simulated ring.
+simulation = ["slopio-core/simulation"]
+tracing               = ["slopio-core/tracing"]
+local_debug_collector = ["slopio-core/local_debug_collector"]
+ebpf_balancer         = ["slopio-core/ebpf_balancer"]
+
+[dependencies]
+slopio-core = { path = "../slopio-core" }
+slopio-machine = { path = "../slopio-machine" }
+libc = "0.2.178"
+
+# Miri cannot call into mimalloc's C; it runs on its own allocator instead.
+[target.'cfg(not(miri))'.dependencies]
+# Not the `mimalloc` crate: its allocator sends every size through the aligned
+# call, which misses mimalloc's fast path (see `src/allocator.rs`).
+libmimalloc-sys = { version = "0.1.44", default-features = false, features = ["local_dynamic_tls", "v3"] }
+
+[dev-dependencies]
+slopio-streams = { path = "../slopio-streams" }
+bytes = "1"
+http = "1"
+rand = "0.8"
+socket2 = "0.5"

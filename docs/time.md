@@ -8,11 +8,11 @@ The runtime has no timer thread. Time is one more thing the event loop drives: o
 - **`timeout(duration, future)`** races a future against a sleep and gives you `Ok(output)` or `Err(())`. The losing side is dropped, so a timed-out I/O operation is cancelled the way described in [cancellation](cancellation.md).
 - **`repeat(interval, f)`** runs an async closure forever with a sleep between runs, and stops on shutdown.
 - **`retry(max, delay, f, should_retry)`** re-runs a fallible async closure with a fixed delay between attempts, up to a maximum, and also stops on shutdown.
-- **`runtime::now()`** returns the current wall-clock time as a `SystemTime`, see below.
+- **`slopio::now()`** returns the current wall-clock time as a `SystemTime`, see below.
 
 ## Reading the time is free
 
-Every turn of the event loop reads the OS clock once, to advance its timer stores, and keeps the value. `runtime::now()` hands that value back: it is a read of a thread-local, no syscall, no vDSO call, no atomic. You can call it on every request, on every log line, in every loop iteration, at zero cost.
+Every turn of the event loop reads the OS clock once, to advance its timer stores, and keeps the value. `slopio::now()` hands that value back: it is a read of a thread-local, no syscall, no vDSO call, no atomic. You can call it on every request, on every log line, in every loop iteration, at zero cost.
 
 The trade-off is that it is only as fresh as the last turn of the loop. Between two turns it does not move, and a task that runs for a long time without yielding sees the same timestamp throughout. Use it for timestamps and coarse deadlines; use `std::time::Instant::now()` when you are measuring something.
 
@@ -37,7 +37,7 @@ Anything else panics on the first poll. This applies to everything above, not ju
 
 Five seconds is in the first set too, and still gets its own store: a duration a whole fleet of timers shares is served more cheaply by a structure that knows they all share it.
 
-The set is meant to grow as the runtime needs it to. Adding a fixed duration is a localised change in `runtime-core/src/runtime/time.rs`: a constant, a store to hold it, and a routing arm. Adding one is cheap; needing one you did not add is a panic you will see immediately.
+The set is meant to grow as the runtime needs it to. Adding a fixed duration is a localised change in `slopio-core/src/runtime/time.rs`: a constant, a store to hold it, and a routing arm. Adding one is cheap; needing one you did not add is a panic you will see immediately.
 
 Until the duration you want exists, build it out of what does — a loop of one-hour sleeps, or a counter over a repeating five-second one.
 

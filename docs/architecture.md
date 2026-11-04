@@ -6,14 +6,14 @@ How the runtime is put together, the rules its design follows, and the conventio
 
 | Crate | Role |
 |-------|------|
-| `runtime-core` | The runtime itself: tasks, the I/O driver, timers, channels, `Bytes`, messaging, tracing, the simulator. |
-| `runtime` | The facade applications depend on: entry points, topologies, the global allocator, telemetry wiring. |
-| `runtime-machine` | Reads the machine from `/sys` and `/proc` without privilege: CPUs, cores, NUMA nodes, NIC queues and where their packets are processed. Depends on `libc` only, so that a tool tuning the machine reads it the same way. |
-| `runtime-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
-| `runtime-http` | The `http` crate's types on the runtime's `Bytes`, not `Send`. |
-| `async_timers` | The two timer stores the event loop drives: a timing wheel for any duration up to one hour, and a queue for a fixed duration, five seconds, see [time](time.md). |
-| `io_uring_rb` | Provided buffer ring memory. |
-| `runtime_ebpf_balancer` | Optional eBPF program steering QUIC connections under `SO_REUSEPORT`; needs `CAP_BPF`. |
+| `slopio-core` | The runtime itself: tasks, the I/O driver, timers, channels, `Bytes`, messaging, tracing, the simulator. |
+| `slopio` | The facade applications depend on: entry points, topologies, the global allocator, telemetry wiring. |
+| `slopio-machine` | Reads the machine from `/sys` and `/proc` without privilege: CPUs, cores, NUMA nodes, NIC queues and where their packets are processed. Depends on `libc` only, so that a tool tuning the machine reads it the same way. |
+| `slopio-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
+| `slopio-http` | The `http` crate's types on the runtime's `Bytes`, not `Send`. |
+| `slopio-timers` | The two timer stores the event loop drives: a timing wheel for any duration up to one hour, and a queue for a fixed duration, five seconds, see [time](time.md). |
+| `slopio-buf-ring` | Provided buffer ring memory. |
+| `slopio-ebpf-balancer` | Optional eBPF program steering QUIC connections under `SO_REUSEPORT`; needs `CAP_BPF`. |
 
 Dependencies are few and chosen one by one: `io-uring`, `libc`, `socket2`, `slab`, `bumpalo`, `smallvec`, `pin-project`, `bitfield-struct`, `rand`. There is no tokio, no `futures`, no `bytes` crate in the runtime: what the runtime needs from them it has its own version of, shaped for one thread.
 
@@ -56,7 +56,7 @@ A waker is only ever woken on the thread it belongs to. Nothing in the runtime m
 
 ## Configuration
 
-Everything a runtime is built with is decided when it is created and does not change afterwards: the ring flags, whether its listeners steer connections, which CPU it runs on. There is no automatic mode that detects and decides, and no setter that changes a running runtime. Detection exists, in `runtime-machine`, but it only reports; the application reads it and decides what to pass. At startup a topology prints what it resolved, so the decision is visible in the logs, see [topology](topology.md).
+Everything a runtime is built with is decided when it is created and does not change afterwards: the ring flags, whether its listeners steer connections, which CPU it runs on. There is no automatic mode that detects and decides, and no setter that changes a running runtime. Detection exists, in `slopio-machine`, but it only reports; the application reads it and decides what to pass. At startup a topology prints what it resolved, so the decision is visible in the logs, see [topology](topology.md).
 
 ## Testing
 

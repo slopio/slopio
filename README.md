@@ -39,14 +39,14 @@ Use `thread_per_core` instead of `main_thread` to run one such loop per core, wi
 
 | Crate | Role |
 |-------|------|
-| `runtime` | The facade to depend on: entry points, buffer ring declarations, telemetry wiring, global allocator. |
-| `runtime-core` | The runtime itself: tasks, I/O driver, timers, channels, tracing, simulator. |
-| `runtime-machine` | Reads CPUs, cores, NUMA nodes and NIC queues from `/sys` and `/proc`, without privilege. |
-| `runtime-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
-| `runtime-http` | The `http` crate's types on the runtime's `Bytes`. |
-| `async_timers` | The two timer stores: a timing wheel for any duration up to one hour, in three levels of milliseconds, seconds and minutes, and a queue for a fixed duration, five seconds. |
-| `io_uring_rb` | Provided buffer ring memory management. |
-| `runtime_ebpf_balancer` | Optional eBPF program steering QUIC connections to the right core under `SO_REUSEPORT`. |
+| `slopio` | The facade to depend on: entry points, buffer ring declarations, telemetry wiring, global allocator. |
+| `slopio-core` | The runtime itself: tasks, I/O driver, timers, channels, tracing, simulator. |
+| `slopio-machine` | Reads CPUs, cores, NUMA nodes and NIC queues from `/sys` and `/proc`, without privilege. |
+| `slopio-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
+| `slopio-http` | The `http` crate's types on the runtime's `Bytes`. |
+| `slopio-timers` | The two timer stores: a timing wheel for any duration up to one hour, in three levels of milliseconds, seconds and minutes, and a queue for a fixed duration, five seconds. |
+| `slopio-buf-ring` | Provided buffer ring memory management. |
+| `slopio-ebpf-balancer` | Optional eBPF program steering QUIC connections to the right core under `SO_REUSEPORT`. |
 
 ## Building and testing
 
@@ -58,7 +58,7 @@ cargo test --workspace
 The simulated suites run the runtime against a scripted kernel and need the `simulation` feature:
 
 ```sh
-cargo test -p runtime-core --features simulation --test simulated_runtime --test cancellation
+cargo test -p slopio-core --features simulation --test simulated_runtime --test cancellation
 ```
 
 Those same suites run under Miri; the exact flags are in the header of each test file.
@@ -69,7 +69,7 @@ To exercise the HTTP/3 path against a running server by hand, a `curl` built wit
 curl --http3 -k https://localhost:4433/{1,2,3} --parallel
 ```
 
-Optional features on the `runtime` crate: `tracing`, `local_debug_collector`, `ebpf_balancer` (needs `clang`), `simulation`.
+Optional features on the `slopio` crate: `tracing`, `local_debug_collector`, `ebpf_balancer` (needs `clang`), `simulation`.
 
 ## License
 

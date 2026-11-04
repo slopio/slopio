@@ -2,16 +2,16 @@
 
 The runtime can run against a simulated io_uring instead of the kernel. The driver, the tasks, the wakers, the timers and the buffer rings all run unmodified; only the ring underneath is replaced by one whose completions a test declares in advance. A test therefore exercises the real runtime against a kernel it controls, and the same test produces the same run every time.
 
-This is behind the `simulation` feature and lives in `runtime_core::deterministic_testing`. It is a test tool, not a production mode: with the feature off, the simulator is not compiled.
+This is behind the `simulation` feature and lives in `slopio_core::deterministic_testing`. It is a test tool, not a production mode: with the feature off, the simulator is not compiled.
 
 ## Writing a test
 
 A simulated test has four steps: build a ring, script what the world does, run a future on the runtime, assert.
 
 ```rust
-use runtime_core::deterministic_testing::{FakeRing, ReadEvent, simulated_socket};
-use runtime_core::io_driver::operations::sockets::recv::socket_recv;
-use runtime_core::runtime::RuntimeInner;
+use slopio_core::deterministic_testing::{FakeRing, ReadEvent, simulated_socket};
+use slopio_core::io_driver::operations::sockets::recv::socket_recv;
+use slopio_core::runtime::RuntimeInner;
 
 let (fake, handle) = FakeRing::builder().virtual_time().build();
 let socket = simulated_socket();
@@ -50,7 +50,7 @@ A simulated socket also remembers what its far end did, so a connection that end
 A script is fixed before the run, so it cannot answer what the program does. An actor can. Attach one to a simulated socket and every read and write on that descriptor is asked of it at the moment the completion is posted:
 
 ```rust
-use runtime_core::deterministic_testing::{Actor, ActorCx, ReadReply, WriteReply};
+use slopio_core::deterministic_testing::{Actor, ActorCx, ReadReply, WriteReply};
 
 struct Echoed { pending: Vec<u8> }
 
@@ -83,7 +83,7 @@ Because the run stops on a program that blocks for good, a peer that waits for a
 For the common case of a peer that plays a conversation, `Dialogue` is an actor built from steps:
 
 ```rust
-use runtime_core::deterministic_testing::{Check, Dialogue};
+use slopio_core::deterministic_testing::{Check, Dialogue};
 
 let (peer, report) = Dialogue::new()
     .send(b"PING\r\n".to_vec())
@@ -157,7 +157,7 @@ A run is a function of its seed, so nothing is recorded while a suite runs: the 
 
 ## What it is good for
 
-The simulator is for the paths a real kernel makes rare or unreproducible: a read cancelled while its data is in flight, a stream dropped mid-batch, a ring that runs out of buffers, a short write followed by a broken pipe, a timeout that wins by one tick. The existing suites under `runtime-core/tests/` cover cancellation, buffer recycling and the runtime's event loop this way, and are the best place to look for patterns.
+The simulator is for the paths a real kernel makes rare or unreproducible: a read cancelled while its data is in flight, a stream dropped mid-batch, a ring that runs out of buffers, a short write followed by a broken pipe, a timeout that wins by one tick. The existing suites under `slopio-core/tests/` cover cancellation, buffer recycling and the runtime's event loop this way, and are the best place to look for patterns.
 
 It also makes the runtime runnable under Miri, which a real io_uring never can be. `just test-sim` runs every simulated suite natively, `just miri` runs them under Miri, and `just miri-one <suite> [filter]` runs one; the flags and the list of suites live in the `justfile`.
 
@@ -165,4 +165,4 @@ It also makes the runtime runnable under Miri, which a real io_uring never can b
 
 - Sends never block and never see backpressure. The simulator models the completion, not the network.
 - A scripted descriptor's far end is only a state, closed or reset; for a peer that answers, attach an actor.
-- The simulator is reachable from `runtime_core` only. The `runtime` facade's entry points always build a real ring.
+- The simulator is reachable from `slopio_core` only. The `slopio` facade's entry points always build a real ring.

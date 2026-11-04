@@ -16,7 +16,7 @@ Telemetry is a Cargo feature. With it on, `main_thread_with` and `thread_per_cor
 ```rust
 let endpoint = "127.0.0.1:4317".parse().unwrap();
 let service = OtlpService { name: "api".into(), version: None, host_name: None };
-runtime::thread_per_core_traced::<Ring, _, _>(
+slopio::thread_per_core_traced::<Ring, _, _>(
     move || OtlpCollector::<Ring>::new(endpoint, &service),
     |ctx| Box::pin(worker(ctx)),
 );

@@ -1,0 +1,118 @@
+[package]
+name = "slopio-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+# The simulated ring and its virtual clock. Off in production: with it off the
+# backend enums have a single variant each, so the driver's dispatch on them
+# compiles away entirely.
+simulation = ["slopio-buf-ring/simulation"]
+tracing = []
+local_debug_collector = ["tracing"]
+ebpf_balancer = ["dep:slopio-ebpf-balancer"]
+
+# Compile-time max verbosity. Pick at most one in each group.
+up_to_off = []
+up_to_error = []
+up_to_warn = []
+up_to_info = []
+up_to_debug = []
+up_to_trace = []
+
+# Release-only variants — only effective under cfg(not(debug_assertions)).
+up_to_off_in_release = []
+up_to_error_in_release = []
+up_to_warn_in_release = []
+up_to_info_in_release = []
+up_to_debug_in_release = []
+up_to_trace_in_release = []
+
+[dependencies]
+io-uring = "0.7.15"
+libc = "0.2.178"
+slopio-buf-ring = { path = "../slopio-buf-ring" }
+slopio-ebpf-balancer = { path = "../slopio-ebpf-balancer", optional = true }
+slopio-timers = { path = "../slopio-timers" }
+slopio-streams = { path = "../slopio-streams" }
+pin-project = "1.1.10"
+slab = "0.4.11"
+socket2 = { version = "0.6.1", features = ["all"] }
+bumpalo = { version = "3.20.2", features = ["collections"] }
+rand = "0.8"
+smallvec = { version = "1", features = ["union"] }
+bitfield-struct = "0.13.0"
+
+[dev-dependencies]
+libc = "0.2.178"
+
+# Skipped outright without the feature, rather than compiled to an empty binary:
+# `cargo test` then says nothing about them instead of reporting "0 passed, ok".
+[[test]]
+name = "fake_ring"
+required-features = ["simulation"]
+
+[[test]]
+name = "simulated_runtime"
+required-features = ["simulation"]
+
+[[test]]
+name = "dst_echo"
+required-features = ["simulation"]
+
+[[test]]
+name = "actors"
+required-features = ["simulation"]
+
+[[test]]
+name = "cancellation"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_unbounded"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_bounded"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_vec"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_mpsc"
+required-features = ["simulation"]
+
+[[test]]
+name = "kill"
+required-features = ["simulation"]
+
+[[test]]
+name = "task_free"
+required-features = ["simulation"]
+
+[[test]]
+name = "kill_drop"
+required-features = ["simulation"]
+
+[[test]]
+name = "multishot_rearm"
+required-features = ["simulation"]
+
+[[test]]
+name = "buf_ring_reserve"
+required-features = ["simulation"]
+
+[[test]]
+name = "root_waker"
+required-features = ["simulation"]
+
+[[test]]
+name = "bytes_ring"
+required-features = ["simulation"]
+
+[[test]]
+name = "spawn_next"
+required-features = ["simulation"]

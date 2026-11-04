@@ -12,7 +12,7 @@ The option would make three links line up:
 - **Core to worker.** Already done by `thread_per_core`.
 - **Connection to worker.** For TCP and UDP, done, for the groups built with `net.steer_connections`: each thread's listeners and UDP sockets carry `SO_INCOMING_CPU`, and the kernel hands a connection or a datagram to the socket of the CPU that received it, hash as fallback (see [topology](topology.md)). Outgoing connections are not covered: their replies arrive on whichever queue the NIC's hash picks. For QUIC, the worker index encoded in the connection ID is chosen from the CPU that received the Initial, so the CID keeps every later datagram on the same core, migration included.
 
-Done: `runtime::net::steering_stats()` counts, per steering thread, the connections it accepted and how many arrived on its own CPU, read from `SO_INCOMING_CPU` on each accepted socket. The application exports it with its other metrics; a falling share shows `irqbalance` or a NIC reconfiguration undoing the alignment. There is no such count for UDP: the kernel does not record the receiving CPU on an unconnected socket.
+Done: `slopio::net::steering_stats()` counts, per steering thread, the connections it accepted and how many arrived on its own CPU, read from `SO_INCOMING_CPU` on each accepted socket. The application exports it with its other metrics; a falling share shows `irqbalance` or a NIC reconfiguration undoing the alignment. There is no such count for UDP: the kernel does not record the receiving CPU on an unconnected socket.
 
 **Pays when:** eight or more cores, many connections with small messages, tail latency matters. **Does not pay when:** few cores, few long-lived bulk connections, or when the instance's network allowance saturates first, which is the case on small cloud instances. With fewer queues than cores, only the cores that own a queue should run workers: `Machine::packet_cpus()` names them, and a group on `Threads::Fixed` puts the workers there.
 
@@ -26,7 +26,7 @@ Available, off by default: `RingOptions::napi_busy_poll` registers NAPI on the r
 
 ## Hardware layout: cpuset and SMT
 
-Done as reading only: the `runtime-machine` crate reads sysfs, no libnuma, no hwloc: the allowed CPU mask from `sched_getaffinity`, SMT siblings from `thread_siblings_list`, node per CPU from `/sys/devices/system/node`, the NIC's node from its device entry. Nothing places a thread from it yet; the application can.
+Done as reading only: the `slopio-machine` crate reads sysfs, no libnuma, no hwloc: the allowed CPU mask from `sched_getaffinity`, SMT siblings from `thread_siblings_list`, node per CPU from `/sys/devices/system/node`, the NIC's node from its device entry. Nothing places a thread from it yet; the application can.
 
 Workers and [topology](topology.md) threads are already placed on the allowed CPU mask, so a container restricted to CPUs `4-7` works. One use left that does not depend on NUMA:
 

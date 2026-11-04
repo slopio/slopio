@@ -9,7 +9,7 @@ A typical case is a database client. The connection handling runs one worker per
 A topology is a list of groups. A group is a set of threads running the same closure, with the same [provided buffer rings](io-model.md) and the same options. On top of the groups, you can add one worker per remaining core with `per_core`. Then `run` starts everything and blocks until every thread has returned.
 
 ```rust
-use runtime::{NetOptions, RingOptions, RuntimeOptions, Threads, Topology};
+use slopio::{NetOptions, RingOptions, RuntimeOptions, Threads, Topology};
 
 let mut topology = Topology::new();
 
@@ -32,7 +32,7 @@ The closure is called once on each thread of the group, on that thread once its 
 The `topology` example runs a TCP server whose workers share a counter owned by a dedicated thread:
 
 ```sh
-cargo run --release -p runtime --example topology -- 8080
+cargo run --release -p slopio --example topology -- 8080
 nc 127.0.0.1 8080
 ```
 
@@ -53,10 +53,10 @@ The placement is checked before any thread starts, and `run` panics with the rea
 Before any thread starts, `run` prints what it resolved to stdout, in one block:
 
 ```text
-runtime: topology of 9 threads, allowed CPUs 0-9, parallelism 10
-runtime:   group 0   threads 0       CPU 9, SQ threads on CPU 8; ring sqpoll idle 50ms; net plain
-runtime:   per_core  threads 1-8     CPUs 0-7; ring defer_taskrun coop_taskrun; net plain
-runtime:   NIC packets processed on CPU 4
+slopio: topology of 9 threads, allowed CPUs 0-9, parallelism 10
+slopio:   group 0   threads 0       CPU 9, SQ threads on CPU 8; ring sqpoll idle 50ms; net plain
+slopio:   per_core  threads 1-8     CPUs 0-7; ring defer_taskrun coop_taskrun; net plain
+slopio:   NIC packets processed on CPU 4
 ```
 
 Each group and the per-core workers get a line: their thread ids, the CPU of each thread in thread order, the CPU of each SQ thread, and the ring and net options they were built with. `parallelism` is what the process may use at once, below the allowed CPUs under a cgroup CPU quota. The last line says where the NICs' packets are processed, or why that cannot be told, and when some group steers connections a line follows on whether its CPUs are those (see below). Reading the machine needs no privilege and changes nothing: the block is for whoever reads the logs.
@@ -73,7 +73,7 @@ The steering line of the startup block compares the steering threads' CPUs with 
 
 ### Placing threads where the packets are
 
-`runtime::topology::Machine::read()` gives the application the same reading, from the `runtime-machine` crate: the CPUs the process may use, the isolated and `nohz_full` ones, the cores with their SMT siblings, the NUMA nodes, each NIC with its receive queues, the CPU of each queue's interrupt and its RPS CPUs, and whether RFS or `irqbalance` are in the way. `packet_cpus()` sums it up as the CPUs where the NICs' packets are processed: a queue's RPS CPUs when RPS is on, its interrupt's CPU otherwise. `cargo run --example machine` prints all of it.
+`slopio::topology::Machine::read()` gives the application the same reading, from the `slopio-machine` crate: the CPUs the process may use, the isolated and `nohz_full` ones, the cores with their SMT siblings, the NUMA nodes, each NIC with its receive queues, the CPU of each queue's interrupt and its RPS CPUs, and whether RFS or `irqbalance` are in the way. `packet_cpus()` sums it up as the CPUs where the NICs' packets are processed: a queue's RPS CPUs when RPS is on, its interrupt's CPU otherwise. `cargo run --example machine` prints all of it.
 
 It only reads, and the topology never uses it on its own. To put steering workers on the CPUs that process packets, declare them as a group on those CPUs:
 
@@ -95,7 +95,7 @@ match aligned {
 
 A group differs from `per_core` in two ways. Its threads find each other in `ctx.group`, while `ctx.workers` stays empty. And it is not cut down to a cgroup CPU quota: compare the number of CPUs with `std::thread::available_parallelism()` before declaring it.
 
-While it runs, each steering thread counts the connections it accepts, and how many of them the kernel received on the thread's own CPU. `runtime::net::steering_stats()` returns the thread's two counts; export them the way the application exports its other metrics. A share well below one means the alignment does not hold, or no longer holds.
+While it runs, each steering thread counts the connections it accepts, and how many of them the kernel received on the thread's own CPU. `slopio::net::steering_stats()` returns the thread's two counts; export them the way the application exports its other metrics. A share well below one means the alignment does not hold, or no longer holds.
 
 ## Options
 
@@ -105,7 +105,7 @@ Each group, and `per_core`, gets a `RuntimeOptions`: `ring`, the ring's setup, a
 |-------------|---------|--------|
 | `steer_connections` | `false` | `SO_INCOMING_CPU` set to the thread's CPU on every listener and UDP socket it binds, see above. |
 
-The options are fixed once the thread starts. Code running on it reads them with `runtime::thread_options()`: its peer id, the CPU it is pinned to, and the options it was built with.
+The options are fixed once the thread starts. Code running on it reads them with `slopio::thread_options()`: its peer id, the CPU it is pinned to, and the options it was built with.
 
 The `ring` fields are plain switches over the io_uring setup flags:
 
