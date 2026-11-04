@@ -2,7 +2,7 @@ use slopio::io_driver::operations::sockets::multi_accept::MultiAccept;
 use slopio::io_driver::operations::sockets::recv::socket_recv;
 use slopio::io_driver::operations::sockets::send_zc::send_all_zc;
 use slopio::main_thread;
-use slopio_streams::StreamExt;
+use slopio::streams::StreamExt;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;

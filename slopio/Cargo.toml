@@ -10,16 +10,43 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Forwarded so a test crate can build the simulated ring.
-simulation = ["slopio-core/simulation"]
-tracing               = ["slopio-core/tracing"]
-local_debug_collector = ["slopio-core/local_debug_collector"]
-ebpf_balancer         = ["slopio-core/ebpf_balancer"]
+# The simulated ring and its virtual clock. Off in production: with it off the
+# backend enums have a single variant each, so the driver's dispatch on them
+# compiles away entirely. Also trades away buffer ring mapping hints the kernel
+# is free to ignore, so a ring can be built somewhere there is no kernel.
+simulation = []
+tracing = []
+local_debug_collector = ["tracing"]
+ebpf_balancer = ["dep:slopio-ebpf-balancer"]
+
+# Compile-time max verbosity. Pick at most one in each group.
+up_to_off = []
+up_to_error = []
+up_to_warn = []
+up_to_info = []
+up_to_debug = []
+up_to_trace = []
+
+# Release-only variants — only effective under cfg(not(debug_assertions)).
+up_to_off_in_release = []
+up_to_error_in_release = []
+up_to_warn_in_release = []
+up_to_info_in_release = []
+up_to_debug_in_release = []
+up_to_trace_in_release = []
 
 [dependencies]
-slopio-core.workspace = true
-slopio-machine.workspace = true
+io-uring = "0.7.15"
 libc = "0.2.178"
+rustix = { version = "1.1.3", features = ["mm"] }
+slopio-ebpf-balancer = { workspace = true, optional = true }
+pin-project = "1.1.10"
+slab = "0.4.11"
+socket2 = { version = "0.6.1", features = ["all"] }
+bumpalo = { version = "3.20.2", features = ["collections"] }
+rand = "0.8"
+smallvec = { version = "1", features = ["union"] }
+bitfield-struct = "0.13.0"
 
 # Miri cannot call into mimalloc's C; it runs on its own allocator instead.
 [target.'cfg(not(miri))'.dependencies]
@@ -28,8 +55,75 @@ libc = "0.2.178"
 libmimalloc-sys = { version = "0.1.44", default-features = false, features = ["local_dynamic_tls", "v3"] }
 
 [dev-dependencies]
-slopio-streams.workspace = true
 bytes = "1"
 http = "1"
-rand = "0.8"
-socket2 = "0.5"
+
+# Skipped outright without the feature, rather than compiled to an empty binary:
+# `cargo test` then says nothing about them instead of reporting "0 passed, ok".
+[[test]]
+name = "fake_ring"
+required-features = ["simulation"]
+
+[[test]]
+name = "simulated_runtime"
+required-features = ["simulation"]
+
+[[test]]
+name = "dst_echo"
+required-features = ["simulation"]
+
+[[test]]
+name = "actors"
+required-features = ["simulation"]
+
+[[test]]
+name = "cancellation"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_unbounded"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_bounded"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_vec"
+required-features = ["simulation"]
+
+[[test]]
+name = "channels_mpsc"
+required-features = ["simulation"]
+
+[[test]]
+name = "kill"
+required-features = ["simulation"]
+
+[[test]]
+name = "task_free"
+required-features = ["simulation"]
+
+[[test]]
+name = "kill_drop"
+required-features = ["simulation"]
+
+[[test]]
+name = "multishot_rearm"
+required-features = ["simulation"]
+
+[[test]]
+name = "buf_ring_reserve"
+required-features = ["simulation"]
+
+[[test]]
+name = "root_waker"
+required-features = ["simulation"]
+
+[[test]]
+name = "bytes_ring"
+required-features = ["simulation"]
+
+[[test]]
+name = "spawn_next"
+required-features = ["simulation"]

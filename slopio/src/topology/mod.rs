@@ -26,15 +26,15 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use slopio_core::io_driver::BufRingSet;
-use slopio_core::runtime::RuntimeOptions;
-use slopio_core::runtime::eventfd;
-use slopio_core::runtime::peers::PeerTable;
+use crate::io_driver::BufRingSet;
+use crate::runtime::RuntimeOptions;
+use crate::runtime::eventfd;
+use crate::runtime::peers::PeerTable;
 
+pub use crate::machine::{Machine, Nic, PacketCpusError, RxQueue};
 use crate::telemetry::{DEFAULT_TELEMETRY, DefaultTelemetry, Telemetry};
 use cpus::Cpu;
 use plan::{Placed, Plan};
-pub use slopio_machine::{Machine, Nic, PacketCpusError, RxQueue};
 use thread::Start;
 
 /// How many threads a group runs, and where.

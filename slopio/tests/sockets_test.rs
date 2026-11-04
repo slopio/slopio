@@ -7,7 +7,7 @@ use slopio::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use slopio::main_thread;
 use slopio::runtime::spawn;
 use slopio::runtime::time::timeout;
-use slopio_streams::StreamExt;
+use slopio::streams::StreamExt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;

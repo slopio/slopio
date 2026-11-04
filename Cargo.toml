@@ -1,13 +1,7 @@
 [workspace]
 members = [
-    "slopio-timers",
-    "slopio-buf-ring",
-    "slopio-ebpf-balancer",
-    "slopio-core",
-    "slopio-machine",
-    "slopio-streams",
     "slopio",
-    "slopio-http",
+    "slopio-ebpf-balancer",
 ]
 resolver = "2"
 
@@ -18,11 +12,6 @@ license = "MIT"
 repository = "https://github.com/slopio/slopio"
 
 [workspace.dependencies]
-slopio-core = { path = "slopio-core", version = "0.1.0" }
-slopio-machine = { path = "slopio-machine", version = "0.1.0" }
-slopio-streams = { path = "slopio-streams", version = "0.1.0" }
-slopio-timers = { path = "slopio-timers", version = "0.1.0" }
-slopio-buf-ring = { path = "slopio-buf-ring", version = "0.1.0" }
 slopio-ebpf-balancer = { path = "slopio-ebpf-balancer", version = "0.1.0" }
 
 [profile.release]

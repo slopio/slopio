@@ -11,11 +11,11 @@ use std::{
     time::Duration,
 };
 
+use slopio::streams::StreamExt;
 use slopio::{
     io_driver::operations::sockets::{multi_accept::MultiAccept, multi_recv::MultiRecv},
     main_thread_with,
 };
-use slopio_streams::StreamExt;
 
 use crate::common::Cv;
 

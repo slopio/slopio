@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use slopio::net::{MultiAccept, send_all};
 use slopio::runtime::{recv_msg_from_peer, reply_msg_to_peer, request_msg_from_peer};
+use slopio::streams::StreamExt;
 use slopio::{RingOptions, Threads, Topology, spawn};
-use slopio_streams::StreamExt;
 
 /// A worker asking for the next visitor number.
 struct Visit;

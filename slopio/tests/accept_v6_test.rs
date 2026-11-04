@@ -4,11 +4,11 @@ use std::{
     sync::mpsc,
 };
 
+use slopio::streams::StreamExt;
 use slopio::{
     main_thread,
     net::{MultiAccept, socket_recv, socket_send},
 };
-use slopio_streams::StreamExt;
 
 /// Skip the v6 cases on a host without IPv6 rather than fail them.
 fn has_ipv6() -> bool {

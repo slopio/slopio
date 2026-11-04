@@ -2,9 +2,9 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use slopio_core::io_driver::BufRingSet;
-use slopio_core::runtime::peers::PeerTable;
-use slopio_core::runtime::{RuntimeInner, RuntimeOptions};
+use crate::io_driver::BufRingSet;
+use crate::runtime::peers::PeerTable;
+use crate::runtime::{RuntimeInner, RuntimeOptions};
 
 use super::WorkerContext;
 use super::cpus::pin_core;

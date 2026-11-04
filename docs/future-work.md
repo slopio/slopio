@@ -26,7 +26,7 @@ Available, off by default: `RingOptions::napi_busy_poll` registers NAPI on the r
 
 ## Hardware layout: cpuset and SMT
 
-Done as reading only: the `slopio-machine` crate reads sysfs, no libnuma, no hwloc: the allowed CPU mask from `sched_getaffinity`, SMT siblings from `thread_siblings_list`, node per CPU from `/sys/devices/system/node`, the NIC's node from its device entry. Nothing places a thread from it yet; the application can.
+Done as reading only: the `slopio::machine` module reads sysfs, no libnuma, no hwloc: the allowed CPU mask from `sched_getaffinity`, SMT siblings from `thread_siblings_list`, node per CPU from `/sys/devices/system/node`, the NIC's node from its device entry. Nothing places a thread from it yet; the application can.
 
 Workers and [topology](topology.md) threads are already placed on the allowed CPU mask, so a container restricted to CPUs `4-7` works. One use left that does not depend on NUMA:
 

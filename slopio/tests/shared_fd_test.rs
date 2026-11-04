@@ -1,11 +1,11 @@
 use std::{io::Read, net::TcpStream, os::fd::FromRawFd, time::Duration};
 
+use slopio::streams::StreamExt;
 use slopio::{
     main_thread_with,
     net::{MultiAccept, SocketWrapper, socket_recv, socket_send},
     runtime::{select::select, time::Sleep},
 };
-use slopio_streams::StreamExt;
 
 use crate::common::Cv;
 

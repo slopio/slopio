@@ -2,20 +2,22 @@
 
 How the runtime is put together, the rules its design follows, and the conventions the code is written in. The other documents describe how to use the runtime; this one is for reading and changing it.
 
-## The crates
+## The crate and its modules
 
-| Crate | Role |
-|-------|------|
-| `slopio-core` | The runtime itself: tasks, the I/O driver, timers, channels, `Bytes`, messaging, tracing, the simulator. |
-| `slopio` | The facade applications depend on: entry points, topologies, the global allocator, telemetry wiring. |
-| `slopio-machine` | Reads the machine from `/sys` and `/proc` without privilege: CPUs, cores, NUMA nodes, NIC queues and where their packets are processed. Depends on `libc` only, so that a tool tuning the machine reads it the same way. |
-| `slopio-streams` | The minimal `Stream` and `StreamExt` traits the streaming operations implement. |
-| `slopio-http` | The `http` crate's types on the runtime's `Bytes`, not `Send`. |
-| `slopio-timers` | The two timer stores the event loop drives: a timing wheel for any duration up to one hour, and a queue for a fixed duration, five seconds, see [time](time.md). |
-| `slopio-buf-ring` | Provided buffer ring memory. |
-| `slopio-ebpf-balancer` | Optional eBPF program steering QUIC connections under `SO_REUSEPORT`; needs `CAP_BPF`. |
+Everything is in one crate, `slopio`, except the eBPF balancer, `slopio-ebpf-balancer`: it compiles a C program with `clang` at build time, so it stays apart, behind the `ebpf_balancer` feature.
 
-Dependencies are few and chosen one by one: `io-uring`, `libc`, `socket2`, `slab`, `bumpalo`, `smallvec`, `pin-project`, `bitfield-struct`, `rand`. There is no tokio, no `futures`, no `bytes` crate in the runtime: what the runtime needs from them it has its own version of, shaped for one thread.
+| Module | Role |
+|--------|------|
+| `runtime` | Tasks and the event loop, time, messaging between threads, the options a runtime is built with. |
+| `io_driver`, `net` | The io_uring driver and its operations, sockets and files. |
+| `topology` | Groups of threads, their placement on CPUs, the block printed at startup. |
+| `machine` | Reads the machine from `/sys` and `/proc` without privilege: CPUs, cores, NUMA nodes, NIC queues and where their packets are processed. |
+| `bytes`, `channels`, `streams`, `task` | `Bytes` and `BytesMut` for one thread, channels, the `Stream` traits, task handles. |
+| `http` | The `http` crate's types on the runtime's `Bytes`, not `Send`. |
+| `timers`, `buf_ring_memory` | Internal: the two timer stores the event loop drives, a timing wheel for any duration up to one hour and a queue for exactly five seconds, see [time](time.md); and the memory of provided buffer rings. |
+| `tracing`, `deterministic_testing` | Behind the `tracing` and `simulation` features: spans and their export, the simulated kernel. |
+
+Dependencies are few and chosen one by one: `io-uring`, `libc`, `rustix`, `socket2`, `slab`, `bumpalo`, `smallvec`, `pin-project`, `bitfield-struct`, `rand`, and `libmimalloc-sys` for the global allocator. There is no tokio, no `futures`, no `bytes` crate in the runtime's dependencies: what the runtime needs from them it has its own version of, shaped for one thread.
 
 ## One thread, one runtime
 
@@ -56,7 +58,7 @@ A waker is only ever woken on the thread it belongs to. Nothing in the runtime m
 
 ## Configuration
 
-Everything a runtime is built with is decided when it is created and does not change afterwards: the ring flags, whether its listeners steer connections, which CPU it runs on. There is no automatic mode that detects and decides, and no setter that changes a running runtime. Detection exists, in `slopio-machine`, but it only reports; the application reads it and decides what to pass. At startup a topology prints what it resolved, so the decision is visible in the logs, see [topology](topology.md).
+Everything a runtime is built with is decided when it is created and does not change afterwards: the ring flags, whether its listeners steer connections, which CPU it runs on. There is no automatic mode that detects and decides, and no setter that changes a running runtime. Detection exists, in `slopio::machine`, but it only reports; the application reads it and decides what to pass. At startup a topology prints what it resolved, so the decision is visible in the logs, see [topology](topology.md).
 
 ## Testing
 

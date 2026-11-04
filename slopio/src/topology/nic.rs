@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use slopio_machine::{Machine, cpu_list};
+use crate::machine::{Machine, cpu_list};
 
 /// What keeps `steering`, the CPUs of the threads that steer, from each
 /// serving the connections it processes the packets of; empty when nothing does.
@@ -57,7 +57,7 @@ fn named(cpus: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slopio_machine::{Nic, RxQueue};
+    use crate::machine::{Nic, RxQueue};
 
     /// One NIC, queue n's packets processed on `cpus[n]`.
     fn machine(cpus: &[usize]) -> Machine {

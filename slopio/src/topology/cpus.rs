@@ -9,7 +9,7 @@ pub(super) enum Cpu {
     Fixed(usize),
 }
 
-pub(super) use slopio_machine::allowed_cpus;
+pub(super) use crate::machine::allowed_cpus;
 
 pub(super) fn pin_core(core_id: usize) {
     unsafe {

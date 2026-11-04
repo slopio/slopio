@@ -4,9 +4,9 @@ use std::fmt;
 use std::ops::Range;
 use std::time::Duration;
 
-use slopio_core::runtime::RuntimeOptions;
+use crate::runtime::RuntimeOptions;
 
-use slopio_machine::cpu_list;
+use crate::machine::cpu_list;
 
 /// A group, or the per-core workers, once placed.
 pub(super) struct Placed {
@@ -138,8 +138,8 @@ fn duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slopio_core::io_driver::RingOptions;
-    use slopio_core::runtime::NetOptions;
+    use crate::io_driver::RingOptions;
+    use crate::runtime::NetOptions;
 
     #[test]
     fn a_plan_prints_one_line_per_group() {

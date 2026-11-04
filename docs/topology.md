@@ -73,7 +73,7 @@ The steering line of the startup block compares the steering threads' CPUs with 
 
 ### Placing threads where the packets are
 
-`slopio::topology::Machine::read()` gives the application the same reading, from the `slopio-machine` crate: the CPUs the process may use, the isolated and `nohz_full` ones, the cores with their SMT siblings, the NUMA nodes, each NIC with its receive queues, the CPU of each queue's interrupt and its RPS CPUs, and whether RFS or `irqbalance` are in the way. `packet_cpus()` sums it up as the CPUs where the NICs' packets are processed: a queue's RPS CPUs when RPS is on, its interrupt's CPU otherwise. `cargo run --example machine` prints all of it.
+`slopio::topology::Machine::read()` gives the application the same reading, from the `slopio::machine` module: the CPUs the process may use, the isolated and `nohz_full` ones, the cores with their SMT siblings, the NUMA nodes, each NIC with its receive queues, the CPU of each queue's interrupt and its RPS CPUs, and whether RFS or `irqbalance` are in the way. `packet_cpus()` sums it up as the CPUs where the NICs' packets are processed: a queue's RPS CPUs when RPS is on, its interrupt's CPU otherwise. `cargo run --example machine` prints all of it.
 
 It only reads, and the topology never uses it on its own. To put steering workers on the CPUs that process packets, declare them as a group on those CPUs:
 

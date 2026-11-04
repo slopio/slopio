@@ -37,7 +37,7 @@ Anything else panics on the first poll. This applies to everything above, not ju
 
 Five seconds is in the first set too, and still gets its own store: a duration a whole fleet of timers shares is served more cheaply by a structure that knows they all share it.
 
-The set is meant to grow as the runtime needs it to. Adding a fixed duration is a localised change in `slopio-core/src/runtime/time.rs`: a constant, a store to hold it, and a routing arm. Adding one is cheap; needing one you did not add is a panic you will see immediately.
+The set is meant to grow as the runtime needs it to. Adding a fixed duration is a localised change in `slopio/src/runtime/time.rs`: a constant, a store to hold it, and a routing arm. Adding one is cheap; needing one you did not add is a panic you will see immediately.
 
 Until the duration you want exists, build it out of what does — a loop of one-hour sleeps, or a counter over a repeating five-second one.
 

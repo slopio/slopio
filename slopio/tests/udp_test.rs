@@ -5,8 +5,8 @@ use slopio::io_driver::operations::sockets::multi_recv::CompletionError;
 use slopio::net::{UdpMultiRecv, UdpRecvHalf, UdpReuniteError, UdpSocket};
 use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
+use slopio::streams::StreamExt;
 use slopio::{main_thread, main_thread_with, spawn};
-use slopio_streams::StreamExt;
 
 slopio::define_buf_ring!(pub Small, bgid = 0, buffer_size = 4096, ring_size = 64);
 slopio::define_buf_ring!(pub Tiny, bgid = 1, buffer_size = 4096, ring_size = 2);

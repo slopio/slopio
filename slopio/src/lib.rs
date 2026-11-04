@@ -1,27 +1,49 @@
 use std::pin::Pin;
 
-use slopio_core::runtime::eventfd;
+pub mod bytes;
+pub mod channels;
+#[cfg(feature = "simulation")]
+pub mod deterministic_testing;
+pub mod http;
+pub mod io_driver;
+pub mod machine;
+pub mod macros;
+pub mod net;
+pub mod runtime;
+pub mod streams;
+pub mod task;
+#[cfg(feature = "tracing")]
+pub mod tracing;
 
-// Re-export core
-pub use slopio_core::bytes::{Bytes, BytesMut};
-pub use slopio_core::io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec};
-pub use slopio_core::runtime::{
+/// Provided buffer ring memory, under the driver's buffer rings.
+#[doc(hidden)]
+pub mod buf_ring_memory;
+/// The timer stores the time driver routes sleeps to.
+#[doc(hidden)]
+pub mod timers;
+
+pub use bytes::{Bytes, BytesMut};
+pub use io_driver::{BorrowedBuffer, BufRingSet, BufRingSpec, RingOptions};
+pub use macros::scoped_tls;
+pub use runtime::{
     NetOptions, RuntimeInner, RuntimeOptions, ThreadOptions, spawn, spawn_next, thread_options,
     yield_now,
 };
-pub use slopio_core::task::Handle;
-pub use slopio_core::{bytes, channels, io_driver, net, runtime, task};
-// Re-export the buf-ring declaration macro so downstream crates can do
-// `slopio::define_buf_ring!(...)` without naming `slopio_core`.
-pub use slopio_core::define_buf_ring;
+pub use task::Handle;
 
-#[cfg(feature = "tracing")]
-pub use slopio_core::tracing;
+use runtime::eventfd;
+
+/// Re-exports used by `define_buf_ring!`-generated code. Not part of the
+/// public API; callers should not rely on items here directly.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::buf_ring_memory::RingBuffer;
+    pub use io_uring::IoUring;
+}
 
 mod telemetry;
 pub mod topology;
 
-pub use slopio_core::io_driver::RingOptions;
 use telemetry::{DEFAULT_TELEMETRY, Telemetry};
 pub use topology::{Threads, Topology, WorkerContext};
 

@@ -7,11 +7,11 @@ use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 
 use slopio::net::{MultiAccept, SteeringStats, UdpSocket, steering_stats};
+use slopio::streams::StreamExt;
 use slopio::{
     NetOptions, RuntimeOptions, Threads, Topology, WorkerContext, main_thread,
     main_thread_with_options, thread_options,
 };
-use slopio_streams::StreamExt;
 
 /// The kernel's value for the socket, -1 when nothing set it.
 fn so_incoming_cpu(fd: RawFd) -> i32 {

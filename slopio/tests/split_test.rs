@@ -3,12 +3,12 @@ use std::{
     net::TcpStream,
 };
 
+use slopio::streams::StreamExt;
 use slopio::{
     main_thread_with,
     net::{MultiAccept, MultiRecv, OwnedReadHalf, ReuniteError, send_all},
     spawn,
 };
-use slopio_streams::StreamExt;
 
 use crate::common::Cv;
 

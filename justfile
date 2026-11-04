@@ -83,19 +83,19 @@ miri-setup:
 
 # Every kernel-free suite against the simulated ring, without Miri
 test-sim *args:
-    cargo test -p slopio-core --features simulation {{MIRI_SUITES}} {{args}}
+    cargo test -p slopio --features simulation {{MIRI_SUITES}} {{args}}
 
 # Check every Miri-able suite for undefined behaviour and leaks
 miri *args:
-    MIRIFLAGS="{{MIRIFLAGS}}" cargo +nightly miri test -p slopio-core --features simulation {{MIRI_SUITES}} {{args}}
+    MIRIFLAGS="{{MIRIFLAGS}}" cargo +nightly miri test -p slopio --features simulation {{MIRI_SUITES}} {{args}}
 
 # One suite, optionally one test:  just miri-one cancellation a_multishot
 miri-one suite filter="":
-    MIRIFLAGS="{{MIRIFLAGS}}" cargo +nightly miri test -p slopio-core --features simulation --test {{suite}} {{filter}}
+    MIRIFLAGS="{{MIRIFLAGS}}" cargo +nightly miri test -p slopio --features simulation --test {{suite}} {{filter}}
 
 # The channels alone, which need neither a ring nor a clock
 miri-channels:
-    MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p slopio-core --test channels
+    MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p slopio --test channels
 
 # Run the thread_per_core multithread stress test with eBPF balancer
 test-multithread:

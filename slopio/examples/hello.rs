@@ -4,8 +4,8 @@
 //! nc 127.0.0.1 8080
 
 use slopio::net::{MultiAccept, send_all};
+use slopio::streams::StreamExt;
 use slopio::{spawn, thread_per_core};
-use slopio_streams::StreamExt;
 
 fn main() {
     let port: u16 = std::env::args()
