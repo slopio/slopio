@@ -9,6 +9,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[package.metadata.docs.rs]
+# Document the telemetry and the simulator too; the eBPF build is skipped there.
+features = ["tracing", "local_debug_collector", "simulation"]
+
 [features]
 # The simulated ring and its virtual clock. Off in production: with it off the
 # backend enums have a single variant each, so the driver's dispatch on them

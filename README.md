@@ -17,7 +17,12 @@ The rules that follow from that:
 
 ## Status
 
-Experimental. The API changes without notice, there is no release on crates.io, and some subsystems are stubs. Read [requirements](docs/requirements.md) before trying it: a 6.1 kernel is the floor and containers need a seccomp profile that allows io_uring.
+Experimental. The API changes between 0.x versions, and some subsystems are stubs. Read [requirements](docs/requirements.md) before trying it: a 6.1 kernel is the floor and containers need a seccomp profile that allows io_uring.
+
+```toml
+[dependencies]
+slopio = "0.1"
+```
 
 Use `thread_per_core` instead of `main_thread` to run one such loop per core, with the workers able to [message each other](docs/messaging.md). When threads do different jobs, a [topology](docs/topology.md) gives each kind its own CPUs and ring settings.
 
