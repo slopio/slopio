@@ -82,9 +82,12 @@ impl CompletionEvent {
                 let event = match ud.io_kind() {
                     IO_REPLY_SIGNAL => Event::ReplySignal { status: data.result },
                     kind /* IO_MULTI or IO_SINGLE */ => {
-                        // EBADF means an SQE named a closed fd: fd ownership is broken.
+                        // EBADF on a descriptor the runtime owns means an SQE named a
+                        // closed fd: fd ownership is broken. On a descriptor the caller
+                        // named (a user-built op, a pidfd) it is an answer and goes to
+                        // the future.
                         assert!(
-                            result != -libc::EBADF,
+                            result != -libc::EBADF || ud.caller_fd(),
                             "op completed with EBADF (user_data {raw:#x}, slab index {})",
                             ud.index(),
                         );

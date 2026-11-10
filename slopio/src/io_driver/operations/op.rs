@@ -41,6 +41,10 @@ pub unsafe trait OpState: 'static {
 /// driver holds the state until the terminal CQE, whose result is lost (an fd is
 /// closed if [`OpState::RESULT_IS_FD`]). To survive a lost race, select on `&mut op`
 /// instead of moving it in.
+///
+/// `EBADF` resolves to an error like any other: the entry names its own fd, and the
+/// kernel also answers it for an fd opened in the wrong mode. On an fd the runtime
+/// vouches for, the driver panics instead.
 pub struct Op<S: OpState> {
     state: Option<S>,
     token: Option<OneshotToken>,
@@ -71,7 +75,7 @@ impl<S: OpState> Future for Op<S> {
                 .as_mut()
                 .expect("Op polled after completion")
                 .entry();
-            this.token = Some(IO_DRIVER.with(|d| d.push_op(entry)));
+            this.token = Some(IO_DRIVER.with(|d| d.push_caller_fd_op(entry)));
         }
         let meta = ready!(IO_DRIVER.with(|d| d.poll_op(&mut this.token, cx.waker())));
         let result = match meta.result {

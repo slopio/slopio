@@ -157,7 +157,7 @@ impl WaitProcess {
         )
         .infop(&**self.siginfo.as_ref().expect("siginfo present") as *const libc::siginfo_t)
         .build();
-        let token = IO_DRIVER.with(|d| d.push_op(entry));
+        let token = IO_DRIVER.with(|d| d.push_caller_fd_op(entry));
         self.token = Some(token);
     }
 }

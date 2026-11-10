@@ -1106,6 +1106,20 @@ impl IODriver {
         token
     }
 
+    /// [`push_op`](Self::push_op) for an op on a descriptor the runtime does
+    /// not vouch for, because the caller named it: the entry of an `Op`, a
+    /// pidfd. `EBADF` is then an answer about the request and reaches the
+    /// future as an error; for every other op it means a descriptor was
+    /// closed under an op, and the driver panics.
+    pub(crate) fn push_caller_fd_op(&self, mut entry: squeue::Entry) -> OneshotToken {
+        let slab = unsafe { &mut *self.slab.get() };
+        let ring_inner = unsafe { &mut *self.ring.get() };
+        let token = slab.insert(SingleOpState::Init, 0).caller_fd();
+        entry.set_user_data(UserData::single(token.raw()).into_bits());
+        ring_inner.add(&entry);
+        token
+    }
+
     pub(crate) fn push_wakeup_timeout(&self, duration: Duration) {
         let ring_inner = unsafe { &mut *self.ring.get() };
         ring_inner.wakeup_timeout = Timespec::from(duration);

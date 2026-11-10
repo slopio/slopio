@@ -75,6 +75,25 @@ fn completes_and_returns_the_state() {
     });
 }
 
+/// Names a descriptor that was never open.
+struct SyncNothing;
+
+unsafe impl OpState for SyncNothing {
+    fn entry(&mut self) -> Entry {
+        opcode::Fsync::new(Fd(1_000_000)).build()
+    }
+}
+
+/// An `Op` names its own descriptor: a bad one is its caller's error to
+/// handle, where on a descriptor the runtime owns the driver panics.
+#[test]
+fn a_bad_descriptor_is_an_error_for_the_caller() {
+    main_thread(async {
+        let (res, _) = Op::new(SyncNothing).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EBADF));
+    });
+}
+
 #[test]
 fn survives_a_lost_select_and_completes_later() {
     main_thread(async {

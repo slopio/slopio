@@ -246,3 +246,13 @@ fn test_stop_notification() {
         }
     });
 }
+
+/// A pidfd is a descriptor the caller names: one that is not open is an error
+/// for the caller, not a broken descriptor of the runtime's.
+#[test]
+fn waiting_on_a_pidfd_that_is_not_open_is_an_error() {
+    main_thread(async {
+        let wait = WaitProcess::new(1_000_000, IdType::PidFd, WaitFlags::EXITED);
+        assert_eq!(wait.await.unwrap_err().raw_os_error(), Some(libc::EBADF));
+    });
+}

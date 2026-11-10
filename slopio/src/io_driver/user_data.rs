@@ -31,7 +31,9 @@ pub(crate) const IO_REPLY_SIGNAL: u8 = 0b11;
 /// carries a slab index (IO ops) or a payload (peer messages).
 ///
 /// Layout (LSB → MSB):
-///   bits  0..=57 : slab index (IO ops)
+///   bits  0..=56 : slab index (IO ops)
+///   bit        57 : the op's descriptor is its caller's to answer for, so
+///                   `EBADF` is a result to hand back and not a broken rule
 ///   bits 58..=59 : buffer ring of the op, read only on a CQE with `F_BUFFER`
 ///   bits 60..=61 : `io_kind`  (IO ops only)
 ///   bits 62..=63 : `tag`
@@ -44,8 +46,9 @@ pub(crate) const IO_REPLY_SIGNAL: u8 = 0b11;
 #[bitfield(u64)]
 #[derive(PartialEq, Eq)]
 pub(crate) struct UserData {
-    #[bits(58)]
+    #[bits(57)]
     pub index: u64,
+    pub caller_fd: bool,
     #[bits(2)]
     pub ring: u8,
     #[bits(2)]
@@ -55,12 +58,14 @@ pub(crate) struct UserData {
 }
 
 impl UserData {
-    /// Largest slab index the 58-bit field can hold. Keep in sync with the
-    /// `#[bits(58)]` on `index`.
-    pub const MAX_INDEX: u64 = (1u64 << 58) - 1;
+    /// Largest slab index the 57-bit field can hold. Keep in sync with the
+    /// `#[bits(57)]` on `index`.
+    pub const MAX_INDEX: u64 = (1u64 << 57) - 1;
+    /// The `caller_fd` bit, as it sits in a token.
+    const CALLER_FD: u64 = 1u64 << 57;
     /// How many buffer rings the `ring` field can name.
     pub const MAX_RINGS: u16 = 4;
-    /// Largest token: a slab index with its ring bits on top.
+    /// Largest token: a slab index with its `caller_fd` and ring bits on top.
     pub const MAX_TOKEN: u64 = (1u64 << 60) - 1;
 
     /// A slab index and the op's buffer ring, as one token value.
@@ -71,10 +76,16 @@ impl UserData {
         index | (ring as u64) << 58
     }
 
-    /// The slab index of a token, ring bits dropped.
+    /// The slab index of a token, the bits above it dropped.
     #[inline]
     pub const fn token_index(token: u64) -> usize {
         (token & Self::MAX_INDEX) as usize
+    }
+
+    /// The same token, marked as an op on a descriptor its caller answers for.
+    #[inline]
+    pub const fn caller_fd_token(token: u64) -> u64 {
+        token | Self::CALLER_FD
     }
 
     #[inline]
@@ -139,6 +150,16 @@ const _: () = assert!(UserData::single(0x1234_5678_9abc).into_bits() == 0x1234_5
 const _: () = assert!(UserData::single(UserData::MAX_TOKEN).into_bits() == UserData::MAX_TOKEN);
 const _: () = assert!(UserData::multi(UserData::token(7, 3)).ring() == 3);
 const _: () = assert!(UserData::multi(UserData::token(7, 3)).index() == 7);
+// The mark rides in the token, so a cancel by the bare token still matches,
+// and it reaches neither the slab index nor the ring bits.
+const _: () = {
+    let token = UserData::caller_fd_token(UserData::token(UserData::MAX_INDEX, 3));
+    let ud = UserData::single(token);
+    assert!(ud.into_bits() == token);
+    assert!(ud.caller_fd() && ud.ring() == 3 && ud.index() == UserData::MAX_INDEX);
+    assert!(UserData::token_index(token) == UserData::MAX_INDEX as usize);
+    assert!(!UserData::single(UserData::token(UserData::MAX_INDEX, 3)).caller_fd());
+};
 
 /// The peer-message view of the same `user_data` u64, selected when the tag is
 /// [`TAG_MESSAGE`]. The low 62 bits are a caller-defined payload; the top 2

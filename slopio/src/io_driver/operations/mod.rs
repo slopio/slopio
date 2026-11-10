@@ -34,9 +34,15 @@ pub struct OneshotToken(pub(crate) u64);
 pub struct MultishotToken(pub(crate) u64);
 
 impl OneshotToken {
-    /// Raw u64 value for io_uring user_data: slab index plus buffer-ring bits.
+    /// Raw u64 value for io_uring user_data: slab index plus the bits a token
+    /// carries above it.
     pub(crate) fn raw(&self) -> u64 {
         self.0
+    }
+
+    /// The same token, for an op on a descriptor its caller answers for.
+    pub(crate) fn caller_fd(self) -> Self {
+        Self(crate::io_driver::UserData::caller_fd_token(self.0))
     }
 
     pub(crate) fn index(&self) -> usize {

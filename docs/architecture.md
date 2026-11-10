@@ -46,6 +46,8 @@ An I/O call returns a future that owns everything the kernel will touch: the buf
 
 Dropping the future does not free what the kernel may still write into. The entry stays in the slab, the buffer and the descriptor reference move into it, and a cancel is submitted; only the operation's final completion releases them. A descriptor is closed, with a close submitted on the ring, only once its last reference is gone, so its close is always the last event on it. A completion that reports a closed descriptor means that rule was broken, and the runtime panics rather than go on.
 
+That holds for the descriptors the runtime vouches for. Where the caller names the descriptor itself, in the entry of an `Op` or as a pidfd handed to `WaitProcess`, the report is an answer about the request and comes back as an ordinary error.
+
 Multishot operations deliver a stream of completions from one submission. They pause themselves when their consumer falls behind and re-arm when it catches up, see [streams](streams.md).
 
 Buffer rings are declared as zero-sized types with `define_buf_ring!`. Each type carries its ring's id and sizes as constants and its per-thread state, so a receive against a ring is generic over that type and the buffer it yields, `BorrowedBuffer<S>`, gives its slot back on drop. A `Bytes` built on a received slot holds the slot until its last view is dropped.
