@@ -164,3 +164,91 @@ fn halves_reunite_only_with_their_own_socket() {
         assert_eq!(b_send.reunite(b_recv).unwrap().fd(), b_fd);
     });
 }
+
+/// `stop`, drain, `into_inner`: the datagrams the stream had received are
+/// yielded, and the socket taken back receives the one that came after.
+/// `into_inner` alone drops datagrams 1 and 2.
+#[test]
+fn a_stopped_stream_yields_the_datagrams_it_had_received() {
+    main_thread_with::<Small, _>(async {
+        let rt = UdpSocket::bind(19407).unwrap();
+        let peer = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        for i in 0..3u8 {
+            peer.send_to(&[i], (Ipv4Addr::LOCALHOST, 19407)).unwrap();
+        }
+
+        let mut stream = UdpMultiRecv::<Small>::new(rt);
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.payload(), [0]);
+        drop(first);
+
+        stream.stop();
+        let mut drained = Vec::new();
+        while let Some(datagram) = stream.next().await {
+            drained.push(datagram.unwrap().payload()[0]);
+        }
+        assert_eq!(drained, [1, 2], "received before the stop, so yielded");
+        // Ended for good: polling again does not re-arm.
+        assert!(stream.next().await.is_none());
+
+        let rt = stream.into_inner();
+        peer.send_to(&[3], (Ipv4Addr::LOCALHOST, 19407)).unwrap();
+        let (packet, buf) = rt.recv_from(Vec::with_capacity(8)).await;
+        assert_eq!(packet.unwrap().len(), 1);
+        assert_eq!(&buf[..], [3]);
+    });
+}
+
+/// Stopped before its first poll, a stream arms nothing and takes nothing
+/// from the socket.
+#[test]
+fn a_stream_stopped_before_its_first_poll_receives_nothing() {
+    main_thread_with::<Small, _>(async {
+        let rt = UdpSocket::bind(19408).unwrap();
+        let peer = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.send_to(b"kept", (Ipv4Addr::LOCALHOST, 19408)).unwrap();
+
+        let mut stream = UdpMultiRecv::<Small>::new(rt);
+        stream.stop();
+        assert!(stream.next().await.is_none());
+
+        let rt = stream.into_inner();
+        let (packet, buf) = rt.recv_from(Vec::with_capacity(8)).await;
+        packet.unwrap();
+        assert_eq!(&buf[..], b"kept");
+    });
+}
+
+/// The ring ran dry before the stop: the stream ends instead of reporting
+/// `ENOBUFS`, and the datagrams it could not take are still in the socket.
+#[test]
+fn a_stream_stopped_on_a_dry_ring_leaves_the_rest_in_the_socket() {
+    main_thread_with::<(Small, Tiny), _>(async {
+        let rt = UdpSocket::bind(19409).unwrap();
+        let peer = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        for i in 0..4u8 {
+            peer.send_to(&[i], (Ipv4Addr::LOCALHOST, 19409)).unwrap();
+        }
+
+        let mut stream = UdpMultiRecv::<Tiny>::new(rt);
+        // Both buffers of the ring, held.
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!((first.payload(), second.payload()), (&[0][..], &[1][..]));
+
+        stream.stop();
+        match select(stream.next(), Sleep::during(Duration::from_secs(5))).await {
+            SelectResult::First(None) => {}
+            SelectResult::First(Some(item)) => panic!("expected the end, got {:?}", item.err()),
+            SelectResult::Second(_) => panic!("the stopped stream never ended"),
+        }
+        drop((first, second));
+
+        let rt = stream.into_inner();
+        for i in 2..4u8 {
+            let (packet, buf) = rt.recv_from(Vec::with_capacity(8)).await;
+            packet.unwrap();
+            assert_eq!(&buf[..], [i]);
+        }
+    });
+}

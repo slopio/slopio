@@ -19,9 +19,11 @@ use crate::io_driver::{
 /// under the armed multishot, and a second stream cannot be armed on the same
 /// socket. The handle is a whole [`SocketWrapper`], or an
 /// [`OwnedReadHalf`](super::split::OwnedReadHalf) when the write half lives
-/// in another task. Send on the connection through [`MultiRecv::socket`];
-/// take the handle back with [`MultiRecv::into_inner`]. Dropping the stream
-/// cancels the multishot and then drops the handle, in that order.
+/// in another task. Send on the connection through [`MultiRecv::socket`].
+/// To read the connection another way, [`stop`](MultiRecv::stop) the stream,
+/// drain it, then take the handle back with [`MultiRecv::into_inner`].
+/// Dropping the stream cancels the multishot and then drops the handle, in
+/// that order.
 pub struct MultiRecv<
     S: BufRingSpec,
     O: SocketOwner = SocketWrapper,
@@ -35,6 +37,8 @@ pub struct MultiRecv<
     queue_limit: usize,
     /// EOF was yielded: every later poll answers `None` without re-arming.
     ended: bool,
+    /// `stop` was called: the stream ends where it would have re-armed.
+    stopping: bool,
     _spec: PhantomData<S>,
 }
 
@@ -112,6 +116,7 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
             reads: MultiOpQueue::new(queue_limit),
             queue_limit,
             ended: false,
+            stopping: false,
             _spec: PhantomData,
         }
     }
@@ -129,9 +134,39 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
         self.socket.as_ref().expect("socket present").socket()
     }
 
-    /// Stop streaming and take the socket handle back. Cancels the multishot
-    /// the same way `Drop` does; the driver absorbs the cancelled op's final
-    /// CQEs and recycles their buffers.
+    /// Stop reading from the socket without losing what was already read.
+    ///
+    /// The stream then yields every chunk the kernel had taken off the socket,
+    /// in order, and ends with `None`; nothing more is read after that, and
+    /// what the peer sends later waits in the socket. Once it has answered
+    /// `None`, [`into_inner`](Self::into_inner) loses nothing:
+    ///
+    /// ```ignore
+    /// stream.stop();
+    /// while let Some(chunk) = stream.next().await {
+    ///     rest.push(chunk?);
+    /// }
+    /// let socket = stream.into_inner();
+    /// ```
+    ///
+    /// A fatal error is still reported once before the end. `None` does not
+    /// tell a stopped stream from a closed peer: the next read on the socket
+    /// does.
+    pub fn stop(&mut self) {
+        if self.stopping || self.ended {
+            return;
+        }
+        self.stopping = true;
+        // Never polled: nothing is armed, the next poll ends the stream.
+        if let Some(token) = &self.id {
+            IO_DRIVER.with(|d| d.stop_multishot(token));
+        }
+    }
+
+    /// Take the socket handle back. Cancels the multishot the same way `Drop`
+    /// does, and like `Drop` discards every chunk the stream had not yielded
+    /// yet, which leaves a hole in what the socket reads next. To keep them,
+    /// call [`stop`](Self::stop) and drain the stream to `None` first.
     pub fn into_inner(mut self) -> O {
         self.recycle_pending_buffers();
         self.driver_cleanup();
@@ -191,6 +226,8 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> MultiRecv<S, O, QU
                 }
                 Err(e) => match e.continuation() {
                     Continuation::Continue => continue,
+                    // A stopped stream will not re-arm: nothing to come back for.
+                    Continuation::ContinueLater if self.stopping => continue,
                     // Armable still: the next poll re-arms, so the consumer
                     // decides when to come back rather than spinning here.
                     Continuation::ContinueLater => return Poll::Ready(Some(Err(e))),
@@ -218,6 +255,11 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream
         if let Poll::Ready(result) = self.try_drain_one() {
             return Poll::Ready(result);
         }
+        // Stopped before the first poll: nothing was ever armed.
+        if self.stopping && self.id.is_none() {
+            self.ended = true;
+            return Poll::Ready(None);
+        }
 
         self.ensure_registered();
         let waker = cx.waker();
@@ -242,6 +284,11 @@ impl<S: BufRingSpec, O: SocketOwner, const QUEUE_SIZE: usize> Stream
                     // The paused queue came with the swap, and nothing will wake us for it.
                     if let Poll::Ready(result) = this.try_drain_one() {
                         return Poll::Ready(result);
+                    }
+                    // The kernel op is over and drained: a stopped stream ends here.
+                    if this.stopping {
+                        this.ended = true;
+                        return Poll::Ready(None);
                     }
                     let entry = this.to_entry();
                     IO_DRIVER.with(|d| {

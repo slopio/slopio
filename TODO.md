@@ -66,19 +66,21 @@ Line numbers are as of commit 2fbf8fa. Each was reproduced on a real ring
   on a read-only fd, `openat` with a bad `dirfd`). Hand the error to the
   future; keep the assert for the simulated ring, or only for ops whose fd the
   runtime owns and whose opcode cannot answer `EBADF` for another reason.
-- [ ] **`MultiRecv::into_inner` discards bytes already received.**
-  `sockets/multi_recv.rs:135` recycles the completions queued on both sides
-  and cancels; whatever the peer sent that the stream had not yielded yet is
-  gone, and so is what lands before the cancel is acknowledged. The socket
-  handed back continues after a hole. Repro: the peer writes `HEAD`, then
-  `BODY` 50 ms later; the stream yields `HEAD`, `into_inner()`, and a
-  `socket_recv` on the socket gets nothing.
-  `a_stream_dropped_mid_batch_gives_the_ring_its_buffers_back` shows the same
-  loss (chunk `b`) and only checks the buffers. Harmless for
-  `UdpMultiRecv::into_inner` (datagrams), a corrupted stream for TCP. Return
-  the leftover buffers with the socket, after waiting for the cancel's
-  terminal CQE, or say in the doc that the call is only for a stream at a
-  known quiet point.
+- [x] **`MultiRecv::into_inner` discards bytes already received.**
+  `into_inner` recycles the completions queued on both sides and cancels;
+  whatever the peer sent that the stream had not yielded yet is gone, and so
+  is what lands before the cancel is acknowledged. The socket handed back
+  continues after a hole. Repro: the peer writes `HEAD`, then `BODY` 50 ms
+  later; the stream yields `HEAD`, `into_inner()`, and a `socket_recv` on the
+  socket gets nothing. Harmless for `UdpMultiRecv::into_inner` (datagrams), a
+  corrupted stream for TCP.
+  Done: `MultiRecv::stop()` cancels through the pause path, so the stream
+  yields what the kernel had read, then `None`, and `into_inner` after that
+  loses nothing. `UdpMultiRecv::stop()` does the same for datagrams.
+  `into_inner` alone still discards, and its doc now says so. Tests in
+  `multishot_rearm.rs` (simulated, TCP only: the simulated ring writes no
+  `recvmsg` header), `multi_recv_test.rs` and `udp_test.rs` (real ring); not
+  run under Miri here.
 - [ ] **The shutdown flag wakes nobody.** The eventfd completion only sets
   `shutting_down` (`io_driver/mod.rs:546`). A `MultiAccept` in the root future
   sees it because the root is polled on every turn (exit 0.4 ms after

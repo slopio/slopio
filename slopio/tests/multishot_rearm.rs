@@ -277,3 +277,182 @@ fn an_accept_reports_emfile_and_re_arms_then_ends_on_a_fatal_error() {
         ]
     );
 }
+
+/// Reads `socket` to its end through a fresh stream: what a stopped stream
+/// left behind for whoever takes the socket next.
+async fn rest_of<S: slopio::BufRingSpec>(socket: slopio::net::SocketWrapper) -> Vec<Vec<u8>> {
+    let mut recv = MultiRecv::<S>::new(socket);
+    let mut rest = Vec::new();
+    while let Some(chunk) = recv.next().await {
+        rest.push(chunk.expect("no error").as_ref().to_vec());
+    }
+    rest
+}
+
+/// `stop` keeps what the kernel had already read: the chunk that landed with
+/// the first one is yielded, then `None`, and the socket handed back by
+/// `into_inner` reads on from where the stream stopped.
+#[test]
+fn a_stopped_stream_yields_what_it_read_and_hands_the_socket_back_whole() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+
+    // "a" and "b" land in one CQ pass; "c" is still on its way at the stop.
+    handle.on_multishot_read(
+        socket.fd(),
+        [
+            vec![ReadEvent::data(b"a").into(), ReadEvent::data(b"b").into()],
+            vec![ReadEvent::data(b"c").after(Duration::from_millis(10))],
+            vec![ReadEvent::Eof.after(Duration::from_millis(1))],
+        ],
+    );
+
+    let (first, drained, rest) = RuntimeInner::simulated(fake).block_on::<BurstRing, _>(
+        async move {
+            let mut recv = MultiRecv::<BurstRing>::new(socket);
+            let first = recv.next().await.expect("a chunk").expect("no error");
+            let first = first.as_ref().to_vec();
+
+            recv.stop();
+            let mut drained = Vec::new();
+            while let Some(chunk) = recv.next().await {
+                drained.push(chunk.expect("no error").as_ref().to_vec());
+            }
+            // Ended for good: polling again does not re-arm.
+            assert!(recv.next().await.is_none());
+
+            let rest = rest_of::<BurstRing>(recv.into_inner()).await;
+            (first, drained, rest)
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(first, b"a");
+    assert_eq!(drained, [b"b".to_vec()], "read before the stop, so yielded");
+    assert_eq!(rest, [b"c".to_vec()], "not read yet, so left in the socket");
+}
+
+/// A stream already pausing under backpressure has a cancel in flight: `stop`
+/// rides on it, and the whole burst the kernel delivered comes out in order.
+#[test]
+fn stopping_a_stream_that_is_pausing_loses_none_of_the_burst() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+
+    let chunks: Vec<Vec<u8>> = (0..12u8).map(|i| vec![i]).collect();
+    // One batch, past the bound of 4: the queue overflows and the op pauses.
+    let burst: Vec<ReadEvent> = chunks.iter().map(|c| ReadEvent::data(c.clone())).collect();
+    handle.on_multishot_read(socket.fd(), [burst, vec![ReadEvent::data(b"later")]]);
+
+    let (got, rest) = RuntimeInner::simulated(fake).block_on::<BurstRing, _>(
+        async move {
+            let mut recv = MultiRecv::<BurstRing, _, 4>::with_queue_size(socket);
+            let mut got = vec![
+                recv.next()
+                    .await
+                    .expect("a chunk")
+                    .expect("no error")
+                    .as_ref()
+                    .to_vec(),
+            ];
+            recv.stop();
+            while let Some(chunk) = recv.next().await {
+                got.push(chunk.expect("no error").as_ref().to_vec());
+            }
+            let socket = recv.into_inner();
+            // Whatever the pause left with the peer is still there to read.
+            let mut again = MultiRecv::<BurstRing>::new(socket);
+            let mut rest = Vec::new();
+            while got.len() + rest.len() < 13 {
+                let chunk = again.next().await.expect("a chunk").expect("no error");
+                rest.push(chunk.as_ref().to_vec());
+            }
+            (got, rest)
+        },
+        None,
+        |run| run(),
+    );
+
+    let all: Vec<Vec<u8>> = got.into_iter().chain(rest).collect();
+    let expected: Vec<Vec<u8>> = chunks.into_iter().chain([b"later".to_vec()]).collect();
+    assert_eq!(all, expected);
+}
+
+/// Stopped before its first poll, a stream arms nothing and takes nothing
+/// from the socket.
+#[test]
+fn a_stream_stopped_before_its_first_poll_reads_nothing() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"all"), ReadEvent::Eof]);
+
+    let rest = RuntimeInner::simulated(fake).block_on::<BurstRing, _>(
+        async move {
+            let mut recv = MultiRecv::<BurstRing>::new(socket);
+            recv.stop();
+            assert!(recv.next().await.is_none());
+            rest_of::<BurstRing>(recv.into_inner()).await
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(rest, [b"all".to_vec()]);
+}
+
+/// A reset that landed before the stop is still reported, once: the caller
+/// must not take the socket for a live one.
+#[test]
+fn a_stopped_stream_still_reports_a_fatal_error() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    handle.on_multishot_read(
+        socket.fd(),
+        [ReadEvent::data(b"a"), ReadEvent::Error(libc::ECONNRESET)],
+    );
+
+    let (reset, end) = RuntimeInner::simulated(fake).block_on::<BurstRing, _>(
+        async move {
+            let mut recv = MultiRecv::<BurstRing>::new(socket);
+            drop(recv.next().await.expect("a chunk").expect("no error"));
+            recv.stop();
+            let reset = matches!(
+                recv.next().await,
+                Some(Err(CompletionError::ConnectionReset))
+            );
+            (reset, recv.next().await.is_none())
+        },
+        None,
+        |run| run(),
+    );
+
+    assert!(reset);
+    assert!(end);
+}
+
+/// A dry ring had already ended the op when the stream is stopped: there is
+/// nothing to re-arm for, so the stream ends instead of reporting `ENOBUFS`.
+#[test]
+fn a_stream_stopped_on_a_dry_ring_ends_without_an_error() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    handle.on_multishot_read(socket.fd(), [ReadEvent::data(b"a"), ReadEvent::data(b"b")]);
+
+    let end = RuntimeInner::simulated(fake).block_on::<OneBuf, _>(
+        async move {
+            let mut recv = MultiRecv::<OneBuf>::new(socket);
+            // Held, so "b" finds no buffer.
+            let a = recv.next().await.expect("a chunk").expect("no error");
+            recv.stop();
+            let end = recv.next().await.is_none();
+            drop(a);
+            drop(recv.into_inner());
+            end
+        },
+        None,
+        |run| run(),
+    );
+
+    assert!(end);
+}

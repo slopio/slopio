@@ -500,3 +500,111 @@ fn an_accepted_socket_is_close_on_exec() {
         "accepted fd leaks into exec'd children"
     );
 }
+
+/// `stop`, drain, `into_inner`: what the stream had read is yielded, and the
+/// socket taken back reads what came after. `into_inner` alone drops "BODY".
+#[test]
+fn a_stopped_stream_hands_back_a_socket_with_no_hole() {
+    let got = main_thread_with::<Small, _>(async {
+        let mut listener = MultiAccept::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.set_nodelay(true).unwrap();
+            client.write_all(b"HEAD").unwrap();
+            sleep(Duration::from_millis(50));
+            client.write_all(b"BODY").unwrap();
+            // Sent only once the stream has been stopped and drained.
+            go_rx.recv().unwrap();
+            client.write_all(b"TAIL").unwrap();
+            client
+        });
+
+        let socket = listener.next().await.unwrap().unwrap();
+        let mut stream = MultiRecv::<Small>::new(socket);
+        let mut got = stream.next().await.unwrap().unwrap().as_ref().to_vec();
+        // "BODY" lands while the consumer is busy with "HEAD".
+        slopio::runtime::time::Sleep::during(Duration::from_millis(200)).await;
+
+        stream.stop();
+        while let Some(chunk) = stream.next().await {
+            got.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        let socket = stream.into_inner();
+
+        go_tx.send(()).unwrap();
+        let (n, buf) = slopio::net::socket_recv(&socket, vec![0u8; 16]).await;
+        got.extend_from_slice(&buf[..n.unwrap()]);
+        drop(client.join().unwrap());
+        got
+    });
+
+    assert_eq!(got, b"HEADBODYTAIL");
+}
+
+/// The stop races live traffic: chunks keep landing between the cancel and its
+/// answer. Going back and forth between the stream and plain reads on one
+/// socket, every byte arrives once and in order.
+#[test]
+fn switching_between_the_stream_and_plain_reads_keeps_every_byte() {
+    const TOTAL: usize = 1 << 20;
+    let pattern = |i: usize| (i * 31 % 251) as u8;
+
+    let (got, switches) = main_thread_with::<Small, _>(async move {
+        let mut listener = MultiAccept::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.set_nodelay(true).unwrap();
+            let data: Vec<u8> = (0..TOTAL).map(pattern).collect();
+            // Paced, so the reader keeps up and switches often instead of
+            // finding the whole megabyte already buffered.
+            for chunk in data.chunks(700) {
+                client.write_all(chunk).unwrap();
+                sleep(Duration::from_micros(20));
+            }
+        });
+
+        let mut socket = Some(listener.next().await.unwrap().unwrap());
+        let mut got = Vec::with_capacity(TOTAL);
+        let mut switches = 0;
+        'connection: loop {
+            // A few chunks through the stream...
+            let mut stream = MultiRecv::<Small>::new(socket.take().unwrap());
+            for _ in 0..3 {
+                match stream.next().await {
+                    Some(chunk) => got.extend_from_slice(chunk.unwrap().as_ref()),
+                    None => break 'connection,
+                }
+            }
+            stream.stop();
+            while let Some(chunk) = stream.next().await {
+                got.extend_from_slice(chunk.unwrap().as_ref());
+            }
+            let plain = stream.into_inner();
+            switches += 1;
+
+            // ...then a few plain reads, where a stopped stream's `None` and
+            // the peer's close are told apart.
+            for _ in 0..3 {
+                let (n, buf) = slopio::net::socket_recv(&plain, vec![0u8; 4096]).await;
+                let n = n.unwrap();
+                if n == 0 {
+                    break 'connection;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            socket = Some(plain);
+        }
+        client.join().unwrap();
+        (got, switches)
+    });
+
+    assert_eq!(got.len(), TOTAL);
+    assert!(got.iter().enumerate().all(|(i, b)| *b == pattern(i)));
+    assert!(
+        switches > 10,
+        "only {switches} switches: the race never ran"
+    );
+}

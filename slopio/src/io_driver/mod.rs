@@ -1581,6 +1581,30 @@ impl IODriver {
         ring_inner.add(&cancel_op);
     }
 
+    /// Stop a multishot op at its consumer's request, keeping what it read:
+    /// the pause's cancel, without a queue having filled. Completions queue
+    /// until the terminal one, which leaves the op `Paused` for the consumer
+    /// to drain and not re-arm.
+    pub(crate) fn stop_multishot(&self, token: &MultishotToken) {
+        let slab = unsafe { &mut *self.multishot_slab.get() };
+        let Some(op) = slab.get_mut(token) else {
+            return;
+        };
+        // Ended on its own, pausing or paused: the kernel op is over, or a cancel is on its way.
+        if !matches!(
+            op,
+            MultiOpState::Sent {
+                last_cqe: false,
+                ..
+            }
+        ) {
+            return;
+        }
+        op.transition_to_trying_to_pause();
+        // Called from a task, not from the CQ loop: the ring is free.
+        self.send_multiop_cancel_event(UserData::multi(token.raw()).into_bits());
+    }
+
     pub(crate) fn resubmit_multishot(
         &self,
         token: &MultishotToken,

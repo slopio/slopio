@@ -38,3 +38,21 @@ Two rules keep this from happening:
 
 - **Drop or copy out quickly.** Treat a borrowed buffer as something to parse and release, not to store. If you need the bytes later, copy them into your own allocation.
 - **Size the ring for the streams sharing it.** The ring must have more buffers than the sum of the queue depths of the streams reading from it, plus whatever your tasks hold between polls.
+
+## Taking the socket back from a receive stream
+
+A `MultiRecv` owns its socket, and a `UdpMultiRecv` does too. To read the connection another way afterwards, with plain receives or after switching the socket to kTLS, stop the stream first:
+
+```rust,ignore
+stream.stop();
+while let Some(chunk) = stream.next().await {
+    rest.push(chunk?);
+}
+let socket = stream.into_inner();
+```
+
+A receive stream reads ahead of you: by the time you decide to stop, it may hold chunks you have not seen yet. `stop()` keeps them. The stream yields each of them in order, then `None`, and reads nothing more; whatever the peer sends after that waits in the socket for the next reader. Taken back at that point, the socket continues exactly where the stream left off.
+
+`into_inner()` on a stream that was not stopped and drained, like dropping it, discards those unseen chunks. On a TCP connection that is a hole in the byte stream, so use it alone only when nothing more is expected from the peer. On a UDP socket it is datagrams lost, as the network may lose them anyway.
+
+A stopped stream that ends with `None` says nothing about the peer: if it had closed, the next read on the socket reports it. A fatal error such as a reset is still yielded once before the end.
