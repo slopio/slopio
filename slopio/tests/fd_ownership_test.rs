@@ -3,8 +3,7 @@
 
 use std::time::Duration;
 
-use slopio::io_driver::operations::files::open::flags;
-use slopio::io_driver::operations::files::open_file;
+use slopio::io_driver::operations::files::OpenedFile;
 use slopio::main_thread;
 use slopio::runtime::select::{SelectResult, select};
 use slopio::runtime::time::Sleep;
@@ -21,11 +20,7 @@ fn a_cancelled_open_closes_the_fd_it_produced() {
             // The open is submitted, then dropped before its CQE is seen. A
             // cached regular file opens inline, so the cancel always loses.
             match select(
-                open_file(
-                    concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
-                    flags::READ_ONLY,
-                    0,
-                ),
+                OpenedFile::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")),
                 std::future::ready(()),
             )
             .await

@@ -7,10 +7,10 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBufMut, OneshotToken, fd::OpFd, files::OpenedFile},
+    operations::{IoBufMut, OneshotToken, fd::OpFd, files::OpenedFile, files::access::Readable},
 };
 
-impl OpenedFile {
+impl<M: Readable> OpenedFile<M> {
     /// Cancellation-safe read: takes ownership of the buffer, returns it on
     /// completion with the kernel-written byte count reflected in
     /// `IoBufMut::set_init`. If dropped mid-flight, the buffer is moved into

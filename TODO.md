@@ -56,16 +56,25 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
 Line numbers are as of commit 2fbf8fa. Each was reproduced on a real ring
 (Linux 6.18) unless it says otherwise.
 
-- [ ] **A legitimate `EBADF` aborts the process.**
-  `io_driver/completion_events.rs:87` asserts that no op completes with
+- [x] **A legitimate `EBADF` aborts the process.**
+  `io_driver/completion_events.rs` asserted that no op completes with
   `EBADF`, taking it for a closed fd. The kernel also answers `EBADF` to a
   read on a write-only fd and to a write on a read-only one:
-  `open_file(path, WRITE_ONLY | CREATE, ..)` then `file.read(buf)` panics with
-  "op completed with EBADF" where it should resolve to `Err`, and in a
-  topology that takes every worker down. An `Op` can reach it too (`fallocate`
-  on a read-only fd, `openat` with a bad `dirfd`). Hand the error to the
-  future; keep the assert for the simulated ring, or only for ops whose fd the
-  runtime owns and whose opcode cannot answer `EBADF` for another reason.
+  `open_file(path, WRITE_ONLY | CREATE, ..)` then `file.read(buf)` panicked
+  with "op completed with EBADF" where it should resolve to `Err`, and in a
+  topology that takes every worker down. An `Op` could reach it too
+  (`fallocate` on a read-only fd, `openat` with a bad `dirfd`).
+  Done, in two parts. Files: the handle is `OpenedFile<M>` with `M` one of
+  `Read`, `Write`, `ReadWrite`; `read` exists on the readable modes and
+  `write` on the writable ones, so the wrong-mode call does not compile, and
+  `EBADF` on a file again means a closed fd and still panics. `open_file` and
+  its raw `i32` flags are gone: `OpenedFile::open`, `create`, `open_rw` and
+  `OpenOptions`, whose create, truncate, append and sync exist only for a
+  writable mode (`O_NONBLOCK` is no longer offered). Descriptors the caller
+  names: `Op` and `WaitProcess` push through `push_caller_fd_op`, which sets a
+  bit in the token (bit 57 of `user_data`, taken from the slab index), and
+  their `EBADF` reaches the future. A typed pidfd handle would let
+  `WaitProcess` drop the bit too.
 - [x] **`MultiRecv::into_inner` discards bytes already received.**
   `into_inner` recycles the completions queued on both sides and cancels;
   whatever the peer sent that the stream had not yielded yet is gone, and so

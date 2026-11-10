@@ -1,8 +1,5 @@
 use slopio::{
-    io_driver::operations::files::{
-        open::{flags, mode},
-        open_file,
-    },
+    io_driver::operations::files::OpenedFile,
     main_thread,
     runtime::join::{join, join3, join5},
     runtime::time::Sleep,
@@ -81,16 +78,8 @@ fn join_io_test() {
         let test_file = "/tmp/test_write_read22.txt";
         let test_file2 = "/tmp/test_write_read23.txt";
 
-        let file1 = open_file(
-            test_file,
-            flags::WRITE_ONLY | flags::CREATE | flags::TRUNCATE,
-            mode::DEFAULT,
-        );
-        let file2 = open_file(
-            test_file2,
-            flags::WRITE_ONLY | flags::CREATE | flags::TRUNCATE,
-            mode::DEFAULT,
-        );
+        let file1 = OpenedFile::create(test_file);
+        let file2 = OpenedFile::create(test_file2);
         let (Ok(f1), Ok(f2)) = join(file1, file2).await else {
             panic!("afdsf");
         };

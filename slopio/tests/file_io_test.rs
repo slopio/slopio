@@ -1,5 +1,5 @@
-use slopio::io_driver::operations::files::open::{flags, mode};
-use slopio::io_driver::operations::files::open_file;
+use slopio::io_driver::operations::files::open::mode;
+use slopio::io_driver::operations::files::{OpenFileError, OpenOptions, OpenedFile};
 use slopio::main_thread;
 use std::fs;
 
@@ -11,13 +11,7 @@ fn test_file_write_and_read() {
 
     main_thread(async {
         // Write to file
-        let file = open_file(
-            test_file,
-            flags::WRITE_ONLY | flags::CREATE | flags::TRUNCATE,
-            mode::DEFAULT,
-        )
-        .await
-        .unwrap();
+        let file = OpenedFile::create(test_file).await.unwrap();
 
         let data = b"Hello from async runtime!";
         let bytes_written = file.write(data).await.0.unwrap();
@@ -26,7 +20,7 @@ fn test_file_write_and_read() {
         drop(file);
 
         // Read from file
-        let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
+        let file = OpenedFile::open(test_file).await.unwrap();
 
         let buffer: Vec<u8> = Vec::with_capacity(128);
         let (result, buffer) = file.read(buffer).await;
@@ -46,7 +40,9 @@ fn test_file_create_write() {
     let _ = fs::remove_file(test_file);
 
     main_thread(async {
-        let file = open_file(test_file, flags::WRITE_ONLY | flags::CREATE, mode::RW_USER)
+        let file = OpenOptions::write()
+            .create(mode::RW_USER)
+            .open(test_file)
             .await
             .unwrap();
 
@@ -71,7 +67,7 @@ fn test_file_read_existing() {
     fs::write(test_file, b"Existing content").unwrap();
 
     main_thread(async {
-        let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
+        let file = OpenedFile::open(test_file).await.unwrap();
 
         let buffer: Vec<u8> = Vec::with_capacity(64);
         let (result, buffer) = file.read(buffer).await;
@@ -91,9 +87,7 @@ fn test_file_append() {
     fs::write(test_file, b"First line\n").unwrap();
 
     main_thread(async {
-        let file = open_file(test_file, flags::WRITE_ONLY | flags::APPEND, 0)
-            .await
-            .unwrap();
+        let file = OpenOptions::write().append().open(test_file).await.unwrap();
 
         let data = b"Second line\n";
         file.write(data).await.0.unwrap();
@@ -114,7 +108,9 @@ fn test_file_truncate() {
     fs::write(test_file, b"Old content that should be removed").unwrap();
 
     main_thread(async {
-        let file = open_file(test_file, flags::WRITE_ONLY | flags::TRUNCATE, 0)
+        let file = OpenOptions::write()
+            .truncate()
+            .open(test_file)
             .await
             .unwrap();
 
@@ -136,7 +132,9 @@ fn test_file_read_write() {
 
     main_thread(async {
         // Open for reading and writing
-        let file = open_file(test_file, flags::READ_WRITE | flags::CREATE, mode::DEFAULT)
+        let file = OpenOptions::read_write()
+            .create(mode::DEFAULT)
+            .open(test_file)
             .await
             .unwrap();
 
@@ -147,7 +145,7 @@ fn test_file_read_write() {
         drop(file);
 
         // Read back (need to reopen for now since we don't have seek)
-        let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
+        let file = OpenedFile::open(test_file).await.unwrap();
 
         let buffer: Vec<u8> = Vec::with_capacity(64);
         let (result, buffer) = file.read(buffer).await;
@@ -165,7 +163,9 @@ fn test_file_multiple_writes() {
     let _ = fs::remove_file(test_file);
 
     main_thread(async {
-        let file = open_file(test_file, flags::WRITE_ONLY | flags::CREATE, mode::DEFAULT)
+        let file = OpenOptions::write()
+            .create(mode::DEFAULT)
+            .open(test_file)
             .await
             .unwrap();
 
@@ -187,7 +187,9 @@ fn test_file_empty_write() {
     let _ = fs::remove_file(test_file);
 
     main_thread(async {
-        let file = open_file(test_file, flags::WRITE_ONLY | flags::CREATE, mode::DEFAULT)
+        let file = OpenOptions::write()
+            .create(mode::DEFAULT)
+            .open(test_file)
             .await
             .unwrap();
 
@@ -207,7 +209,9 @@ fn test_file_large_write() {
     let _ = fs::remove_file(test_file);
 
     main_thread(async {
-        let file = open_file(test_file, flags::WRITE_ONLY | flags::CREATE, mode::DEFAULT)
+        let file = OpenOptions::write()
+            .create(mode::DEFAULT)
+            .open(test_file)
             .await
             .unwrap();
 
@@ -233,7 +237,7 @@ fn test_file_read_chunks() {
     fs::write(test_file, b"0123456789ABCDEF").unwrap();
 
     main_thread(async {
-        let file = open_file(test_file, flags::READ_ONLY, 0).await.unwrap();
+        let file = OpenedFile::open(test_file).await.unwrap();
 
         // Read in small chunks
         let buffer1: Vec<u8> = Vec::with_capacity(5);
@@ -251,4 +255,68 @@ fn test_file_read_chunks() {
     });
 
     let _ = fs::remove_file(test_file);
+}
+
+/// A handle opened for both reads back what it wrote: `open_rw` on a file
+/// that exists, positioned at its start.
+#[test]
+fn a_read_write_handle_does_both() {
+    let test_file = "/tmp/test_open_rw.txt";
+    fs::write(test_file, b"0123456789").unwrap();
+
+    main_thread(async {
+        let file = OpenedFile::open_rw(test_file).await.unwrap();
+        assert_eq!(file.write(b"ab").await.0.unwrap(), 2);
+        let (result, buffer) = file.read(Vec::<u8>::with_capacity(4)).await;
+        assert_eq!(result.unwrap(), 4);
+        assert_eq!(&buffer[..], b"2345");
+    });
+
+    assert_eq!(fs::read(test_file).unwrap(), b"ab23456789");
+    let _ = fs::remove_file(test_file);
+}
+
+/// `create_new` refuses a file that is already there, and leaves it alone.
+#[test]
+fn create_new_refuses_an_existing_file() {
+    let test_file = "/tmp/test_create_new.txt";
+    let _ = fs::remove_file(test_file);
+
+    main_thread(async {
+        let file = OpenOptions::write()
+            .create_new(mode::RW_USER)
+            .open(test_file)
+            .await
+            .unwrap();
+        assert_eq!(file.write(b"first").await.0.unwrap(), 5);
+        drop(file);
+
+        let again = OpenOptions::write()
+            .create_new(mode::RW_USER)
+            .open(test_file)
+            .await;
+        match again {
+            Err(OpenFileError::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EEXIST)),
+            other => panic!("expected EEXIST, got {other:?}"),
+        }
+    });
+
+    assert_eq!(fs::read(test_file).unwrap(), b"first");
+    let _ = fs::remove_file(test_file);
+}
+
+/// Opening a file that is not there for reading does not create it.
+#[test]
+fn open_does_not_create() {
+    let test_file = "/tmp/test_open_missing.txt";
+    let _ = fs::remove_file(test_file);
+
+    main_thread(async {
+        match OpenedFile::open(test_file).await {
+            Err(OpenFileError::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::ENOENT)),
+            other => panic!("expected ENOENT, got {other:?}"),
+        }
+    });
+
+    assert!(!std::path::Path::new(test_file).exists());
 }

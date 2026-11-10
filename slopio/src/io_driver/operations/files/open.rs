@@ -9,6 +9,8 @@ use crate::io_driver::IO_DRIVER;
 use crate::io_driver::operations::IoOP;
 use crate::io_driver::operations::OneshotToken;
 use crate::io_driver::operations::files::OpenedFile;
+use crate::io_driver::operations::files::access::{Access, Read, ReadWrite, Writable, Write};
+use std::marker::PhantomData;
 
 struct OpenFile {
     filename: CString,
@@ -23,21 +25,114 @@ pub enum OpenFileError {
     Io(std::io::Error),
 }
 
-pub async fn open_file(filename: &str, flags: i32, mode: u32) -> Result<OpenedFile, OpenFileError> {
-    let filename = CString::new(filename).map_err(OpenFileError::NameIssue)?;
-    let mut s = OpenFile {
-        filename,
-        flags,
-        mode,
-        id: None,
-    };
-    s.register_to_driver();
-    let res = s.await.map_err(OpenFileError::Io)?;
-    Ok(res)
+/// How to open a file, for the access mode `M`.
+///
+/// The access mode comes from the constructor and ends up in the type of the
+/// handle; the options a mode cannot honour are not offered for it.
+///
+/// ```ignore
+/// let log = OpenOptions::write().create(mode::DEFAULT).append().open(path).await?;
+/// ```
+#[derive(Debug)]
+pub struct OpenOptions<M> {
+    /// Everything but the access mode, which `M` supplies.
+    flags: i32,
+    mode: u32,
+    _mode: PhantomData<M>,
+}
+
+impl OpenOptions<Read> {
+    /// Open for reading only.
+    pub fn read() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenOptions<Write> {
+    /// Open for writing only.
+    pub fn write() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenOptions<ReadWrite> {
+    /// Open for reading and writing.
+    pub fn read_write() -> Self {
+        Self::new()
+    }
+}
+
+impl<M: Access> OpenOptions<M> {
+    fn new() -> Self {
+        Self {
+            flags: 0,
+            mode: 0,
+            _mode: PhantomData,
+        }
+    }
+
+    fn with(mut self, flag: i32) -> Self {
+        self.flags |= flag;
+        self
+    }
+
+    /// Bypass the page cache (`O_DIRECT`). Buffers, lengths and offsets must
+    /// then meet the device's alignment.
+    pub fn direct(self) -> Self {
+        self.with(libc::O_DIRECT)
+    }
+
+    /// Open `path`. The handle's type carries the access mode asked for.
+    pub async fn open(self, path: &str) -> Result<OpenedFile<M>, OpenFileError> {
+        let filename = CString::new(path).map_err(OpenFileError::NameIssue)?;
+        let mut s = OpenFile {
+            filename,
+            flags: M::FLAGS | self.flags,
+            mode: self.mode,
+            id: None,
+        };
+        s.register_to_driver();
+        let fd = s.await.map_err(OpenFileError::Io)?;
+        Ok(OpenedFile::from_fd(fd))
+    }
+}
+
+/// What only makes sense on a file opened for writing. On a read-only open the
+/// kernel would still create the file, and still truncate it.
+impl<M: Writable> OpenOptions<M> {
+    /// Create the file with permission bits `mode` if it does not exist. See
+    /// [`mode`] for the usual values.
+    pub fn create(mut self, mode: u32) -> Self {
+        self.mode = mode;
+        self.with(libc::O_CREAT)
+    }
+
+    /// Create the file with permission bits `mode`, and fail with `EEXIST` if
+    /// it already exists.
+    pub fn create_new(mut self, mode: u32) -> Self {
+        self.mode = mode;
+        self.with(libc::O_CREAT | libc::O_EXCL)
+    }
+
+    /// Empty the file on open.
+    pub fn truncate(self) -> Self {
+        self.with(libc::O_TRUNC)
+    }
+
+    /// Every write lands at the end of the file.
+    pub fn append(self) -> Self {
+        self.with(libc::O_APPEND)
+    }
+
+    /// Every write returns once the data is on stable storage (`O_SYNC`).
+    pub fn sync(self) -> Self {
+        self.with(libc::O_SYNC)
+    }
 }
 
 impl Future for OpenFile {
-    type Output = std::io::Result<OpenedFile>;
+    /// The raw fd: its opener gives it a handle of the right type at once.
+    type Output = std::io::Result<i32>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -47,7 +142,7 @@ impl Future for OpenFile {
         match IO_DRIVER.with(|d| d.poll_op(&mut self.id, waker)) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(io_result) => std::task::Poll::Ready(match io_result.result {
-                fd @ 0.. => Ok(OpenedFile::from_fd(fd)),
+                fd @ 0.. => Ok(fd),
                 err => Err(std::io::Error::from_raw_os_error(-err)),
             }),
         }
@@ -86,20 +181,7 @@ impl IoOP for OpenFile {
     }
 }
 
-pub mod flags {
-    #![allow(unused)]
-    pub const READ_ONLY: i32 = libc::O_RDONLY;
-    pub const WRITE_ONLY: i32 = libc::O_WRONLY;
-    pub const READ_WRITE: i32 = libc::O_RDWR;
-    pub const CREATE: i32 = libc::O_CREAT;
-    pub const TRUNCATE: i32 = libc::O_TRUNC;
-    pub const APPEND: i32 = libc::O_APPEND;
-    pub const EXCLUSIVE: i32 = libc::O_EXCL;
-    pub const DIRECT: i32 = libc::O_DIRECT;
-    pub const SYNC: i32 = libc::O_SYNC;
-    pub const NONBLOCK: i32 = libc::O_NONBLOCK;
-}
-
+/// Permission bits for a file an open creates.
 pub mod mode {
     #![allow(unused)]
     pub const OWNER_READ: u32 = 0o400;

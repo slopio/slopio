@@ -7,10 +7,10 @@ use io_uring::{opcode, types::Fd};
 
 use crate::io_driver::{
     IO_DRIVER,
-    operations::{IoBuf, OneshotToken, fd::OpFd, files::OpenedFile},
+    operations::{IoBuf, OneshotToken, fd::OpFd, files::OpenedFile, files::access::Writable},
 };
 
-impl OpenedFile {
+impl<M: Writable> OpenedFile<M> {
     /// Cancellation-safe write: takes ownership of the buffer, returns it on
     /// completion. If the future is dropped mid-flight, the buffer (when
     /// `B::NEEDS_KEEPALIVE`) is moved into the driver's keepalive slot so
@@ -82,7 +82,10 @@ impl<B: IoBuf> Drop for WriteFile<B> {
 /// flushed to the file or an error occurs. Returns the buffer back to the
 /// caller alongside the result. Returns `WriteZero` if the kernel ever
 /// accepts zero bytes (which would otherwise spin forever).
-pub async fn write_all<B: IoBuf>(file: &OpenedFile, buf: B) -> (std::io::Result<()>, B) {
+pub async fn write_all<M: Writable, B: IoBuf>(
+    file: &OpenedFile<M>,
+    buf: B,
+) -> (std::io::Result<()>, B) {
     let total = buf.bytes_init();
     if total == 0 {
         return (Ok(()), buf);
