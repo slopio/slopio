@@ -28,7 +28,7 @@ Every worker thread runs one runtime, and a runtime belongs to one thread for it
 - a **time driver**, the timer stores;
 - the **options** it was built with, which code on the thread reads with `thread_options()`.
 
-Nothing of it is shared with another thread. That is why futures need not be `Send`, why the driver's state sits in `UnsafeCell` and `Cell` rather than behind locks, and why there are no atomics on the hot path. While `block_on` runs, the task list, the driver and the time driver are reachable through scoped thread-locals; outside it they are not, and calling into them panics.
+Nothing of it is shared with another thread. That is why futures need not be `Send`, why the driver's state sits in `UnsafeCell` and `Cell` rather than behind locks, and why there are no atomics on the hot path. It also means a future belongs to the worker that first polled it: the runtime never moves one, and neither should you. A few of them, such as `Sleep`, hold nothing but an index into their worker's tables, so the compiler will let you send one to another thread; polled there after it has started, it reads the wrong worker's tables, and nothing checks that. While `block_on` runs, the task list, the driver and the time driver are reachable through scoped thread-locals; outside it they are not, and calling into them panics.
 
 The event loop is in `RuntimeInner::block_on`. Each turn:
 

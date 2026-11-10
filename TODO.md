@@ -103,16 +103,6 @@ Line numbers are as of commit 2fbf8fa. Each was reproduced on a real ring
   `process::exit(1)` whatever happened since. Repro: the workers return 0.5 s
   after `SIGTERM`, `main` goes on with its own work, and the process exits
   with code 1 at 30.5 s. Disarm it when `Topology::run` returns.
-- [ ] **Futures bound to one thread's driver are `Send`.** `Sleep`, the
-  `open_file()` future, `RecvFromPeer`, `RecvMsgFromPeer`, `RecvMsgReply` and
-  `ReplySignal` hold a token or a slot index and nothing that is `!Send`;
-  `Op` has `PhantomData<*const ()>` for this, they do not. An `open_file`
-  future polled once on worker A, sent over an `mpsc` and polled on worker B
-  indexes B's slab through `get_unchecked_mut`: "unsafe precondition(s)
-  violated" in a debug build, an out-of-bounds access in release, from safe
-  code. A moved `Sleep` polls or frees another timer's node, a moved
-  `RecvMsgReply` takes another request's reply and casts it. Give each the
-  same marker as `Op`.
 - [ ] **`BufRingSpec::make_buffer` and `recycle_bid` are public and safe.**
   (`io_driver/buf_ring.rs:105`, `:109`.) `make_buffer` does not check `len`:
   `Ring::make_buffer(0, 1 << 20).as_ref()` on 64-byte buffers is a megabyte
@@ -267,6 +257,16 @@ per connection or per timeout:
 - A7: a failed MSG_RING is ignored; callers put timeouts on requests.
 - Cross-thread wakes do not exist in this runtime; wakers need no thread
   safety.
+- A future that has been polled stays on its worker; the types do not
+  enforce it. `Sleep`, the file-open future, `RecvFromPeer`,
+  `RecvMsgFromPeer`, `RecvMsgReply` and `ReplySignal` hold only a token or a
+  slot index, so the compiler takes them for `Send`. The runtime never moves
+  a task, so only a caller who polls one, carries it to another worker by
+  hand and polls it there gets hurt: that worker's slab is then indexed with
+  the first one's token (found by the review of 2026-11-10, reproduced with
+  an `mpsc`). The marker `Op` has would stop it, and would also make every
+  async block holding a `Sleep` across an await `!Send`, which rules out
+  handing a future that has not started to another worker. Not worth that.
 - D6: one Timeout SQE per idle wait instead of `EXT_ARG`; not worth reworking
   the simulator.
 - D9 was a false positive (`..Default::default()` keeps the default driver).
