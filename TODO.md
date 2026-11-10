@@ -51,6 +51,91 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   `metadata()?` fails, the temporary `File` closes the fd, then `FdInner`
   closes it again.
 
+## Found by the runtime review of 2026-11-10
+
+Line numbers are as of commit 2fbf8fa. Each was reproduced on a real ring
+(Linux 6.18) unless it says otherwise.
+
+- [ ] **A legitimate `EBADF` aborts the process.**
+  `io_driver/completion_events.rs:87` asserts that no op completes with
+  `EBADF`, taking it for a closed fd. The kernel also answers `EBADF` to a
+  read on a write-only fd and to a write on a read-only one:
+  `open_file(path, WRITE_ONLY | CREATE, ..)` then `file.read(buf)` panics with
+  "op completed with EBADF" where it should resolve to `Err`, and in a
+  topology that takes every worker down. An `Op` can reach it too (`fallocate`
+  on a read-only fd, `openat` with a bad `dirfd`). Hand the error to the
+  future; keep the assert for the simulated ring, or only for ops whose fd the
+  runtime owns and whose opcode cannot answer `EBADF` for another reason.
+- [ ] **`MultiRecv::into_inner` discards bytes already received.**
+  `sockets/multi_recv.rs:135` recycles the completions queued on both sides
+  and cancels; whatever the peer sent that the stream had not yielded yet is
+  gone, and so is what lands before the cancel is acknowledged. The socket
+  handed back continues after a hole. Repro: the peer writes `HEAD`, then
+  `BODY` 50 ms later; the stream yields `HEAD`, `into_inner()`, and a
+  `socket_recv` on the socket gets nothing.
+  `a_stream_dropped_mid_batch_gives_the_ring_its_buffers_back` shows the same
+  loss (chunk `b`) and only checks the buffers. Harmless for
+  `UdpMultiRecv::into_inner` (datagrams), a corrupted stream for TCP. Return
+  the leftover buffers with the socket, after waiting for the cancel's
+  terminal CQE, or say in the doc that the call is only for a stream at a
+  known quiet point.
+- [ ] **The shutdown flag wakes nobody.** The eventfd completion only sets
+  `shutting_down` (`io_driver/mod.rs:546`). A `MultiAccept` in the root future
+  sees it because the root is polled on every turn (exit 0.4 ms after
+  `SIGTERM`); the same accept loop in a spawned task that the root awaits is
+  never polled again, `SIGTERM` does nothing, and the watchdog ends the
+  process with code 1 thirty seconds later. Wake what waits on the flag: the
+  parked multishot accepts at least, their wakers are in the slab. Goes with
+  "Graceful shutdown" in `docs/future-work.md`.
+- [ ] **The signal watchdog kills a process that shut down cleanly.**
+  `setup_sig_handling` (`lib.rs:152`) sleeps 30 s after the signal and calls
+  `process::exit(1)` whatever happened since. Repro: the workers return 0.5 s
+  after `SIGTERM`, `main` goes on with its own work, and the process exits
+  with code 1 at 30.5 s. Disarm it when `Topology::run` returns.
+- [ ] **Futures bound to one thread's driver are `Send`.** `Sleep`, the
+  `open_file()` future, `RecvFromPeer`, `RecvMsgFromPeer`, `RecvMsgReply` and
+  `ReplySignal` hold a token or a slot index and nothing that is `!Send`;
+  `Op` has `PhantomData<*const ()>` for this, they do not. An `open_file`
+  future polled once on worker A, sent over an `mpsc` and polled on worker B
+  indexes B's slab through `get_unchecked_mut`: "unsafe precondition(s)
+  violated" in a debug build, an out-of-bounds access in release, from safe
+  code. A moved `Sleep` polls or frees another timer's node, a moved
+  `RecvMsgReply` takes another request's reply and casts it. Give each the
+  same marker as `Op`.
+- [ ] **`BufRingSpec::make_buffer` and `recycle_bid` are public and safe.**
+  (`io_driver/buf_ring.rs:105`, `:109`.) `make_buffer` does not check `len`:
+  `Ring::make_buffer(0, 1 << 20).as_ref()` on 64-byte buffers is a megabyte
+  slice and a segfault. `recycle_bid` on a buffer still held puts it under
+  two owners. Make them `unsafe fn`, or hide them and check `len` against
+  `BUFFER_SIZE`.
+- [ ] **Wheel sleeps fire up to two ticks early, and `docs/time.md` says the
+  opposite** (extends B12). `init_timer` (`timers/wheel/mod.rs:333`) rounds
+  down to a tick, then takes one off. `docs/time.md:21` promises between `d`
+  rounded down and 10 ms after that. Shortest sleep measured while another
+  task keeps the loop turning: 10 ms asked, 0.4 ms; 19 ms, 0.23 ms; 20 ms,
+  10.4 ms; 100 ms, 90.4 ms. So `timeout(10 ms, ..)` can expire at once. An
+  idle loop hides half of it: it sleeps whole ticks from now, and 15 ms comes
+  out as 10 ms. The five-second store is exact (5.00 to 5.01 s). Round up and
+  do not take the tick off, or correct the doc and B12's "~10 ms".
+
+Smaller:
+
+- [ ] **`docs/cancellation.md:11` says a completed op "drops without side
+  effects".** For a receive the bytes have left the socket and are dropped
+  with the buffer: the `Ended` fast path of `cancel_single_op_keep`, and
+  `CancelledRecycling` for a result that lands after the drop. A
+  `timeout(d, recv)` in a loop loses stream data whenever the two race. Read
+  from the code, not reproduced. Inherent to cancelling by drop; the doc
+  should say so and point at `select(&mut recv, ..)`.
+- [ ] **`Topology::run` blocks `SIGTERM` / `SIGINT` on the calling thread
+  only** (`topology/mod.rs:187`). A thread started before it takes the signal
+  with the default action and the process dies without a shutdown (exit 143
+  in the first repro). Document that `run` comes before any other thread, or
+  install a handler instead of relying on the mask.
+- B4 looks done: `options::install` (`runtime/options.rs:90`) panics with
+  "a runtime is already running on this thread" before a nested `block_on`
+  touches `TASK_LIST`. Tick it once a test pins it.
+
 ## Open audit items
 
 ### Structural
