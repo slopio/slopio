@@ -320,3 +320,72 @@ fn open_does_not_create() {
 
     assert!(!std::path::Path::new(test_file).exists());
 }
+
+/// `fstat` reports what the file is: its size, its kind, the permission bits
+/// it was created with, and a modification time that is now.
+#[test]
+fn fstat_reports_size_kind_permissions_and_time() {
+    let test_file = "/tmp/test_fstat.txt";
+    let _ = fs::remove_file(test_file);
+    let before = std::time::SystemTime::now() - std::time::Duration::from_secs(2);
+
+    main_thread(async {
+        let file = OpenOptions::write()
+            .create_new(mode::RW_USER)
+            .open(test_file)
+            .await
+            .unwrap();
+        let empty = file.fstat().await.unwrap();
+        assert!(empty.is_empty());
+
+        assert_eq!(file.write(b"0123456789").await.0.unwrap(), 10);
+        let meta = file.fstat().await.unwrap();
+        assert_eq!(meta.len(), 10);
+        assert!(meta.is_file() && !meta.is_dir());
+        assert_eq!(meta.permissions(), mode::RW_USER);
+        assert_eq!(meta.uid(), unsafe { libc::getuid() });
+        assert_eq!(meta.nlink(), 1);
+        assert!(meta.modified() >= before, "modified {:?}", meta.modified());
+        assert!(
+            meta.modified() <= std::time::SystemTime::now() + std::time::Duration::from_secs(2)
+        );
+    });
+
+    // The same answer std gives.
+    let std_meta = fs::metadata(test_file).unwrap();
+    assert_eq!(std_meta.len(), 10);
+    let _ = fs::remove_file(test_file);
+}
+
+/// A directory opened for reading says it is one.
+#[test]
+fn fstat_tells_a_directory_from_a_file() {
+    main_thread(async {
+        let dir = OpenedFile::open("/tmp").await.unwrap();
+        let meta = dir.fstat().await.unwrap();
+        assert!(meta.is_dir() && !meta.is_file());
+    });
+}
+
+/// An `fstat` dropped in flight leaves the file usable: the driver keeps the
+/// answer's buffer until the kernel is done with it, and the next one works.
+#[test]
+fn an_fstat_dropped_in_flight_is_absorbed() {
+    use slopio::runtime::select::select;
+
+    let test_file = "/tmp/test_fstat_cancel.txt";
+    fs::write(test_file, b"abc").unwrap();
+
+    main_thread(async {
+        let file = OpenedFile::open(test_file).await.unwrap();
+        for _ in 0..64 {
+            let mut stat = file.fstat();
+            // Polled once, so submitted; then dropped before its answer.
+            let _ = select(&mut stat, std::future::ready(())).await;
+            drop(stat);
+        }
+        assert_eq!(file.fstat().await.unwrap().len(), 3);
+    });
+
+    let _ = fs::remove_file(test_file);
+}

@@ -47,9 +47,14 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   (`processes/spawn.rs`): it binds `..`, so `stdin` stays in the partly moved
   `self` and drops only after the `await`. `wait()` on `cat` without
   `close_stdin()` hangs, although the doc says it sends EOF.
-- [ ] **`OpenedFile::fstat` double-closes on error** (`files/mod.rs`): if
+- [x] **`OpenedFile::fstat` double-closes on error** (`files/mod.rs`): if
   `metadata()?` fails, the temporary `File` closes the fd, then `FdInner`
   closes it again.
+  Done: `fstat` no longer borrows the fd through a `std::fs::File`. It is a
+  `statx` submitted to the ring (`files/stat.rs`), so it also stopped
+  blocking the worker, and resolves to the runtime's own `Metadata`. The
+  simulated ring has no model for `statx`: there the op answers 0 and the
+  metadata is all zeroes.
 
 ## Found by the runtime review of 2026-11-10
 

@@ -60,20 +60,17 @@
 //! let _ = OpenOptions::read().truncate();
 //! ```
 
-use std::{
-    fs::Metadata,
-    marker::PhantomData,
-    os::fd::{FromRawFd, IntoRawFd},
-    rc::Rc,
-};
+use std::{marker::PhantomData, rc::Rc};
 
 use crate::io_driver::operations::fd::{FdInner, OpFd};
 pub mod open;
 pub mod read;
+pub mod stat;
 pub mod write;
 
 pub use open::{OpenFileError, OpenOptions};
 pub use read::ReadFile;
+pub use stat::{Metadata, StatFile};
 pub use write::{WriteFile, write_all};
 
 /// How a file is opened: the marker types a handle is parameterised by.
@@ -182,13 +179,6 @@ impl<M> OpenedFile<M> {
     /// A strong ref for an operation to hold until completion.
     pub(crate) fn share(&self) -> OpFd {
         OpFd::new(&self.inner)
-    }
-
-    pub fn fstat(&self) -> std::io::Result<Metadata> {
-        let f = unsafe { std::fs::File::from_raw_fd(self.fd()) };
-        let metadata = f.metadata()?;
-        let _ = f.into_raw_fd(); //preventing closing the fd
-        Ok(metadata)
     }
 }
 
