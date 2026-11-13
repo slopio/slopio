@@ -13,8 +13,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use super::files::FileMeta;
 use super::timeline::Outcome;
 
 /// What a scripted response is attached to.
@@ -30,6 +31,11 @@ pub enum Trigger {
     /// Any write-side op on this descriptor — `SEND`, `SEND_ZC`, `SENDMSG`,
     /// `WRITE`, `WRITEV` or `WRITE_FIXED`.
     Write(RawFd),
+    /// An open. It names no descriptor yet, so opens answer in the order they
+    /// are submitted, whatever their paths.
+    Open,
+    /// A `statx` on this descriptor.
+    Stat(RawFd),
 }
 
 /// What a scripted read does.
@@ -304,6 +310,65 @@ pub enum WriteEvent {
     Error(i32),
 }
 
+/// What a scripted open does.
+///
+/// Nothing declared means the open succeeds, onto a file the simulator makes
+/// up: created empty if the open may create, found empty otherwise.
+pub enum OpenEvent {
+    /// The file was already there, and is this. The open's own flags still
+    /// apply: `O_TRUNC` empties it, `O_APPEND` writes at its end.
+    Existing(FileMeta),
+    /// The open fails with this errno, given positive.
+    Error(i32),
+}
+
+impl OpenEvent {
+    /// [`Existing`](Self::Existing), for a regular file of `size` bytes.
+    pub fn existing(size: u64) -> Self {
+        Self::Existing(FileMeta::file(size))
+    }
+}
+
+/// What a scripted `statx` does.
+///
+/// Nothing declared means the simulator answers from what it knows of the
+/// file: what it was opened as, grown by the writes accepted since.
+pub enum StatEvent {
+    /// The file is this, whatever the simulator knew of it.
+    Meta(FileMeta),
+    /// The stat fails with this errno, given positive.
+    Error(i32),
+}
+
+impl StatEvent {
+    /// A regular file of `size` bytes, `0o644`.
+    pub fn file(size: u64) -> Self {
+        Self::Meta(FileMeta::file(size))
+    }
+
+    /// A directory, `0o755`.
+    pub fn dir() -> Self {
+        Self::Meta(FileMeta::dir())
+    }
+
+    fn refine(self, builder: &str, refine: impl FnOnce(FileMeta) -> FileMeta) -> Self {
+        match self {
+            Self::Meta(meta) => Self::Meta(refine(meta)),
+            Self::Error(_) => panic!("{builder} applies to a file"),
+        }
+    }
+
+    /// The permission bits, `0o600` and the like.
+    pub fn permissions(self, bits: u32) -> Self {
+        self.refine("permissions", |meta| meta.permissions(bits))
+    }
+
+    /// When the content last changed.
+    pub fn modified(self, at: SystemTime) -> Self {
+        self.refine("modified", |meta| meta.modified(at))
+    }
+}
+
 /// How long an entry is held back.
 #[derive(Clone, Copy, Debug)]
 pub enum Delay {
@@ -402,6 +467,8 @@ timed!(ReadEvent);
 timed!(AcceptEvent);
 timed!(ConnectEvent);
 timed!(WriteEvent);
+timed!(OpenEvent);
+timed!(StatEvent);
 
 impl From<ReadEvent> for Outcome {
     fn from(event: ReadEvent) -> Self {
@@ -445,6 +512,24 @@ impl From<WriteEvent> for Outcome {
             WriteEvent::All => Outcome::Accept(None),
             WriteEvent::Short(n) => Outcome::Accept(Some(n)),
             WriteEvent::Error(errno) => Outcome::result(as_errno(errno)),
+        }
+    }
+}
+
+impl From<OpenEvent> for Outcome {
+    fn from(event: OpenEvent) -> Self {
+        match event {
+            OpenEvent::Existing(meta) => Outcome::Open(meta),
+            OpenEvent::Error(errno) => Outcome::result(as_errno(errno)),
+        }
+    }
+}
+
+impl From<StatEvent> for Outcome {
+    fn from(event: StatEvent) -> Self {
+        match event {
+            StatEvent::Meta(meta) => Outcome::Stat(Some(meta)),
+            StatEvent::Error(errno) => Outcome::result(as_errno(errno)),
         }
     }
 }

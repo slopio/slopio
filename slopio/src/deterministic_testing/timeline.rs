@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 
 use super::clock::Nanos;
 use super::fds::FdKind;
+use super::files::FileMeta;
 use super::scenario::{Batch, Flow, Scripted};
 use super::sqe::Sqe;
 
@@ -25,6 +26,12 @@ pub enum Outcome {
     Data(Vec<u8>),
     /// Complete with a freshly minted descriptor, for ops that hand one back.
     NewFd(FdKind),
+    /// Complete an open with a freshly minted descriptor, onto a file that was
+    /// already there and is this.
+    Open(FileMeta),
+    /// Write what `statx` reports into the op's buffer, then complete with 0:
+    /// this description, or what the simulator knows of the file.
+    Stat(Option<FileMeta>),
     /// Take the bytes the op offers — all of them, or the first `n` — record
     /// them against the descriptor, and complete with the count. The mirror of
     /// `Data`, for the write side.

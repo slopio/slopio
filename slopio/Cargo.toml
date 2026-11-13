@@ -73,6 +73,10 @@ name = "simulated_runtime"
 required-features = ["simulation"]
 
 [[test]]
+name = "simulated_files"
+required-features = ["simulation"]
+
+[[test]]
 name = "dst_echo"
 required-features = ["simulation"]
 

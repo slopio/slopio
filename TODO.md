@@ -53,8 +53,9 @@ Found by the review of commits a9a5d14..505fc55. None is high severity.
   Done: `fstat` no longer borrows the fd through a `std::fs::File`. It is a
   `statx` submitted to the ring (`files/stat.rs`), so it also stopped
   blocking the worker, and resolves to the runtime's own `Metadata`. The
-  simulated ring has no model for `statx`: there the op answers 0 and the
-  metadata is all zeroes.
+  simulated ring answers it from what it keeps of each open file
+  (`deterministic_testing/files.rs`): a size that follows the writes, dates
+  on the ring's clock, or whatever a test scripts with `on_stat`.
 
 ## Found by the runtime review of 2026-11-10
 

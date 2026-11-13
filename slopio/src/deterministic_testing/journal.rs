@@ -274,6 +274,7 @@ fn name(code: u8) -> String {
         (opcode::Connect::CODE, "CONNECT"),
         (opcode::Close::CODE, "CLOSE"),
         (opcode::OpenAt::CODE, "OPENAT"),
+        (opcode::Statx::CODE, "STATX"),
         (opcode::AsyncCancel::CODE, "ASYNC_CANCEL"),
         (opcode::Timeout::CODE, "TIMEOUT"),
         (opcode::MsgRingData::CODE, "MSG_RING"),

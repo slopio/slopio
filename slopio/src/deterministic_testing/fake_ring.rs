@@ -9,6 +9,7 @@ use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use io_uring::{opcode, squeue};
 
@@ -17,6 +18,7 @@ use crate::io_driver::BufRingTake;
 use super::actor::{Actor, ActorCx, Effect, ReadReply, WriteReply};
 use super::clock::{self, Nanos};
 use super::fds::{self, FdKind};
+use super::files::Files;
 use super::journal::{Answer, Entry as Logged, Event, Journal};
 use super::scenario::{Batch, Delay, Entry, Flow, Scenario, Scripted, SplitMix64, Step, Trigger};
 use super::sqe::{
@@ -52,6 +54,14 @@ impl Pace {
             Self::Virtual(clock) => clock.advance_to_nanos(deadline),
         }
     }
+
+    /// The date, for what a file is stamped with.
+    fn wall(&self) -> SystemTime {
+        match self {
+            Self::Real => SystemTime::now(),
+            Self::Virtual(clock) => clock.now_wall(),
+        }
+    }
 }
 
 /// The `ring_fd` a simulated ring reports. Deliberately invalid, so a stray
@@ -83,6 +93,7 @@ const OP_WRITE: u8 = opcode::Write::CODE;
 const OP_WRITEV: u8 = opcode::Writev::CODE;
 const OP_WRITE_FIXED: u8 = opcode::WriteFixed::CODE;
 const OP_OPENAT: u8 = opcode::OpenAt::CODE;
+const OP_STATX: u8 = opcode::Statx::CODE;
 const OP_ASYNC_CANCEL: u8 = opcode::AsyncCancel::CODE;
 const OP_CLOSE: u8 = opcode::Close::CODE;
 
@@ -152,6 +163,8 @@ pub fn trigger_for(sqe: &Sqe) -> Option<Trigger> {
         OP_CONNECT => Some(Trigger::Connect(sqe.fd)),
         OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_SENDMSG_ZC | OP_WRITE | OP_WRITEV
         | OP_WRITE_FIXED => Some(Trigger::Write(sqe.fd)),
+        OP_OPENAT => Some(Trigger::Open),
+        OP_STATX => Some(Trigger::Stat(sqe.fd)),
         _ => None,
     }
 }
@@ -199,7 +212,7 @@ fn dead(state: &FakeRingState, trigger: Trigger) -> bool {
     match trigger {
         Trigger::Read(fd) => state.peers.contains_key(&fd),
         Trigger::Write(fd) => state.peers.get(&fd) == Some(&Peer::Reset),
-        Trigger::Accept(_) | Trigger::Connect(_) => false,
+        Trigger::Accept(_) | Trigger::Connect(_) | Trigger::Open | Trigger::Stat(_) => false,
     }
 }
 
@@ -409,6 +422,8 @@ fn serve_write(state: &mut FakeRingState, pending: Pending, now: Nanos) {
                 .entry(sqe.fd)
                 .or_default()
                 .push(bytes[..n].to_vec());
+            let wall = state.pace.wall();
+            state.files.wrote(&sqe, n as u64, wall);
             let after = match reply {
                 WriteReply::AcceptedAfter(_, after) => nanos(after),
                 _ => 0,
@@ -526,6 +541,7 @@ fn serve_read(
                         if peek {
                             state.unread.entry(fd).or_default().splice(0..0, bytes);
                         }
+                        state.files.read(&sqe, completion.result as u64);
                         // Ended by the kernel on its own: no F_MORE, the op is over.
                         if multishot {
                             if !state.scenario.chance(state.kernel_faults.ended) {
@@ -672,6 +688,7 @@ fn advance_stream(
 fn default_outcome(sqe: &Sqe) -> Outcome {
     match sqe.opcode {
         OP_OPENAT => Outcome::NewFd(FdKind::File),
+        OP_STATX => Outcome::Stat(None),
         OP_SEND | OP_SEND_ZC | OP_SENDMSG | OP_SENDMSG_ZC | OP_WRITE | OP_WRITEV
         | OP_WRITE_FIXED => Outcome::Accept(None),
         _ => Outcome::result(0),
@@ -714,10 +731,12 @@ unsafe fn gather(iov: *const libc::iovec, count: usize) -> Vec<u8> {
 
 /// Retire an op: deliver its outcome and build the CQE. A CQE carries no
 /// payload, so data goes into the op's buffer and only the count is reported.
-/// Data each way is recorded, in `read` and `written`.
+/// Data each way is recorded, in `read` and `written`, and what it does to a
+/// file — its size, its position, its date as of `now` — in `files`.
 ///
 /// Also returns what a flow has left unread, for the completions after this
 /// one, and whether the flow ends the op here whatever the result.
+#[allow(clippy::too_many_arguments)]
 fn complete_outcome(
     sqe: Sqe,
     outcome: Outcome,
@@ -725,6 +744,8 @@ fn complete_outcome(
     read: &mut HashMap<RawFd, Vec<Vec<u8>>>,
     written: &mut HashMap<RawFd, Vec<Vec<u8>>>,
     scenario: &mut Scenario,
+    files: &mut Files,
+    now: SystemTime,
 ) -> (Completion, Option<Flow>, bool) {
     let completion = match outcome {
         Outcome::Result { result, flags } => Completion {
@@ -739,18 +760,66 @@ fn complete_outcome(
             }
             let n = bytes.len() as i32;
             written.entry(sqe.fd).or_default().push(bytes);
+            files.wrote(&sqe, n as u64, now);
             Completion {
                 user_data: sqe.user_data,
                 result: n,
                 flags: 0,
             }
         }
-        Outcome::NewFd(kind) => Completion {
-            user_data: sqe.user_data,
-            result: fds::mint(kind),
-            flags: 0,
-        },
-        Outcome::Data(bytes) => deliver(sqe, provider, read, |_| bytes).unwrap_or_else(|| dry(sqe)),
+        Outcome::NewFd(kind) => {
+            let fd = fds::mint(kind);
+            if sqe.opcode == OP_OPENAT {
+                files.opened(fd, &sqe, None, now);
+            }
+            Completion {
+                user_data: sqe.user_data,
+                result: fd,
+                flags: 0,
+            }
+        }
+        Outcome::Open(meta) => {
+            let fd = fds::mint(FdKind::File);
+            files.opened(fd, &sqe, Some(meta), now);
+            Completion {
+                user_data: sqe.user_data,
+                result: fd,
+                flags: 0,
+            }
+        }
+        Outcome::Stat(meta) => {
+            let answer = match meta {
+                Some(meta) => Some(files.described(sqe.fd, meta)),
+                // The descriptor itself, not a path looked up from it.
+                None if sqe.op_flags as i32 & libc::AT_EMPTY_PATH != 0 => files.stat(sqe.fd),
+                None => None,
+            };
+            // A file the simulator knows nothing of: the buffer stays as it was.
+            if let Some(statx) = answer {
+                assert!(
+                    sqe.off != 0,
+                    "answering user_data {:#x}, a statx with no buffer",
+                    sqe.user_data,
+                );
+                // SAFETY: a `STATX` carries its `struct statx` in `off`, and the
+                // submitting future keeps it alive until its op completes — the
+                // contract the kernel writes it under. The op is being retired
+                // now, and the answer is a local, so the two do not overlap.
+                unsafe { std::ptr::write(sqe.off as *mut libc::statx, statx) };
+            }
+            Completion {
+                user_data: sqe.user_data,
+                result: 0,
+                flags: 0,
+            }
+        }
+        Outcome::Data(bytes) => {
+            let completion = deliver(sqe, provider, read, |_| bytes).unwrap_or_else(|| dry(sqe));
+            if completion.result > 0 {
+                files.read(&sqe, completion.result as u64);
+            }
+            completion
+        }
         Outcome::Actor => unreachable!("an actor's op is served by serve_actor"),
         Outcome::Committed(result) => Completion {
             user_data: sqe.user_data,
@@ -1027,6 +1096,8 @@ struct FakeRingState {
     /// What the runtime wrote and the simulation accepted, per descriptor, one
     /// entry per completed op in completion order.
     written: HashMap<RawFd, Vec<Vec<u8>>>,
+    /// What `statx` would say of each open file, kept up as it is written.
+    files: Files,
     /// Registered buffer rings, by group id, with the size of their buffers.
     buf_rings: Vec<(u16, BufRingTake, u32)>,
     /// Descriptors whose far end is an actor.
@@ -1206,6 +1277,19 @@ impl FakeRingHandle {
     /// `WRITEV`, … alike. A write nobody scripted is accepted whole.
     pub fn on_write(&self, fd: RawFd, event: impl Into<Scripted>) {
         self.script(Trigger::Write(fd), event.into());
+    }
+
+    /// Queue what the next open does, whatever its path. An open nobody
+    /// scripted succeeds, onto an empty file.
+    pub fn on_open(&self, event: impl Into<Scripted>) {
+        self.script(Trigger::Open, event.into());
+    }
+
+    /// Queue what the next `statx` on `fd` answers. One nobody scripted is
+    /// answered from what the simulator knows of the file: what it was opened
+    /// as, grown by the writes accepted since.
+    pub fn on_stat(&self, fd: RawFd, event: impl Into<Scripted>) {
+        self.script(Trigger::Stat(fd), event.into());
     }
 
     /// Queue everything one multishot read on `fd` produces, in order.
@@ -1453,6 +1537,7 @@ impl FakeRingBuilder {
             voided: 0,
             read: HashMap::new(),
             written: HashMap::new(),
+            files: Files::new(pace.wall()),
             buf_rings: Vec::new(),
             actors: HashMap::new(),
             unread: HashMap::new(),
@@ -1552,6 +1637,7 @@ impl FakeRing {
                 // Its last word; nothing it asks for can reach the program now.
                 call_actor(state, sqe.fd, now, |actor, cx| actor.on_closed(cx));
                 state.actors.remove(&sqe.fd);
+                state.files.closed(sqe.fd);
                 state.unread.remove(&sqe.fd);
                 state.writes_due.remove(&sqe.fd);
                 state.cq.push_back(Completion {
@@ -1745,7 +1831,7 @@ impl FakeRing {
 
                     let mut ended = false;
                     while let Some(outcome) = batch.pop_front() {
-                        let minted = matches!(outcome, Outcome::NewFd(_));
+                        let minted = matches!(outcome, Outcome::NewFd(_) | Outcome::Open(_));
                         let st = &mut *state;
                         let (mut completion, unread, ends) = complete_outcome(
                             sqe,
@@ -1754,6 +1840,8 @@ impl FakeRing {
                             &mut st.read,
                             &mut st.written,
                             &mut st.scenario,
+                            &mut st.files,
+                            pace.wall(),
                         );
                         if minted && completion.result >= 0 {
                             state.opened.push(completion.result);
