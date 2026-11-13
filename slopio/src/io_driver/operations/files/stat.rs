@@ -116,7 +116,8 @@ impl<M> OpenedFile<M> {
         StatFile {
             fd: self.share(),
             id: None,
-            buf: Some(Box::new(unsafe { std::mem::zeroed() })),
+            // SAFETY: `statx` is integers and padding, so all zeroes is one.
+            buf: vec![unsafe { std::mem::zeroed() }],
         }
     }
 }
@@ -125,13 +126,16 @@ impl<M> OpenedFile<M> {
 pub struct StatFile {
     fd: OpFd,
     id: Option<OneshotToken>,
-    /// `Some` until a cancel hands it to the driver as keepalive.
-    buf: Option<Box<libc::statx>>,
+    /// Where the kernel writes its answer; a cancel hands it to the driver as
+    /// keepalive. A `Vec` of one and not a `Box`: a `Box` that moves claims
+    /// to be the only way to its memory, and the kernel keeps writing there
+    /// until the cancelled op's CQE.
+    buf: Vec<libc::statx>,
 }
 
 impl StatFile {
     fn register_to_driver(&mut self) {
-        let buf: *mut libc::statx = &mut **self.buf.as_mut().expect("buf present");
+        let buf = self.buf.as_mut_ptr();
         // An empty path with `AT_EMPTY_PATH` names the descriptor itself.
         let entry = opcode::Statx::new(types::Fd(self.fd.fd()), c"".as_ptr(), buf.cast())
             .flags(libc::AT_EMPTY_PATH)
@@ -151,7 +155,7 @@ impl Future for StatFile {
         match IO_DRIVER.with(|d| d.poll_op(&mut self.id, cx.waker())) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(io_result) => Poll::Ready(match io_result.result {
-                0 => Ok(Metadata(**self.buf.as_ref().expect("buf present"))),
+                0 => Ok(Metadata(self.buf[0])),
                 err => Err(std::io::Error::from_raw_os_error(-err)),
             }),
         }
@@ -162,9 +166,9 @@ impl Drop for StatFile {
     fn drop(&mut self) {
         if let Some(token) = self.id.take() {
             // The kernel writes the answer until the cancelled op's CQE.
-            let keep = self.buf.take().map(|b| b as Box<dyn Any>);
+            let keep: Box<dyn Any> = Box::new(std::mem::take(&mut self.buf));
             let parked = Some(self.fd.park());
-            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, keep, parked));
+            IO_DRIVER.with(|d| d.cancel_single_op_keep(token, None, Some(keep), parked));
         }
     }
 }
