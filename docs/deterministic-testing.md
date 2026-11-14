@@ -51,7 +51,7 @@ A simulated file has no content and no filesystem behind it: its reads are scrip
 
 - An open that may create the file finds nothing there and creates it, empty, with the permission bits it asked for. Any other open finds an empty file with `0o644`, or the file an `OpenEvent` described. `truncate` then empties it, and `append` sends every write to its end.
 - The size follows the writes the file accepted, a short write counting for what it took and a failed one for nothing. Reads and writes share one position, so a write after a read to the end of the file extends it.
-- A file is created when its open completes and modified when a write is last accepted, on the ring's clock: under virtual time, `handle.clock()` gives the same dates through `now_wall()`. A file that was already there is as old as the ring unless the test dated it.
+- A file is created when its open completes and modified when a write is last accepted, on the ring's clock: under virtual time these are dates counted from `VirtualClock::wall_start()`, the same in every run, and `handle.clock()` gives them through `now_wall()`. A file that was already there is as old as the ring unless the test dated it.
 
 A scripted `StatEvent` answers one `fstat` in place of this, and changes nothing of what the simulator knows. Descriptors are numbered from `FIRST_SIMULATED_FD` in the order they are created, sockets and files alike, and a new ring starts the numbering again, so the reads, writes and stats of a file can be scripted before the open that hands it out.
 
@@ -142,7 +142,7 @@ By default a completion lands as soon as the runtime next waits on the ring, in 
 
 ## Virtual time
 
-Build the ring with `.virtual_time()` and the timer stores read the same virtual clock as the simulated ring. A sleep is a jump: a test that sleeps for five seconds finishes in microseconds, and timers and completions fire in an order fully determined by the script. Without `.virtual_time()` the simulator sleeps for real on the monotonic clock, which is still deterministic but slow.
+Build the ring with `.virtual_time()` and the timer stores read the same virtual clock as the simulated ring. A sleep is a jump: a test that sleeps for five seconds finishes in microseconds, and timers and completions fire in an order fully determined by the script. The date is virtual too: every run starts at `VirtualClock::wall_start()`, midnight UTC on 1 January 2000, so `runtime::now()` and the dates of simulated files are the same from one run to the next. Without `.virtual_time()` the simulator sleeps for real on the monotonic clock, which is still deterministic but slow.
 
 Time only moves when the program blocks. A program that spins, polling again at once instead of waiting, keeps virtual time where it is, so nothing due later ever lands. The ring treats a hundred thousand waits in a row at one instant as that, and panics instead of hanging.
 

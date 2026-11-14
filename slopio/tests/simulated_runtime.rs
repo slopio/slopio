@@ -8,7 +8,8 @@
 use std::time::{Duration, Instant};
 
 use slopio::deterministic_testing::{
-    Cut, FakeRing, FakeRingHandle, Hiccup, Peer, ReadEvent, WriteEvent, is_open, simulated_socket,
+    Cut, FakeRing, FakeRingHandle, Hiccup, Peer, ReadEvent, VirtualClock, WriteEvent, is_open,
+    simulated_socket,
 };
 use slopio::io_driver::operations::sockets::multi_recv::{CompletionError, MultiRecv};
 use slopio::io_driver::operations::sockets::recv::{socket_peek, socket_recv};
@@ -708,6 +709,35 @@ fn a_sleep_fires_on_virtual_time_whatever_real_time_setup_took() {
     );
     let slept = clock.now() - start;
     assert_eq!(slept, Duration::from_millis(100));
+}
+
+/// The date does not come from the machine: every virtual clock starts at the
+/// same one, so what a program makes of `now()` is the same on every run.
+#[test]
+fn virtual_wall_time_starts_at_the_same_date_on_every_run() {
+    let (_, earlier) = simulated();
+    let earlier = earlier.clock().expect("built with virtual time");
+    let (fake, handle) = simulated();
+    let clock = handle.clock().expect("built with virtual time");
+    assert_eq!(earlier.now_wall(), VirtualClock::wall_start());
+    assert_eq!(clock.now_wall(), VirtualClock::wall_start());
+
+    RuntimeInner::simulated(fake).block_on::<(), _>(
+        async move {
+            assert_eq!(slopio::runtime::now(), VirtualClock::wall_start());
+            Sleep::during(Duration::from_millis(1_500)).await;
+            assert!(
+                clock.elapsed() >= Duration::from_secs(1),
+                "the sleep moved no time"
+            );
+            assert_eq!(
+                slopio::runtime::now(),
+                VirtualClock::wall_start() + clock.elapsed(),
+            );
+        },
+        None,
+        |run| run(),
+    );
 }
 
 /// Wall time is derived from the monotonic clock between anchors, and the

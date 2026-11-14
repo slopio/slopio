@@ -17,7 +17,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use io_uring::{opcode, types::Fd};
 use slopio::deterministic_testing::{
     FIRST_SIMULATED_FD, FakeRing, FakeRingHandle, FileMeta, OpenEvent, ReadEvent, StatEvent,
-    WriteEvent, is_open,
+    VirtualClock, WriteEvent, is_open,
 };
 use slopio::io_driver::operations::files::open::mode;
 use slopio::io_driver::operations::files::{OpenFileError, OpenOptions, OpenedFile};
@@ -109,9 +109,10 @@ fn a_created_file_has_the_mode_it_was_created_with() {
     assert_all_closed(&handle);
 }
 
-/// The dates are the ring's own clock: a file is created when its open
-/// completes and modified when a write is last accepted, however long ago
-/// that was by the time anyone asks.
+/// The dates are the ring's own clock, which starts at the same date on every
+/// run: a file is created when its open completes and modified when a write
+/// is last accepted, however long ago that was by the time anyone asks. A
+/// file the ring only found is as old as the ring, whenever it is opened.
 #[test]
 fn a_file_is_dated_by_the_virtual_clock() {
     let (fake, handle) = simulated();
@@ -120,6 +121,7 @@ fn a_file_is_dated_by_the_virtual_clock() {
     run(fake, async move {
         let file = OpenedFile::create("/sim/log").await.expect("open");
         let created = clock.now_wall();
+        assert_eq!(created, VirtualClock::wall_start());
         Sleep::during(Duration::from_secs(3)).await;
 
         let untouched = file.fstat().await.expect("fstat");
@@ -135,7 +137,11 @@ fn a_file_is_dated_by_the_virtual_clock() {
         assert_eq!(later.created(), Some(created));
         assert_eq!(later.modified(), written);
 
-        drop(file);
+        let found = OpenedFile::open("/sim/conf").await.expect("open");
+        let old = found.fstat().await.expect("fstat");
+        assert_eq!(old.modified(), VirtualClock::wall_start());
+
+        drop((file, found));
         settle().await;
     });
 

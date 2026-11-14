@@ -1,18 +1,21 @@
 //! A clock a simulation advances by hand.
 //!
-//! It hands out real [`Instant`]s and [`SystemTime`]s, offset from a base taken
-//! at construction, so everything downstream keeps its types and learns
-//! nothing. Simulated time is just an origin plus an elapsed duration a test
-//! controls, rather than one the OS does.
+//! It hands out real [`Instant`]s and [`SystemTime`]s, so everything downstream
+//! keeps its types and learns nothing. Simulated time is just an origin plus an
+//! elapsed duration a test controls, rather than one the OS does.
+//!
+//! The two origins differ. An `Instant` cannot be made up, so the monotonic
+//! one is read when the clock is built; it is only ever compared with another
+//! instant of the same clock. The date can be read, printed and branched on,
+//! so its origin is the same in every run: [`VirtualClock::wall_start`].
 
 use std::cell::Cell;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::clock::{self, Nanos};
 
 pub struct VirtualClock {
     base: Instant,
-    base_wall: SystemTime,
     /// The same instant as `base`, read raw.
     ///
     /// Two representations are needed because the simulated ring schedules in
@@ -33,7 +36,6 @@ impl VirtualClock {
     pub fn new() -> Self {
         Self {
             base: Instant::now(),
-            base_wall: SystemTime::now(),
             base_nanos: clock::now(),
             elapsed: Cell::new(Duration::ZERO),
         }
@@ -43,8 +45,15 @@ impl VirtualClock {
         self.base + self.elapsed.get()
     }
 
+    /// The date every virtual clock starts at, 2000-01-01T00:00:00Z: not the
+    /// day of the run, so that what a program does with a date is the same on
+    /// every run.
+    pub fn wall_start() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(946_684_800)
+    }
+
     pub fn now_wall(&self) -> SystemTime {
-        self.base_wall + self.elapsed.get()
+        Self::wall_start() + self.elapsed.get()
     }
 
     /// The same instant as [`now`](Self::now), raw.
